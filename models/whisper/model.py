@@ -844,48 +844,231 @@ def verify_with_random_weights():
 # ---------------------------------------------------------------------------
 
 def run_full_inference(audio_path: str):
-    """Run Whisper-Tiny transcription with real weights via transformers."""
-    import torch
-    from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+    """Run Whisper-Tiny transcription fully on Triton WebGPU — no PyTorch.
 
-    model_id = "openai/whisper-tiny"
+    All operations (mel spectrogram, encoder, decoder) run on WebGPU/numpy.
+    """
+    print("=== Whisper-Tiny — Full Triton WebGPU ===")
 
-    print("=== Loading Whisper-Tiny ===")
-    processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id)
-    model.eval()
-    print(f"  Model loaded: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+    # --- Load weights ---
+    npz_path = os.path.join(_SCRIPT_DIR, "weights", "whisper_tiny_fp16.npz")
+    if not os.path.exists(npz_path):
+        print(f"Weights not found: {npz_path}")
+        print("Run:  python models/whisper/convert_weights.py")
+        sys.exit(1)
 
-    # Load audio
-    try:
-        import librosa
-        audio, sr = librosa.load(audio_path, sr=16000)
-    except ImportError:
-        import soundfile as sf
-        audio, sr = sf.read(audio_path)
-        if sr != 16000:
-            # Simple resample
-            from scipy import signal
-            audio = signal.resample(audio, int(len(audio) * 16000 / sr))
-            sr = 16000
-
-    print(f"  Audio: {len(audio)/sr:.1f}s at {sr}Hz")
-
-    # Process
-    inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
-
-    print("  Transcribing...")
+    print("  Loading weights...")
     t0 = time.time()
-    with torch.no_grad():
-        generated_ids = model.generate(
-            inputs["input_features"],
-            max_new_tokens=128,
-        )
-    t1 = time.time()
+    data = np.load(npz_path)
+    weights = {k: data[k].astype(np.float32) for k in data.files}
+    print(f"  Loaded {len(weights)} tensors in {(time.time()-t0)*1000:.0f}ms")
 
-    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    print(f"  Time: {(t1-t0)*1000:.0f}ms")
+    # --- Load audio ---
+    print(f"  Loading audio: {audio_path}")
+    audio = _load_audio(audio_path)
+    audio_sec = len(audio) / 16000
+    print(f"  Audio: {audio_sec:.1f}s at 16kHz ({len(audio)} samples)")
+
+    # --- Mel spectrogram (no librosa, pure numpy) ---
+    print("  Computing mel spectrogram...")
+    t0 = time.time()
+    mel = _compute_mel_spectrogram(audio)
+    t_mel = time.time() - t0
+    print(f"  Mel: {mel.shape} in {t_mel*1000:.0f}ms")
+
+    # --- Create model ---
+    config = {k: v for k, v in WHISPER_CONFIGS["tiny"].items() if k != "hf_repo"}
+    model = WhisperWebGPU(weights, **config)
+    print("  Model created")
+
+    # --- Encode ---
+    print("  Encoding audio...")
+    t0 = time.time()
+    encoder_out = model.encode(mel)
+    t_enc = time.time() - t0
+    print(f"  Encoder output: {encoder_out.shape} in {t_enc*1000:.0f}ms")
+
+    # --- Autoregressive decode ---
+    print("  Decoding (autoregressive)...")
+    t0 = time.time()
+
+    # Whisper special tokens
+    SOT = 50258      # <|startoftranscript|>
+    LANG_EN = 50259  # <|en|>
+    TRANSCRIBE = 50359  # <|transcribe|>
+    NO_TIMESTAMPS = 50363  # <|notimestamps|>
+    EOT = 50257      # <|endoftext|>
+
+    # Start tokens: SOT, language, task, notimestamps
+    token_ids = [SOT, LANG_EN, TRANSCRIBE, NO_TIMESTAMPS]
+    max_tokens = 128
+
+    for step in range(max_tokens):
+        tokens_np = np.array(token_ids, dtype=np.int32)
+        logits = model.decode(tokens_np, encoder_out)
+        next_token = int(logits[-1].argmax())
+        if next_token == EOT:
+            break
+        token_ids.append(next_token)
+
+    t_dec = time.time() - t0
+    n_out = len(token_ids) - 4  # exclude prompt tokens
+    tps = n_out / t_dec if t_dec > 0 else 0
+    print(f"  Generated {n_out} tokens in {t_dec*1000:.0f}ms ({tps:.1f} tok/s)")
+
+    # --- Decode tokens to text ---
+    # Use tokenizers library if available, else simple decode
+    text = _decode_tokens(token_ids[4:], weights)  # skip prompt tokens
     print(f"\n  Transcription: {text}")
+
+    print(f"\n--- Performance (all Triton WebGPU) ---")
+    print(f"  Mel spectrogram: {t_mel*1000:.0f}ms")
+    print(f"  Encoder:         {t_enc*1000:.0f}ms")
+    print(f"  Decoder:         {t_dec*1000:.0f}ms ({n_out} tokens)")
+    print(f"  Total:           {(t_mel + t_enc + t_dec)*1000:.0f}ms")
+
+
+def _load_audio(path: str, sr: int = 16000) -> np.ndarray:
+    """Load audio file to 16kHz mono float32. No torch/librosa needed."""
+    import wave
+    import struct
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.wav':
+        with wave.open(path, 'rb') as wf:
+            n_channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            frame_rate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        if sample_width == 2:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sample_width == 4:
+            samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported sample width: {sample_width}")
+
+        if n_channels > 1:
+            samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+        # Resample to 16kHz if needed
+        if frame_rate != sr:
+            duration = len(samples) / frame_rate
+            n_out = int(duration * sr)
+            indices = np.linspace(0, len(samples) - 1, n_out)
+            samples = np.interp(indices, np.arange(len(samples)), samples)
+
+        return samples.astype(np.float32)
+    else:
+        # Try soundfile as fallback
+        try:
+            import soundfile as sf
+            audio, file_sr = sf.read(path)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            if file_sr != sr:
+                duration = len(audio) / file_sr
+                n_out = int(duration * sr)
+                indices = np.linspace(0, len(audio) - 1, n_out)
+                audio = np.interp(indices, np.arange(len(audio)), audio)
+            return audio.astype(np.float32)
+        except ImportError:
+            raise ImportError(
+                f"Cannot read {ext} files. Install soundfile: pip install soundfile")
+
+
+def _compute_mel_spectrogram(audio: np.ndarray,
+                             sr: int = 16000,
+                             n_fft: int = 400,
+                             hop_length: int = 160,
+                             n_mels: int = 80) -> np.ndarray:
+    """Compute log-mel spectrogram matching Whisper's preprocessing.
+
+    Pure numpy — no librosa or torchaudio dependency.
+    Returns: (n_mels, T) float32
+    """
+    # Pad or trim to 30 seconds (Whisper's fixed context)
+    target_length = sr * 30  # 480000
+    if len(audio) < target_length:
+        audio = np.pad(audio, (0, target_length - len(audio)))
+    else:
+        audio = audio[:target_length]
+
+    # STFT
+    window = np.hanning(n_fft).astype(np.float32)
+    n_frames = 1 + (len(audio) - n_fft) // hop_length
+    stft = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.complex64)
+    for i in range(n_frames):
+        start = i * hop_length
+        frame = audio[start:start + n_fft] * window
+        spectrum = np.fft.rfft(frame)
+        stft[:, i] = spectrum
+
+    magnitudes = np.abs(stft) ** 2
+
+    # Mel filterbank
+    mel_filters = _mel_filterbank(sr, n_fft, n_mels)  # (n_mels, n_fft//2+1)
+
+    mel_spec = mel_filters @ magnitudes  # (n_mels, n_frames)
+
+    # Log mel
+    log_spec = np.log10(np.maximum(mel_spec, 1e-10))
+    log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0  # Whisper's normalization
+
+    return log_spec.astype(np.float32)
+
+
+def _mel_filterbank(sr: int, n_fft: int, n_mels: int) -> np.ndarray:
+    """Create mel filterbank matrix. (n_mels, n_fft//2+1)"""
+    def hz_to_mel(hz):
+        return 2595 * np.log10(1 + hz / 700)
+    def mel_to_hz(mel):
+        return 700 * (10 ** (mel / 2595) - 1)
+
+    n_freqs = n_fft // 2 + 1
+    all_freqs = np.linspace(0, sr / 2, n_freqs)
+
+    mel_low = hz_to_mel(0)
+    mel_high = hz_to_mel(sr / 2)
+    mel_points = np.linspace(mel_low, mel_high, n_mels + 2)
+    hz_points = mel_to_hz(mel_points)
+
+    filterbank = np.zeros((n_mels, n_freqs), dtype=np.float32)
+    for i in range(n_mels):
+        lower = hz_points[i]
+        center = hz_points[i + 1]
+        upper = hz_points[i + 2]
+        for j, freq in enumerate(all_freqs):
+            if lower <= freq <= center:
+                filterbank[i, j] = (freq - lower) / (center - lower + 1e-10)
+            elif center < freq <= upper:
+                filterbank[i, j] = (upper - freq) / (upper - center + 1e-10)
+
+    return filterbank
+
+
+def _decode_tokens(token_ids, weights=None):
+    """Decode Whisper token IDs to text."""
+    try:
+        from tokenizers import Tokenizer
+        tok_path = os.path.join(_SCRIPT_DIR, "weights", "tokenizer.json")
+        if os.path.exists(tok_path):
+            tokenizer = Tokenizer.from_file(tok_path)
+            return tokenizer.decode(token_ids)
+    except ImportError:
+        pass
+
+    try:
+        from transformers import WhisperTokenizer
+        tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-tiny")
+        return tokenizer.decode(token_ids, skip_special_tokens=True)
+    except ImportError:
+        pass
+
+    # Fallback: just show token IDs
+    return f"[token IDs: {token_ids}]"
 
 
 # ---------------------------------------------------------------------------
