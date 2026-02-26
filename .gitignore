@@ -1,0 +1,28 @@
+# Ignore weight files
+models/*/weights/
+*.npz
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Generated files
+*.png
+profile.html
+
+# Third party repos (cloned separately)
+third_party/triton-windows/
+third_party/dawn/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
