@@ -85,21 +85,24 @@ def _w(weights, name):
 
 
 def group_norm_cpu(x, w, b, num_groups, eps=1e-5):
-    """GroupNorm on (C,) or (C, H, W) via CPU."""
+    """GroupNorm on (C,) or (C, H, W) — vectorized."""
     shape = x.shape
     C = shape[0]
     G = min(num_groups, C)
     cpg = C // G
-    out = np.empty_like(x, dtype=np.float32)
-    for g in range(G):
-        cs, ce = g * cpg, (g + 1) * cpg
-        gd = x[cs:ce].astype(np.float32)
-        mean = gd.mean()
-        var = gd.var()
-        rstd = 1.0 / np.sqrt(var + eps)
-        for c in range(cs, ce):
-            out[c] = (x[c].astype(np.float32) - mean) * rstd * w[c] + b[c]
-    return out
+    x32 = x.astype(np.float32) if x.dtype != np.float32 else x
+    # Reshape: (G, cpg, ...) for per-group stats
+    spatial = shape[1:]
+    x_g = x32.reshape(G, cpg, *spatial)
+    # Reduce over channels-per-group and spatial dims
+    reduce_axes = tuple(range(1, x_g.ndim))
+    mean = x_g.mean(axis=reduce_axes, keepdims=True)
+    var = x_g.var(axis=reduce_axes, keepdims=True)
+    x_g = (x_g - mean) / np.sqrt(var + eps)
+    out = x_g.reshape(shape)
+    # Apply affine per channel
+    w_shape = (C,) + (1,) * len(spatial)
+    return out * w.reshape(w_shape) + b.reshape(w_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +337,7 @@ class SDXLWebGPU(WebGPUModel):
 
         x_flat: (S, C)  — spatial tokens
         context: (S_ctx, context_dim) — text encoder output
-        Uses GPU full multi-head attention kernel.
+        Vectorized multi-head attention (no per-head loop).
         """
         S, C = x_flat.shape
         S_ctx = context.shape[0]
@@ -354,16 +357,16 @@ class SDXLWebGPU(WebGPUModel):
         K_t = k.reshape(S_ctx, n_head, hd).astype(np.float32)
         V_t = v.reshape(S_ctx, n_head, hd).astype(np.float32)
 
-        # Cross-attention: Q from image, K/V from text
-        # Use per-head CPU attention since Q and KV have different seq lengths
+        # Vectorized cross-attention: batched matmul over heads
         scale = 1.0 / np.sqrt(float(hd))
-        attn_out = np.zeros((S, n_head, hd), dtype=np.float32)
-        for h_idx in range(n_head):
-            scores = Q[:, h_idx, :] @ K_t[:, h_idx, :].T * scale
-            scores -= scores.max(axis=-1, keepdims=True)
-            attn = np.exp(scores)
-            attn /= attn.sum(axis=-1, keepdims=True)
-            attn_out[:, h_idx, :] = attn @ V_t[:, h_idx, :]
+        Q_h = Q.transpose(1, 0, 2)      # (n_head, S, hd)
+        K_h = K_t.transpose(1, 2, 0)    # (n_head, hd, S_ctx)
+        V_h = V_t.transpose(1, 0, 2)    # (n_head, S_ctx, hd)
+        scores = np.float32(Q_h @ K_h * scale)  # (n_head, S, S_ctx)
+        scores -= scores.max(axis=-1, keepdims=True)
+        exp_s = np.exp(scores)
+        attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
+        attn_out = (attn @ V_h).transpose(1, 0, 2)  # (S, n_head, hd)
 
         out = attn_out.reshape(S, ch)
         out = self._linear_w(out, prefix + "to_out.0.weight",

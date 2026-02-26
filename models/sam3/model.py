@@ -195,9 +195,11 @@ class SAMWebGPU(WebGPUModel):
         # Self-attention with full (non-causal) attention
         ln1 = self._layer_norm(
             x, self._gpu_weights[pfx + "norm1.weight"],
-            self._gpu_weights[pfx + "norm1.bias"])
+            self._gpu_weights[pfx + "norm1.bias"],
+            gpu_out=True)
 
-        T = ln1.shape[0]
+        T = ln1.shape[0] if not hasattr(ln1, 'size') else (
+            ln1.shape[0] if ln1.shape else 1)
         q = self._linear(
             ln1, self._gpu_weights[pfx + "attn.q.weight"],
             self._gpu_weights[pfx + "attn.q.bias"], E)
@@ -212,31 +214,37 @@ class SAMWebGPU(WebGPUModel):
         K = k.reshape(T, n_head, HD)
         V = v.reshape(T, n_head, HD)
 
-        # Full (non-causal) attention per head
-        attn_out = np.zeros((T, n_head, HD), dtype=np.float32)
-        for h in range(n_head):
-            attn_out[:, h, :] = self._full_attention(
-                Q[:, h, :].copy(), K[:, h, :].copy(),
-                V[:, h, :].copy())
+        # Full (non-causal) multi-head attention — vectorized
+        scale = 1.0 / np.sqrt(HD)
+        Q_t = Q.transpose(1, 0, 2)    # (n_head, T, HD)
+        K_t = K.transpose(1, 2, 0)    # (n_head, HD, T)
+        scores = np.float32(Q_t @ K_t * scale)  # (n_head, T, T)
+        scores -= scores.max(axis=-1, keepdims=True)
+        exp_s = np.exp(scores)
+        attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
+        V_t = V.transpose(1, 0, 2)    # (n_head, T, HD)
+        attn_out = (attn @ V_t).transpose(1, 0, 2)  # (T, n_head, HD)
 
         attn_flat = attn_out.reshape(T, E)
         proj = self._linear(
             attn_flat, self._gpu_weights[pfx + "attn.proj.weight"],
             self._gpu_weights[pfx + "attn.proj.bias"], E)
-        x = self._add(x, proj)
+        x = self._add(x, proj, gpu_out=True)
 
-        # MLP
+        # MLP — chain on GPU
         ln2 = self._layer_norm(
             x, self._gpu_weights[pfx + "norm2.weight"],
-            self._gpu_weights[pfx + "norm2.bias"])
+            self._gpu_weights[pfx + "norm2.bias"],
+            gpu_out=True)
         h = self._linear(
             ln2, self._gpu_weights[pfx + "mlp.fc1.weight"],
-            self._gpu_weights[pfx + "mlp.fc1.bias"], IM)
-        h = self._gelu(h)
+            self._gpu_weights[pfx + "mlp.fc1.bias"], IM,
+            gpu_out=True)
+        h = self._gelu(h, gpu_out=True)
         h = self._linear(
             h, self._gpu_weights[pfx + "mlp.fc2.weight"],
             self._gpu_weights[pfx + "mlp.fc2.bias"], E)
-        x = self._add(x, h)
+        x = self._add(x, h, gpu_out=True)
         return x
 
     def encode_image(self, image: np.ndarray) -> np.ndarray:
