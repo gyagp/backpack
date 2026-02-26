@@ -15,6 +15,11 @@ build/
 *.png
 profile.html
 
+# Log files
+*.log
+triton-build*.log
+triton-err.log
+
 # Third party repos (cloned separately)
 third_party/triton-windows/
 third_party/dawn/
