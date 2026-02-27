@@ -6,8 +6,8 @@ with MXFP4 quantized expert weights, GQA attention with sinks,
 alternating full/sliding-window attention, and YaRN RoPE.
 
 Usage:
-    python python/examples/webgpu/gpt_oss/model.py --prompt "Hello" --max-tokens 50
-    python python/examples/webgpu/gpt_oss/model.py --verify
+    python python/examples/webgpu/gpt-oss/model.py --prompt "Hello" --max-tokens 50
+    python python/examples/webgpu/gpt-oss/model.py --verify
 
 Requirements:
     Dawn WebGPU library built at third_party/webgpu/dawn/build/

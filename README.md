@@ -39,7 +39,7 @@ backpack/
 │   ├── gpt2/         # GPT-2 inference
 │   ├── gemma/        # Google Gemma
 │   ├── phi4/         # Microsoft Phi-4
-│   ├── qwen/         # Alibaba Qwen
+│   ├── qwen2.5/      # Alibaba Qwen 2.5
 │   └── ...           # More models
 ├── docs/             # Documentation
 ├── third_party/

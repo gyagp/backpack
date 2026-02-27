@@ -39,8 +39,8 @@
 
 ```bash
 # First time: download weights (requires HF_TOKEN for gated repo)
-python python/examples/webgpu/gpt_oss/model.py --prompt "Hello" --max-tokens 50
+python python/examples/webgpu/gpt-oss/model.py --prompt "Hello" --max-tokens 50
 
 # Verify correctness
-python python/examples/webgpu/gpt_oss/model.py --verify
+python python/examples/webgpu/gpt-oss/model.py --verify
 ```
