@@ -47,17 +47,14 @@ When adding a new model:
 - Quantized keys: `{name}.q4`, `{name}.scales`, `{name}.zeros`, `{name}.K`
 - Typical compression: ~4× (e.g., 55GB BF16 → 14GB INT4)
 
-## Performance Optimization Checklist
+## Performance Optimization
 
-- [ ] **GPU-chain ops**: Pass `gpu_out=True` to keep intermediates on GPU
-- [ ] **Vectorize attention**: Use batched matmul (`Q_t @ K_t`) instead of per-head Python loops
-- [ ] **CPU decode path**: For T=1 decode, use `_cpu_matmul()` to avoid GPU dispatch overhead (~5-11ms per dispatch)
-- [ ] **Pre-allocate KV cache**: Write-in-place instead of `np.concatenate` per step
-- [ ] **Pre-compute RoPE tables**: Compute cos/sin at init, not per forward pass
-- [ ] **Vectorize norms**: Use numpy broadcasting instead of per-element loops
-- [ ] **Fast GELU**: Use `x * sigmoid(1.702 * x)` instead of `tanh`-based (5× faster)
-- [ ] **Window attention**: For vision models, partition → batched matmul → unpartition
-- [ ] **Profile first**: Add `--bench` mode with per-layer timing before optimizing blindly
+See [opt-guide.md](opt-guide.md) for detailed optimization techniques and profiling methodology.
+
+Key principles:
+- Profile first (`--bench` mode) before optimizing
+- Keep data on GPU (`gpu_out=True`) — CPU readback kills performance
+- For T=1 decode, CPU matmul beats GPU dispatch overhead
 
 ## Code Conventions
 
