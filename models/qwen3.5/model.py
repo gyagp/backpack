@@ -142,6 +142,8 @@ QWEN35_CONFIG = {
     "ssm_d_state": 128,
     "ssm_conv_kernel": 4,
     "hf_repo": "Qwen/Qwen3.5-27B",
+    # Q proj uses 2× heads (48 Q heads for double-Q with QK-norm)
+    "n_q_heads": 48,
 }
 
 
@@ -182,12 +184,15 @@ class Qwen35WebGPU(WebGPUModel):
                  ssm_d_state: int = 128,
                  ssm_conv_kernel: int = 4,
                  max_seq_len: int = 2048,
-                 quantized: bool = False):
+                 quantized: bool = False,
+                 n_q_heads: int = None):
         self.partial_rotary_factor = partial_rotary_factor
         self.rotary_dim = int(head_dim * partial_rotary_factor)
         self.attn_output_gate = attn_output_gate
         self.MAX_SEQ_LEN = max_seq_len
         self._quantized = quantized
+        # Q heads can differ from output heads (e.g. 48 Q heads, 24 output heads)
+        self.n_q_heads = n_q_heads if n_q_heads is not None else n_head
 
         # Mamba-2 SSM params
         self.ssm_n_heads = ssm_n_heads
@@ -212,12 +217,14 @@ class Qwen35WebGPU(WebGPUModel):
         # So in_proj_qkv = expand_dim + B_dim + C_dim = 6144 + 2048 + 2048 = 10240
         self.ssm_qkv_dim = self.ssm_dim + 2 * (ssm_n_groups * ssm_d_state)
 
-        # Full attention output dimension
+        # Full attention output dimension (o_proj: n_head × head_dim)
         self.full_attn_qo_dim = n_head * head_dim  # 24 * 256 = 6144
+        # Q projection dimension (may differ: n_q_heads × head_dim)
+        self.full_attn_q_dim = self.n_q_heads * head_dim  # 48 * 256 = 12288
 
         # Fused QKV output dimension for full attention
         self.full_attn_qkv_dim = (
-            self.full_attn_qo_dim + 2 * n_kv_heads * head_dim)
+            self.full_attn_q_dim + 2 * n_kv_heads * head_dim)
 
         # Fused gate_up output dimension for MLP
         self.gate_up_out = 2 * intermediate_size
@@ -335,17 +342,24 @@ class Qwen35WebGPU(WebGPUModel):
 
     def _proj(self, x, weight_name, bias_key, out_features,
               K=None, gpu_out=False):
-        """Linear projection using fp16w when available, else fp32.
-
-        weight_name: base name of the weight (without .fp16 suffix).
-        Automatically selects the best available kernel.
-        """
+        """Linear projection using best available kernel (Q4/fp16/fp32)."""
+        # INT4 GPU path
+        q4_key = weight_name + ".q4.gpu"
+        if q4_key in self._gpu_weights:
+            return self._linear_q4(
+                x, self._gpu_weights[q4_key],
+                self._gpu_weights[weight_name + ".scales.gpu"],
+                self._gpu_weights[weight_name + ".zeros.gpu"],
+                self._gpu_weights[bias_key], out_features,
+                K=K, gpu_out=gpu_out)
+        # fp16 path
         fp16_name = weight_name + ".fp16"
         if fp16_name in self._gpu_weights and hasattr(self, '_linear_fp16w_result'):
             return self._linear_fp16w(
                 x, self._gpu_weights[fp16_name],
                 self._gpu_weights[bias_key], out_features,
                 K=K, gpu_out=gpu_out)
+        # fp32 fallback
         return self._linear(
             x, self._gpu_weights[weight_name],
             self._gpu_weights[bias_key], out_features,
@@ -389,19 +403,30 @@ class Qwen35WebGPU(WebGPUModel):
         pass  # Use numpy-based cache in kv_cache dict
 
     def _upload_weights_to_gpu(self):
-        """Upload all weights to GPU (fp16 for linear layers)."""
+        """Upload all weights to GPU (INT4/fp16/fp32 depending on capabilities)."""
         E = self.n_embd
         HD = self.head_dim
         IM = self.intermediate_size
         ssm_dim = self.ssm_dim  # 6144
 
-        if self._quantized:
+        # Determine upload path
+        use_q4_gpu = (self._quantized
+                      and getattr(self, '_has_fp16_linear', False))
+        self._use_q4_gpu = use_q4_gpu
+        has_fp16 = (not use_q4_gpu
+                    and getattr(self, '_has_fp16_linear', False))
+
+        if self._quantized and not use_q4_gpu:
+            # Pre-dequantize when GPU INT4 kernels unavailable
             self._dequantize_all_weights()
 
-        # Determine if fp16 linear kernel is available
-        has_fp16 = hasattr(self, '_linear_fp16w_result')
-        _ul = (self._upload_linear_weight_fp16 if has_fp16
-               else self._upload_linear_weight)
+        def _ul(name, N, K):
+            if use_q4_gpu and (name + ".q4") in self.weights:
+                self._upload_q4_weight(name, N, K)
+            elif has_fp16:
+                self._upload_linear_weight_fp16(name, N, K)
+            else:
+                self._upload_linear_weight(name, N, K)
 
         for i in range(self.n_layer):
             pfx = f"layers.{i}."
@@ -513,9 +538,10 @@ class Qwen35WebGPU(WebGPUModel):
         else:
             T = x.shape[0]
         HD = self.head_dim
-        n_head = self.n_head
+        n_q_heads = self.n_q_heads  # 48 (Q heads)
+        n_head = self.n_head        # 24 (output heads)
         n_kv = self.n_kv_heads
-        n_rep = self.n_rep
+        n_rep = n_q_heads // n_kv   # 48/4 = 12 (GQA expansion)
         pfx = f"layers.{layer}.self_attn."
 
         # Fused QKV projection (single dispatch)
@@ -525,13 +551,13 @@ class Qwen35WebGPU(WebGPUModel):
             K=self.n_embd)
 
         # Split into Q, K, V
-        qo_dim = self.full_attn_qo_dim
-        q = qkv[:, :qo_dim]
-        k = qkv[:, qo_dim:qo_dim + self.kv_dim]
-        v = qkv[:, qo_dim + self.kv_dim:]
+        q_dim = self.full_attn_q_dim  # 48 * 256 = 12288
+        q = qkv[:, :q_dim]
+        k = qkv[:, q_dim:q_dim + self.kv_dim]
+        v = qkv[:, q_dim + self.kv_dim:]
 
         # Reshape to heads
-        Q = q.reshape(T, n_head, HD)
+        Q = q.reshape(T, n_q_heads, HD)
         K_new = k.reshape(T, n_kv, HD)
         V_new = v.reshape(T, n_kv, HD)
 
@@ -593,6 +619,15 @@ class Qwen35WebGPU(WebGPUModel):
             attn_out = self._causal_attention_multihead(
                 Q, K_full, V_full, n_rep)
 
+        # Attention output: 48 Q heads → gate to 24 output heads
+        # Reshape (T, 48, 256) → (T, 24, 512) then split: gate + value
+        if self.attn_output_gate and n_q_heads > n_head:
+            attn_out = attn_out.reshape(T, n_head, 2 * HD)
+            gate_part = attn_out[:, :, :HD]
+            value_part = attn_out[:, :, HD:]
+            gate = 1.0 / (1.0 + np.exp(-gate_part))
+            attn_out = gate * value_part  # (T, n_head, HD)
+
         attn_flat = attn_out.reshape(T, self.full_attn_qo_dim)
 
         # O projection
@@ -600,13 +635,6 @@ class Qwen35WebGPU(WebGPUModel):
             attn_flat, pfx + "o_proj.weight",
             "zero_bias_E", self.n_embd,
             K=self.full_attn_qo_dim)
-
-        # Output gate: sigmoid(gate) * attn_output
-        # Gate comes from a separate projection of the input
-        # For Qwen3.5, the output gate is applied as: sigmoid(z) * output
-        # where z is computed from the original hidden state
-        # In practice, attn_output_gate means the o_proj output is gated
-        # We handle this in _transformer_block_full_attn
         return o
 
     # ------------------------------------------------------------------
@@ -691,9 +719,14 @@ class Qwen35WebGPU(WebGPUModel):
         kernel_size = self.ssm_conv_kernel
         heads_per_group = n_heads // n_groups
 
-        # 1. QKV projection on CPU
-        W_qkv = self.weights[pfx + "in_proj_qkv.weight"]
-        qkv = np.float32(x_np @ W_qkv.T)  # (1, ssm_qkv_dim)
+        # 1. QKV projection (GPU Q4 or CPU)
+        if getattr(self, '_use_q4_gpu', False):
+            qkv = self._proj(x_np, pfx + "in_proj_qkv.weight",
+                              "zero_bias_SSM_QKV", self.ssm_qkv_dim,
+                              K=E)
+        else:
+            qkv = self._cpu_matmul(x_np, pfx + "in_proj_qkv.weight",
+                                   self.ssm_qkv_dim, E)
 
         x_expand = qkv[0, :ssm_dim]  # (ssm_dim,)
         bc_start = ssm_dim
@@ -702,30 +735,48 @@ class Qwen35WebGPU(WebGPUModel):
         C_vec = qkv[0, bc_start + b_dim:].reshape(n_groups, d_state)
 
         # 2. Conv1d with cached state (shift-and-add)
+        # Conv1d operates on the full QKV dimension (ssm_qkv_dim)
+        conv_dim = self.ssm_qkv_dim
         if layer not in self._ssm_conv_states:
             self._ssm_conv_states[layer] = np.zeros(
-                (kernel_size - 1, ssm_dim), dtype=np.float32)
+                (kernel_size - 1, conv_dim), dtype=np.float32)
         conv_state = self._ssm_conv_states[layer]
-        conv_w = self.weights[pfx + "conv1d.weight"].reshape(ssm_dim, kernel_size)
-        # Causal conv: window = [conv_state; x_expand]
-        x_conv = (conv_state * conv_w[:, :kernel_size - 1].T).sum(axis=0) + \
-                 x_expand * conv_w[:, kernel_size - 1]
-        # Update state: shift left, append new
+        conv_w_raw = self.weights[pfx + "conv1d.weight"]
+        if conv_w_raw.dtype == np.float16:
+            conv_w_raw = conv_w_raw.astype(np.float32)
+        conv_w = conv_w_raw.reshape(conv_dim, kernel_size)
+        # Full QKV vector for conv
+        qkv_flat = qkv[0]  # (ssm_qkv_dim,)
+        x_conv_full = (conv_state * conv_w[:, :kernel_size - 1].T).sum(axis=0) + \
+                      qkv_flat * conv_w[:, kernel_size - 1]
         conv_state[:-1] = conv_state[1:]
-        conv_state[-1] = x_expand
+        conv_state[-1] = qkv_flat
 
-        # SiLU
-        x_silu = x_conv / (1.0 + np.exp(-x_conv))  # (ssm_dim,)
+        # After conv, split back to x_expand, B, C
+        x_expand = x_conv_full[:ssm_dim]
+        B_vec = x_conv_full[bc_start:bc_start + b_dim].reshape(n_groups, d_state)
+        C_vec = x_conv_full[bc_start + b_dim:].reshape(n_groups, d_state)
 
-        # 3. dt computation
+        # SiLU (only on x_expand)
+        x_silu = x_expand / (1.0 + np.exp(-x_expand))  # (ssm_dim,)
+
+        # 3. dt computation (uses original input x_np, not post-conv)
         A_log = self.weights[pfx + "A_log"]
+        if A_log.dtype == np.float16:
+            A_log = A_log.astype(np.float32)
         A = -np.exp(A_log)
         dt_bias = self.weights[pfx + "dt_bias"]
+        if dt_bias.dtype == np.float16:
+            dt_bias = dt_bias.astype(np.float32)
         in_proj_a = self.weights.get(pfx + "in_proj_a.weight")
         in_proj_b = self.weights.get(pfx + "in_proj_b.weight")
 
         if in_proj_a is not None and in_proj_b is not None:
-            dt_raw = (x_silu @ in_proj_a.T) @ in_proj_b.T + dt_bias
+            a = in_proj_a.astype(np.float32) if in_proj_a.dtype == np.float16 else in_proj_a
+            b = in_proj_b.astype(np.float32) if in_proj_b.dtype == np.float16 else in_proj_b
+            # Low-rank factored dt: dt = (x @ A^T) * (x @ B^T) + bias
+            x_flat = x_np.ravel()
+            dt_raw = (x_flat @ a.T) * (x_flat @ b.T) + dt_bias
         else:
             x_heads_mean = x_silu.reshape(n_heads, hd).mean(axis=-1)
             dt_raw = x_heads_mean + dt_bias
@@ -753,18 +804,31 @@ class Qwen35WebGPU(WebGPUModel):
         y_out = y_expanded * x_silu
 
         norm_w = self.weights[pfx + "norm.weight"]
-        rms = np.sqrt(np.mean(y_out * y_out) + self.rms_norm_eps)
-        y_normed = y_out / rms * norm_w
+        if norm_w.dtype == np.float16:
+            norm_w = norm_w.astype(np.float32)
+        # Per-head RMSNorm: reshape to (n_heads, hd), norm per head
+        y_heads_shaped = y_out.reshape(n_heads, hd)
+        rms = np.sqrt(np.mean(y_heads_shaped ** 2, axis=-1, keepdims=True)
+                      + self.rms_norm_eps)
+        y_normed = (y_heads_shaped / rms * norm_w).reshape(ssm_dim)
 
         # 6. Gate with sigmoid(z)
-        W_z = self.weights[pfx + "in_proj_z.weight"]
-        z = np.float32(x_np @ W_z.T).ravel()  # (ssm_dim,)
+        if getattr(self, '_use_q4_gpu', False):
+            z = self._proj(x_np, pfx + "in_proj_z.weight",
+                            "zero_bias_SSM", ssm_dim, K=E).ravel()
+        else:
+            z = self._cpu_matmul(x_np, pfx + "in_proj_z.weight",
+                                 ssm_dim, E).ravel()
         gate = 1.0 / (1.0 + np.exp(-z))
         y_gated = y_normed * gate
 
         # 7. Output projection
-        W_out = self.weights[pfx + "out_proj.weight"]
-        out = np.float32(y_gated[None, :] @ W_out.T)  # (1, E)
+        if getattr(self, '_use_q4_gpu', False):
+            out = self._proj(y_gated[None, :], pfx + "out_proj.weight",
+                              "zero_bias_E", E, K=ssm_dim)
+        else:
+            out = self._cpu_matmul(y_gated[None, :], pfx + "out_proj.weight",
+                                   E, ssm_dim)
         return out
 
     def _linear_attention_block(self, x, layer: int,
@@ -810,37 +874,44 @@ class Qwen35WebGPU(WebGPUModel):
         B_val = B_flat.reshape(T, n_groups, d_state)
         C_val = C_flat.reshape(T, n_groups, d_state)
 
-        # 2. Short 1D convolution on x_expand
-        conv_w = self.weights[pfx + "conv1d.weight"]  # (ssm_dim, 1, kernel)
+        # 2. Short 1D convolution on full QKV output
+        conv_w = self.weights[pfx + "conv1d.weight"]  # (ssm_qkv_dim, 1, kernel)
+        if conv_w.dtype == np.float16:
+            conv_w = conv_w.astype(np.float32)
         kernel_size = self.ssm_conv_kernel  # 4
+        conv_dim = self.ssm_qkv_dim
 
+        # Conv operates on full QKV output
+        qkv_full = qkv  # (T, ssm_qkv_dim)
         if use_cache:
             if layer not in self._ssm_conv_states:
                 self._ssm_conv_states[layer] = np.zeros(
-                    (kernel_size - 1, ssm_dim), dtype=np.float32)
+                    (kernel_size - 1, conv_dim), dtype=np.float32)
             conv_state = self._ssm_conv_states[layer]
-            # Prepend conv state
-            x_conv_in = np.concatenate([conv_state, x_expand], axis=0)
-            # Update conv state
+            x_conv_in = np.concatenate([conv_state, qkv_full], axis=0)
             self._ssm_conv_states[layer] = x_conv_in[-(kernel_size - 1):].copy()
         else:
-            # Pad with zeros for causal conv
             x_conv_in = np.concatenate([
-                np.zeros((kernel_size - 1, ssm_dim), dtype=np.float32),
-                x_expand], axis=0)
+                np.zeros((kernel_size - 1, conv_dim), dtype=np.float32),
+                qkv_full], axis=0)
 
         # Depthwise conv1d: vectorized using sliding window matmul
-        conv_w_sq = conv_w.reshape(ssm_dim, kernel_size)  # (ssm_dim, kernel)
+        conv_w_sq = conv_w.reshape(conv_dim, kernel_size)
         from numpy.lib.stride_tricks import as_strided
         strides = x_conv_in.strides
         windows = as_strided(
             x_conv_in,
-            shape=(T, kernel_size, ssm_dim),
+            shape=(T, kernel_size, conv_dim),
             strides=(strides[0], strides[0], strides[1]))
         x_conv = np.einsum('tkc,ck->tc', windows, conv_w_sq)
 
-        # Apply SiLU activation
-        x_silu = x_conv / (1.0 + np.exp(-x_conv))
+        # Split post-conv back to x_expand, B, C
+        x_expand = x_conv[:, :ssm_dim]
+        B_val = x_conv[:, bc_start:bc_start + b_dim].reshape(T, n_groups, d_state)
+        C_val = x_conv[:, bc_start + b_dim:].reshape(T, n_groups, d_state)
+
+        # Apply SiLU activation (only on x_expand)
+        x_silu = x_expand / (1.0 + np.exp(-x_expand))
 
         # 3. Compute dt and A
         A_log = self.weights[pfx + "A_log"]  # (n_heads,)
@@ -892,9 +963,14 @@ class Qwen35WebGPU(WebGPUModel):
         y_out = (y_3d * x_3d).reshape(T, ssm_dim)  # broadcast multiply
 
         norm_w = self.weights[pfx + "norm.weight"]
+        if norm_w.dtype == np.float16:
+            norm_w = norm_w.astype(np.float32)
+        # Per-head RMSNorm
+        y_heads_shaped = y_out.reshape(T, n_heads, hd)
         rms = np.sqrt(
-            np.mean(y_out ** 2, axis=-1, keepdims=True) + self.rms_norm_eps)
-        y_normed = y_out / rms * norm_w
+            np.mean(y_heads_shaped ** 2, axis=-1, keepdims=True)
+            + self.rms_norm_eps)
+        y_normed = (y_heads_shaped / rms * norm_w).reshape(T, ssm_dim)
 
         # 6. Gate with sigmoid(z)
         z = self._proj(
@@ -937,12 +1013,35 @@ class Qwen35WebGPU(WebGPUModel):
     # ------------------------------------------------------------------
 
     def _cpu_matmul(self, x, weight_name, N, K=None):
-        """CPU matmul for T=1 decode: avoids GPU dispatch overhead."""
-        W = self.weights[weight_name]
-        if K is None:
-            K = W.shape[1] if W.ndim == 2 else W.size // N
-        W = W.reshape(N, K)
-        return np.float32(x @ W.T)
+        """CPU matmul for T=1 decode.
+
+        Handles both fp32 weights and INT4 quantized weights (on-the-fly
+        dequantization for Q4 — caches result for reuse within the same
+        decode step).
+        """
+        if weight_name in self.weights:
+            W = self.weights[weight_name]
+            if K is None:
+                K = W.shape[1] if W.ndim == 2 else W.size // N
+            W = W.reshape(N, K)
+            return np.float32(x @ W.T)
+        # Q4 path: dequantize on-the-fly (cached per layer)
+        q4_key = weight_name + ".q4"
+        if q4_key in self.weights:
+            cache_key = "_cpu_deq_" + weight_name
+            if not hasattr(self, cache_key):
+                K_orig = int(self.weights[weight_name + ".K"][0])
+                W = dequantize_int4(
+                    self.weights[q4_key],
+                    self.weights[weight_name + ".scales"],
+                    self.weights[weight_name + ".zeros"],
+                    K_orig)
+                setattr(self, cache_key, W)
+            W = getattr(self, cache_key)
+            if K is None:
+                K = W.shape[1]
+            return np.float32(x @ W.reshape(N, K).T)
+        raise KeyError(f"Weight not found: {weight_name}")
 
     def _rms_norm_vec(self, x, w_name):
         """CPU RMSNorm for 2D array."""
@@ -951,28 +1050,36 @@ class Qwen35WebGPU(WebGPUModel):
         return (x / rms * w).astype(np.float32)
 
     def _attn_decode_cpu(self, x_np, layer, positions):
-        """CPU-only full-attention decode for T=1."""
+        """CPU-only full-attention decode for T=1 (GPU Q4 for projections)."""
         HD = self.head_dim
+        n_q_heads = self.n_q_heads
         n_head = self.n_head
         n_kv = self.n_kv_heads
-        n_rep = self.n_rep
+        n_rep = n_q_heads // n_kv
         pfx = f"layers.{layer}.self_attn."
 
-        # Fused QKV on CPU (single matmul)
-        qkv = self._cpu_matmul(x_np, pfx + "qkv_proj.weight",
-                               self.full_attn_qkv_dim, self.n_embd)
-        qo_dim = self.full_attn_qo_dim
-        q = qkv[:, :qo_dim]
-        k = qkv[:, qo_dim:qo_dim + self.kv_dim]
-        v = qkv[:, qo_dim + self.kv_dim:]
+        # QKV projection (GPU Q4 or CPU)
+        qkv = self._proj(x_np, pfx + "qkv_proj.weight",
+                          "zero_bias_QKV", self.full_attn_qkv_dim,
+                          K=self.n_embd) if getattr(self, '_use_q4_gpu', False) \
+              else self._cpu_matmul(x_np, pfx + "qkv_proj.weight",
+                                    self.full_attn_qkv_dim, self.n_embd)
+        q_dim = self.full_attn_q_dim
+        q = qkv[:, :q_dim]
+        k = qkv[:, q_dim:q_dim + self.kv_dim]
+        v = qkv[:, q_dim + self.kv_dim:]
 
-        Q = q.reshape(1, n_head, HD)
+        Q = q.reshape(1, n_q_heads, HD)
         K_new = k.reshape(1, n_kv, HD)
         V_new = v.reshape(1, n_kv, HD)
 
         # QK-norm
         q_norm_w = self.weights[pfx + "q_norm.weight"]
         k_norm_w = self.weights[pfx + "k_norm.weight"]
+        if q_norm_w.dtype == np.float16:
+            q_norm_w = q_norm_w.astype(np.float32)
+        if k_norm_w.dtype == np.float16:
+            k_norm_w = k_norm_w.astype(np.float32)
         q_rms = np.sqrt(np.mean(Q * Q, axis=-1, keepdims=True) + self.rms_norm_eps)
         Q = Q / q_rms * q_norm_w
         k_rms = np.sqrt(np.mean(K_new * K_new, axis=-1, keepdims=True) + self.rms_norm_eps)
@@ -999,21 +1106,30 @@ class Qwen35WebGPU(WebGPUModel):
 
         _, _, T_total = self.kv_cache[layer]
 
-        # Vectorized attention
+        # Vectorized attention with n_q_heads
         scale = 1.0 / np.sqrt(HD)
-        K_exp = np.repeat(K_buf[:T_total], n_rep, axis=1)  # (T_total, n_head, HD)
+        K_exp = np.repeat(K_buf[:T_total], n_rep, axis=1)
         V_exp = np.repeat(V_buf[:T_total], n_rep, axis=1)
-        Q_t = Q.transpose(1, 0, 2)        # (n_head, 1, HD)
-        K_t = K_exp.transpose(1, 2, 0)    # (n_head, HD, T_total)
-        scores = np.float32((Q_t @ K_t).squeeze(1) * scale)  # (n_head, T_total)
+        Q_t = Q.transpose(1, 0, 2)
+        K_t = K_exp.transpose(1, 2, 0)
+        scores = np.float32((Q_t @ K_t).squeeze(1) * scale)
         scores -= scores.max(axis=1, keepdims=True)
         exp_s = np.exp(scores)
         attn = exp_s / exp_s.sum(axis=1, keepdims=True)
-        V_t = V_exp.transpose(1, 0, 2)    # (n_head, T_total, HD)
-        attn_out = (attn[:, None, :] @ V_t).squeeze(1)  # (n_head, HD)
+        V_t = V_exp.transpose(1, 0, 2)
+        attn_out = (attn[:, None, :] @ V_t).squeeze(1)  # (n_q_heads, HD)
 
-        # O projection
+        # Output gate: 48 Q heads → 24 output heads via sigmoid gating
+        if self.attn_output_gate and n_q_heads > n_head:
+            attn_out = attn_out.reshape(n_head, 2 * HD)
+            gate = 1.0 / (1.0 + np.exp(-attn_out[:, :HD]))
+            attn_out = gate * attn_out[:, HD:]
+
         attn_flat = attn_out.reshape(1, self.full_attn_qo_dim)
+        if getattr(self, '_use_q4_gpu', False):
+            return self._proj(attn_flat, pfx + "o_proj.weight",
+                              "zero_bias_E", self.n_embd,
+                              K=self.full_attn_qo_dim)
         return self._cpu_matmul(attn_flat, pfx + "o_proj.weight",
                                 self.n_embd, self.full_attn_qo_dim)
 
@@ -1041,15 +1157,27 @@ class Qwen35WebGPU(WebGPUModel):
         # RMSNorm 2
         rn2 = self._rms_norm_vec(x_np, pfx + "post_attention_layernorm.weight")
 
-        # MLP on CPU for T=1 — fused gate_up
+        # MLP — use GPU Q4 if available (avoids OOM from CPU dequant)
         E = self.n_embd
         IM = self.intermediate_size
-        gate_up = self._cpu_matmul(
-            rn2, pfx + "mlp.gate_up_proj.weight", self.gate_up_out, E)
-        gate = gate_up[:, :IM]
-        up = gate_up[:, IM:]
-        h = gate / (1.0 + np.exp(-gate)) * up  # SiLU * up
-        mlp_out = self._cpu_matmul(h, pfx + "mlp.down_proj.weight", E, IM)
+        if getattr(self, '_use_q4_gpu', False):
+            gate_up = self._proj(
+                rn2, pfx + "mlp.gate_up_proj.weight",
+                "zero_bias_GU", self.gate_up_out, K=E)
+            gate = gate_up[:, :IM]
+            up = gate_up[:, IM:]
+            h = gate / (1.0 + np.exp(-gate)) * up
+            mlp_out = self._proj(
+                h, pfx + "mlp.down_proj.weight",
+                "zero_bias_E", E, K=IM)
+        else:
+            gate_up = self._cpu_matmul(
+                rn2, pfx + "mlp.gate_up_proj.weight", self.gate_up_out, E)
+            gate = gate_up[:, :IM]
+            up = gate_up[:, IM:]
+            h = gate / (1.0 + np.exp(-gate)) * up
+            mlp_out = self._cpu_matmul(
+                h, pfx + "mlp.down_proj.weight", E, IM)
 
         return x_np + mlp_out
 
@@ -1450,9 +1578,9 @@ def verify_with_random_weights():
             weights[pfx + "linear_attn.out_proj.weight"] = np.random.randn(
                 n_embd, ssm_dim).astype(np.float32) * 0.02
             weights[pfx + "linear_attn.conv1d.weight"] = np.random.randn(
-                ssm_dim, 1, ssm_conv_kernel).astype(np.float32) * 0.02
+                ssm_qkv_dim, 1, ssm_conv_kernel).astype(np.float32) * 0.02
             weights[pfx + "linear_attn.norm.weight"] = np.ones(
-                ssm_dim, dtype=np.float32)
+                ssm_head_dim, dtype=np.float32)
             weights[pfx + "linear_attn.A_log"] = np.random.randn(
                 ssm_n_heads).astype(np.float32) * 0.1
             weights[pfx + "linear_attn.dt_bias"] = np.zeros(
@@ -1593,9 +1721,9 @@ def bench_with_random_weights():
             weights[pfx + "linear_attn.out_proj.weight"] = np.random.randn(
                 n_embd, ssm_dim).astype(np.float32) * 0.02
             weights[pfx + "linear_attn.conv1d.weight"] = np.random.randn(
-                ssm_dim, 1, ssm_conv_kernel).astype(np.float32) * 0.02
+                ssm_qkv_dim, 1, ssm_conv_kernel).astype(np.float32) * 0.02
             weights[pfx + "linear_attn.norm.weight"] = np.ones(
-                ssm_dim, dtype=np.float32)
+                ssm_head_dim, dtype=np.float32)
             weights[pfx + "linear_attn.A_log"] = np.random.randn(
                 ssm_n_heads).astype(np.float32) * 0.1
             weights[pfx + "linear_attn.dt_bias"] = np.zeros(
@@ -1764,7 +1892,8 @@ def main():
         ssm_n_groups=config["ssm_n_groups"],
         ssm_d_state=config["ssm_d_state"],
         ssm_conv_kernel=config["ssm_conv_kernel"],
-        quantized=quantized)
+        quantized=quantized,
+        n_q_heads=config.get("n_q_heads"))
     print("Model created, kernels compiled")
 
     if args.profile:
