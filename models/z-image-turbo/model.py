@@ -249,21 +249,22 @@ class ZImageTurboWebGPU(WebGPUModel):
     # ------------------------------------------------------------------
 
     def _embed_caption(self, caption_embeds: np.ndarray) -> np.ndarray:
-        """Project caption features: Linear(no_bias) → RMSNorm → Linear(with_bias).
+        """Project caption features: RMSNorm → Linear(with_bias).
+
+        cap_embedder.0: RMSNorm (weight only, no bias)
+        cap_embedder.1: Linear(CAP_FEAT_DIM → DIM, bias)
 
         caption_embeds: (S, CAP_FEAT_DIM)
         Returns: (S, DIM)
         """
-        # cap_embedder.0: Linear(no_bias)
-        x = self._linear_proj(caption_embeds, "cap_embedder.0.weight", DIM)
-        # cap_embedder.1: LayerNorm with bias
-        # Actually this is a nn.LayerNorm — use weight+bias
-        x = rms_norm_cpu(x,
-                         self.weights["cap_embedder.1.weight"].astype(np.float32),
+        # RMSNorm
+        x = rms_norm_cpu(caption_embeds,
+                         self.weights["cap_embedder.0.weight"].astype(np.float32),
                          NORM_EPS)
-        # Add bias of cap_embedder.1
-        b = self.weights["cap_embedder.1.bias"].astype(np.float32)
-        x = x + b
+        # Linear projection to DIM
+        x = self._linear_with_bias(x,
+                                   "cap_embedder.1.weight",
+                                   "cap_embedder.1.bias", DIM)
         return x
 
     # ------------------------------------------------------------------
@@ -347,9 +348,11 @@ class ZImageTurboWebGPU(WebGPUModel):
             NORM_EPS)
         norm_x = (1.0 + scale_ff) * norm_x + shift_ff
 
-        # SwiGLU: w1 (gate), w3 (up), w2 (down)
-        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM)
-        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM)
+        # SwiGLU: w1 (gate), w3 (up), w2 (down) — gpu_out to stay on GPU
+        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
+                                     gpu_out=True)
+        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM,
+                                   gpu_out=True)
         ff_out = self._silu_mul(gate_val, up_val)
         ff_out = self._linear_proj(ff_out, f"{pfx}.feed_forward.w2.weight", D)
 
@@ -415,8 +418,10 @@ class ZImageTurboWebGPU(WebGPUModel):
             x, self.weights[f"{pfx}.ffn_norm1.weight"].astype(np.float32),
             NORM_EPS)
 
-        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM)
-        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM)
+        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
+                                     gpu_out=True)
+        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM,
+                                   gpu_out=True)
         ff_out = self._silu_mul(gate_val, up_val)
         ff_out = self._linear_proj(ff_out, f"{pfx}.feed_forward.w2.weight", D)
 
@@ -490,8 +495,10 @@ class ZImageTurboWebGPU(WebGPUModel):
             NORM_EPS)
         norm_x = (1.0 + scale_ff) * norm_x + shift_ff
 
-        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM)
-        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM)
+        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
+                                     gpu_out=True)
+        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM,
+                                   gpu_out=True)
         ff_out = self._silu_mul(gate_val, up_val)
         ff_out = self._linear_proj(ff_out, f"{pfx}.feed_forward.w2.weight", D)
 
@@ -724,9 +731,9 @@ def verify_with_random_weights():
     W["t_embedder.mlp.2.weight"] = rng.randn(D, D).astype(np.float32) * s
     W["t_embedder.mlp.2.bias"] = np.zeros(D, dtype=np.float32)
 
-    # Caption embedder
-    W["cap_embedder.0.weight"] = rng.randn(D, cap_dim).astype(np.float32) * s
-    W["cap_embedder.1.weight"] = np.ones(D, dtype=np.float32)
+    # Caption embedder: RMSNorm(cap_dim) → Linear(cap_dim → D, bias)
+    W["cap_embedder.0.weight"] = np.ones(cap_dim, dtype=np.float32)
+    W["cap_embedder.1.weight"] = rng.randn(D, cap_dim).astype(np.float32) * s
     W["cap_embedder.1.bias"] = np.zeros(D, dtype=np.float32)
 
     # Input projection
@@ -858,6 +865,8 @@ def main():
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="output.png")
+    parser.add_argument("--profile", action="store_true",
+                        help="Profile the denoising loop")
     args = parser.parse_args()
 
     if args.verify:
@@ -911,7 +920,9 @@ def main():
 
     print("\n=== Initializing WebGPU model ===")
     model = ZImageTurboWebGPU(weights)
-
+    if args.profile:
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
     # Step 4: Denoise
     print(f"\n=== Generating {args.height}x{args.width} image "
           f"({args.steps} steps) ===")
@@ -942,6 +953,19 @@ def main():
     from PIL import Image
     Image.fromarray(img).save(args.output)
     print(f"\n  Saved to {args.output}")
+
+    if args.profile:
+        model.profiler.report()
+        from common.profiler_html import generate_html_report
+        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
+        runner = model.cache.runner
+        generate_html_report(
+            model.profiler,
+            output_path=profile_path,
+            title=f"Z-Image-Turbo — {runner.adapter_info.get('description', 'GPU')}",
+            adapter_info=runner.adapter_info,
+            memory_info=model.get_memory_info())
+        print(f"HTML profile: {profile_path}")
 
 
 if __name__ == "__main__":

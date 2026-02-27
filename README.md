@@ -26,6 +26,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **SAM-3** | Segmentation | 31M | FP16 | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
 | **Flux-Klein** | Image Gen | — | FP16 | ✅ Verified | DiT architecture |
 | **SD-Turbo** | Image Gen | ~5B | FP16 | ✅ Shipping | 7.9s/step (512×512), 1-step distilled |
+| **Z-Image-Turbo** | Image Gen | ~12B | FP16 | ✅ Shipping | 23s/step (512×512), DiT, Qwen3 text encoder |
 | **SDXL** | Image Gen | — | FP16 | ✅ Verified | UNet, cross-attention |
 
 **Legend:** ✅ Shipping = runs with real HuggingFace weights end-to-end. ✅ Verified = passes correctness test with random weights.
