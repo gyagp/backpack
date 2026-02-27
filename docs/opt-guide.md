@@ -373,6 +373,17 @@ The profiler records three types of events on a shared nanosecond clock:
 to the CPU timeline by anchoring the first GPU timestamp's `begin_ns` to
 its `cpu_submit_ns` and applying the offset to all subsequent GPU events.
 
+**CPU-GPU clock calibration**: The current approach uses a simple anchor
+(first GPU timestamp aligned to its CPU submit time), which can drift over
+long runs.  A more accurate method is D3D12's
+[`ID3D12CommandQueue::GetClockCalibration`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandqueue-getclockcalibration),
+which returns a matched pair of GPU and CPU timestamps at the same instant.
+This gives the exact relative offset between the two clocks, enabling
+precise wall-time alignment of CPU and GPU timeline events without drift.
+Dawn exposes the underlying D3D12 command queue, so this calibration could
+be called at profiling start (and periodically during long runs) to
+maintain accurate cross-clock alignment.
+
 **Enabling profiling**:
 
 ```python
@@ -470,6 +481,38 @@ The profiler tracks:
    hotspot list, ensure weights are pre-uploaded and cached on GPU.
 4. **Small-op overhead**: If norms/activations take > 0.5 ms each,
    they're dominated by dispatch overhead — move to CPU or fuse.
+5. **GPU bubbles between kernel executions**: In the HTML timeline,
+   look for gaps between consecutive GPU kernel bars.  If GPU HW time
+   is much smaller than CPU-timed dispatch time (e.g., 5.9ms vs 21.6ms
+   per token), the GPU is idle while the CPU prepares the next dispatch.
+   This is the strongest signal that the **fast decode path** should be
+   enabled.
+
+   **Diagnosis**: Compare the GPU Kernels (HW Timestamps) total with
+   the GPU Dispatches (CPU-timed) total in the profiler report:
+
+   ```
+   GPU Dispatches (CPU-timed):  228ms (2432 dispatches)  ← includes bubbles
+   GPU Kernels (HW Timestamps):  59ms (2432 kernels)     ← actual compute
+   ```
+
+   If HW time is < 50% of CPU-timed dispatch time, the GPU is bubble-
+   bound.  The gap is CPU overhead per dispatch (~0.04ms × 219
+   dispatches/token = ~9ms/token) plus fence/readback latency.
+
+   **Fix**: Use the pre-recorded fast decode path (`_decode_fast`).
+   This pre-creates all bind groups and dispatch lists at init time,
+   then submits them via `submit_dispatches_pipelined()` with only
+   3 buffer writes per token.  Example result (SmolLM2-1.7B):
+
+   | Path | Dispatches/token | Decode tok/s |
+   |------|-----------------|--------------|
+   | Regular GPU decode | 219 individual | 93.6 |
+   | Fast decode | 1 pipelined submit | 209 |
+
+   The fast path reduces per-token dispatch from 219 individual Python-
+   level dispatches to a single pipelined submit of pre-recorded
+   commands, eliminating virtually all CPU-GPU bubbles.
 
 ### 3.6 Key Metrics
 

@@ -451,14 +451,25 @@ function draw(){
   X.fillRect(LW,CPU_Y,w-LW,TH);
   X.fillRect(LW,GPU_Y,w-LW,TH);
 
-  // Step markers as background bands in CPU lane
+  // Step markers as background bands in BOTH lanes
+  // Prefill = green-tinted, Decode = blue-tinted (obvious differentiation)
   for(const s of steps){
     const x1=t2x(s.start_us),x2=t2x(s.start_us+s.dur_us),bw=Math.max(x2-x1,1);
     if(x2<LW||x1>w)continue;
-    X.fillStyle=s.name==='prefill'?'#292e42':'#24283b';
+    const isPrefill=s.name==='prefill';
+    const bandColor=isPrefill?'rgba(158,206,106,0.12)':'rgba(122,162,247,0.08)';
+    const borderColor=isPrefill?'rgba(158,206,106,0.35)':'rgba(122,162,247,0.25)';
+    const labelColor=isPrefill?'#9ece6a':'#7aa2f7';
+    // CPU lane band
+    X.fillStyle=bandColor;
     X.fillRect(x1,CPU_Y,bw,TH);
-    X.strokeStyle='#3b4261'; X.beginPath();X.moveTo(x1,CPU_Y);X.lineTo(x1,CPU_Y+TH);X.stroke();
-    if(bw>30){X.fillStyle='#3b4261';X.font='8px system-ui';X.fillText(s.name,x1+2,CPU_Y+TH-2);}
+    // GPU lane band (same phase coloring)
+    X.fillRect(x1,GPU_Y,bw,TH);
+    // Phase border line
+    X.strokeStyle=borderColor; X.lineWidth=1;
+    X.beginPath();X.moveTo(x1,CPU_Y);X.lineTo(x1,GPU_Y+TH);X.stroke();
+    // Phase label — show at top of CPU lane
+    if(bw>24){X.fillStyle=labelColor;X.font='bold 9px system-ui';X.fillText(s.name,x1+3,CPU_Y+10);}
   }
 
   // CPU lane (ops on top of step bands)
