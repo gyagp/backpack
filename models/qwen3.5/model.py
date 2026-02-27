@@ -460,15 +460,21 @@ class Qwen35WebGPU(WebGPUModel):
             # Down projection
             _ul(pfx + "mlp.down_proj.weight", E, IM)
 
-        # Final norm + embeddings
+        # Final norm
         self._upload_norm_weight("norm.weight")
-        self._upload_embedding_weight("embed_tokens.weight", self.n_vocab, E)
-        self._upload_embedding_weight("lm_head.weight", self.n_vocab, E)
+
+        # Embed/LM head: keep on CPU to save VRAM.
+        # embed_tokens is only used for token lookup (CPU).
+        # lm_head runs as CPU matmul (avoids 4.8 GB GPU upload for
+        # 248K vocab × 5120 × 2 = 2.4 GB each).
+        # Ensure lm_head weights are fp32 for CPU matmul.
+        lm_w = self.weights.get("lm_head.weight")
+        if lm_w is not None and lm_w.dtype == np.float16:
+            self.weights["lm_head.weight"] = lm_w.astype(np.float32)
 
         # Zero biases
         self._upload_zero_bias("zero_bias_E", E)
         self._upload_zero_bias("zero_bias_GU", self.gate_up_out)
-        self._upload_zero_bias("zero_bias_V", self.n_vocab)
         self._upload_zero_bias("zero_bias_KV", self.kv_dim)
         self._upload_zero_bias("zero_bias_QKV", self.full_attn_qkv_dim)
         self._upload_zero_bias("zero_bias_QO", self.full_attn_qo_dim)
@@ -1244,9 +1250,11 @@ class Qwen35WebGPU(WebGPUModel):
 
         x = self._rms_norm(x, self._gpu_weights["norm.weight"])
 
-        logits = self._linear(
-            x, self._gpu_weights["lm_head.weight"],
-            self._gpu_weights["zero_bias_V"], self.n_vocab)
+        # LM head on CPU (avoids uploading 2.4 GB to GPU)
+        lm_w = self.weights["lm_head.weight"]
+        if lm_w.dtype != np.float32:
+            lm_w = lm_w.astype(np.float32)
+        logits = np.float32(x @ lm_w.T)
         return logits
 
 
