@@ -1097,9 +1097,14 @@ def download_qwen35_weights(model_dir: str = None) -> Tuple[str, str]:
             return None
         return new_key, arr
 
+    # Discover safetensors shard files
+    shard_files = [f"model.safetensors-{i:05d}-of-00011.safetensors"
+                   for i in range(1, 12)]
+
     npz_path, tokenizer_path = download_weights(
         hf_repo=hf_repo,
         model_dir=model_dir,
+        safetensors_files=shard_files,
         key_transform=qwen35_key_transform,
         download_tokenizer=True,
     )
