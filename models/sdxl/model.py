@@ -831,6 +831,7 @@ class EulerDiscreteScheduler:
 
     def __init__(self, num_train_timesteps=1000,
                  beta_start=0.00085, beta_end=0.012):
+        self.num_train_timesteps = num_train_timesteps
         betas = np.linspace(beta_start**0.5, beta_end**0.5,
                             num_train_timesteps, dtype=np.float64) ** 2
         alphas = 1.0 - betas
@@ -840,10 +841,14 @@ class EulerDiscreteScheduler:
         self.sigmas = np.append(self.sigmas, 0.0).astype(np.float32)
 
     def get_timesteps(self, num_steps):
-        """Get linearly spaced timesteps."""
-        step_ratio = 1000 // num_steps
-        timesteps = np.arange(num_steps, dtype=np.float32) * step_ratio
-        timesteps = np.flip(timesteps).copy()
+        """Get timesteps using 'trailing' spacing (matches HF default).
+
+        trailing: step_ratio = N // num_steps
+        timesteps = arange(N, 0, -step_ratio) - 1
+        """
+        step_ratio = self.num_train_timesteps // num_steps
+        timesteps = (np.arange(self.num_train_timesteps, 0, -step_ratio)
+                     - 1).astype(np.float32)
         return timesteps
 
     def get_sigmas(self, timesteps):
