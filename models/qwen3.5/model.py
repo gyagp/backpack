@@ -714,7 +714,7 @@ class Qwen35WebGPU(WebGPUModel):
         return y, state
 
     def _ssm_decode_cpu(self, x_np, layer):
-        """Optimized T=1 SSM decode: all-CPU, no GPU dispatch, no allocs."""
+        """Optimized T=1 SSM decode with batched GPU projections."""
         E = self.n_embd
         pfx = f"layers.{layer}.linear_attn."
         n_heads = self.ssm_n_heads
@@ -725,14 +725,25 @@ class Qwen35WebGPU(WebGPUModel):
         kernel_size = self.ssm_conv_kernel
         heads_per_group = n_heads // n_groups
 
-        # 1. QKV projection (GPU Q4 or CPU)
-        if getattr(self, '_use_q4_gpu', False):
-            qkv = self._proj(x_np, pfx + "in_proj_qkv.weight",
-                              "zero_bias_SSM_QKV", self.ssm_qkv_dim,
-                              K=E)
+        # 1. Batch QKV + Z projections (both from same input x_np)
+        use_gpu = getattr(self, '_use_q4_gpu', False)
+        if use_gpu:
+            runner = self.cache.runner
+            runner.begin_batch()
+            qkv_gpu = self._proj(x_np, pfx + "in_proj_qkv.weight",
+                                  "zero_bias_SSM_QKV", self.ssm_qkv_dim,
+                                  K=E, gpu_out=True)
+            z_gpu = self._proj(x_np, pfx + "in_proj_z.weight",
+                                "zero_bias_SSM", ssm_dim,
+                                K=E, gpu_out=True)
+            rb = runner.end_batch(readback_buffers=[qkv_gpu, z_gpu])
+            qkv = rb[id(qkv_gpu)].reshape(1, self.ssm_qkv_dim)
+            z = rb[id(z_gpu)].reshape(1, ssm_dim)
         else:
             qkv = self._cpu_matmul(x_np, pfx + "in_proj_qkv.weight",
                                    self.ssm_qkv_dim, E)
+            z = self._cpu_matmul(x_np, pfx + "in_proj_z.weight",
+                                 ssm_dim, E)
 
         x_expand = qkv[0, :ssm_dim]  # (ssm_dim,)
         bc_start = ssm_dim
@@ -818,14 +829,9 @@ class Qwen35WebGPU(WebGPUModel):
                       + self.rms_norm_eps)
         y_normed = (y_heads_shaped / rms * norm_w).reshape(ssm_dim)
 
-        # 6. Gate with sigmoid(z)
-        if getattr(self, '_use_q4_gpu', False):
-            z = self._proj(x_np, pfx + "in_proj_z.weight",
-                            "zero_bias_SSM", ssm_dim, K=E).ravel()
-        else:
-            z = self._cpu_matmul(x_np, pfx + "in_proj_z.weight",
-                                 ssm_dim, E).ravel()
-        gate = 1.0 / (1.0 + np.exp(-z))
+        # 6. Gate with sigmoid(z) — already computed in step 1
+        z_flat = z.ravel()  # (ssm_dim,)
+        gate = 1.0 / (1.0 + np.exp(-z_flat))
         y_gated = y_normed * gate
 
         # 7. Output projection
@@ -1167,15 +1173,17 @@ class Qwen35WebGPU(WebGPUModel):
         E = self.n_embd
         IM = self.intermediate_size
         if getattr(self, '_use_q4_gpu', False):
+            runner = self.cache.runner
+            runner.begin_batch()
             gate_up = self._proj(
                 rn2, pfx + "mlp.gate_up_proj.weight",
-                "zero_bias_GU", self.gate_up_out, K=E)
-            gate = gate_up[:, :IM]
-            up = gate_up[:, IM:]
-            h = gate / (1.0 + np.exp(-gate)) * up
-            mlp_out = self._proj(
+                "zero_bias_GU", self.gate_up_out, K=E, gpu_out=True)
+            h = self._silu_mul_fused(gate_up, IM, gpu_out=True)
+            mlp_gpu = self._proj(
                 h, pfx + "mlp.down_proj.weight",
-                "zero_bias_E", E, K=IM)
+                "zero_bias_E", E, K=IM, gpu_out=True)
+            rb = runner.end_batch(readback_buffers=[mlp_gpu])
+            mlp_out = rb[id(mlp_gpu)].reshape(1, E)
         else:
             gate_up = self._cpu_matmul(
                 rn2, pfx + "mlp.gate_up_proj.weight", self.gate_up_out, E)
