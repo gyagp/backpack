@@ -56,6 +56,85 @@ WEBGPU_TARGET = GPUTarget("webgpu", 0, 32)
 
 
 # ---------------------------------------------------------------------------
+# Size-class buffer pool — patched onto DawnRunner for GPU buffer reuse
+# ---------------------------------------------------------------------------
+
+def _round_to_size_class(size):
+    """Round buffer size up to the next size class.
+
+    - ≤256B: 256 (minimum WebGPU buffer)
+    - 256B–4KB: next multiple of 256
+    - >4KB: next power of 2
+    """
+    if size <= 256:
+        return 256
+    if size <= 4096:
+        return ((size + 255) // 256) * 256
+    p = 1
+    while p < size:
+        p <<= 1
+    return p
+
+
+def _install_buffer_pool(runner):
+    """Install size-class memory pool on a DawnRunner instance.
+
+    Wraps _get_or_create_buffer so transient buffers (names starting with
+    '__') are allocated at rounded size classes.  When a buffer is freed
+    it returns to a per-class free list for zero-cost reuse.
+    """
+    if getattr(runner, '_has_buffer_pool', False):
+        return
+    runner._has_buffer_pool = True
+    runner._pool_free = {}
+    runner._pool_alloc = 0
+    runner._pool_reuse = 0
+    runner._pool_bytes = 0
+
+    original_get_or_create = runner._get_or_create_buffer
+
+    def _pooled_get_or_create(name, size, usage):
+        key = (name, size, usage)
+        if key in runner._buffer_cache:
+            return runner._buffer_cache[key]
+
+        # Transient buffers use the pool
+        if name.startswith("__"):
+            rounded = _round_to_size_class(size)
+            free_list = runner._pool_free.get(rounded)
+            if free_list:
+                buf = free_list.pop()
+                runner._pool_reuse += 1
+                runner._buffer_cache[key] = buf
+                return buf
+            # Create at rounded size via original method (bypasses pool)
+            pool_name = f"__pool_{rounded}_{runner._pool_alloc}"
+            buf = original_get_or_create(pool_name, rounded, usage)
+            runner._pool_alloc += 1
+            runner._pool_bytes += rounded
+            runner._buffer_cache[key] = buf
+            return buf
+
+        return original_get_or_create(name, size, usage)
+
+    runner._get_or_create_buffer = _pooled_get_or_create
+
+    # Expose pool stats in gpu_memory_stats
+    original_stats = runner.gpu_memory_stats
+
+    def _pool_stats():
+        s = original_stats()
+        pool_free_count = sum(len(v) for v in runner._pool_free.values())
+        s['pool_alloc'] = runner._pool_alloc
+        s['pool_reuse'] = runner._pool_reuse
+        s['pool_free'] = pool_free_count
+        s['pool_bytes_mb'] = runner._pool_bytes / 1024 / 1024
+        return s
+
+    runner.gpu_memory_stats = _pool_stats
+
+
+# ---------------------------------------------------------------------------
 # Kernel cache — compile once, reuse
 # ---------------------------------------------------------------------------
 
@@ -67,6 +146,7 @@ class KernelCache:
         self.runner = DawnRunner()
         self.profiler = None  # Set by WebGPUModel.enable_profiling()
         self._gpu_op_name = None  # Current op name for GPU timestamps
+        _install_buffer_pool(self.runner)
 
     def _key(self, fn, signature: dict, constexprs: dict, num_warps: int) -> str:
         # Include pointer types in key so fp16/fp32 variants are distinct
