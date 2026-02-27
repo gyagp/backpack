@@ -14,19 +14,19 @@ Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes
 
 All models run fully on Triton WebGPU — no PyTorch at inference time.
 
-| Model | Type | Params | Real Weights | Status | Performance |
-|-------|------|--------|:------------:|--------|-------------|
-| **GPT-2** | LLM | 124M | ✅ | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
-| **Phi-4** | LLM | 3.8B | ✅ | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode, INT4 |
-| **Qwen 2.5** | LLM | 1.5B | ✅ | ✅ Shipping | 183ms TTFT, 25.1 tok/s decode, GQA |
-| **Qwen 3.5** | LLM | 27B | ✅ | ✅ Shipping | 919 tok/s (bench), INT4, Mamba-2 hybrid |
-| **SmolLM2** | LLM | 1.7B | ✅ | ✅ Shipping | 133ms TTFT, 208 tok/s decode, INT4 |
-| **GPT-OSS** | LLM (MoE) | — | ✅ | ✅ Shipping | MXFP4 quantized, MoE routing |
-| **Whisper** | Speech-to-Text | 39M | ✅ | ✅ Shipping | 160ms encoder, 30 tok/s decode, 0.9s total |
-| **SAM3** | Segmentation | 31M | ✅ | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
-| **Flux-Klein** | Image Gen | — | — | ✅ Verified | DiT architecture |
-| **SD-Turbo** | Image Gen | ~5B | ✅ | ✅ Shipping | 7.9s/step (512×512), 1-step distilled |
-| **SDXL** | Image Gen | — | — | ✅ Verified | UNet, cross-attention |
+| Model | Type | Params | Precision | Real Weights | Status | Performance |
+|-------|------|--------|-----------|:------------:|--------|-------------|
+| **GPT-2** | LLM | 124M | FP32 | ✅ | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
+| **Phi-4** | LLM | 3.8B | INT4 | ✅ | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode |
+| **Qwen 2.5** | LLM | 1.5B | FP32 | ✅ | ✅ Shipping | 183ms TTFT, 25.1 tok/s decode |
+| **Qwen 3.5** | LLM | 27B | INT4 | ✅ | ✅ Shipping | 919 tok/s (bench), Mamba-2 hybrid |
+| **SmolLM2** | LLM | 1.7B | INT4 | ✅ | ✅ Shipping | 133ms TTFT, 208 tok/s decode |
+| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | ✅ | ✅ Shipping | MoE top-4 routing |
+| **Whisper** | Speech-to-Text | 39M | FP16 | ✅ | ✅ Shipping | 160ms encoder, 30 tok/s decode, 0.9s total |
+| **SAM3** | Segmentation | 31M | FP16 | ✅ | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
+| **Flux-Klein** | Image Gen | — | FP16 | — | ✅ Verified | DiT architecture |
+| **SD-Turbo** | Image Gen | ~5B | FP16 | ✅ | ✅ Shipping | 7.9s/step (512×512), 1-step distilled |
+| **SDXL** | Image Gen | — | FP16 | — | ✅ Verified | UNet, cross-attention |
 
 **Legend:** ✅ Real Weights = runs with real HuggingFace weights end-to-end. ✅ Verified = passes correctness test with random weights.
 
