@@ -912,11 +912,11 @@ class FluxKleinWebGPU(WebGPUModel):
         # AdaLayerNormContinuous: LayerNorm → SiLU(temb) → Linear → scale + shift
         norm_x = layer_norm_cpu(hidden_states, EPS)
         emb = temb * (1.0 / (1.0 + np.exp(-temb)))  # SiLU
-        emb = self._linear(emb, "norm_out.linear.weight", HIDDEN_DIM * 2)  # (1, 6144)
-        scale, shift = np.split(emb, 2, axis=-1)  # Each (1, 3072)
+        emb = self._linear(emb, "norm_out.linear.weight", HIDDEN_DIM * 2)
+        scale, shift = np.split(emb, 2, axis=-1)
         norm_x = norm_x * (1.0 + scale) + shift
 
-        # Final projection
+        # Final projection — use gpu_out=False since this is the last op
         output = self._linear(norm_x, "proj_out.weight", IN_CHANNELS)
         return output
 
@@ -1008,12 +1008,14 @@ class FluxKleinWebGPU(WebGPUModel):
         mod_img_gpu = _upload_mod_set(mod_img, "db_img")
         mod_txt_gpu = _upload_mod_set(mod_txt, "db_txt")
 
-        # --- GPU-resident double blocks (no batching, sequential submit) ---
+        # --- GPU-resident double blocks (batched dispatch for lower overhead) ---
         for i in range(NUM_DOUBLE_BLOCKS):
+            runner.begin_batch()
             ctx_gpu, hs_gpu = self._double_block(
                 hs_gpu, ctx_gpu, mod_img_gpu, mod_txt_gpu,
                 concat_cos, concat_sin, i,
                 gpu_state=True, _profile=(_profile and i < 2))
+            runner.end_batch()
             if _profile: _labels.append(_mark(f"double_{i}"))
 
         # Concatenate ctx + hs on GPU for single stream
