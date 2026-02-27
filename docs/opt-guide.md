@@ -636,6 +636,48 @@ self._moe_acc_gpu = runner.upload_to_gpu(zeros(E), "moe_acc")
 runner.write_buffer(self._moe_x_gpu.handle, data.tobytes())
 ```
 
+### 4.5 Memory Pool with Smart Heuristics
+
+Balancing performance and memory usage requires a managed memory pool
+rather than allocate-on-demand / destroy-on-free.  Key principles:
+
+1. **Over-allocate to aligned sizes**: Allocate buffers rounded up to
+   a **size class** (e.g., powers of 2, or fixed buckets like 4KB,
+   16KB, 64KB, 256KB, 1MB, 4MB, ...).  When a buffer is freed, it
+   returns to the pool's free list under its size class instead of
+   being destroyed.  Future allocations of the same or smaller size
+   reuse the pooled buffer with zero allocation cost.
+
+2. **Free → pool, not destroy**: GPU buffer creation
+   (`wgpuDeviceCreateBuffer`) is expensive (~0.1–0.5 ms).  By
+   returning freed buffers to a per-size-class free list, subsequent
+   allocations become O(1) lookups instead of GPU API calls.
+
+3. **Smart size-class alignment**: Choose size classes that balance
+   fragmentation vs. reuse:
+   - Too many classes → buffers rarely match → low reuse
+   - Too few classes → large waste per buffer → high memory overhead
+   - Good default: powers of 2 above 4KB, with finer granularity
+     (e.g., 1.5× steps) below 4KB for small norm/bias buffers
+
+4. **Peak memory tracking**: Monitor high-water-mark to right-size
+   the pool.  After warmup (first inference pass), the pool stabilizes
+   and no further allocations should occur during steady-state decode.
+
+```
+Example size classes:
+  4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K,
+  1M, 2M, 4M, 8M, 16M, 32M, 64M, 128M, 256M
+
+A 3000-float buffer (12KB) → rounded to 16KB class
+A 3100-float buffer (12.4KB) → same 16KB class → reuses freed buffer
+```
+
+**Current status**: The dawn runner uses exact `(name, size, usage)`
+caching with a toggle pool.  Migrating to size-class pooling would
+reduce allocation count by ~50% for models with varying activation
+sizes (e.g., MoE, varying sequence lengths).
+
 ---
 
 ## 5. Matmul Optimization
