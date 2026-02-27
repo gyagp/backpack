@@ -36,10 +36,196 @@ from contextlib import contextmanager
 
 import numpy as np
 
-# D3D12 GPU timestamp frequency — used to convert GPU ticks to nanoseconds.
-# For NVIDIA GPUs on D3D12, the timestamp period is typically 1ns.
-# We'll query the actual period from the resolve buffer results.
-_GPU_NS_PER_TICK = 1.0  # Adjusted at runtime if needed
+
+# ---------------------------------------------------------------------------
+# D3D12 Clock Calibration — precise CPU↔GPU timeline alignment
+# ---------------------------------------------------------------------------
+
+def _d3d12_clock_calibration():
+    """Query D3D12 GPU/CPU clock calibration via ID3D12CommandQueue.
+
+    Uses the D3D12 API GetClockCalibration() to obtain a correlated pair
+    of (gpu_tick, cpu_qpc_tick) sampled at the same instant, plus
+    GetTimestampFrequency() for the GPU tick rate.
+
+    Returns:
+        (gpu_tick, cpu_qpc_tick, gpu_freq, qpc_freq) on success, or
+        None if D3D12 is not available.
+
+    With these values, any GPU timestamp (in ticks) can be converted to
+    the CPU perf_counter_ns timeline:
+
+        gpu_ns  = gpu_tick / gpu_freq * 1e9
+        cpu_ns  = cpu_qpc_tick / qpc_freq * 1e9
+        offset  = cpu_ns - gpu_ns
+        mapped  = raw_gpu_tick / gpu_freq * 1e9 + offset
+    """
+    import sys
+    if sys.platform != 'win32':
+        return None
+    return _d3d12_clock_calibration_ctypes()
+
+
+def _d3d12_clock_calibration_ctypes():
+    """D3D12 clock calibration using pure ctypes COM vtable calls.
+
+    ID3D12CommandQueue vtable layout (inherits IUnknown → ID3D12Object →
+    ID3D12DeviceChild → ID3D12Pageable → ID3D12CommandQueue):
+      [0-2]   IUnknown: QueryInterface, AddRef, Release
+      [3-6]   ID3D12Object: Get/SetPrivateData, SetName
+      [7]     ID3D12DeviceChild: GetDevice
+      [8-15]  ID3D12CommandQueue: UpdateTileMappings..Signal, Wait
+      [16]    GetTimestampFrequency
+      [17]    GetClockCalibration
+    """
+    try:
+        import uuid as _uuid
+
+        d3d12 = ctypes.windll.d3d12
+        dxgi = ctypes.windll.dxgi
+        kernel32 = ctypes.windll.kernel32
+
+        def _guid(s):
+            return (ctypes.c_byte * 16)(*_uuid.UUID(s).bytes_le)
+
+        IID_IDXGIFactory4 = _guid('{1bc6ea02-ef36-464f-bf0c-21ca39e5168a}')
+        IID_ID3D12Device = _guid('{189819f1-1db6-4b57-be54-1821339b85f7}')
+        IID_ID3D12CommandQueue = _guid('{0ec870a6-5d7e-4c22-8cfc-5baae07616ed}')
+
+        def _vtbl(obj):
+            return ctypes.cast(
+                ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p))
+
+        def _release(obj):
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(
+                _vtbl(obj)[2])(obj)
+
+        # Create DXGI Factory
+        factory = ctypes.c_void_p()
+        if dxgi.CreateDXGIFactory1(IID_IDXGIFactory4,
+                                   ctypes.byref(factory)) != 0:
+            return None
+
+        # EnumAdapters (vtable[7])
+        adapter = ctypes.c_void_p()
+        hr = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(
+            _vtbl(factory)[7])(factory, 0, ctypes.byref(adapter))
+        if hr != 0:
+            _release(factory)
+            return None
+
+        # D3D12CreateDevice
+        device = ctypes.c_void_p()
+        hr = d3d12.D3D12CreateDevice(adapter, 0xb000,
+                                      IID_ID3D12Device,
+                                      ctypes.byref(device))
+        if hr != 0:
+            _release(adapter); _release(factory)
+            return None
+
+        # CreateCommandQueue (vtable[8])
+        class D3D12_COMMAND_QUEUE_DESC(ctypes.Structure):
+            _fields_ = [('Type', ctypes.c_int), ('Priority', ctypes.c_int),
+                        ('Flags', ctypes.c_uint), ('NodeMask', ctypes.c_uint)]
+        qd = D3D12_COMMAND_QUEUE_DESC(0, 0, 0, 0)
+        queue = ctypes.c_void_p()
+        hr = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p,
+            ctypes.POINTER(D3D12_COMMAND_QUEUE_DESC),
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+            _vtbl(device)[8])(
+            device, ctypes.byref(qd),
+            IID_ID3D12CommandQueue, ctypes.byref(queue))
+        if hr != 0:
+            _release(device); _release(adapter); _release(factory)
+            return None
+
+        qvt = _vtbl(queue)
+
+        # GetTimestampFrequency (vtable[16])
+        gpu_freq = ctypes.c_uint64()
+        hr = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64))(qvt[16])(
+            queue, ctypes.byref(gpu_freq))
+        if hr != 0:
+            for o in (queue, device, adapter, factory): _release(o)
+            return None
+
+        # GetClockCalibration (vtable[17])
+        gpu_tick = ctypes.c_uint64()
+        cpu_qpc = ctypes.c_uint64()
+        hr = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64))(qvt[17])(
+            queue, ctypes.byref(gpu_tick), ctypes.byref(cpu_qpc))
+        if hr != 0:
+            for o in (queue, device, adapter, factory): _release(o)
+            return None
+
+        # QPC frequency
+        qpc_freq = ctypes.c_int64()
+        kernel32.QueryPerformanceFrequency(ctypes.byref(qpc_freq))
+
+        # Release all COM objects
+        for o in (queue, device, adapter, factory):
+            _release(o)
+
+        return (gpu_tick.value, cpu_qpc.value,
+                gpu_freq.value, qpc_freq.value)
+
+    except Exception:
+        return None
+
+
+@dataclass
+class ClockCalibration:
+    """Stores D3D12 GPU↔CPU clock calibration data.
+
+    Enables precise conversion of GPU timestamp ticks to the CPU
+    perf_counter_ns timeline using correlated clock samples from
+    ID3D12CommandQueue::GetClockCalibration.
+    """
+    gpu_tick: int       # GPU timestamp counter at calibration point
+    cpu_qpc_tick: int   # CPU QPC counter at the same instant
+    gpu_freq: int       # GPU ticks per second
+    qpc_freq: int       # QPC ticks per second
+
+    @property
+    def gpu_ns_per_tick(self) -> float:
+        """Nanoseconds per GPU tick."""
+        return 1e9 / self.gpu_freq
+
+    def gpu_tick_to_cpu_ns(self, gpu_tick: int) -> int:
+        """Convert a raw GPU tick to the CPU perf_counter_ns timeline.
+
+        Uses the calibration point to compute:
+          elapsed_gpu_ns = (gpu_tick - cal_gpu_tick) / gpu_freq * 1e9
+          cpu_ns = cal_cpu_ns + elapsed_gpu_ns
+        """
+        # GPU elapsed since calibration (in nanoseconds)
+        gpu_elapsed_ns = (gpu_tick - self.gpu_tick) * 1e9 / self.gpu_freq
+        # CPU time at calibration (QPC → ns)
+        cal_cpu_ns = self.cpu_qpc_tick * 1_000_000_000 // self.qpc_freq
+        return int(cal_cpu_ns + gpu_elapsed_ns)
+
+    @staticmethod
+    def acquire() -> 'ClockCalibration':
+        """Acquire a D3D12 clock calibration sample.
+
+        Returns ClockCalibration on success, or None on non-D3D12 platforms.
+        """
+        result = _d3d12_clock_calibration()
+        if result is None:
+            return None
+        gpu_tick, cpu_qpc, gpu_freq, qpc_freq = result
+        return ClockCalibration(
+            gpu_tick=gpu_tick, cpu_qpc_tick=cpu_qpc,
+            gpu_freq=gpu_freq, qpc_freq=qpc_freq)
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +255,10 @@ class GPUTimestampProfiler:
     Creates a timestamp query set and resolve buffer. Each profiled
     compute pass writes two timestamps (begin/end) which are resolved
     to a GPU buffer and read back after the command buffer completes.
+
+    When D3D12 clock calibration is available, GPU ticks are precisely
+    mapped to the CPU perf_counter_ns timeline.  Otherwise, falls back
+    to using cpu_submit_ns as an approximate anchor.
     """
 
     # Maximum number of timestamp pairs (begin+end) per profiling session
@@ -86,9 +276,15 @@ class GPUTimestampProfiler:
         self._next_index = 0
         self._timestamps: List[GPUTimestamp] = []
         self._pending_names: Dict[int, str] = {}
+        self._calibration: Optional[ClockCalibration] = None
 
         if self._enabled:
             self._create_query_set()
+            self._calibration = ClockCalibration.acquire()
+            if self._calibration:
+                print(f"  GPU clock calibration: {self._calibration.gpu_freq/1e6:.1f} MHz GPU, "
+                      f"{self._calibration.qpc_freq/1e6:.1f} MHz QPC, "
+                      f"{self._calibration.gpu_ns_per_tick:.2f} ns/tick")
 
     def _create_query_set(self):
         """Create the timestamp query set and resolve buffer."""
@@ -259,14 +455,25 @@ class GPUTimestampProfiler:
         lib.wgpuCommandEncoderRelease(encoder)
         lib.wgpuCommandBufferRelease(cmd_buf)
 
-        # Parse timestamp pairs
+        # Parse timestamp pairs and apply clock calibration
+        cal = self._calibration
         for begin_idx, (name, cpu_ns) in sorted(self._pending_names.items()):
             end_idx = begin_idx + 1
             if end_idx < len(values):
+                raw_begin = int(values[begin_idx])
+                raw_end = int(values[end_idx])
+                if cal:
+                    # Precise: convert GPU ticks → CPU nanosecond timeline
+                    begin_ns = cal.gpu_tick_to_cpu_ns(raw_begin)
+                    end_ns = cal.gpu_tick_to_cpu_ns(raw_end)
+                else:
+                    # Fallback: treat raw values as nanoseconds (approximate)
+                    begin_ns = raw_begin
+                    end_ns = raw_end
                 ts = GPUTimestamp(
                     name=name,
-                    begin_ns=int(values[begin_idx]),
-                    end_ns=int(values[end_idx]),
+                    begin_ns=begin_ns,
+                    end_ns=end_ns,
                     cpu_submit_ns=cpu_ns,
                 )
                 self._timestamps.append(ts)
@@ -303,6 +510,7 @@ class CPUEvent:
     begin_ns: int
     end_ns: int = 0
     gpu_dispatch: Optional[str] = None  # associated GPU dispatch name
+    link_id: Optional[str] = None  # links CPU event to corresponding GPU event
 
     @property
     def duration_us(self) -> float:
@@ -324,6 +532,7 @@ class GPUDispatchEvent:
     name: str
     begin_ns: int  # CPU perf_counter_ns before dispatch
     end_ns: int    # CPU perf_counter_ns after readback complete
+    link_id: Optional[str] = None  # links GPU event to corresponding CPU event
 
     @property
     def duration_us(self) -> float:
@@ -431,6 +640,12 @@ class InferenceProfiler:
     @property
     def gpu_enabled(self) -> bool:
         return self._gpu is not None and self._gpu.enabled
+
+    @property
+    def has_clock_calibration(self) -> bool:
+        """True if D3D12 GPU↔CPU clock calibration is available."""
+        return (self._gpu is not None and
+                self._gpu._calibration is not None)
 
     def reset(self):
         """Reset all profiling data for a new session."""

@@ -52,39 +52,56 @@ def generate_html_report(profiler: InferenceProfiler,
     for e in cpu_events:
         if e.name in ("total", "scope_total"):
             continue
-        cpu_json.append({
+        entry = {
             "name": e.name,
             "scope": e.scope,
             "start_us": (e.begin_ns - t0) / 1000.0,
             "dur_us": (e.end_ns - e.begin_ns) / 1000.0,
             "gpu": bool(e.gpu_dispatch),
-        })
+        }
+        if hasattr(e, 'link_id') and e.link_id:
+            entry["link"] = e.link_id
+        cpu_json.append(entry)
 
     # GPU dispatch events (CPU-timed)
     gpu_json = []
     for de in dispatch_events:
-        gpu_json.append({
+        entry = {
             "name": de.name,
             "start_us": (de.begin_ns - t0) / 1000.0,
             "dur_us": (de.end_ns - de.begin_ns) / 1000.0,
-        })
+        }
+        if hasattr(de, 'link_id') and de.link_id:
+            entry["link"] = de.link_id
+        gpu_json.append(entry)
 
-    # GPU hardware timestamps — map to CPU timeline via cpu_submit_ns
-    # Correlation: offset GPU clock to align with CPU timeline using
-    # the first timestamp's cpu_submit_ns as anchor for its GPU begin_ns
+    # GPU hardware timestamps — map to CPU timeline
+    # When D3D12 clock calibration is available, gpu_timestamps already have
+    # begin_ns/end_ns in the CPU perf_counter_ns domain (mapped during
+    # resolve_and_read).  Otherwise, fall back to the approximate anchor
+    # method using cpu_submit_ns of the first timestamp.
     gpu_hw_json = []
     if gpu_timestamps:
-        # Find the offset: first GPU timestamp's begin_ns <-> its cpu_submit_ns
-        first = gpu_timestamps[0]
-        gpu_to_cpu_offset = first.cpu_submit_ns - first.begin_ns
-        for ts in gpu_timestamps:
-            # Map GPU begin/end to CPU time domain
-            mapped_begin_ns = ts.begin_ns + gpu_to_cpu_offset
-            gpu_hw_json.append({
-                "name": ts.name,
-                "start_us": (mapped_begin_ns - t0) / 1000.0,
-                "dur_us": ts.duration_us,
-            })
+        has_calibration = profiler.has_clock_calibration
+        if has_calibration:
+            # Calibrated: timestamps are already in CPU ns
+            for ts in gpu_timestamps:
+                gpu_hw_json.append({
+                    "name": ts.name,
+                    "start_us": (ts.begin_ns - t0) / 1000.0,
+                    "dur_us": (ts.end_ns - ts.begin_ns) / 1000.0,
+                })
+        else:
+            # Fallback: anchor first GPU timestamp to its cpu_submit_ns
+            first = gpu_timestamps[0]
+            gpu_to_cpu_offset = first.cpu_submit_ns - first.begin_ns
+            for ts in gpu_timestamps:
+                mapped_begin_ns = ts.begin_ns + gpu_to_cpu_offset
+                gpu_hw_json.append({
+                    "name": ts.name,
+                    "start_us": (mapped_begin_ns - t0) / 1000.0,
+                    "dur_us": ts.duration_us,
+                })
 
     summary = _compute_summary(cpu_events, dispatch_events, gpu_timestamps,
                                 steps_json)
@@ -449,6 +466,29 @@ function draw(){
 
   // GPU lane (merged: HW timestamps if available, else CPU-timed)
   drawLane(gpuMerged, GPU_Y, e=>e.name.split('/').pop());
+
+  // Connector lines: link CPU recording to GPU execution
+  // Draws dashed lines from CPU bar bottom-center to GPU bar top-center
+  // for events that share a "link" id
+  const cpuLinks={}, gpuLinks={};
+  for(const e of cpu){if(e.link){const cx=t2x(e.start_us+e.dur_us/2);if(cx>=LW&&cx<=w)cpuLinks[e.link]={x:cx,x1:t2x(e.start_us),x2:t2x(e.start_us+e.dur_us),name:e.name};}}
+  for(const e of gpuMerged){if(e.link){const cx=t2x(e.start_us+e.dur_us/2);if(cx>=LW&&cx<=w)gpuLinks[e.link]={x:cx,x1:t2x(e.start_us),x2:t2x(e.start_us+e.dur_us),name:e.name};}}
+  X.save();
+  X.setLineDash([3,3]);
+  X.lineWidth=0.8;
+  for(const id in cpuLinks){
+    if(!gpuLinks[id])continue;
+    const c=cpuLinks[id],g=gpuLinks[id];
+    // Color: match the op color
+    X.strokeStyle=oc(c.name);
+    X.globalAlpha=0.6;
+    // Draw from CPU bar bottom to GPU bar top
+    X.beginPath();
+    X.moveTo(c.x, CPU_Y+TH);
+    X.lineTo(g.x, GPU_Y);
+    X.stroke();
+  }
+  X.restore();
 
   document.getElementById('range-label').textContent=
     range>=1e6?(range/1e6).toFixed(2)+'s':(range/1e3).toFixed(1)+'ms';
