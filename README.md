@@ -14,22 +14,20 @@ Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes
 
 All models run fully on Triton WebGPU — no PyTorch at inference time.
 
-| Model | Type | Params | Precision | Status | Performance |
-|-------|------|--------|-----------|--------|-------------|
-| **GPT-2** | LLM | 124M | FP32 | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
-| **Phi-4** | LLM | 3.8B | INT4 | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode |
-| **Qwen-2.5** | LLM | 1.5B | INT4 | ✅ Shipping | 148ms TTFT, 220 tok/s decode |
-| **Qwen-3.5** | LLM | 27B | INT4 | ✅ Shipping | 919 tok/s (bench), Mamba-2 hybrid |
-| **SmolLM-2** | LLM | 1.7B | INT4 | ✅ Shipping | 133ms TTFT, 208 tok/s decode |
-| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | ✅ Shipping | MoE top-4 routing |
-| **Whisper** | Speech-to-Text | 39M | FP16 | ✅ Shipping | 160ms encoder, 30 tok/s decode, 0.9s total |
-| **SAM-3** | Segmentation | 31M | FP16 | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
-| **Flux-Klein** | Image Gen | — | FP16 | ✅ Verified | DiT architecture |
-| **SD-Turbo** | Image Gen | ~5B | FP16 | ✅ Shipping | 7.9s/step (512×512), 1-step distilled |
-| **Z-Image-Turbo** | Image Gen | ~12B | FP16 | ✅ Shipping | 23s/step (512×512), DiT, Qwen3 text encoder |
-| **SDXL** | Image Gen | — | FP16 | ✅ Verified | UNet, cross-attention |
-
-**Legend:** ✅ Shipping = runs with real HuggingFace weights end-to-end. ✅ Verified = passes correctness test with random weights.
+| Model | Type | Params | Precision | Performance | Status |
+|-------|------|--------|-----------|-------------|--------|
+| **GPT-2** | LLM | 124M | FP32 | 60ms TTFT, 97.5 tok/s decode | Done |
+| **Phi-4** | LLM | 3.8B | INT4 | 458ms TTFT, 124.6 tok/s decode | WIP |
+| **Qwen-2.5** | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s decode | Done |
+| **Qwen-3.5** | LLM | 27B | INT4 | 919 tok/s (bench), Mamba-2 hybrid |  |
+| **SmolLM-2** | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s decode | Done |
+| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | MoE top-4 routing |  |
+| **Whisper** | Speech-to-Text | 39M | FP16 | 160ms encoder, 30 tok/s decode, 0.9s total | Done |
+| **SAM-3** | Segmentation | 31M | FP16 | 2.3s encoder + 33ms decoder (1024×1024) |  |
+| **Flux-Klein** | Image Gen | — | FP16 | DiT architecture |  |
+| **SD-Turbo** | Image Gen | ~5B | FP16 | 7.9s/step (512×512), 1-step distilled |  |
+| **Z-Image-Turbo** | Image Gen | ~12B | FP16 | 23s/step (512×512), DiT, Qwen3 text encoder |  |
+| **SDXL** | Image Gen | ~5B | FP16 | 14.6s/step (512×512 CFG), 20-step default |  |
 
 ## Project Structure
 

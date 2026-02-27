@@ -70,6 +70,21 @@ SDXL_CONFIGS = {
         "attn_levels": [1, 2],
         "transformer_depth": [0, 2, 10],  # per down block
     },
+    "sdxl-base": {
+        "in_channels": 4,
+        "out_channels": 4,
+        "model_channels": 320,
+        "channel_mult": [1, 2, 4],
+        "n_head": -1,
+        "head_dim": 64,
+        "n_res_blocks": 2,
+        "spatial_size": 128,  # 1024x1024 default
+        "time_emb_dim": 1280,
+        "num_groups": 32,
+        "context_dim": 2048,
+        "attn_levels": [1, 2],
+        "transformer_depth": [0, 2, 10],
+    },
 }
 
 VAE_SCALE_FACTOR = 8
@@ -932,7 +947,11 @@ def vae_decode(vae, latents):
 def generate_image(model, tokenizer, tokenizer_2, text_encoder,
                    text_encoder_2, vae, prompt, height=512, width=512,
                    num_steps=4, guidance_scale=0.0, seed=42):
-    """Generate image using SDXL UNet on WebGPU."""
+    """Generate image using SDXL UNet on WebGPU.
+
+    When guidance_scale > 1, uses classifier-free guidance (CFG):
+    runs UNet twice per step (unconditional + conditional) and blends.
+    """
     np.random.seed(seed)
     lat_h, lat_w = height // VAE_SCALE_FACTOR, width // VAE_SCALE_FACTOR
     print(f"Image: {width}×{height} → latent: {lat_w}×{lat_h}")
@@ -942,6 +961,17 @@ def generate_image(model, tokenizer, tokenizer_2, text_encoder,
     context, pooled = encode_prompt(
         tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompt)
     print(f"  Context: {context.shape}, pooled: {pooled.shape}")
+
+    use_cfg = guidance_scale > 1.0
+    if use_cfg:
+        # Unconditional context (empty prompt)
+        context_uc, pooled_uc = encode_prompt(
+            tokenizer, tokenizer_2, text_encoder, text_encoder_2, "")
+        print(f"  CFG scale: {guidance_scale}")
+
+    # Time IDs: [orig_h, orig_w, crop_top, crop_left, target_h, target_w]
+    time_ids = np.array([height, width, 0, 0, height, width],
+                        dtype=np.float32)
 
     # Initialize noise
     latent = np.random.randn(4, lat_h, lat_w).astype(np.float32)
@@ -965,9 +995,22 @@ def generate_image(model, tokenizer, tokenizer_2, text_encoder,
         # Scale input
         latent_input = scheduler.scale_input(latent, sigma)
 
-        # UNet forward
-        noise_pred = model.forward(latent_input, timestep=ts,
-                                   context=context)
+        if use_cfg:
+            # Classifier-free guidance: 2 forward passes
+            noise_cond = model.forward(latent_input, timestep=ts,
+                                       context=context,
+                                       pooled_text_embeds=pooled,
+                                       time_ids=time_ids)
+            noise_uncond = model.forward(latent_input, timestep=ts,
+                                         context=context_uc,
+                                         pooled_text_embeds=pooled_uc,
+                                         time_ids=time_ids)
+            noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        else:
+            noise_pred = model.forward(latent_input, timestep=ts,
+                                       context=context,
+                                       pooled_text_embeds=pooled,
+                                       time_ids=time_ids)
 
         # Euler step
         latent = scheduler.step(noise_pred, sigma, sigma_next, latent)
@@ -1155,10 +1198,10 @@ def main():
                         default="a beautiful landscape painting")
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=4,
-                        help="Denoising steps (4 for Turbo, 20-50 for base)")
-    parser.add_argument("--cfg", type=float, default=0.0,
-                        help="CFG scale (0 for Turbo, 7.5 for base)")
+    parser.add_argument("--steps", type=int, default=20,
+                        help="Denoising steps (1-4 for Turbo, 20-50 for base)")
+    parser.add_argument("--cfg", type=float, default=7.5,
+                        help="CFG scale (0 for Turbo, 5-9 for base)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="output.png")
     parser.add_argument("--profile", action="store_true")
