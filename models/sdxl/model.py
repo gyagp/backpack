@@ -264,6 +264,57 @@ class SDXLWebGPU(WebGPUModel):
         """SiLU activation using GPU kernel."""
         return self._silu(x)
 
+    def _conv2d(self, x, w_name, b_name, out_ch, stride=1):
+        """2D convolution via im2col + matmul — handles 1×1, 3×3, stride 1 & 2.
+
+        x: (C_in, H, W)
+        w: (C_out, C_in, kH, kW)  or  (C_out, C_in) for 1×1
+        Returns: (C_out, H_out, W_out)
+        """
+        w = _w(self.weights, w_name)
+        b = _w(self.weights, b_name) if b_name and b_name in self.weights else None
+
+        if w.ndim == 2:
+            # 1×1 conv — use linear projection path
+            C, H, W = x.shape
+            x_flat = x.transpose(1, 2, 0).reshape(H * W, C)
+            out_flat = self._linear_w(x_flat, w_name, b_name,
+                                      N=out_ch, K=C)
+            return out_flat.reshape(H, W, out_ch).transpose(2, 0, 1)
+
+        C_out, C_in, kH, kW = w.shape
+        C, H, W = x.shape
+        assert C == C_in, f"Channel mismatch: {C} vs {C_in}"
+
+        # Pad for same-size output (padding = kH//2 for odd kernels)
+        pad = kH // 2
+        if pad > 0:
+            x_pad = np.pad(x, ((0, 0), (pad, pad), (pad, pad)),
+                           mode='constant', constant_values=0)
+        else:
+            x_pad = x
+
+        _, H_p, W_p = x_pad.shape
+        H_out = (H_p - kH) // stride + 1
+        W_out = (W_p - kW) // stride + 1
+
+        # im2col: extract patches → (H_out*W_out, C_in*kH*kW)
+        from numpy.lib.stride_tricks import as_strided
+        s = x_pad.strides  # (C_in_stride, H_stride, W_stride)
+        col = as_strided(
+            x_pad,
+            shape=(H_out, W_out, C_in, kH, kW),
+            strides=(s[1] * stride, s[2] * stride, s[0], s[1], s[2])
+        )
+        col_2d = col.reshape(H_out * W_out, C_in * kH * kW)
+
+        # matmul with kernel reshaped to (C_out, C_in*kH*kW)
+        w_2d = w.reshape(C_out, C_in * kH * kW).astype(np.float32)
+        out = col_2d.astype(np.float32) @ w_2d.T  # (H_out*W_out, C_out)
+        if b is not None:
+            out = out + b
+        return out.reshape(H_out, W_out, C_out).transpose(2, 0, 1)
+
     # ------------------------------------------------------------------
     # Building blocks
     # ------------------------------------------------------------------
@@ -285,18 +336,30 @@ class SDXLWebGPU(WebGPUModel):
         return h  # (1, TED)
 
     def _resnet_block(self, x, temb, pfx, ch_in, ch):
-        """ResNet block: GN → SiLU → Conv1x1 → +time → GN → SiLU → Conv1x1."""
+        """ResNet block: GN → SiLU → Conv → +time → GN → SiLU → Conv."""
         C, H, W = x.shape
         h = self._group_norm(x, pfx + "norm1.weight", pfx + "norm1.bias")
-        h_flat = h.transpose(1, 2, 0).reshape(H * W, C)
-        h_flat = self._silu_act(h_flat)
-        h_flat = self._linear_w(h_flat, pfx + "conv1.weight",
-                                pfx + "conv1.bias", N=ch, K=C,
-                                gpu_out=True)
-        # Readback for spatial reshape + time conditioning
-        if isinstance(h_flat, GPUBuffer):
-            h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
-        h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
+
+        # Detect if conv weights are 3×3 or 1×1
+        conv1_w = self.weights[pfx + "conv1.weight"]
+        use_conv2d = (conv1_w.ndim == 4 and conv1_w.shape[2] > 1)
+
+        if use_conv2d:
+            # 3×3 path: apply SiLU on spatial tensor, then conv2d
+            h_flat = h.transpose(1, 2, 0).reshape(H * W, C)
+            h_flat = self._silu_act(h_flat)
+            h = h_flat.reshape(H, W, C).transpose(2, 0, 1)
+            h = self._conv2d(h, pfx + "conv1.weight",
+                             pfx + "conv1.bias", ch)
+        else:
+            h_flat = h.transpose(1, 2, 0).reshape(H * W, C)
+            h_flat = self._silu_act(h_flat)
+            h_flat = self._linear_w(h_flat, pfx + "conv1.weight",
+                                    pfx + "conv1.bias", N=ch, K=C,
+                                    gpu_out=True)
+            if isinstance(h_flat, GPUBuffer):
+                h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
+            h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
 
         # Time conditioning
         temb_proj = self._linear_w(
@@ -305,20 +368,32 @@ class SDXLWebGPU(WebGPUModel):
         h = h + temb_proj.ravel()[:, None, None]
 
         h = self._group_norm(h, pfx + "norm2.weight", pfx + "norm2.bias")
-        h_flat = h.transpose(1, 2, 0).reshape(H * W, ch)
-        h_flat = self._silu_act(h_flat)
-        h_flat = self._linear_w(h_flat, pfx + "conv2.weight",
-                                pfx + "conv2.bias", N=ch, K=ch,
-                                gpu_out=True)
-        if isinstance(h_flat, GPUBuffer):
-            h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
-        h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
 
-        # Skip projection
+        if use_conv2d:
+            h_flat = h.transpose(1, 2, 0).reshape(H * W, ch)
+            h_flat = self._silu_act(h_flat)
+            h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
+            h = self._conv2d(h, pfx + "conv2.weight",
+                             pfx + "conv2.bias", ch)
+        else:
+            h_flat = h.transpose(1, 2, 0).reshape(H * W, ch)
+            h_flat = self._silu_act(h_flat)
+            h_flat = self._linear_w(h_flat, pfx + "conv2.weight",
+                                    pfx + "conv2.bias", N=ch, K=ch,
+                                    gpu_out=True)
+            if isinstance(h_flat, GPUBuffer):
+                h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
+            h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
+
+        # Skip projection (handles both 1×1 and 3×3)
         if ch_in != ch:
             proj_name = pfx + "proj.weight"
             if proj_name in self.weights:
-                x = self._conv1x1(x, proj_name, pfx + "proj.bias", ch)
+                proj_w = self.weights[proj_name]
+                if proj_w.ndim == 4 and proj_w.shape[2] > 1:
+                    x = self._conv2d(x, proj_name, pfx + "proj.bias", ch)
+                else:
+                    x = self._conv1x1(x, proj_name, pfx + "proj.bias", ch)
         return x + h
 
     def _self_attn(self, x_flat, ch, prefix):
@@ -508,18 +583,22 @@ class SDXLWebGPU(WebGPUModel):
         MC = self.model_channels
         temb = self._time_embedding(timestep)
 
-        # Input conv
-        x = self._conv1x1(latent, "input_conv.weight",
-                          "input_conv.bias", MC)
+        # Input conv (handles both 1×1 and 3×3)
+        input_w = self.weights["input_conv.weight"]
+        if input_w.ndim == 4 and input_w.shape[2] > 1:
+            x = self._conv2d(latent, "input_conv.weight",
+                             "input_conv.bias", MC)
+        else:
+            x = self._conv1x1(latent, "input_conv.weight",
+                              "input_conv.bias", MC)
 
         # --- Down path ---
-        skips = []
+        skips = [x.copy()]  # Save input conv output as first skip
         for level, mult in enumerate(self.channel_mult):
             ch = MC * mult
             ch_in = x.shape[0]
             for rb in range(self.n_res_blocks):
                 pfx = f"down.{level}.res{rb}."
-                skips.append(x.copy())
                 x = self._resnet_block(x, temb, pfx, ch_in, ch)
                 ch_in = ch
 
@@ -531,13 +610,18 @@ class SDXLWebGPU(WebGPUModel):
                         np.float32)
                     n_depth = (self.transformer_depth[level]
                                if level < len(self.transformer_depth) else 1)
-                    # Norm before transformer
                     norm_pfx = f"down.{level}.attn{rb}."
                     if norm_pfx + "norm.weight" in self.weights:
                         x_flat = self._group_norm_flat(
                             x_flat, C, H, W,
                             norm_pfx + "norm.weight",
                             norm_pfx + "norm.bias")
+                    # proj_in linear
+                    proj_in = norm_pfx + "proj_in.weight"
+                    if proj_in in self.weights:
+                        x_flat = self._linear_w(
+                            x_flat, proj_in, norm_pfx + "proj_in.bias",
+                            N=ch, K=ch)
                     for td in range(n_depth):
                         tpfx = f"down.{level}.attn{rb}.t{td}."
                         x_flat = self._transformer_block(
@@ -550,14 +634,25 @@ class SDXLWebGPU(WebGPUModel):
                             N=ch, K=ch)
                     x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
 
+                # Save skip (after resnet + optional transformer)
+                skips.append(x.copy())
+
+            # Downsample between levels (except last)
+            ds_w = f"down.{level}.downsample.weight"
+            if ds_w in self.weights:
+                x = self._conv2d(x, ds_w, f"down.{level}.downsample.bias",
+                                 ch, stride=2)
+                skips.append(x.copy())
+
         # --- Mid block ---
         ch_mid = x.shape[0]
         x = self._resnet_block(x, temb, "mid.res1.", ch_mid, ch_mid)
 
         # Mid attention (simple self-attn or transformer)
-        if "mid.attn.norm.weight" in self.weights:
+        mid_has_transformer = "mid.attn.t0.norm1.weight" in self.weights
+        if "mid.attn.norm.weight" in self.weights and not mid_has_transformer:
             x = self._attn_block_simple(x, "mid.attn.", ch_mid)
-        elif context is not None and "mid.attn.t0.norm1.weight" in self.weights:
+        elif context is not None and mid_has_transformer:
             C, H, W = x.shape
             S = H * W
             x_flat = x.transpose(1, 2, 0).reshape(S, C).astype(np.float32)
@@ -565,8 +660,20 @@ class SDXLWebGPU(WebGPUModel):
                 x_flat = self._group_norm_flat(
                     x_flat, C, H, W,
                     "mid.attn.norm.weight", "mid.attn.norm.bias")
-            x_flat = self._transformer_block(
-                x_flat, context, ch_mid, "mid.attn.t0.")
+            if "mid.attn.proj_in.weight" in self.weights:
+                x_flat = self._linear_w(
+                    x_flat, "mid.attn.proj_in.weight",
+                    "mid.attn.proj_in.bias", N=ch_mid, K=ch_mid)
+            # Count mid transformer blocks
+            td = 0
+            while f"mid.attn.t{td}.norm1.weight" in self.weights:
+                x_flat = self._transformer_block(
+                    x_flat, context, ch_mid, f"mid.attn.t{td}.")
+                td += 1
+            if "mid.attn.proj_out.weight" in self.weights:
+                x_flat = self._linear_w(
+                    x_flat, "mid.attn.proj_out.weight",
+                    "mid.attn.proj_out.bias", N=ch_mid, K=ch_mid)
             x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
 
         x = self._resnet_block(x, temb, "mid.res2.", ch_mid, ch_mid)
@@ -574,68 +681,98 @@ class SDXLWebGPU(WebGPUModel):
         # --- Up path ---
         for level, mult in enumerate(reversed(self.channel_mult)):
             ch = MC * mult
-            for rb in range(self.n_res_blocks):
-                ch_prev = x.shape[0]
+            # Detect up block resnet count from weights
+            n_up_res = 0
+            while f"up.{level}.res{n_up_res}.norm1.weight" in self.weights:
+                n_up_res += 1
+            if n_up_res == 0:
+                n_up_res = self.n_res_blocks
+
+            for rb in range(n_up_res):
                 pfx = f"up.{level}.res{rb}."
 
-                # Project x to target channels if needed
-                if ch_prev != ch:
-                    proj = pfx + "in_proj.weight"
-                    if proj in self.weights:
-                        x = self._conv1x1(x, proj, pfx + "in_proj.bias", ch)
-
                 # Skip connection
-                skip = skips.pop()
-                if skip.shape[0] != ch:
-                    spfx = pfx + "skip_proj."
-                    if spfx + "weight" in self.weights:
-                        skip = self._conv1x1(skip, spfx + "weight",
-                                             spfx + "bias", ch)
-                    elif skip.shape[0] + ch == ch * 2:
-                        # Concatenate skip (real SDXL style) — not used in simplified
-                        pass
-                x = x + skip
+                if skips:
+                    skip = skips.pop()
+                    # Concat-skip when resnet has proj (conv_shortcut)
+                    proj_name = pfx + "proj.weight"
+                    if proj_name in self.weights:
+                        x = np.concatenate([x, skip], axis=0)
+                    else:
+                        # Additive skip: project skip if channels differ
+                        spfx = pfx + "skip_proj."
+                        if skip.shape[0] != x.shape[0]:
+                            if spfx + "weight" in self.weights:
+                                skip = self._conv1x1(
+                                    skip, spfx + "weight",
+                                    spfx + "bias", x.shape[0])
+                        # Project x if channels differ
+                        ipfx = pfx + "in_proj.weight"
+                        if ipfx in self.weights:
+                            x = self._conv1x1(
+                                x, ipfx, pfx + "in_proj.bias", ch)
+                        if skip.shape[0] == x.shape[0]:
+                            x = x + skip
 
-                # ResNet
-                x = self._resnet_block(x, temb, pfx, ch, ch)
+                ch_in = x.shape[0]
+                x = self._resnet_block(x, temb, pfx, ch_in, ch)
 
                 # Transformer at this level
                 up_idx = len(self.channel_mult) - 1 - level
                 if up_idx in self.attn_levels and context is not None:
-                    C, H, W = x.shape
-                    S = H * W
-                    x_flat = x.transpose(1, 2, 0).reshape(
-                        S, C).astype(np.float32)
-                    n_depth = (self.transformer_depth[up_idx]
-                               if up_idx < len(self.transformer_depth) else 1)
-                    norm_pfx = f"up.{level}.attn{rb}."
-                    if norm_pfx + "norm.weight" in self.weights:
+                    attn_pfx = f"up.{level}.attn{rb}."
+                    if attn_pfx + "norm.weight" in self.weights:
+                        C, H, W = x.shape
+                        S = H * W
+                        x_flat = x.transpose(1, 2, 0).reshape(
+                            S, C).astype(np.float32)
+                        n_depth = (self.transformer_depth[up_idx]
+                                   if up_idx < len(self.transformer_depth)
+                                   else 1)
                         x_flat = self._group_norm_flat(
                             x_flat, C, H, W,
-                            norm_pfx + "norm.weight",
-                            norm_pfx + "norm.bias")
-                    for td in range(n_depth):
-                        tpfx = f"up.{level}.attn{rb}.t{td}."
-                        x_flat = self._transformer_block(
-                            x_flat, context, ch, tpfx)
-                    proj_name = norm_pfx + "proj_out.weight"
-                    if proj_name in self.weights:
-                        x_flat = self._linear_w(
-                            x_flat, proj_name, norm_pfx + "proj_out.bias",
-                            N=ch, K=ch)
-                    x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
+                            attn_pfx + "norm.weight",
+                            attn_pfx + "norm.bias")
+                        proj_in = attn_pfx + "proj_in.weight"
+                        if proj_in in self.weights:
+                            x_flat = self._linear_w(
+                                x_flat, proj_in,
+                                attn_pfx + "proj_in.bias",
+                                N=ch, K=ch)
+                        for td in range(n_depth):
+                            tpfx = f"up.{level}.attn{rb}.t{td}."
+                            x_flat = self._transformer_block(
+                                x_flat, context, ch, tpfx)
+                        proj_out = attn_pfx + "proj_out.weight"
+                        if proj_out in self.weights:
+                            x_flat = self._linear_w(
+                                x_flat, proj_out,
+                                attn_pfx + "proj_out.bias",
+                                N=ch, K=ch)
+                        x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
+
+            # Upsample between levels (except last)
+            us_w = f"up.{level}.upsample.weight"
+            if us_w in self.weights:
+                C, H, W = x.shape
+                x = np.repeat(np.repeat(x, 2, axis=1), 2, axis=2)
+                x = self._conv2d(x, us_w, f"up.{level}.upsample.bias", ch)
 
         # Output: GroupNorm → SiLU → Conv
-        x = self._group_norm(x, "out_norm.weight", "out_norm.bias") \
-            if "out_norm.weight" in self.weights else x
         if "out_norm.weight" in self.weights:
+            x = self._group_norm(x, "out_norm.weight", "out_norm.bias")
             C, H, W = x.shape
             x_flat = x.transpose(1, 2, 0).reshape(H * W, C)
             x_flat = self._silu_act(x_flat)
             x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
 
-        x = self._conv1x1(x, "output_conv.weight",
-                          "output_conv.bias", self.out_channels)
+        out_w = self.weights["output_conv.weight"]
+        if out_w.ndim == 4 and out_w.shape[2] > 1:
+            x = self._conv2d(x, "output_conv.weight",
+                             "output_conv.bias", self.out_channels)
+        else:
+            x = self._conv1x1(x, "output_conv.weight",
+                              "output_conv.bias", self.out_channels)
         return x
 
     def _group_norm_flat(self, x_flat, C, H, W, w_name, b_name):
@@ -751,11 +888,13 @@ def vae_decode(vae, latents):
     from PIL import Image
 
     with torch.no_grad():
-        lt = torch.from_numpy(latents).to(dtype=vae.dtype, device=vae.device)
-        if lt.ndim == 3:
-            lt = lt.unsqueeze(0)
-        lt = lt / vae.config.scaling_factor
-        img = vae.decode(lt).sample
+        lt = torch.from_numpy(latents).unsqueeze(0) if latents.ndim == 3 else \
+             torch.from_numpy(latents)
+        # Use float32 for CPU VAE (fp16 on CPU causes silent failures)
+        lt = lt.to(dtype=torch.float32, device=vae.device)
+        vae_f32 = vae.float()
+        lt = lt / vae_f32.config.scaling_factor
+        img = vae_f32.decode(lt).sample
     img = img.float().cpu().numpy()[0].transpose(1, 2, 0)
     img = np.clip((img + 1) / 2 * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(img)

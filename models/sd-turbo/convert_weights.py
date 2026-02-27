@@ -9,18 +9,20 @@ Usage:
         "text_encoder/*" "text_encoder_2/*" "scheduler/*" "model_index.json"
 
     # Then convert:
-    python python/examples/webgpu/sd-turbo/convert_weights.py
+    python models/sd-turbo/convert_weights.py
 """
 import os
 import sys
 import numpy as np
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 _WEIGHTS_DIR = os.path.join(_SCRIPT_DIR, "weights", "hf_cache")
 
 
 def convert():
     from safetensors.torch import load_file
+    from sdxl.convert_weights import _rename_key
     import torch
 
     unet_dir = os.path.join(_WEIGHTS_DIR, "unet")
@@ -47,7 +49,7 @@ def convert():
         all_tensors.update(tensors)
     print(f"  Loaded {len(all_tensors)} tensors")
 
-    # Convert to fp16 numpy
+    # Convert to fp16 numpy with key renaming and conv reshaping
     np_tensors = {}
     total_bytes = 0
     for name in sorted(all_tensors.keys()):
@@ -60,7 +62,13 @@ def convert():
             arr = t.half().numpy()
         else:
             arr = t.numpy()
-        np_tensors[name] = arr
+
+        # Reshape 1×1 conv weights: (C_out, C_in, 1, 1) → (C_out, C_in)
+        if arr.ndim == 4 and arr.shape[2] == 1 and arr.shape[3] == 1:
+            arr = arr.reshape(arr.shape[0], arr.shape[1])
+
+        new_name = _rename_key(name)
+        np_tensors[new_name] = arr
         total_bytes += arr.nbytes
 
     out_dir = os.path.join(_SCRIPT_DIR, "weights")
