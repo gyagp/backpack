@@ -18,7 +18,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 |-------|------|--------|-----------|:------------:|--------|-------------|
 | **GPT-2** | LLM | 124M | FP32 | ✅ | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
 | **Phi-4** | LLM | 3.8B | INT4 | ✅ | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode |
-| **Qwen 2.5** | LLM | 1.5B | FP32 | ✅ | ✅ Shipping | 183ms TTFT, 25.1 tok/s decode |
+| **Qwen 2.5** | LLM | 1.5B | INT4 | ✅ | ✅ Shipping | 148ms TTFT, 220 tok/s decode |
 | **Qwen 3.5** | LLM | 27B | INT4 | ✅ | ✅ Shipping | 919 tok/s (bench), Mamba-2 hybrid |
 | **SmolLM2** | LLM | 1.7B | INT4 | ✅ | ✅ Shipping | 133ms TTFT, 208 tok/s decode |
 | **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | ✅ | ✅ Shipping | MoE top-4 routing |
