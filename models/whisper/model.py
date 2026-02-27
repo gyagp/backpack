@@ -226,7 +226,7 @@ class WhisperWebGPU(WebGPUModel):
 
     def _conv1d(self, x: np.ndarray, weight_name: str,
                 bias_name: str, stride: int = 1) -> np.ndarray:
-        """1D convolution in NumPy. x: (C_in, T), weight: (C_out, C_in, K)."""
+        """1D convolution via im2col + matmul. x: (C_in, T), weight: (C_out, C_in, K)."""
         w = self.weights[weight_name]
         b = self.weights[bias_name]
         if w.dtype == np.float16:
@@ -236,23 +236,25 @@ class WhisperWebGPU(WebGPUModel):
         if x.dtype == np.float16:
             x = x.astype(np.float32)
         C_out, C_in, K = w.shape
-        T_in = x.shape[1]
-        # Pad to maintain temporal dimension for stride=1
         pad = (K - 1) // 2
         x_padded = np.pad(x, ((0, 0), (pad, pad)), mode='constant')
         T_out = (x_padded.shape[1] - K) // stride + 1
-        out = np.zeros((C_out, T_out), dtype=np.float32)
-        for co in range(C_out):
-            for ci in range(C_in):
-                for ki in range(K):
-                    out[co] += w[co, ci, ki] * x_padded[ci, ki:ki + T_out * stride:stride]
-            out[co] += b[co]
+        # im2col: extract (K, C_in) patches → (T_out, C_in*K) matrix
+        from numpy.lib.stride_tricks import as_strided
+        s = x_padded.strides  # (C_in*T_padded*4, 4) bytes
+        # Shape: (T_out, C_in, K), strides: (stride*s[1], s[0], s[1])
+        cols = as_strided(
+            x_padded,
+            shape=(T_out, C_in, K),
+            strides=(s[1] * stride, s[0], s[1]))
+        cols_flat = cols.reshape(T_out, C_in * K)  # (T_out, C_in*K)
+        w_flat = w.reshape(C_out, C_in * K)         # (C_out, C_in*K)
+        out = (cols_flat @ w_flat.T + b).T           # (C_out, T_out)
         return out
 
     def _gelu_np(self, x: np.ndarray) -> np.ndarray:
-        """GELU activation in NumPy (used for conv outputs before GPU)."""
-        inner = 0.7978845608 * (x + 0.044715 * x ** 3)
-        return 0.5 * x * (1.0 + np.tanh(inner))
+        """GELU activation — fast sigmoid approximation."""
+        return x * (1.0 / (1.0 + np.exp(-1.702 * x)))
 
     def encode(self, mel: np.ndarray) -> np.ndarray:
         """Encode mel spectrogram to encoder hidden states.
@@ -374,20 +376,18 @@ class WhisperWebGPU(WebGPUModel):
             ln1, self._gpu_weights[pfx + "self_attn.v_proj.weight"],
             self._gpu_weights[pfx + "self_attn.v_proj.bias"], D)
 
-        # Causal self-attention (numpy for simplicity)
-        Q = q.reshape(T_dec, n_head, HD)
-        K_s = k.reshape(T_dec, n_head, HD)
-        V_s = v.reshape(T_dec, n_head, HD)
+        # Causal self-attention — vectorized
+        Q = q.reshape(T_dec, n_head, HD).transpose(1, 0, 2)     # (n_head, T, HD)
+        K_s = k.reshape(T_dec, n_head, HD).transpose(1, 2, 0)   # (n_head, HD, T)
+        V_s = v.reshape(T_dec, n_head, HD).transpose(1, 0, 2)   # (n_head, T, HD)
         scale = 1.0 / np.sqrt(HD)
-        sa_out = np.zeros((T_dec, n_head, HD), dtype=np.float32)
-        for h in range(n_head):
-            scores = Q[:, h, :] @ K_s[:, h, :].T * scale
-            # Causal mask
-            mask = np.triu(np.full((T_dec, T_dec), -1e9), k=1)
-            scores = scores + mask
-            exp_s = np.exp(scores - scores.max(axis=-1, keepdims=True))
-            attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
-            sa_out[:, h, :] = attn @ V_s[:, h, :]
+        scores = np.float32(Q @ K_s * scale)                    # (n_head, T, T)
+        mask = np.triu(np.full((T_dec, T_dec), -1e9, dtype=np.float32), k=1)
+        scores = scores + mask
+        scores -= scores.max(axis=-1, keepdims=True)
+        exp_s = np.exp(scores)
+        attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
+        sa_out = (attn @ V_s).transpose(1, 0, 2)                # (T, n_head, HD)
 
         sa_flat = sa_out.reshape(T_dec, D)
         proj = self._linear(
@@ -411,17 +411,16 @@ class WhisperWebGPU(WebGPUModel):
             encoder_out, self._gpu_weights[pfx + "encoder_attn.v_proj.weight"],
             self._gpu_weights[pfx + "encoder_attn.v_proj.bias"], D)
 
-        # Cross-attention (full, non-causal)
-        Q_c = q_c.reshape(T_dec, n_head, HD)
-        K_c = k_c.reshape(T_enc, n_head, HD)
-        V_c = v_c.reshape(T_enc, n_head, HD)
+        # Cross-attention — vectorized
+        Q_c = q_c.reshape(T_dec, n_head, HD).transpose(1, 0, 2)   # (n_head, T_dec, HD)
+        K_c = k_c.reshape(T_enc, n_head, HD).transpose(1, 2, 0)   # (n_head, HD, T_enc)
+        V_c = v_c.reshape(T_enc, n_head, HD).transpose(1, 0, 2)   # (n_head, T_enc, HD)
         scale = 1.0 / np.sqrt(HD)
-        ca_out = np.zeros((T_dec, n_head, HD), dtype=np.float32)
-        for h in range(n_head):
-            scores = Q_c[:, h, :] @ K_c[:, h, :].T * scale
-            exp_s = np.exp(scores - scores.max(axis=-1, keepdims=True))
-            attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
-            ca_out[:, h, :] = attn @ V_c[:, h, :]
+        scores = np.float32(Q_c @ K_c * scale)
+        scores -= scores.max(axis=-1, keepdims=True)
+        exp_s = np.exp(scores)
+        attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
+        ca_out = (attn @ V_c).transpose(1, 0, 2)  # (T_dec, n_head, HD)
 
         ca_flat = ca_out.reshape(T_dec, D)
         proj_c = self._linear(
