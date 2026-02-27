@@ -21,7 +21,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **Qwen-2.5** | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s decode | Done |
 | **Qwen-3.5** | LLM | 27B | INT4 | 1.7s TTFT, 4.4 tok/s decode |  |
 | **SmolLM-2** | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s decode | Done |
-| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 38.4 tok/s decode |  |
+| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 38.4 tok/s decode | Done |
 | **Whisper** | Speech-to-Text | 39M | FP16 | 160ms encoder, 30 tok/s decode, 0.9s total | Done |
 | **SAM-3** | Segmentation | 31M | FP16 | 2.3s encoder + 33ms decoder (1024×1024) |  |
 | **Flux-Klein** | Image Gen | 4B | FP16 | 5.6s/step (512×512), DiT dual-stream |  |
@@ -35,10 +35,10 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 backpack/
 ├── models/           # Model implementations
 │   ├── common/       # Shared kernels, base classes, utilities
-│   ├── gpt2/         # GPT-2 inference
+│   ├── gpt-2/        # GPT-2 inference
 │   ├── gemma/        # Google Gemma
-│   ├── phi4/         # Microsoft Phi-4
-│   ├── qwen2.5/      # Alibaba Qwen 2.5
+│   ├── phi-4/        # Microsoft Phi-4
+│   ├── qwen-2.5/     # Alibaba Qwen 2.5
 │   └── ...           # More models
 ├── docs/             # Documentation
 ├── third_party/
@@ -198,10 +198,10 @@ cd ../..
 
 ```powershell
 # Quick pipeline verification with random weights (no download needed)
-python models/gpt2/model.py --verify
+python models/gpt-2/model.py --verify
 
 # Full GPT-2 text generation (downloads ~500 MB weights on first run)
-python models/gpt2/model.py --prompt "The future of AI is"
+python models/gpt-2/model.py --prompt "The future of AI is"
 ```
 
 </details>

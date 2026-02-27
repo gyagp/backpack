@@ -400,7 +400,7 @@ generate_html_report(model.profiler, "profile.html")
 
 Most models support `--profile` flag:
 ```bash
-python models/phi4/model.py --profile --prompt "Hello" --max-tokens 10
+python models/phi-4/model.py --profile --prompt "Hello" --max-tokens 10
 ```
 
 ### 3.2 The HTML Timeline — What It Shows
@@ -461,7 +461,7 @@ Use `--profile` to generate both a console report and an interactive
 HTML timeline (`profile.html` in the model folder).
 
 ```bash
-python python/examples/webgpu/phi4/model.py --profile --prompt "Hello" --max-tokens 10
+python models/phi-4/model.py --profile --prompt "Hello" --max-tokens 10
 ```
 
 The profiler tracks:

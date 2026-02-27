@@ -8,8 +8,8 @@ All matrix multiplications, normalization, attention, and activation
 operations run as WebGPU compute shaders — no CUDA required.
 
 Usage:
-    python python/examples/webgpu/gpt2/model.py
-    python python/examples/webgpu/gpt2/model.py --verify
+    python models/gpt-2/model.py
+    python models/gpt-2/model.py --verify
 
 Requirements:
     pip install tiktoken requests

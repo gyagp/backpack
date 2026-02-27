@@ -101,10 +101,10 @@ python models/<name>/model.py --verify
 python models/<name>/convert_weights.py
 
 # Run with real weights
-python models/gpt2/model.py --prompt "Hello"
+python models/gpt-2/model.py --prompt "Hello"
 python models/whisper/model.py --audio file.wav
-python models/sam3/model.py --image photo.jpg --point-x 128 --point-y 128
+python models/sam-3/model.py --image photo.jpg --point-x 128 --point-y 128
 
 # Benchmark
-python models/qwen3.5/model.py --bench
+python models/qwen-3.5/model.py --bench
 ```

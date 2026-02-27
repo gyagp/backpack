@@ -15,7 +15,7 @@ This implementation provides a simplified ViT encoder + mask decoder
 suitable for demonstrating vision model inference on WebGPU.
 
 Usage:
-    python python/examples/webgpu/sam3/model.py --verify
+    python models/sam-3/model.py --verify
 
 Requirements:
     pip install requests
@@ -948,7 +948,7 @@ def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
     npz_path = os.path.join(_SCRIPT_DIR, "weights", "sam2_hiera_tiny.npz")
     if not os.path.exists(npz_path):
         print(f"Weights not found: {npz_path}")
-        print("Run:  python models/sam3/convert_weights.py")
+        print("Run:  python models/sam-3/convert_weights.py")
         sys.exit(1)
 
     print("  Loading weights...")

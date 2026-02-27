@@ -3,7 +3,7 @@
 Downloads from facebook/sam2.1-hiera-tiny via transformers.
 
 Usage:
-    python models/sam3/convert_weights.py
+    python models/sam-3/convert_weights.py
 
 Extracts vision encoder + prompt encoder + mask decoder weights.
 """

@@ -19,10 +19,10 @@ Optimizations:
   - Fast decode pipeline (pre-recorded dispatches)
 
 Usage:
-    python models/qwen2.5/model.py --verify
-    python models/qwen2.5/model.py --prompt "Hello"
-    python models/qwen2.5/model.py --quantize
-    python models/qwen2.5/model.py --prompt "Hello" --decode-mode gpu
+    python models/qwen-2.5/model.py --verify
+    python models/qwen-2.5/model.py --prompt "Hello"
+    python models/qwen-2.5/model.py --quantize
+    python models/qwen-2.5/model.py --prompt "Hello" --decode-mode gpu
 
 Requirements:
     pip install requests tokenizers

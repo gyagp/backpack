@@ -69,14 +69,14 @@ GPU decode is 3× faster than CPU decode for Phi-4 mini.
 
 ```bash
 # First time: download + quantize
-python python/examples/webgpu/phi4/model.py --quantize
+python models/phi-4/model.py --quantize
 
 # Inference
-python python/examples/webgpu/phi4/model.py --prompt "Hello" --max-tokens 50
+python models/phi-4/model.py --prompt "Hello" --max-tokens 50
 
 # Profile with HTML report
-python python/examples/webgpu/phi4/model.py --profile --prompt "Hello" --max-tokens 10
-# → generates phi4/profile.html
+python models/phi-4/model.py --profile --prompt "Hello" --max-tokens 10
+# → generates phi-4/profile.html
 ```
 
 ## Profiling

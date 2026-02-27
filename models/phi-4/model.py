@@ -22,9 +22,9 @@ All matrix multiplications, normalization, attention, and activation
 operations run as WebGPU compute shaders — no CUDA required.
 
 Usage:
-    python python/examples/webgpu/phi4/model.py --verify
-    python python/examples/webgpu/phi4/model.py --quantize   # quantize weights first
-    python python/examples/webgpu/phi4/model.py --prompt "Hello"
+    python models/phi-4/model.py --verify
+    python models/phi-4/model.py --quantize   # quantize weights first
+    python models/phi-4/model.py --prompt "Hello"
 
 Requirements:
     pip install requests tokenizers

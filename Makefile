@@ -129,7 +129,7 @@ setup: deps clone dawn triton
 	$(call ECHO,============================)
 	$(call ECHO, Backpack setup complete!)
 	$(call ECHO,============================)
-	$(call ECHO,Run: $(PYTHON) models/gpt2/model.py --verify)
+	$(call ECHO,Run: $(PYTHON) models/gpt-2/model.py --verify)
 
 # ===========================================================================
 # Clone third-party repos (skip if already present)
@@ -205,7 +205,7 @@ install:
 # ===========================================================================
 
 verify:
-	$(PYTHON) $(MODELS_DIR)/gpt2/model.py --verify
+	$(PYTHON) $(MODELS_DIR)/gpt-2/model.py --verify
 
 # ===========================================================================
 # Clean

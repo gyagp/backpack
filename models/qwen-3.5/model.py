@@ -17,9 +17,9 @@ Optimizations:
   - Vectorized multi-head attention
 
 Usage:
-    python models/qwen3.5/model.py --verify
-    python models/qwen3.5/model.py --quantize
-    python models/qwen3.5/model.py --prompt "Hello"
+    python models/qwen-3.5/model.py --verify
+    python models/qwen-3.5/model.py --quantize
+    python models/qwen-3.5/model.py --prompt "Hello"
 
 Requirements:
     pip install requests tokenizers

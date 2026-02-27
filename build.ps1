@@ -345,7 +345,7 @@ function Invoke-Triton {
 function Invoke-Verify {
     Write-Step "Running GPT-2 verification"
     $env:TRITON_BACKENDS_IN_TREE = "1"
-    python (Join-Path $MODELS_DIR "gpt2\model.py") --verify
+    python (Join-Path $MODELS_DIR "gpt-2\model.py") --verify
     if ($LASTEXITCODE -eq 0) {
         Write-OK "Verification passed"
     } else {
@@ -375,7 +375,7 @@ function Invoke-Setup {
     Write-Host "============================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "  Verify:  .\build.ps1 verify"
-    Write-Host "  Run:     python models\gpt2\model.py --prompt `"The future of AI is`""
+    Write-Host "  Run:     python models\gpt-2\model.py --prompt `"The future of AI is`""
     Write-Host ""
 }
 

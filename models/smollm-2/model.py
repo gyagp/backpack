@@ -14,8 +14,8 @@ All matrix multiplications, normalization, attention, and activation
 operations run as WebGPU compute shaders — no CUDA required.
 
 Usage:
-    python python/examples/webgpu/smollm2/model.py
-    python python/examples/webgpu/smollm2/model.py --model 360M --prompt "Hello"
+    python models/smollm-2/model.py
+    python models/smollm-2/model.py --model 360M --prompt "Hello"
 
 Requirements:
     pip install requests tokenizers
