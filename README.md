@@ -18,12 +18,12 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 |-------|------|--------|-----------|--------|-------------|
 | **GPT-2** | LLM | 124M | FP32 | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
 | **Phi-4** | LLM | 3.8B | INT4 | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode |
-| **Qwen 2.5** | LLM | 1.5B | INT4 | ✅ Shipping | 148ms TTFT, 220 tok/s decode |
-| **Qwen 3.5** | LLM | 27B | INT4 | ✅ Shipping | 919 tok/s (bench), Mamba-2 hybrid |
-| **SmolLM2** | LLM | 1.7B | INT4 | ✅ Shipping | 133ms TTFT, 208 tok/s decode |
+| **Qwen-2.5** | LLM | 1.5B | INT4 | ✅ Shipping | 148ms TTFT, 220 tok/s decode |
+| **Qwen-3.5** | LLM | 27B | INT4 | ✅ Shipping | 919 tok/s (bench), Mamba-2 hybrid |
+| **SmolLM-2** | LLM | 1.7B | INT4 | ✅ Shipping | 133ms TTFT, 208 tok/s decode |
 | **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | ✅ Shipping | MoE top-4 routing |
 | **Whisper** | Speech-to-Text | 39M | FP16 | ✅ Shipping | 160ms encoder, 30 tok/s decode, 0.9s total |
-| **SAM3** | Segmentation | 31M | FP16 | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
+| **SAM-3** | Segmentation | 31M | FP16 | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
 | **Flux-Klein** | Image Gen | — | FP16 | ✅ Verified | DiT architecture |
 | **SD-Turbo** | Image Gen | ~5B | FP16 | ✅ Shipping | 7.9s/step (512×512), 1-step distilled |
 | **SDXL** | Image Gen | — | FP16 | ✅ Verified | UNet, cross-attention |
