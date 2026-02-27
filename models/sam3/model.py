@@ -882,11 +882,13 @@ class SAMMaskDecoderWebGPU:
 # Full WebGPU inference (no PyTorch dependency)
 # ---------------------------------------------------------------------------
 
-def _layer_norm_np(x, w, b, eps=1e-5):
-    """LayerNorm on last dim."""
-    mean = x.mean(axis=-1, keepdims=True)
-    var = x.var(axis=-1, keepdims=True)
-    return (x - mean) / np.sqrt(var + eps) * w + b
+def _layer_norm_np(x, w, b, eps=1e-6):
+    """LayerNorm on last dim — optimized to avoid redundant allocs."""
+    x32 = x if x.dtype == np.float32 else x.astype(np.float32)
+    mean = x32.mean(axis=-1, keepdims=True)
+    # Use (E[x^2] - E[x]^2) = var formula — single pass, faster for large arrays
+    var = (x32 * x32).mean(axis=-1, keepdims=True) - mean * mean
+    return (x32 - mean) * (1.0 / np.sqrt(var + eps)) * w + b
 
 
 def _gelu_np(x):
@@ -896,10 +898,29 @@ def _gelu_np(x):
 
 
 def _attn_np(q, k, v, n_head):
-    """Multi-head full attention, vectorized."""
+    """Multi-head full attention. Per-head for large S, batched for small S."""
     S_q, C = q.shape
     S_kv = k.shape[0]
     hd = C // n_head
+
+    # For large sequence lengths (global attention), compute per-head
+    # to avoid allocating a huge (n_head, S, S) score matrix
+    if S_q * S_kv > 1_000_000:  # > ~1000 tokens
+        Q = q.reshape(S_q, n_head, hd)
+        K_m = k.reshape(S_kv, n_head, hd)
+        V_m = v.reshape(S_kv, n_head, hd)
+        scale = np.float32(1.0 / np.sqrt(hd))
+        out = np.empty((S_q, n_head, hd), dtype=np.float32)
+        for h in range(n_head):
+            # (S_q, hd) @ (hd, S_kv) = (S_q, S_kv) — one head at a time
+            scores = Q[:, h, :] @ K_m[:, h, :].T * scale
+            scores -= scores.max(axis=-1, keepdims=True)
+            exp_s = np.exp(scores)
+            attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
+            out[:, h, :] = attn @ V_m[:, h, :]
+        return out.reshape(S_q, C)
+
+    # Small S: fully batched (faster due to BLAS batched matmul)
     Q = q.reshape(S_q, n_head, hd).transpose(1, 0, 2)
     K = k.reshape(S_kv, n_head, hd).transpose(1, 2, 0)
     V = v.reshape(S_kv, n_head, hd).transpose(1, 0, 2)

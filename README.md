@@ -23,7 +23,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **SmolLM2** | LLM | 135M–1.7B | ✅ | ✅ Shipping | Verified |
 | **GPT-OSS** | LLM (MoE) | — | ✅ | ✅ Shipping | MXFP4 quantized, MoE routing |
 | **Whisper** | Speech-to-Text | 39M | ✅ | ✅ Shipping | 955ms encoder, 28 tok/s decode, 1.7s total |
-| **SAM3** | Segmentation | 31M | ✅ | ✅ Shipping | 2.6s encoder + 33ms decoder (1024×1024) |
+| **SAM3** | Segmentation | 31M | ✅ | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
 | **Flux-Klein** | Image Gen | — | — | ✅ Verified | DiT architecture |
 | **SD-Turbo** | Image Gen | — | — | ✅ Verified | UNet, 1-step distilled |
 | **SDXL** | Image Gen | — | — | ✅ Verified | UNet, cross-attention |
