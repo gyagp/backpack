@@ -19,15 +19,15 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **GPT-2** | LLM | 124M | FP32 | 60ms TTFT, 97.5 tok/s decode | Done |
 | **Phi-4** | LLM | 3.8B | INT4 | 458ms TTFT, 124.6 tok/s decode | WIP |
 | **Qwen-2.5** | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s decode | Done |
-| **Qwen-3.5** | LLM | 27B | INT4 | 919 tok/s (bench), Mamba-2 hybrid |  |
+| **Qwen-3.5** | LLM | 27B | INT4 | 1.7s TTFT, 4.1 tok/s decode (CPU lm_head) |  |
 | **SmolLM-2** | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s decode | Done |
-| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | MoE top-4 routing |  |
+| **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 36.6 tok/s decode |  |
 | **Whisper** | Speech-to-Text | 39M | FP16 | 160ms encoder, 30 tok/s decode, 0.9s total | Done |
 | **SAM-3** | Segmentation | 31M | FP16 | 2.3s encoder + 33ms decoder (1024×1024) |  |
-| **Flux-Klein** | Image Gen | — | FP16 | DiT architecture |  |
-| **SD-Turbo** | Image Gen | ~5B | FP16 | 7.9s/step (512×512), 1-step distilled |  |
-| **Z-Image-Turbo** | Image Gen | ~12B | FP16 | 23s/step (512×512), DiT, Qwen3 text encoder |  |
-| **SDXL** | Image Gen | ~5B | FP16 | 14.6s/step (512×512 CFG), 20-step default |  |
+| **Flux-Klein** | Image Gen | 4B | FP16 | 5.6s/step (512×512), DiT dual-stream |  |
+| **SD-Turbo** | Image Gen | ~5B | FP16 | 7.1s/step (512×512), 1-step distilled |  |
+| **Z-Image-Turbo** | Image Gen | ~12B | FP16 | 24s/step (512×512), DiT + Qwen3 |  |
+| **SDXL** | Image Gen | ~5B | FP16 | 7.3s/step (512×512), 14.5s with CFG |  |
 
 ## Project Structure
 

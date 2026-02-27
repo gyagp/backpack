@@ -193,7 +193,7 @@ def main():
     print(f"\nSaved to {out}")
 
     if args.profile:
-        model.profiler.print_summary()
+        model.profiler.report()
 
 
 if __name__ == "__main__":
