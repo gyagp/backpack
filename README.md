@@ -17,7 +17,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | Model | Type | Params | Real Weights | Status | Performance |
 |-------|------|--------|:------------:|--------|-------------|
 | **GPT-2** | LLM | 124M | ✅ | ✅ Shipping | 97.5 tok/s decode, 60ms TTFT |
-| **Phi-4** | LLM | 3.8B | ✅ | ✅ Shipping | INT4 quantized, CPU+GPU decode |
+| **Phi-4** | LLM | 3.8B | ✅ | ✅ Shipping | 124.6 tok/s decode, INT4 quantized |
 | **Qwen 2.5** | LLM | 0.5B–1.5B | ✅ | ✅ Shipping | GQA, RoPE, SwiGLU |
 | **Qwen 3.5** | LLM | 27B | ✅ | ✅ Shipping | 919 tok/s (bench), INT4, Mamba-2 hybrid |
 | **SmolLM2** | LLM | 135M–1.7B | ✅ | ✅ Shipping | Verified |
