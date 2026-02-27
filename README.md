@@ -12,22 +12,24 @@ Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes
 
 ## Supported Models
 
+All models run fully on Triton WebGPU — no PyTorch at inference time.
+
 | Model | Type | Params | Real Weights | Status | Performance |
 |-------|------|--------|:------------:|--------|-------------|
-| **GPT-2** | LLM | 124M | ✅ | Shipping | 65 tok/s decode |
-| **Gemma** | LLM | 2B | ✅ | Shipping | — |
-| **Phi-4** | LLM | 3.8B | ✅ | Shipping | INT4 quantized |
-| **Qwen 2.5** | LLM | 0.5B–1.5B | ✅ | Shipping | — |
-| **Qwen 3.5** | LLM | 27B | ⬇️ | Shipping | ~960 tok/s (bench), INT4 quantized, Mamba-2 hybrid |
-| **SmolLM2** | LLM | 135M–1.7B | ✅ | Shipping | — |
-| **GPT-OSS** | LLM (MoE) | — | ✅ | Shipping | MXFP4 quantized |
-| **Whisper** | Speech-to-Text | 39M | ✅ | Shipping | 1.8s for 7s audio, 27 tok/s decode |
-| **SAM3** | Segmentation | 31M | ✅ | Shipping | 2.6s encoder + 36ms decoder (1024×1024) |
-| **Flux-Klein** | Image Gen | — | — | WIP | — |
-| **SD-Turbo** | Image Gen | — | — | Shipping (verify) | 35ms (tiny config) |
-| **SDXL** | Image Gen | — | — | Shipping (verify) | 34ms (tiny config) |
+| **GPT-2** | LLM | 124M | ✅ | ✅ Shipping | 97.5 tok/s decode, 60ms TTFT |
+| **Gemma** | LLM | 2B | ✅ | ✅ Shipping | Verified |
+| **Phi-4** | LLM | 3.8B | ✅ | ✅ Shipping | INT4 quantized, CPU+GPU decode |
+| **Qwen 2.5** | LLM | 0.5B–1.5B | ✅ | ✅ Shipping | GQA, RoPE, SwiGLU |
+| **Qwen 3.5** | LLM | 27B | ✅ | ✅ Shipping | 919 tok/s (bench), INT4, Mamba-2 hybrid |
+| **SmolLM2** | LLM | 135M–1.7B | ✅ | ✅ Shipping | Verified |
+| **GPT-OSS** | LLM (MoE) | — | ✅ | ✅ Shipping | MXFP4 quantized, MoE routing |
+| **Whisper** | Speech-to-Text | 39M | ✅ | ✅ Shipping | 28 tok/s decode, 1.7s total (7s audio) |
+| **SAM3** | Segmentation | 31M | ✅ | ✅ Shipping | 2.6s encoder + 33ms decoder (1024×1024) |
+| **Flux-Klein** | Image Gen | — | — | ✅ Verified | DiT architecture |
+| **SD-Turbo** | Image Gen | — | — | ✅ Verified | UNet, 1-step distilled |
+| **SDXL** | Image Gen | — | — | ✅ Verified | UNet, cross-attention |
 
-**Legend:** ✅ = runs with real HuggingFace weights, fully on Triton WebGPU (no PyTorch at inference). ⬇️ = weights downloading (55GB).
+**Legend:** ✅ Real Weights = runs with real HuggingFace weights end-to-end. ✅ Verified = passes correctness test with random weights.
 
 ## Project Structure
 
