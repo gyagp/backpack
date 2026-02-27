@@ -113,8 +113,13 @@ def generate_image(model, tokenizer, tokenizer_2, text_encoder,
         ts = timesteps[step]
 
         latent_input = scheduler.scale_input(latent, sigma)
+        # SDXL time_ids: [orig_h, orig_w, crop_top, crop_left, target_h, target_w]
+        time_ids = np.array([height, width, 0, 0, height, width],
+                            dtype=np.float32)
         noise_pred = model.forward(latent_input, timestep=ts,
-                                   context=context)
+                                   context=context,
+                                   pooled_text_embeds=pooled,
+                                   time_ids=time_ids)
         latent = scheduler.step(noise_pred, sigma, sigma_next, latent)
 
         elapsed = time.perf_counter() - t_start

@@ -319,8 +319,12 @@ class SDXLWebGPU(WebGPUModel):
     # Building blocks
     # ------------------------------------------------------------------
 
-    def _time_embedding(self, timestep):
-        """Sinusoidal timestep embedding → MLP → (1, TED)."""
+    def _time_embedding(self, timestep, pooled_text_embeds=None,
+                        time_ids=None):
+        """Sinusoidal timestep embedding → MLP → (1, TED).
+
+        For SDXL: adds pooled text embeddings + time_ids via add_embedding.
+        """
         MC = self.model_channels
         half = MC // 2
         freqs = np.exp(
@@ -333,6 +337,53 @@ class SDXLWebGPU(WebGPUModel):
         h = self._silu_act(h)
         h = self._linear_w(h, "time_embed.2.weight", "time_embed.2.bias",
                            N=self.time_emb_dim, K=self.time_emb_dim)
+
+        # SDXL add_embedding: pooled text + time_ids
+        if pooled_text_embeds is not None and "add_embed.0.weight" in self.weights:
+            # Encode time_ids: each of the 6 values gets its own sinusoidal
+            # embedding (same as timestep embedding, dim=256 per value)
+            if time_ids is not None:
+                time_ids_flat = time_ids.ravel().astype(np.float32)
+                tid_dim = 256  # add_time_proj uses dim=256
+                tid_half = tid_dim // 2
+                tid_freqs = np.exp(
+                    -np.log(10000.0) * np.arange(tid_half, dtype=np.float32)
+                    / tid_half)
+                tid_embeds = []
+                for tid in time_ids_flat:
+                    args = np.float32(tid) * tid_freqs
+                    tid_embeds.append(np.concatenate([np.cos(args),
+                                                      np.sin(args)]))
+                add_time_embed = np.concatenate(tid_embeds).reshape(1, -1)
+            else:
+                add_time_embed = np.zeros((1, 0), dtype=np.float32)
+
+            # Concat pooled text + time embeddings
+            pooled = pooled_text_embeds.reshape(1, -1)
+            add_input = np.concatenate([pooled, add_time_embed], axis=-1)
+
+            # MLP: Linear → SiLU → Linear
+            add_w0 = self.weights["add_embed.0.weight"]
+            K_add = add_input.shape[1]
+            if K_add != add_w0.shape[1]:
+                # Pad or truncate to match weight shape
+                target_K = add_w0.shape[1]
+                if K_add < target_K:
+                    add_input = np.pad(add_input,
+                                       ((0, 0), (0, target_K - K_add)))
+                else:
+                    add_input = add_input[:, :target_K]
+
+            add_h = self._linear_w(add_input, "add_embed.0.weight",
+                                   "add_embed.0.bias",
+                                   N=self.time_emb_dim, K=add_input.shape[1])
+            add_h = add_h * (1.0 / (1.0 + np.exp(-add_h)))  # SiLU
+            add_h = self._linear_w(add_h, "add_embed.2.weight",
+                                   "add_embed.2.bias",
+                                   N=self.time_emb_dim,
+                                   K=self.time_emb_dim)
+            h = h + add_h
+
         return h  # (1, TED)
 
     def _resnet_block(self, x, temb, pfx, ch_in, ch):
@@ -572,16 +623,19 @@ class SDXLWebGPU(WebGPUModel):
     # Forward pass
     # ------------------------------------------------------------------
 
-    def forward(self, latent, timestep=500, context=None, **kwargs):
+    def forward(self, latent, timestep=500, context=None,
+                pooled_text_embeds=None, time_ids=None, **kwargs):
         """UNet forward pass for one denoising step.
 
         latent: (in_channels, H, W) noisy latent
         timestep: diffusion timestep (int or float)
         context: (S_ctx, context_dim) text encoder output, or None
+        pooled_text_embeds: (1280,) pooled CLIP text embeddings (SDXL)
+        time_ids: (6,) original/crop/target size IDs (SDXL)
         Returns: (out_channels, H, W) predicted noise
         """
         MC = self.model_channels
-        temb = self._time_embedding(timestep)
+        temb = self._time_embedding(timestep, pooled_text_embeds, time_ids)
 
         # Input conv (handles both 1×1 and 3×3)
         input_w = self.weights["input_conv.weight"]
