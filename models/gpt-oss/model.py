@@ -148,8 +148,11 @@ class GptOssWebGPU(WebGPUModel):
                  n_embd: int = 2880, intermediate_size: int = 2880,
                  n_vocab: int = 201088, head_dim: int = 64,
                  rope_theta: float = 150000.0, rms_norm_eps: float = 1e-5,
-                 max_seq_len: int = 2048):
+                 max_seq_len: int = 2048,
+                 num_experts: int = 32, top_k_experts: int = 4):
         self.MAX_SEQ_LEN = max_seq_len
+        self.NUM_EXPERTS = num_experts
+        self.TOP_K_EXPERTS = top_k_experts
 
         # Q, K, V output dimensions
         self.q_dim = n_head * head_dim       # 4096
@@ -719,6 +722,143 @@ def load_gptoss_weights(model_dir: str) -> Dict[str, np.ndarray]:
 # Main
 # ---------------------------------------------------------------------------
 
+def verify_with_random_weights():
+    """Verify GPT-OSS pipeline with small random weights (no download)."""
+    print("=" * 60)
+    print("GPT-OSS WebGPU Pipeline Verification (random weights)")
+    print("=" * 60)
+
+    # Scaled-down config: 2 layers, 4 experts, top-2 routing
+    # n_embd=384 triggers loop-mode kernels (>256) for fp16w support
+    n_layer = 2
+    n_head, n_kv_heads = 6, 2
+    n_embd, intermediate_size, n_vocab = 384, 384, 256
+    head_dim = n_embd // n_head  # 64
+    num_experts = 4
+    top_k = 2
+
+    kv_dim = n_kv_heads * head_dim
+    q_dim = n_head * head_dim
+    qkv_out = q_dim + 2 * kv_dim
+
+    np.random.seed(42)
+    weights = {}
+    weights["embed_tokens.weight"] = np.random.randn(
+        n_vocab, n_embd).astype(np.float32) * 0.02
+    weights["lm_head.weight"] = np.random.randn(
+        n_vocab, n_embd).astype(np.float32) * 0.02
+    weights["norm.weight"] = np.ones(n_embd, dtype=np.float32)
+
+    # Use alternating sliding/full as in the real model
+    layer_types = ["sliding_attention", "full_attention"]
+
+    for i in range(n_layer):
+        pfx = f"layers.{i}."
+        weights[pfx + "input_layernorm.weight"] = np.ones(
+            n_embd, dtype=np.float32)
+        weights[pfx + "post_attention_layernorm.weight"] = np.ones(
+            n_embd, dtype=np.float32)
+
+        # QKV (will be fused by constructor)
+        weights[pfx + "self_attn.q_proj.weight"] = np.random.randn(
+            q_dim, n_embd).astype(np.float32) * 0.02
+        weights[pfx + "self_attn.q_proj.bias"] = np.zeros(
+            q_dim, dtype=np.float32)
+        weights[pfx + "self_attn.k_proj.weight"] = np.random.randn(
+            kv_dim, n_embd).astype(np.float32) * 0.02
+        weights[pfx + "self_attn.k_proj.bias"] = np.zeros(
+            kv_dim, dtype=np.float32)
+        weights[pfx + "self_attn.v_proj.weight"] = np.random.randn(
+            kv_dim, n_embd).astype(np.float32) * 0.02
+        weights[pfx + "self_attn.v_proj.bias"] = np.zeros(
+            kv_dim, dtype=np.float32)
+        weights[pfx + "self_attn.o_proj.weight"] = np.random.randn(
+            n_embd, q_dim).astype(np.float32) * 0.02
+        weights[pfx + "self_attn.o_proj.bias"] = np.zeros(
+            n_embd, dtype=np.float32)
+
+        # Sinks (attention sink positions): zeros for test
+        weights[pfx + "self_attn.sinks"] = np.zeros(
+            n_head * head_dim, dtype=np.float32)
+
+        # Router
+        weights[pfx + "mlp.router.weight"] = np.random.randn(
+            num_experts, n_embd).astype(np.float32) * 0.1
+        weights[pfx + "mlp.router.bias"] = np.zeros(
+            num_experts, dtype=np.float32)
+
+        # Expert weights as MXFP4 format
+        N_gate_up = 2 * intermediate_size
+        block_size = 32
+        for proj_name, N_out in [("gate_up_proj", N_gate_up),
+                                  ("down_proj", n_embd)]:
+            K_in = n_embd if proj_name == "gate_up_proj" else intermediate_size
+            n_blocks = (K_in + block_size - 1) // block_size
+            # Random MXFP4 blocks: (num_experts, N_out, n_blocks, 16) u8
+            blocks = np.random.randint(
+                0, 256, (num_experts, N_out, n_blocks, 16), dtype=np.uint8)
+            # Random scales: (num_experts, N_out, n_blocks) u8
+            scales = np.full(
+                (num_experts, N_out, n_blocks), 127, dtype=np.uint8)
+            # Zero bias: (num_experts, N_out) fp32
+            bias = np.zeros((num_experts, N_out), dtype=np.float32)
+            epfx = pfx + "mlp.experts."
+            weights[epfx + proj_name + "_blocks"] = blocks
+            weights[epfx + proj_name + "_scales"] = scales
+            weights[epfx + proj_name + "_bias"] = bias
+
+    print(f"\nModel: {n_layer} layers, {n_head} Q-heads, {n_kv_heads} KV-heads, "
+          f"{n_embd} embd, {num_experts} experts (top-{top_k}), {n_vocab} vocab")
+
+    # Temporarily override LAYER_TYPES for small model
+    orig_layer_types = globals()['LAYER_TYPES']
+    globals()['LAYER_TYPES'] = layer_types[:n_layer]
+
+    try:
+        model = GptOssWebGPU(
+            weights, n_layer=n_layer, n_head=n_head, n_kv_heads=n_kv_heads,
+            n_embd=n_embd, intermediate_size=intermediate_size,
+            n_vocab=n_vocab, head_dim=head_dim,
+            num_experts=num_experts, top_k_experts=top_k)
+
+        # Forward pass
+        token_ids = np.array([1, 42, 100, 200], dtype=np.int32)
+        T = len(token_ids)
+        t0 = time.time()
+        logits = model.forward(token_ids)
+        t1 = time.time()
+
+        print(f"\nForward pass: {token_ids} → shape {logits.shape} "
+              f"in {(t1-t0)*1000:.0f}ms")
+        print(f"Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+        print(f"Predictions: {logits.argmax(axis=1)}")
+
+        ok = True
+        if logits.shape != (1, n_vocab):
+            # Forward returns last-token logits for prefill
+            if logits.shape[-1] != n_vocab:
+                print(f"FAIL: unexpected vocab dim {logits.shape[-1]}")
+                ok = False
+        if np.any(np.isnan(logits)):
+            print("FAIL: NaN in logits")
+            ok = False
+        if np.any(np.isinf(logits)):
+            print("FAIL: Inf in logits")
+            ok = False
+
+        if ok:
+            print("\nAll checks PASSED!")
+        else:
+            print("\nSome checks FAILED!")
+        return ok
+    finally:
+        globals()['LAYER_TYPES'] = orig_layer_types
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
@@ -734,10 +874,16 @@ def main():
                         default=None,
                         help="Directory for cached weights")
     parser.add_argument("--verify", action="store_true",
-                        help="Quick verification with first token only")
+                        help="Verify with random weights (no download)")
+    parser.add_argument("--verify-real", action="store_true",
+                        help="Quick verification with real weights")
     parser.add_argument("--profile", action="store_true",
                         help="Profile a short generation and save HTML report")
     args = parser.parse_args()
+
+    if args.verify:
+        success = verify_with_random_weights()
+        sys.exit(0 if success else 1)
 
     # Download weights if needed
     print("=" * 60)
@@ -762,7 +908,7 @@ def main():
     print(f"Backend: {runner.adapter_info.get('backend', 'unknown')}")
     print(f"GPU memory used: {runner._total_gpu_bytes / (1024**3):.2f} GB")
 
-    if args.verify:
+    if args.verify_real:
         # Quick verification: encode prompt and run one forward pass
         tokenizer = load_tokenizer(tokenizer_path)
         token_ids = np.array(tokenizer.encode(args.prompt), dtype=np.int32)

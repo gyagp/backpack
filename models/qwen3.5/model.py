@@ -215,6 +215,13 @@ class Qwen35WebGPU(WebGPUModel):
         # Full attention output dimension
         self.full_attn_qo_dim = n_head * head_dim  # 24 * 256 = 6144
 
+        # Fused QKV output dimension for full attention
+        self.full_attn_qkv_dim = (
+            self.full_attn_qo_dim + 2 * n_kv_heads * head_dim)
+
+        # Fused gate_up output dimension for MLP
+        self.gate_up_out = 2 * intermediate_size
+
         # Collect all K dimensions for kernel compilation
         k_dims = {
             n_embd,              # most projections: K=5120
@@ -223,6 +230,12 @@ class Qwen35WebGPU(WebGPUModel):
             self.ssm_dim,        # ssm out_proj, in_proj_z: K=6144
             self.full_attn_qo_dim,  # attn o_proj: K=6144
         }
+
+        # Fuse QKV and gate_up weights before base class init
+        self._fuse_qkv_weights(weights, n_layer, n_head, n_kv_heads,
+                               head_dim, n_embd)
+        self._fuse_gate_up_weights(weights, n_layer, intermediate_size,
+                                   n_embd)
 
         super().__init__(
             weights, n_layer=n_layer, n_head=n_head, n_embd=n_embd,
@@ -239,11 +252,104 @@ class Qwen35WebGPU(WebGPUModel):
         self._init_ssm_state()
         self._init_gpu_kv_cache()
 
+    @staticmethod
+    def _fuse_qkv_weights(weights, n_layer, n_head, n_kv_heads,
+                          head_dim, n_embd):
+        """Fuse Q, K, V projection weights into single QKV matrix.
+
+        Only for full-attention layers.  Reduces 3 GPU dispatches to 1.
+        Handles both fp32 and INT4-quantized weight formats.
+        """
+        E = n_embd
+        qo_dim = n_head * head_dim
+        kv_dim = n_kv_heads * head_dim
+        for i in range(n_layer):
+            if LAYER_TYPES[i] != "full_attention":
+                continue
+            pfx = f"layers.{i}.self_attn."
+            q_key = pfx + "q_proj.weight"
+            k_key = pfx + "k_proj.weight"
+            v_key = pfx + "v_proj.weight"
+            fused_key = pfx + "qkv_proj.weight"
+
+            if q_key in weights:
+                # fp32 unfused path
+                q_w = weights[q_key].reshape(qo_dim, E)
+                k_w = weights[k_key].reshape(kv_dim, E)
+                v_w = weights[v_key].reshape(kv_dim, E)
+                weights[fused_key] = np.concatenate(
+                    [q_w, k_w, v_w], axis=0)
+                del weights[q_key], weights[k_key], weights[v_key]
+            elif (q_key + ".q4") in weights:
+                # INT4-quantized: dequant, fuse, re-quantize
+                for suffix in (".q4", ".scales", ".zeros", ".K"):
+                    parts = []
+                    for src in (q_key, k_key, v_key):
+                        parts.append(weights[src + suffix])
+                        del weights[src + suffix]
+                    if suffix == ".K":
+                        # K values should all be the same (= n_embd)
+                        weights[fused_key + suffix] = parts[0]
+                    else:
+                        weights[fused_key + suffix] = np.concatenate(
+                            parts, axis=0)
+
+    @staticmethod
+    def _fuse_gate_up_weights(weights, n_layer, intermediate_size, n_embd):
+        """Fuse gate_proj + up_proj into single gate_up matrix.
+
+        Reduces 2 GPU dispatches to 1 per layer.
+        Handles both fp32 and INT4-quantized weight formats.
+        """
+        E = n_embd
+        IM = intermediate_size
+        for i in range(n_layer):
+            pfx = f"layers.{i}.mlp."
+            g_key = pfx + "gate_proj.weight"
+            u_key = pfx + "up_proj.weight"
+            fused_key = pfx + "gate_up_proj.weight"
+
+            if g_key in weights:
+                g_w = weights[g_key].reshape(IM, E)
+                u_w = weights[u_key].reshape(IM, E)
+                weights[fused_key] = np.concatenate(
+                    [g_w, u_w], axis=0)
+                del weights[g_key], weights[u_key]
+            elif (g_key + ".q4") in weights:
+                for suffix in (".q4", ".scales", ".zeros", ".K"):
+                    parts = []
+                    for src in (g_key, u_key):
+                        parts.append(weights[src + suffix])
+                        del weights[src + suffix]
+                    if suffix == ".K":
+                        weights[fused_key + suffix] = parts[0]
+                    else:
+                        weights[fused_key + suffix] = np.concatenate(
+                            parts, axis=0)
+
     def _compile_model_kernels(self):
         """Compile Qwen3.5-specific kernels."""
         self._compile_rms_norm()
         self._compile_silu_mul()
         self._compile_sigmoid()
+
+    def _proj(self, x, weight_name, bias_key, out_features,
+              K=None, gpu_out=False):
+        """Linear projection using fp16w when available, else fp32.
+
+        weight_name: base name of the weight (without .fp16 suffix).
+        Automatically selects the best available kernel.
+        """
+        fp16_name = weight_name + ".fp16"
+        if fp16_name in self._gpu_weights and hasattr(self, '_linear_fp16w_result'):
+            return self._linear_fp16w(
+                x, self._gpu_weights[fp16_name],
+                self._gpu_weights[bias_key], out_features,
+                K=K, gpu_out=gpu_out)
+        return self._linear(
+            x, self._gpu_weights[weight_name],
+            self._gpu_weights[bias_key], out_features,
+            gpu_out=gpu_out)
 
     def _precompute_rope_tables(self):
         """Pre-compute partial RoPE cos/sin tables."""
@@ -283,7 +389,7 @@ class Qwen35WebGPU(WebGPUModel):
         pass  # Use numpy-based cache in kv_cache dict
 
     def _upload_weights_to_gpu(self):
-        """Upload all weights to GPU."""
+        """Upload all weights to GPU (fp16 for linear layers)."""
         E = self.n_embd
         HD = self.head_dim
         IM = self.intermediate_size
@@ -292,6 +398,11 @@ class Qwen35WebGPU(WebGPUModel):
         if self._quantized:
             self._dequantize_all_weights()
 
+        # Determine if fp16 linear kernel is available
+        has_fp16 = hasattr(self, '_linear_fp16w_result')
+        _ul = (self._upload_linear_weight_fp16 if has_fp16
+               else self._upload_linear_weight)
+
         for i in range(self.n_layer):
             pfx = f"layers.{i}."
             # RMSNorm weights (all layers)
@@ -299,45 +410,30 @@ class Qwen35WebGPU(WebGPUModel):
             self._upload_norm_weight(pfx + "post_attention_layernorm.weight")
 
             if LAYER_TYPES[i] == "full_attention":
-                # Full attention: Q, K, V, O projections
-                self._upload_linear_weight(
-                    pfx + "self_attn.q_proj.weight",
-                    self.full_attn_qo_dim, E)
-                self._upload_linear_weight(
-                    pfx + "self_attn.k_proj.weight",
-                    self.kv_dim, E)
-                self._upload_linear_weight(
-                    pfx + "self_attn.v_proj.weight",
-                    self.kv_dim, E)
-                self._upload_linear_weight(
-                    pfx + "self_attn.o_proj.weight",
+                # Fused QKV projection
+                _ul(pfx + "self_attn.qkv_proj.weight",
+                    self.full_attn_qkv_dim, E)
+                # O projection
+                _ul(pfx + "self_attn.o_proj.weight",
                     E, self.full_attn_qo_dim)
                 # QK norm weights
                 self._upload_norm_weight(pfx + "self_attn.q_norm.weight")
                 self._upload_norm_weight(pfx + "self_attn.k_norm.weight")
             else:
                 # Linear attention (Mamba-2)
-                self._upload_linear_weight(
-                    pfx + "linear_attn.in_proj_qkv.weight",
+                _ul(pfx + "linear_attn.in_proj_qkv.weight",
                     self.ssm_qkv_dim, E)
-                self._upload_linear_weight(
-                    pfx + "linear_attn.in_proj_z.weight",
+                _ul(pfx + "linear_attn.in_proj_z.weight",
                     ssm_dim, E)
-                self._upload_linear_weight(
-                    pfx + "linear_attn.out_proj.weight",
+                _ul(pfx + "linear_attn.out_proj.weight",
                     E, ssm_dim)
                 self._upload_norm_weight(
                     pfx + "linear_attn.norm.weight")
-                # Small weights loaded as numpy (conv1d, A_log, dt_bias,
-                # in_proj_a, in_proj_b)
 
-            # MLP (all layers)
-            self._upload_linear_weight(
-                pfx + "mlp.gate_proj.weight", IM, E)
-            self._upload_linear_weight(
-                pfx + "mlp.up_proj.weight", IM, E)
-            self._upload_linear_weight(
-                pfx + "mlp.down_proj.weight", E, IM)
+            # Fused gate_up MLP projection
+            _ul(pfx + "mlp.gate_up_proj.weight", self.gate_up_out, E)
+            # Down projection
+            _ul(pfx + "mlp.down_proj.weight", E, IM)
 
         # Final norm + embeddings
         self._upload_norm_weight("norm.weight")
@@ -346,9 +442,10 @@ class Qwen35WebGPU(WebGPUModel):
 
         # Zero biases
         self._upload_zero_bias("zero_bias_E", E)
-        self._upload_zero_bias("zero_bias_IM", IM)
+        self._upload_zero_bias("zero_bias_GU", self.gate_up_out)
         self._upload_zero_bias("zero_bias_V", self.n_vocab)
         self._upload_zero_bias("zero_bias_KV", self.kv_dim)
+        self._upload_zero_bias("zero_bias_QKV", self.full_attn_qkv_dim)
         self._upload_zero_bias("zero_bias_QO", self.full_attn_qo_dim)
         self._upload_zero_bias("zero_bias_SSM_QKV", self.ssm_qkv_dim)
         self._upload_zero_bias("zero_bias_SSM", ssm_dim)
@@ -356,23 +453,21 @@ class Qwen35WebGPU(WebGPUModel):
         self._print_gpu_weight_stats()
 
     def _dequantize_all_weights(self):
-        """Pre-dequantize all INT4 weights at startup."""
+        """Pre-dequantize all INT4 weights at startup.
+
+        Handles both fused (qkv_proj, gate_up_proj) and unfused weight names.
+        """
         import gc
         print("  Pre-dequantizing INT4 weights...")
         for layer in range(self.n_layer):
             pfx = f"layers.{layer}."
             keys = [
-                pfx + "mlp.gate_proj.weight",
-                pfx + "mlp.up_proj.weight",
+                pfx + "mlp.gate_up_proj.weight",
                 pfx + "mlp.down_proj.weight",
             ]
             if LAYER_TYPES[layer] == "full_attention":
-                keys.extend([
-                    pfx + "self_attn.q_proj.weight",
-                    pfx + "self_attn.k_proj.weight",
-                    pfx + "self_attn.v_proj.weight",
-                    pfx + "self_attn.o_proj.weight",
-                ])
+                keys.append(pfx + "self_attn.qkv_proj.weight")
+                keys.append(pfx + "self_attn.o_proj.weight")
             else:
                 keys.extend([
                     pfx + "linear_attn.in_proj_qkv.weight",
@@ -423,16 +518,17 @@ class Qwen35WebGPU(WebGPUModel):
         n_rep = self.n_rep
         pfx = f"layers.{layer}.self_attn."
 
-        # Q, K, V projections (no bias) — readback for CPU-side attention
-        q = self._linear(
-            x, self._gpu_weights[pfx + "q_proj.weight"],
-            self._gpu_weights["zero_bias_QO"], self.full_attn_qo_dim)
-        k = self._linear(
-            x, self._gpu_weights[pfx + "k_proj.weight"],
-            self._gpu_weights["zero_bias_KV"], self.kv_dim)
-        v = self._linear(
-            x, self._gpu_weights[pfx + "v_proj.weight"],
-            self._gpu_weights["zero_bias_KV"], self.kv_dim)
+        # Fused QKV projection (single dispatch)
+        qkv = self._proj(
+            x, pfx + "qkv_proj.weight",
+            "zero_bias_QKV", self.full_attn_qkv_dim,
+            K=self.n_embd)
+
+        # Split into Q, K, V
+        qo_dim = self.full_attn_qo_dim
+        q = qkv[:, :qo_dim]
+        k = qkv[:, qo_dim:qo_dim + self.kv_dim]
+        v = qkv[:, qo_dim + self.kv_dim:]
 
         # Reshape to heads
         Q = q.reshape(T, n_head, HD)
@@ -500,10 +596,10 @@ class Qwen35WebGPU(WebGPUModel):
         attn_flat = attn_out.reshape(T, self.full_attn_qo_dim)
 
         # O projection
-        o = self._linear(
-            attn_flat,
-            self._gpu_weights[pfx + "o_proj.weight"],
-            self._gpu_weights["zero_bias_E"], self.n_embd)
+        o = self._proj(
+            attn_flat, pfx + "o_proj.weight",
+            "zero_bias_E", self.n_embd,
+            K=self.full_attn_qo_dim)
 
         # Output gate: sigmoid(gate) * attn_output
         # Gate comes from a separate projection of the input
@@ -700,9 +796,10 @@ class Qwen35WebGPU(WebGPUModel):
 
         # 1. Project input via in_proj_qkv: (T, E) -> (T, ssm_qkv_dim)
         # Compute z projection in parallel (both need x as input)
-        qkv = self._linear(
-            x, self._gpu_weights[pfx + "in_proj_qkv.weight"],
-            self._gpu_weights["zero_bias_SSM_QKV"], self.ssm_qkv_dim)
+        qkv = self._proj(
+            x, pfx + "in_proj_qkv.weight",
+            "zero_bias_SSM_QKV", self.ssm_qkv_dim,
+            K=E)
 
         # Split: x_expand (ssm_dim), B (n_groups*d_state), C (n_groups*d_state)
         x_expand = qkv[:, :ssm_dim]  # (T, 6144)
@@ -800,17 +897,18 @@ class Qwen35WebGPU(WebGPUModel):
         y_normed = y_out / rms * norm_w
 
         # 6. Gate with sigmoid(z)
-        z = self._linear(
-            x, self._gpu_weights[pfx + "in_proj_z.weight"],
-            self._gpu_weights["zero_bias_SSM"], ssm_dim)
+        z = self._proj(
+            x, pfx + "in_proj_z.weight",
+            "zero_bias_SSM", ssm_dim,
+            K=E)
         gate = 1.0 / (1.0 + np.exp(-z))  # sigmoid
         y_gated = y_normed * gate
 
         # 7. Output projection
-        out = self._linear(
-            y_gated,
-            self._gpu_weights[pfx + "out_proj.weight"],
-            self._gpu_weights["zero_bias_E"], self.n_embd)
+        out = self._proj(
+            y_gated, pfx + "out_proj.weight",
+            "zero_bias_E", self.n_embd,
+            K=ssm_dim)
 
         return out
 
@@ -819,21 +917,20 @@ class Qwen35WebGPU(WebGPUModel):
     # ------------------------------------------------------------------
 
     def _mlp_block(self, x, layer: int, gpu_out: bool = False):
-        """SwiGLU MLP: gate_proj + up_proj → silu_mul → down_proj."""
+        """SwiGLU MLP: fused gate_up → silu_mul → down_proj."""
         E = self.n_embd
         IM = self.intermediate_size
         pfx = f"layers.{layer}.mlp."
 
-        gate = self._linear(
-            x, self._gpu_weights[pfx + "gate_proj.weight"],
-            self._gpu_weights["zero_bias_IM"], IM, gpu_out=True)
-        up = self._linear(
-            x, self._gpu_weights[pfx + "up_proj.weight"],
-            self._gpu_weights["zero_bias_IM"], IM, gpu_out=True)
-        h = self._silu_mul(gate, up, gpu_out=True)
-        return self._linear(
-            h, self._gpu_weights[pfx + "down_proj.weight"],
-            self._gpu_weights["zero_bias_E"], E, gpu_out=gpu_out)
+        gate_up = self._proj(
+            x, pfx + "gate_up_proj.weight",
+            "zero_bias_GU", self.gate_up_out,
+            K=E, gpu_out=True)
+        h = self._silu_mul_fused(gate_up, IM, gpu_out=True)
+        return self._proj(
+            h, pfx + "down_proj.weight",
+            "zero_bias_E", E,
+            K=IM, gpu_out=gpu_out)
 
     # ------------------------------------------------------------------
     # Transformer block dispatcher
@@ -861,13 +958,13 @@ class Qwen35WebGPU(WebGPUModel):
         n_rep = self.n_rep
         pfx = f"layers.{layer}.self_attn."
 
-        # QKV on CPU
-        q = self._cpu_matmul(x_np, pfx + "q_proj.weight",
-                             self.full_attn_qo_dim, self.n_embd)
-        k = self._cpu_matmul(x_np, pfx + "k_proj.weight",
-                             self.kv_dim, self.n_embd)
-        v = self._cpu_matmul(x_np, pfx + "v_proj.weight",
-                             self.kv_dim, self.n_embd)
+        # Fused QKV on CPU (single matmul)
+        qkv = self._cpu_matmul(x_np, pfx + "qkv_proj.weight",
+                               self.full_attn_qkv_dim, self.n_embd)
+        qo_dim = self.full_attn_qo_dim
+        q = qkv[:, :qo_dim]
+        k = qkv[:, qo_dim:qo_dim + self.kv_dim]
+        v = qkv[:, qo_dim + self.kv_dim:]
 
         Q = q.reshape(1, n_head, HD)
         K_new = k.reshape(1, n_kv, HD)
@@ -944,11 +1041,13 @@ class Qwen35WebGPU(WebGPUModel):
         # RMSNorm 2
         rn2 = self._rms_norm_vec(x_np, pfx + "post_attention_layernorm.weight")
 
-        # MLP on CPU for T=1
+        # MLP on CPU for T=1 — fused gate_up
         E = self.n_embd
         IM = self.intermediate_size
-        gate = self._cpu_matmul(rn2, pfx + "mlp.gate_proj.weight", IM, E)
-        up = self._cpu_matmul(rn2, pfx + "mlp.up_proj.weight", IM, E)
+        gate_up = self._cpu_matmul(
+            rn2, pfx + "mlp.gate_up_proj.weight", self.gate_up_out, E)
+        gate = gate_up[:, :IM]
+        up = gate_up[:, IM:]
         h = gate / (1.0 + np.exp(-gate)) * up  # SiLU * up
         mlp_out = self._cpu_matmul(h, pfx + "mlp.down_proj.weight", E, IM)
 
@@ -980,12 +1079,20 @@ class Qwen35WebGPU(WebGPUModel):
             attn = self._linear_attention_block(rn1, layer,
                                                 use_cache=use_cache)
 
-        x = self._add(x, attn, gpu_out=True)
+        # Fused residual add + RMSNorm (saves 1 dispatch) when available
+        use_fused = (hasattr(self, '_add_rn_result') and
+                     isinstance(x, GPUBuffer) and isinstance(attn, GPUBuffer))
+        if use_fused:
+            rn2 = self._add_rms_norm(
+                x, attn,
+                self._gpu_weights[pfx + "post_attention_layernorm.weight"],
+                gpu_out=True)
+        else:
+            x = self._add(x, attn, gpu_out=True)
+            rn2 = self._rms_norm(
+                x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
+                gpu_out=True)
 
-        # Post-attention layernorm + MLP
-        rn2 = self._rms_norm(
-            x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
-            gpu_out=True)
         mlp = self._mlp_block(rn2, layer, gpu_out=True)
         x = self._add(x, mlp, gpu_out=True)
         return x
@@ -1083,21 +1190,17 @@ def download_qwen35_weights(model_dir: str = None) -> Tuple[str, str]:
         model_dir = os.path.join(_SCRIPT_DIR, "weights")
 
     def qwen35_key_transform(key, arr):
-        # Strip model.language_model. prefix for language model weights
         new_key = key
         if new_key.startswith("model.language_model."):
             new_key = new_key[len("model.language_model."):]
         elif new_key.startswith("model."):
-            # Skip vision model weights
             if "visual" in new_key or "merger" in new_key:
                 return None
             new_key = new_key[len("model."):]
-        # Skip MTP (multi-token prediction) weights
         if new_key.startswith("mtp."):
             return None
         return new_key, arr
 
-    # Discover safetensors shard files
     shard_files = [f"model.safetensors-{i:05d}-of-00011.safetensors"
                    for i in range(1, 12)]
 
@@ -1109,6 +1212,164 @@ def download_qwen35_weights(model_dir: str = None) -> Tuple[str, str]:
         download_tokenizer=True,
     )
     return npz_path, tokenizer_path
+
+
+def download_and_quantize_streaming(weights_dir: str = None):
+    """Download Qwen3.5-27B shards and quantize in streaming fashion.
+
+    Processes one shard at a time to avoid OOM on 55GB+ models.
+    Each shard's tensors are extracted, transformed, quantized (if linear),
+    and accumulated. Memory per shard: ~5GB peak (1 shard BF16 + converted).
+    """
+    import requests, gc
+    from common.utils import _parse_safetensors
+
+    config = QWEN35_CONFIG
+    hf_repo = config["hf_repo"]
+    if weights_dir is None:
+        weights_dir = os.path.join(_SCRIPT_DIR, "weights")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    q4_path = os.path.join(weights_dir, "weights_q4.npz")
+    if os.path.exists(q4_path):
+        print(f"Quantized weights already exist: {q4_path}")
+        return q4_path
+
+    base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
+
+    # Auth
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
+        "HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        token_file = os.path.join(
+            os.path.expanduser("~"), ".cache", "huggingface", "token")
+        if os.path.exists(token_file):
+            with open(token_file) as f:
+                hf_token = f.read().strip()
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    # Download tokenizer
+    tok_path = os.path.join(weights_dir, "tokenizer.json")
+    if not os.path.exists(tok_path):
+        print("Downloading tokenizer...")
+        resp = requests.get(f"{base_url}/tokenizer.json", headers=headers)
+        resp.raise_for_status()
+        with open(tok_path, 'wb') as f:
+            f.write(resp.content)
+
+    shard_files = [f"model.safetensors-{i:05d}-of-00011.safetensors"
+                   for i in range(1, 12)]
+
+    def key_transform(key, arr):
+        new_key = key
+        if new_key.startswith("model.language_model."):
+            new_key = new_key[len("model.language_model."):]
+        elif new_key.startswith("model."):
+            if "visual" in new_key or "merger" in new_key:
+                return None
+            new_key = new_key[len("model."):]
+        if new_key.startswith("mtp."):
+            return None
+        return new_key, arr
+
+    # Determine which keys are linear weights (for INT4 quantization)
+    linear_keys = set()
+    for i in range(config["n_layer"]):
+        pfx = f"layers.{i}."
+        linear_keys.update([
+            pfx + "mlp.gate_proj.weight",
+            pfx + "mlp.up_proj.weight",
+            pfx + "mlp.down_proj.weight",
+        ])
+        if LAYER_TYPES[i] == "full_attention":
+            linear_keys.update([
+                pfx + "self_attn.q_proj.weight",
+                pfx + "self_attn.k_proj.weight",
+                pfx + "self_attn.v_proj.weight",
+                pfx + "self_attn.o_proj.weight",
+            ])
+        else:
+            linear_keys.update([
+                pfx + "linear_attn.in_proj_qkv.weight",
+                pfx + "linear_attn.in_proj_z.weight",
+                pfx + "linear_attn.out_proj.weight",
+            ])
+
+    all_quantized = {}
+    total_orig = 0
+    total_quant = 0
+
+    for shard_idx, sf in enumerate(shard_files):
+        sf_path = os.path.join(weights_dir, sf)
+
+        # Download shard if not cached
+        if not os.path.exists(sf_path):
+            st_url = f"{base_url}/{sf}"
+            print(f"Downloading shard {shard_idx+1}/11: {sf}...")
+            resp = requests.get(st_url, headers=headers, stream=True)
+            resp.raise_for_status()
+            total = int(resp.headers.get('content-length', 0))
+            downloaded = 0
+            with open(sf_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded * 100 // total
+                        print(f"\r  Progress: {pct}% "
+                              f"({downloaded // (1024*1024)}MB / "
+                              f"{total // (1024*1024)}MB)",
+                              end="", flush=True)
+            print()
+        else:
+            print(f"Shard {shard_idx+1}/11: {sf} (cached)")
+
+        # Parse this shard
+        print(f"  Parsing {sf}...")
+        shard_weights = _parse_safetensors(sf_path)
+
+        # Transform + quantize each tensor in this shard
+        for key, arr in shard_weights.items():
+            val = arr.astype(np.float32)
+            result = key_transform(key, val)
+            if result is None:
+                continue
+            new_key, val = result
+
+            orig_bytes = val.nbytes
+            total_orig += orig_bytes
+
+            if new_key in linear_keys and val.ndim == 2:
+                N, K = val.shape
+                q_packed, scales, zeros = quantize_int4(val)
+                all_quantized[new_key + ".q4"] = q_packed
+                all_quantized[new_key + ".scales"] = scales
+                all_quantized[new_key + ".zeros"] = zeros
+                all_quantized[new_key + ".K"] = np.array([K], dtype=np.int32)
+                q_bytes = q_packed.nbytes + scales.nbytes + zeros.nbytes
+                total_quant += q_bytes
+            else:
+                fp16 = val.astype(np.float16) if val.dtype in (
+                    np.float32, np.float64) else val
+                all_quantized[new_key] = fp16
+                total_quant += fp16.nbytes
+
+        # Free shard memory
+        del shard_weights
+        gc.collect()
+        print(f"  Shard {shard_idx+1}/11 done. "
+              f"Accumulated {len(all_quantized)} tensors "
+              f"({total_quant / 1024**3:.1f} GB quantized)")
+
+    print(f"\nQuantization complete:")
+    print(f"  Original: {total_orig / 1024**3:.1f} GB")
+    print(f"  Quantized: {total_quant / 1024**3:.1f} GB")
+    print(f"  Compression: {total_orig / max(total_quant, 1):.1f}x")
+
+    print(f"Saving to {q4_path}...")
+    np.savez(q4_path, **all_quantized)
+    print(f"Done! File: {os.path.getsize(q4_path) / 1024**3:.1f} GB")
+    return q4_path
 
 
 # ---------------------------------------------------------------------------
@@ -1465,14 +1726,8 @@ def main():
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
 
     if args.quantize:
-        # Download BF16 weights and quantize to INT4
-        npz_path, _ = download_qwen35_weights(weights_dir)
-        print("\nQuantizing weights to INT4...")
-        weights = load_weights(npz_path)
-        quantized = quantize_model_weights(weights, config["n_layer"])
-        print(f"Saving quantized weights to {q4_path}...")
-        np.savez(q4_path, **quantized)
-        print("Done!")
+        # Streaming download + quantize (one shard at a time, low RAM)
+        download_and_quantize_streaming(weights_dir)
         return
 
     # Load weights (prefer quantized if available)

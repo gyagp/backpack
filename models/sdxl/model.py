@@ -209,26 +209,35 @@ class SDXLWebGPU(WebGPUModel):
     # Primitives
     # ------------------------------------------------------------------
 
-    def _linear_w(self, x, w_name, b_name=None, N=None, K=None):
+    def _linear_w(self, x, w_name, b_name=None, N=None, K=None,
+                  gpu_out=False):
         """Linear projection using GPU weights (fp16 or fp32) or CPU fallback."""
         w_gpu = self._gpu_weights.get(w_name)
         if w_gpu is not None:
             if N is None:
                 N = self.weights[w_name].shape[0]
             if K is None:
-                K = x.shape[-1]
+                K = x.shape[-1] if not isinstance(x, GPUBuffer) else K
             b_gpu = self._gpu_weights.get(b_name) if b_name else None
             if b_gpu is None and b_name and b_name in self.weights:
                 b_gpu = _w(self.weights, b_name)
             elif b_gpu is None:
                 b_gpu = np.zeros(N, dtype=np.float32)
-            orig = x.shape
-            x2 = x.reshape(-1, K).astype(np.float32)
+            is_gpu = isinstance(x, GPUBuffer)
+            if not is_gpu:
+                orig = x.shape
+                x2 = x.reshape(-1, K).astype(np.float32)
+            else:
+                x2 = x
             has_fp16 = getattr(self, '_has_fp16_linear', False)
             if has_fp16:
-                out = self._linear_fp16w(x2, w_gpu, b_gpu, N, K)
+                out = self._linear_fp16w(x2, w_gpu, b_gpu, N, K,
+                                         gpu_out=gpu_out)
             else:
-                out = self._linear(x2, w_gpu, b_gpu, N)
+                out = self._linear(x2, w_gpu, b_gpu, N,
+                                   gpu_out=gpu_out)
+            if gpu_out:
+                return out
             return out.reshape(*orig[:-1], N)
         else:
             W = _w(self.weights, w_name)
@@ -282,7 +291,11 @@ class SDXLWebGPU(WebGPUModel):
         h_flat = h.transpose(1, 2, 0).reshape(H * W, C)
         h_flat = self._silu_act(h_flat)
         h_flat = self._linear_w(h_flat, pfx + "conv1.weight",
-                                pfx + "conv1.bias", N=ch, K=C)
+                                pfx + "conv1.bias", N=ch, K=C,
+                                gpu_out=True)
+        # Readback for spatial reshape + time conditioning
+        if isinstance(h_flat, GPUBuffer):
+            h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
         h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
 
         # Time conditioning
@@ -295,7 +308,10 @@ class SDXLWebGPU(WebGPUModel):
         h_flat = h.transpose(1, 2, 0).reshape(H * W, ch)
         h_flat = self._silu_act(h_flat)
         h_flat = self._linear_w(h_flat, pfx + "conv2.weight",
-                                pfx + "conv2.bias", N=ch, K=ch)
+                                pfx + "conv2.bias", N=ch, K=ch,
+                                gpu_out=True)
+        if isinstance(h_flat, GPUBuffer):
+            h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
         h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
 
         # Skip projection
@@ -309,17 +325,29 @@ class SDXLWebGPU(WebGPUModel):
         """Self-attention on flat spatial tokens (S, C).
 
         Uses GPU full multi-head attention kernel.
+        GPU-resident Q/K/V projections to minimize transfers.
         """
         S, C = x_flat.shape
         hd = self._head_dim
         n_head = ch // hd
 
         q = self._linear_w(x_flat, prefix + "to_q.weight",
-                           prefix + "to_q.bias", N=ch, K=C)
+                           prefix + "to_q.bias", N=ch, K=C,
+                           gpu_out=True)
         k = self._linear_w(x_flat, prefix + "to_k.weight",
-                           prefix + "to_k.bias", N=ch, K=C)
+                           prefix + "to_k.bias", N=ch, K=C,
+                           gpu_out=True)
         v = self._linear_w(x_flat, prefix + "to_v.weight",
-                           prefix + "to_v.bias", N=ch, K=C)
+                           prefix + "to_v.bias", N=ch, K=C,
+                           gpu_out=True)
+
+        # Readback for attention (CPU-side multi-head attention)
+        if isinstance(q, GPUBuffer):
+            q = self.cache.runner.readback(q).reshape(S, ch)
+        if isinstance(k, GPUBuffer):
+            k = self.cache.runner.readback(k).reshape(S, ch)
+        if isinstance(v, GPUBuffer):
+            v = self.cache.runner.readback(v).reshape(S, ch)
 
         Q = q.reshape(S, n_head, hd).astype(np.float32)
         K_t = k.reshape(S, n_head, hd).astype(np.float32)
@@ -337,7 +365,7 @@ class SDXLWebGPU(WebGPUModel):
 
         x_flat: (S, C)  — spatial tokens
         context: (S_ctx, context_dim) — text encoder output
-        Vectorized multi-head attention (no per-head loop).
+        GPU-resident Q/K/V projections, vectorized multi-head attention.
         """
         S, C = x_flat.shape
         S_ctx = context.shape[0]
@@ -345,13 +373,22 @@ class SDXLWebGPU(WebGPUModel):
         n_head = ch // hd
 
         q = self._linear_w(x_flat, prefix + "to_q.weight",
-                           prefix + "to_q.bias", N=ch, K=C)
+                           prefix + "to_q.bias", N=ch, K=C,
+                           gpu_out=True)
         k = self._linear_w(context, prefix + "to_k.weight",
                            prefix + "to_k.bias", N=ch,
-                           K=self.context_dim)
+                           K=self.context_dim, gpu_out=True)
         v = self._linear_w(context, prefix + "to_v.weight",
                            prefix + "to_v.bias", N=ch,
-                           K=self.context_dim)
+                           K=self.context_dim, gpu_out=True)
+
+        # Readback for CPU attention
+        if isinstance(q, GPUBuffer):
+            q = self.cache.runner.readback(q).reshape(S, ch)
+        if isinstance(k, GPUBuffer):
+            k = self.cache.runner.readback(k).reshape(S_ctx, ch)
+        if isinstance(v, GPUBuffer):
+            v = self.cache.runner.readback(v).reshape(S_ctx, ch)
 
         Q = q.reshape(S, n_head, hd).astype(np.float32)
         K_t = k.reshape(S_ctx, n_head, hd).astype(np.float32)
@@ -397,7 +434,11 @@ class SDXLWebGPU(WebGPUModel):
             ff_dim = self.weights[prefix + "ff.net.0.proj.weight"].shape[0]
             ff = self._linear_w(xn, prefix + "ff.net.0.proj.weight",
                                 prefix + "ff.net.0.proj.bias",
-                                N=ff_dim, K=ch)
+                                N=ff_dim, K=ch, gpu_out=True)
+            # Readback for CPU GEGLU split
+            if isinstance(ff, GPUBuffer):
+                ff = self.cache.runner.readback(ff).reshape(
+                    xn.shape[0], ff_dim)
             # GEGLU split: first half is gate (apply GELU), second half is value
             half = ff_dim // 2
             gate = ff[:, :half]
