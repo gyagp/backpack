@@ -76,7 +76,8 @@ models/<name>/
 
 ## Git Conventions
 
-- Commit after each working milestone (not WIP states)
+- Commit after each working milestone (not WIP states) — **do this automatically**
+- Once a model is supported with real weights and good perf, **update the model status table in `README.md`**
 - Include architecture summary and perf numbers in commit messages
 - Example: `"Whisper: full Triton WebGPU inference with real weights\n\nEncoder: 960ms, Decoder: 27 tok/s"`
 
