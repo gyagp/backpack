@@ -342,7 +342,109 @@ WebGPU compute shaders have specific constraints compared to CUDA:
 
 ## 3. Profiling
 
-### 3.1 Identifying Bottlenecks
+### 3.1 Unified CPU+GPU Timeline Profiler
+
+The most important tool for optimization is the **unified CPU+GPU timeline
+profiler** (`common/profiler.py` + `common/profiler_html.py`). It correlates
+CPU and GPU events on a single timeline so you can see exactly where time
+is spent — and more critically, where the CPU is waiting on the GPU
+or vice versa.
+
+**Architecture**:
+
+```
+InferenceProfiler
+  ├── CPUProfiler        — time.perf_counter_ns() scoped events
+  ├── GPUTimestampProfiler  — WebGPU hardware timestamp queries
+  └── GPUDispatchEvents  — CPU-timed GPU dispatch durations
+```
+
+The profiler records three types of events on a shared nanosecond clock:
+
+| Event type | Source | What it measures |
+|-----------|--------|-----------------|
+| **CPU events** | `profiler.cpu("op_name")` context manager | CPU-side compute (norms, attention, activation) |
+| **GPU dispatch events** | Automatically by `KernelCache.run()` | Wall-clock cost of each GPU dispatch (encode → submit → poll → readback) |
+| **GPU hardware timestamps** | WebGPU `TimestampQuery` feature | Exact GPU-side kernel execution time (excludes dispatch overhead) |
+
+**How it works**: When a GPU dispatch finishes, `KernelCache.run()` calls
+`profiler.record_dispatch(name, begin_ns, end_ns)` with CPU-side
+`perf_counter_ns()` timestamps. GPU hardware timestamps are correlated
+to the CPU timeline by anchoring the first GPU timestamp's `begin_ns` to
+its `cpu_submit_ns` and applying the offset to all subsequent GPU events.
+
+**Enabling profiling**:
+
+```python
+# In model code:
+model.enable_profiling()   # sets model.profiler.enable()
+
+# After inference:
+model.profiler.report()    # console summary
+
+# HTML timeline:
+from common.profiler_html import generate_html_report
+generate_html_report(model.profiler, "profile.html")
+```
+
+Most models support `--profile` flag:
+```bash
+python models/phi4/model.py --profile --prompt "Hello" --max-tokens 10
+```
+
+### 3.2 The HTML Timeline — What It Shows
+
+The `generate_html_report()` produces an interactive HTML page with:
+
+- **Two swim lanes**: CPU events (top) and GPU events (bottom) on a
+  synchronized time axis
+- **Step markers**: vertical lines separating decode steps
+- **Zoom/pan**: scroll to zoom, drag to pan — examine individual
+  dispatches at microsecond granularity
+- **Tooltips**: hover any bar to see exact duration
+- **Summary tables**: aggregated time per operation across all steps
+
+**Why this matters**: The unified timeline reveals bottlenecks that
+per-op timing alone cannot:
+
+1. **CPU-GPU pipeline bubbles**: If the CPU lane shows idle gaps while
+   waiting for GPU readback, the bottleneck is readback latency, not
+   compute. Fix: use `gpu_out=True` to eliminate unnecessary readbacks.
+
+2. **Dispatch overhead dominance**: If GPU bars are tiny but the gap
+   between them is large, dispatch overhead dominates. Fix: batch
+   dispatches or move small ops to CPU.
+
+3. **Serialization stalls**: If CPU and GPU never overlap, the pipeline
+   is fully serial. Fix: overlap CPU ops (norm, activation) with
+   in-flight GPU dispatches via batched command buffers.
+
+4. **Memory bandwidth saturation**: If GPU hardware timestamps show
+   near-identical kernel times regardless of compute intensity,
+   the kernel is memory-bound. Fix: fp16 weights, quantization.
+
+### 3.3 Per-Layer Profiling with CPU Scopes
+
+For decode-path optimization, the profiler also integrates directly
+into model code via CPU scopes:
+
+```python
+# In _decode_cpu() or _transformer_block():
+p = self.profiler
+if p and p.enabled:
+    p._cpu.begin("rms_norm_1")
+    rn1 = self._rms_norm_cpu(x, ...)
+    p._cpu.end("rms_norm_1")
+
+    p._cpu.begin("qkv_linear")
+    qkv = self._cpu_matmul(rn1, ...)
+    p._cpu.end("qkv_linear")
+```
+
+This produces per-op timing within each layer, making it easy to see
+which operation is the bottleneck (matmul vs. attention vs. norm).
+
+### 3.4 Identifying Bottlenecks
 
 Use `--profile` to generate both a console report and an interactive
 HTML timeline (`profile.html` in the model folder).
@@ -356,7 +458,7 @@ The profiler tracks:
 - **GPU timeline**: WebGPU timestamp queries (if `TimestampQuery` feature
   is available)
 
-### 3.2 What to Look For
+### 3.5 What to Look For
 
 1. **Dispatch overhead dominating**: If CPU time per op is mostly
    dispatch overhead (encode → submit → fence → readback), consider
@@ -369,7 +471,7 @@ The profiler tracks:
 4. **Small-op overhead**: If norms/activations take > 0.5 ms each,
    they're dominated by dispatch overhead — move to CPU or fuse.
 
-### 3.3 Key Metrics
+### 3.6 Key Metrics
 
 | Metric | How to compute | Target |
 |--------|---------------|--------|
@@ -378,7 +480,7 @@ The profiler tracks:
 | Dispatch overhead ratio | dispatch_overhead / total_time | < 10% |
 | GPU occupancy | active_threads / max_threads | > 50% |
 
-### 3.4 TPS Measurement Methodology
+### 3.7 TPS Measurement Methodology
 
 The `generate()` function uses two timers:
 
