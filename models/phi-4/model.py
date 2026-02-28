@@ -1896,9 +1896,14 @@ class Phi4WebGPU(WebGPUModel):
 
         wte = self.weights["embed_tokens.weight"]
 
+        import time as _t
+        _times = {}
+        _t0 = _t.perf_counter()
+
         if self._profiling: self._begin_cpu("embed")
         x = wte[token_ids]
         if self._profiling: self._end_cpu("embed")
+        _times["embed"] = (_t.perf_counter() - _t0) * 1000
 
         positions = np.arange(pos_offset, pos_offset + T, dtype=np.int32)
 
@@ -1917,6 +1922,7 @@ class Phi4WebGPU(WebGPUModel):
         if use_batch:
             runner.begin_batch()
 
+        _t1 = _t.perf_counter()
         for layer in range(self.n_layer):
             x = self._transformer_block(x, layer, use_cache=use_cache,
                                         positions=positions)
@@ -1929,6 +1935,7 @@ class Phi4WebGPU(WebGPUModel):
         # Flush any remaining dispatches
         if use_batch and runner.is_batching:
             runner.end_batch()
+        _times["layers (32)"] = (_t.perf_counter() - _t1) * 1000
 
         # Final RMSNorm
         if self._profiling:
@@ -1961,6 +1968,9 @@ class Phi4WebGPU(WebGPUModel):
             if self._profiling: self._begin_cpu("lm_head")
             logits = np.float32(x @ wte.T)
             if self._profiling: self._end_cpu("lm_head")
+
+        _times["norm + lm_head"] = (_t.perf_counter() - _t1 - _times["layers (32)"] / 1000) * 1000
+        self._prefill_times = _times
         return logits
 
 
@@ -2272,9 +2282,29 @@ def main():
                 k, v, _ = model._gpu_kv_cache[layer]
                 model._gpu_kv_cache[layer] = (k, v, 0)
 
-        # Prefill
+        # Prefill with detailed timing
+        import time as _time
+        print("\n--- Prefill Breakdown ---")
+
+        t0 = _time.perf_counter()
         with model.profiler.step("prefill"):
             logits = model.forward(token_ids, use_cache=True, pos_offset=0)
+        t1 = _time.perf_counter()
+
+        # Print per-phase timing from the forward pass
+        if hasattr(model, '_prefill_times'):
+            for name, ms in model._prefill_times.items():
+                print(f"  {name:22s} {ms:.1f}ms")
+        else:
+            print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
+
+        # Warmup fast decode (uploads all layer weights + creates bind groups)
+        t2 = _time.perf_counter()
+        if hasattr(model, '_warmup_fast_decode'):
+            model._warmup_fast_decode()
+        t3 = _time.perf_counter()
+        print(f"  Fast decode init:   {(t3 - t2)*1000:.1f}ms")
+        print(f"  Total TTFT:         {(t3 - t0)*1000:.1f}ms")
 
         # Decode N tokens with profiling
         n_profile = min(args.max_tokens, 10)
