@@ -558,19 +558,19 @@ class SDXLWebGPU(WebGPUModel):
         norm3_w = prefix + "norm3.weight"
         if norm3_w in self.weights:
             xn = self._layer_norm_1d(x, norm3_w, prefix + "norm3.bias")
-            # GEGLU: split linear output into gate and value, gate = GELU(gate)
+            # GEGLU: split linear output into value and gate
             ff_dim = self.weights[prefix + "ff.net.0.proj.weight"].shape[0]
             ff = self._linear_w(xn, prefix + "ff.net.0.proj.weight",
                                 prefix + "ff.net.0.proj.bias",
                                 N=ff_dim, K=ch)
-            # GEGLU split: first half is gate (apply GELU), second half is value
+            # GEGLU split: first half is value, second half is gate (apply GELU)
             half = ff_dim // 2
-            gate = ff[:, :half]
-            val = ff[:, half:]
-            # GELU activation
+            val = ff[:, :half]
+            gate = ff[:, half:]
+            # GELU activation on gate
             gate = gate * 0.5 * (1.0 + np.tanh(
                 np.sqrt(2.0 / np.pi) * (gate + 0.044715 * gate ** 3)))
-            ff_out = gate * val
+            ff_out = val * gate
             ff_out = self._linear_w(ff_out, prefix + "ff.net.2.weight",
                                     prefix + "ff.net.2.bias",
                                     N=ch, K=half)
@@ -660,6 +660,7 @@ class SDXLWebGPU(WebGPUModel):
                     S = H * W
                     x_flat = x.transpose(1, 2, 0).reshape(S, C).astype(
                         np.float32)
+                    residual = x_flat.copy()
                     n_depth = (self.transformer_depth[level]
                                if level < len(self.transformer_depth) else 1)
                     norm_pfx = f"down.{level}.attn{rb}."
@@ -684,6 +685,7 @@ class SDXLWebGPU(WebGPUModel):
                         x_flat = self._linear_w(
                             x_flat, proj_name, norm_pfx + "proj_out.bias",
                             N=ch, K=ch)
+                    x_flat = x_flat + residual
                     x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
 
                 # Save skip (after resnet + optional transformer)
@@ -708,6 +710,7 @@ class SDXLWebGPU(WebGPUModel):
             C, H, W = x.shape
             S = H * W
             x_flat = x.transpose(1, 2, 0).reshape(S, C).astype(np.float32)
+            residual = x_flat.copy()
             if "mid.attn.norm.weight" in self.weights:
                 x_flat = self._group_norm_flat(
                     x_flat, C, H, W,
@@ -726,6 +729,7 @@ class SDXLWebGPU(WebGPUModel):
                 x_flat = self._linear_w(
                     x_flat, "mid.attn.proj_out.weight",
                     "mid.attn.proj_out.bias", N=ch_mid, K=ch_mid)
+            x_flat = x_flat + residual
             x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
 
         x = self._resnet_block(x, temb, "mid.res2.", ch_mid, ch_mid)
@@ -778,6 +782,7 @@ class SDXLWebGPU(WebGPUModel):
                         S = H * W
                         x_flat = x.transpose(1, 2, 0).reshape(
                             S, C).astype(np.float32)
+                        residual = x_flat.copy()
                         n_depth = (self.transformer_depth[up_idx]
                                    if up_idx < len(self.transformer_depth)
                                    else 1)
@@ -801,6 +806,7 @@ class SDXLWebGPU(WebGPUModel):
                                 x_flat, proj_out,
                                 attn_pfx + "proj_out.bias",
                                 N=ch, K=ch)
+                        x_flat = x_flat + residual
                         x = x_flat.reshape(H, W, C).transpose(2, 0, 1)
 
             # Upsample between levels (except last)
@@ -899,11 +905,14 @@ def load_pipeline_components(hf_dir):
     tokenizer_2 = CLIPTokenizer.from_pretrained(
         hf_dir, subfolder="tokenizer_2")
     text_encoder = CLIPTextModel.from_pretrained(
-        hf_dir, subfolder="text_encoder", torch_dtype=torch.float16)
+        hf_dir, subfolder="text_encoder", torch_dtype=torch.float16,
+        variant="fp16")
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-        hf_dir, subfolder="text_encoder_2", torch_dtype=torch.float16)
+        hf_dir, subfolder="text_encoder_2", torch_dtype=torch.float16,
+        variant="fp16")
     vae = AutoencoderKL.from_pretrained(
-        hf_dir, subfolder="vae", torch_dtype=torch.float16)
+        hf_dir, subfolder="vae", torch_dtype=torch.float16,
+        variant="fp16")
 
     t1 = time.perf_counter()
     print(f"  Loaded in {t1-t0:.1f}s")
