@@ -135,10 +135,18 @@ def _compute_summary(cpu_events: List[CPUEvent],
                      steps_json: list = None) -> dict:
     cpu_agg = {}
     total_cpu_ms = 0
+    # Structural scope names that aren't real CPU kernels
+    _structural = {"total", "scope_total", "layers", "norm_lm_head",
+                   "fast_decode_init", "attn", "mlp"}
     for e in cpu_events:
         if e.name in ("total", "scope_total"):
             if e.name == "total" and "/" not in e.scope:
                 total_cpu_ms += e.duration_ms
+            continue
+        # Skip structural scopes, batch_submit_*, and per-layer L* entries
+        if (e.name in _structural
+                or e.name.startswith("batch_submit_")
+                or (e.name.startswith("L") and e.name[1:].isdigit())):
             continue
         if e.name not in cpu_agg:
             cpu_agg[e.name] = {"total_ms": 0, "count": 0}
@@ -348,9 +356,6 @@ canvas { display:block; }
 <div id="timeline-wrap"><canvas id="c"></canvas></div>
 <div id="tooltip"></div>
 <div id="summary">
-  <div class="panel"><h2>Prefill Breakdown</h2><table id="prefill-tbl"><thead><tr>
-    <th>Step</th><th>Time (ms)</th><th></th>
-  </tr></thead><tbody></tbody></table></div>
   <div class="panel"><h2>CPU Ops</h2><table id="cpu-tbl"><thead><tr>
     <th>Op</th><th>Total</th><th>#</th><th>Avg</th><th>%</th><th></th>
   </tr></thead><tbody></tbody></table></div>
@@ -602,19 +607,6 @@ function fillTbl(id,data,tCol,aCol){
   }).join('');
 }
 fillTbl('cpu-tbl',S.cpu,'total_ms','avg_ms');
-
-// Prefill breakdown table
-(function(){
-  const pb=S.prefill_breakdown;
-  const tb=document.querySelector('#prefill-tbl tbody');
-  if(!pb||!pb.length){tb.innerHTML='<tr><td colspan="3" style="color:var(--fg3)">No data</td></tr>';return;}
-  const maxMs=pb[0].ms||1;
-  tb.innerHTML=pb.map(d=>{
-    const pct=(d.ms/maxMs*100).toFixed(0);
-    return`<tr><td>${d.name}</td><td class="r">${d.ms>=1?d.ms.toFixed(1):d.ms.toFixed(2)} ms</td>
-    <td><div class="bar" style="width:${Math.max(pct,1)}%;background:${oc(d.name)}"></div></td></tr>`;
-  }).join('');
-})();
 // Use HW timestamp summary if available, else CPU-timed dispatch summary
 fillTbl('gpu-tbl',S.gpu_hw&&S.gpu_hw.length?S.gpu_hw:S.gpu,'total_ms','avg_ms');
 
