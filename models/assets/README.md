@@ -17,7 +17,7 @@ python models/sam-3/model.py --image models/assets/test_image.jpg --interactive
 python models/whisper/model.py --audio models/assets/test_speech.wav
 
 # Image generation models write output here too
-python models/sd-turbo/model.py --prompt "a cat" --output models/assets/output.png
+python models/sdxl-turbo/model.py --prompt "a cat" --output models/assets/output.png
 ```
 
 ## Adding Assets

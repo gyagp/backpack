@@ -1,4 +1,4 @@
-# Shared SDXL UNet implementation for SDXL and SD-Turbo.
+# Shared SDXL UNet implementation for SDXL-Turbo.
 
 import argparse
 import math
