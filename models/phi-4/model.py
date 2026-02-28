@@ -735,7 +735,8 @@ class Phi4WebGPU(WebGPUModel):
         """GPU-resident prefill: all ops on GPU, no per-layer readbacks."""
         from common.model_base import GPUBuffer
 
-        if self._profiling:
+        _prof = self._profiling
+        if _prof:
             self._begin_cpu(f"L{layer}")
             self.profiler._cpu.push_scope(f"L{layer}")
 
@@ -753,11 +754,6 @@ class Phi4WebGPU(WebGPUModel):
             x = self.cache.runner.upload_to_gpu(
                 x.ravel().astype(np.float32), '__prefill_residual')
             x.shape = (T, self.n_embd)
-
-        # 1. RMSNorm
-        if self._profiling:
-            self._begin_cpu(f"L{layer}")
-            self.profiler._cpu.push_scope(f"L{layer}")
 
         # 1. RMSNorm
         if self._profiling: self._begin_cpu("norm1")
@@ -885,7 +881,7 @@ class Phi4WebGPU(WebGPUModel):
         if self._profiling: self._end_cpu("res2")
 
         if self._profiling: self._clear_gpu_op()
-        if self._profiling:
+        if _prof:
             self.profiler._cpu.pop_scope()  # pop L{layer}
             self._end_cpu(f"L{layer}")
         return x
