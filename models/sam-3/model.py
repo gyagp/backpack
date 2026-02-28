@@ -942,14 +942,18 @@ def _layer_norm_np(x, w, b, eps=1e-6):
 def _get_dense_pe(pe_weight, H, W):
     """Generate dense positional encoding for image features.
 
-    pe_weight: (2, 128) — shared_embedding.positional_embedding
+    Matches HF Sam2PositionalEmbedding.forward():
+      coords in [0,1] → map to [-1,1] → multiply by PE weight → 2π → sin/cos
+
+    pe_weight: (2, 128) — shared_embedding.positional_embedding (includes scale)
     H, W: spatial dimensions of image features (e.g. 64, 64)
     Returns: (H*W, 256) sinusoidal positional encoding
     """
     grid_y, grid_x = np.mgrid[0:H, 0:W].astype(np.float32)
-    grid_x = (grid_x + 0.5) / W
+    grid_x = (grid_x + 0.5) / W  # [0, 1]
     grid_y = (grid_y + 0.5) / H
-    coords = np.stack([grid_x, grid_y], axis=-1)  # (H, W, 2)
+    coords = np.stack([grid_x, grid_y], axis=-1)  # (H, W, 2) in [0,1]
+    coords = 2 * coords - 1  # map to [-1, 1]
     proj = coords @ pe_weight.astype(np.float32) * (2 * np.pi)  # (H, W, 128)
     pe = np.concatenate([np.sin(proj), np.cos(proj)], axis=-1)  # (H, W, 256)
     return pe.reshape(H * W, 256)
