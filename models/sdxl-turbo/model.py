@@ -82,7 +82,10 @@ def main():
         prompt=args.prompt, height=args.height, width=args.width,
         num_steps=args.steps, guidance_scale=args.cfg, seed=args.seed)
 
-    out = os.path.join(_SCRIPT_DIR, args.output)
+    out_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models",
+                          os.path.basename(_SCRIPT_DIR))
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, args.output)
     image.save(out)
     print(f"\nSaved to {out}")
 

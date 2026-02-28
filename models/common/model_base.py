@@ -375,7 +375,7 @@ class WebGPUModel:
 
         Generates:
           1. Console profiling report
-          2. HTML timeline at {script_dir}/profile.html
+          2. HTML timeline at gitignore/models/<model>/profile.html
         """
         if not self.profiler:
             return
@@ -384,7 +384,12 @@ class WebGPUModel:
         self.profiler.report()
 
         from common.profiler_html import generate_html_report
-        profile_path = os.path.join(script_dir, "profile.html")
+        # Save to gitignore/models/<model-name>/ instead of source dir
+        model_folder = os.path.basename(script_dir)
+        gitignore_dir = os.path.join(script_dir, "..", "..", "gitignore",
+                                     "models", model_folder)
+        os.makedirs(gitignore_dir, exist_ok=True)
+        profile_path = os.path.join(gitignore_dir, "profile.html")
         runner = self.cache.runner
         adapter = runner.adapter_info
         generate_html_report(

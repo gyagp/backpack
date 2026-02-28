@@ -1702,7 +1702,10 @@ def run_interactive(image_path: str):
         r = max(3, min(W_orig, H_orig) // 100)
         img_orig[max(0,orig_y-r):min(H_orig,orig_y+r),
                  max(0,orig_x-r):min(W_orig,orig_x+r)] = [255, 0, 0]
-        out_path = os.path.join(_SCRIPT_DIR, "mask_output.png")
+        out_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models",
+                              os.path.basename(_SCRIPT_DIR))
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "mask_output.png")
         PILImage.fromarray(img_orig).save(out_path)
         status.config(text=f"Saved to {out_path}  "
                            f"Point=({orig_x},{orig_y})  IoU={iou:.2f}")
