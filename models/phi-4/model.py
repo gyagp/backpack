@@ -857,6 +857,10 @@ class Phi4WebGPU(WebGPUModel):
         from common.wgsl_kernels import WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, pack_dp4a_params, TILE_N
         runner = self.cache.runner
 
+        # Ensure all layer weights are on GPU before building bind groups
+        for layer in range(self.n_layer):
+            self._upload_layer_weights(layer)
+
         E = self.n_embd
         HD = self.head_dim
         n_head = self.n_head
@@ -1148,6 +1152,10 @@ class Phi4WebGPU(WebGPUModel):
         """
         import struct
         runner = self.cache.runner
+
+        # Ensure all layer weights are on GPU before building bind groups
+        for layer in range(self.n_layer):
+            self._upload_layer_weights(layer)
 
         E = self.n_embd           # 3072
         HD = self.head_dim         # 128
