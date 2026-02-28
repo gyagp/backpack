@@ -870,6 +870,53 @@ data = np.load("weights_q4.npz", mmap_mode='r')
 
 All models now use `mmap_mode='r'` by default for weight loading.
 
+### 4.4 Disk Space: Delete Redundant Weight Files
+
+Weight conversion produces **multiple copies** of the same data:
+the original HuggingFace safetensors, the converted fp32 npz, and
+the quantized INT4 npz.  These are often kept on disk unnecessarily,
+doubling or tripling storage requirements.
+
+**Common redundancy patterns**:
+
+| Pattern | Example | Space wasted |
+|---------|---------|--------------|
+| Original safetensors kept after npz conversion | `model.safetensors` + `weights.npz` | 1× model size |
+| fp32 npz kept after INT4 quantization | `weights.npz` + `weights_q4.npz` | 2–4× Q4 size |
+| Multiple format copies (ONNX + safetensors + fp16) | SD-Turbo hf_cache | 3× model size |
+| Multiple model sizes all kept | SmolLM-2 135M + 360M + 1.7B | unused sizes |
+| Duplicate weight files | GPT-2: `gpt2_weights.npz` + `weights.npz` | 1× copy |
+
+**Rule**: After converting weights to the runtime format (npz or q4.npz),
+the original safetensors and intermediate fp32 npz can be deleted.
+Only keep:
+- The **runtime weight file** (`weights_q4.npz` for quantized models,
+  `*_fp16.npz` for image models)
+- The **tokenizer** (`tokenizer.json`)
+- Any **HF pipeline components** needed at runtime (text encoders, VAE)
+
+**Cleanup command**:
+
+```powershell
+# Delete original safetensors after conversion (per model)
+Remove-Item models/<name>/weights/*.safetensors
+
+# Delete intermediate fp32 npz after quantization
+Remove-Item models/<name>/weights/weights.npz
+
+# Delete ONNX files (not used by our engine)
+Get-ChildItem models -Recurse -Include *.onnx,*.onnx_data | Remove-Item
+```
+
+**Space savings by model** (measured):
+
+| Model | Before cleanup | After | Savings |
+|-------|---------------|-------|---------|
+| Qwen-3.5 | 68.6 GB | 16.8 GB | 51.8 GB (76%) |
+| Phi-4 | 24.2 GB | 2.7 GB | 21.5 GB (89%) |
+| SD-Turbo | 24.2 GB | 4.8 GB + VAE/encoders | 19.4 GB (80%) |
+| Total project | ~257 GB | ~112 GB | ~145 GB (56%) |
+
 ### 4.4 Buffer Reuse with Size-Class Pooling
 
 GPU buffer allocation (`wgpuDeviceCreateBuffer`) is expensive.  The
