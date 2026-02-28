@@ -932,6 +932,112 @@ def _attn_np(q, k, v, n_head):
     return (attn @ V).transpose(1, 0, 2).reshape(S_q, C)
 
 
+def _encode_image_hiera(W, img_chw):
+    """Run Hiera image encoder. Returns (image_tokens, H_feat, W_feat).
+
+    Shared between run_webgpu_inference and run_interactive.
+    """
+    from numpy.lib.stride_tricks import as_strided
+
+    pe_w = W["vision_encoder.backbone.patch_embed.projection.weight"]
+    pe_b = W["vision_encoder.backbone.patch_embed.projection.bias"]
+    C_out, C_in, kH, kW = pe_w.shape
+    stride_val = 4
+    pad = 3
+    _, iH, iW = img_chw.shape
+    img_padded = np.pad(img_chw, ((0,0),(pad,pad),(pad,pad)), mode='constant')
+    _, pH, pW = img_padded.shape
+    oH = (pH - kH) // stride_val + 1
+    oW = (pW - kW) // stride_val + 1
+    s = img_padded.strides
+    patches = as_strided(img_padded,
+        shape=(oH, oW, C_in, kH, kW),
+        strides=(s[1]*stride_val, s[2]*stride_val, s[0], s[1], s[2]))
+    x = (patches.reshape(oH*oW, -1) @ pe_w.reshape(C_out,-1).T + pe_b
+         ).reshape(oH, oW, C_out)
+
+    pos_embed = W["vision_encoder.backbone.pos_embed"].squeeze(0)
+    tile_h = (oH + 6) // 7
+    tile_w = (oW + 6) // 7
+    x = x + np.tile(pos_embed, (1,tile_h,tile_w))[:,:oH,:oW].transpose(1,2,0)
+
+    BLOCK_HEADS = [1,2,2,4,4,4,4,4,4,4,8,8]
+    STAGE_TRANSITIONS = {1,3,10}
+    WINDOW_SIZES = [8,4,4,14,14,0,14,0,14,0,7,7]
+    GLOBAL_BLOCKS = {5,7,9}
+    STAGE_OUTPUT_BLOCKS = {0:0, 1:2, 2:9, 3:11}
+    stage_features = {}
+
+    for bi in range(12):
+        pfx = "vision_encoder.backbone.blocks.%d." % bi
+        H_c, W_c, C_c = x.shape
+        S = H_c * W_c
+        x_flat = x.reshape(S, C_c)
+        n_head = BLOCK_HEADS[bi]
+        xn = _layer_norm_np(x_flat, W[pfx+"layer_norm1.weight"], W[pfx+"layer_norm1.bias"])
+
+        if bi in STAGE_TRANSITIONS:
+            xn_for_attn = xn
+        else:
+            xn_for_attn = xn
+
+        qkv_w = W[pfx+"attn.qkv.weight"]
+        C_ao = qkv_w.shape[0] // 3
+        qkv = xn_for_attn @ qkv_w.T + W[pfx+"attn.qkv.bias"]
+        q, k, v = np.split(qkv, 3, axis=-1)
+
+        ws = WINDOW_SIZES[bi]
+        if ws > 0 and bi not in GLOBAL_BLOCKS:
+            q_s = q.reshape(H_c,W_c,C_ao); k_s = k.reshape(H_c,W_c,C_ao); v_s = v.reshape(H_c,W_c,C_ao)
+            ph = (ws-H_c%ws)%ws; pw = (ws-W_c%ws)%ws
+            if ph or pw:
+                q_s=np.pad(q_s,((0,ph),(0,pw),(0,0))); k_s=np.pad(k_s,((0,ph),(0,pw),(0,0))); v_s=np.pad(v_s,((0,ph),(0,pw),(0,0)))
+            Hp,Wp = q_s.shape[:2]; nH,nW = Hp//ws, Wp//ws
+            def _wr(t): return t.reshape(nH,ws,nW,ws,C_ao).transpose(0,2,1,3,4).reshape(nH*nW,ws*ws,C_ao)
+            qw,kw,vw = _wr(q_s),_wr(k_s),_wr(v_s)
+            nw=nH*nW; ws2=ws*ws; hd=C_ao//n_head; sc=1/np.sqrt(hd)
+            Qw=qw.reshape(nw,ws2,n_head,hd).transpose(0,2,1,3).reshape(-1,ws2,hd)
+            Kw=kw.reshape(nw,ws2,n_head,hd).transpose(0,2,1,3).reshape(-1,ws2,hd)
+            Vw=vw.reshape(nw,ws2,n_head,hd).transpose(0,2,1,3).reshape(-1,ws2,hd)
+            sc_arr=np.float32(Qw@Kw.transpose(0,2,1)*sc); sc_arr-=sc_arr.max(axis=-1,keepdims=True)
+            ea=np.exp(sc_arr); aw=ea/ea.sum(axis=-1,keepdims=True)
+            ao=(aw@Vw).reshape(nw,n_head,ws2,hd).transpose(0,2,1,3).reshape(nw,ws2,C_ao)
+            attn_out = ao.reshape(nH,nW,ws,ws,C_ao).transpose(0,2,1,3,4).reshape(Hp,Wp,C_ao)[:H_c,:W_c].reshape(S,C_ao)
+        else:
+            attn_out = _attn_np(q,k,v,n_head)
+
+        attn_out = attn_out @ W[pfx+"attn.proj.weight"].T + W[pfx+"attn.proj.bias"]
+
+        if bi in STAGE_TRANSITIONS:
+            dp_w = W[pfx+"proj.weight"]; dp_b = W[pfx+"proj.bias"]
+            C_new = dp_w.shape[0]; H_n,W_n = H_c//2, W_c//2
+            x_p = (x_flat @ dp_w.T + dp_b).reshape(H_c,W_c,C_new).reshape(H_n,2,W_n,2,C_new).mean(axis=(1,3))
+            a_d = attn_out.reshape(H_c,W_c,C_new).reshape(H_n,2,W_n,2,C_new).mean(axis=(1,3))
+            x = x_p + a_d
+        else:
+            x = x_flat.reshape(H_c,W_c,C_c) + attn_out.reshape(H_c,W_c,C_ao)
+
+        H_c,W_c,C_c = x.shape; S = H_c*W_c; x_flat = x.reshape(S,C_c)
+        xn2 = _layer_norm_np(x_flat, W[pfx+"layer_norm2.weight"], W[pfx+"layer_norm2.bias"])
+        h = _gelu_np(xn2 @ W[pfx+"mlp.proj_in.weight"].T + W[pfx+"mlp.proj_in.bias"])
+        h = h @ W[pfx+"mlp.proj_out.weight"].T + W[pfx+"mlp.proj_out.bias"]
+        x = x + h.reshape(H_c,W_c,-1)
+
+        for stg, lb in STAGE_OUTPUT_BLOCKS.items():
+            if bi == lb: stage_features[stg] = x.copy()
+
+    neck_outputs = {}
+    for stg, ni in {3:0, 2:1, 1:2, 0:3}.items():
+        f = stage_features[stg]; Hf,Wf,Cf = f.shape
+        cw = W["vision_encoder.neck.convs.%d.weight"%ni]; cb = W["vision_encoder.neck.convs.%d.bias"%ni]
+        neck_outputs[stg] = (f.reshape(Hf*Wf,Cf) @ cw.reshape(256,Cf).T + cb).reshape(Hf,Wf,256)
+
+    no_mem = W["no_memory_embedding"].squeeze()
+    image_feat = neck_outputs[2] + no_mem
+    H_feat, W_feat = image_feat.shape[:2]
+    return image_feat.reshape(H_feat*W_feat, 256), H_feat, W_feat
+
+
 def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
                          output: str = "mask_output.png"):
     """Run SAM 2.1 fully on Triton WebGPU — no PyTorch at inference.
@@ -1332,124 +1438,10 @@ def run_interactive(image_path: str):
     img_chw = img_arr.transpose(2, 0, 1)
     print(f"  Image: {W_orig}x{H_orig}")
 
-    # --- Encode image ONCE ---
+    # --- Encode image ONCE (reuse the working encoder from run_webgpu_inference) ---
     print("  Encoding image (this takes a few seconds)...")
-    # Reuse the encoder from run_webgpu_inference
-    # We need to run the full Hiera encoder inline
     t0 = time.time()
-
-    # Patch embedding
-    pe_w = W["vision_encoder.backbone.patch_embed.projection.weight"]
-    pe_b = W["vision_encoder.backbone.patch_embed.projection.bias"]
-    C_out, C_in, kH, kW = pe_w.shape
-    stride_pe = 4
-    pad = 3
-    _, iH, iW = img_chw.shape
-    img_padded = np.pad(img_chw, ((0,0),(pad,pad),(pad,pad)), mode='constant')
-    _, pH, pW = img_padded.shape
-    oH = (pH - kH) // stride_pe + 1
-    oW = (pW - kW) // stride_pe + 1
-    from numpy.lib.stride_tricks import as_strided
-    s = img_padded.strides
-    col = as_strided(img_padded,
-        shape=(oH, oW, C_in, kH, kW),
-        strides=(s[1]*stride_pe, s[2]*stride_pe, s[0], s[1], s[2]))
-    col_2d = col.reshape(oH * oW, C_in * kH * kW)
-    w_2d = pe_w.reshape(C_out, C_in * kH * kW)
-    x = (col_2d @ w_2d.T + pe_b).reshape(oH, oW, C_out)
-
-    # Hiera blocks
-    stage_dims = [96, 192, 384, 768]
-    stage_blocks = [1, 2, 7, 2]
-    block_idx = 0
-    stage_features = {}
-
-    for stage in range(4):
-        H_s, W_s, C_s = x.shape
-        S = H_s * W_s
-
-        if stage > 0:
-            merge_w = W[f"vision_encoder.backbone.blocks.{block_idx}.dim_reduce.weight"]
-            merge_b = W[f"vision_encoder.backbone.blocks.{block_idx}.dim_reduce.bias"]
-            C_new = stage_dims[stage]
-            x2 = x.reshape(H_s // 2, 2, W_s // 2, 2, C_s)
-            x2 = x2.transpose(0, 2, 1, 3, 4).reshape(H_s // 2 * W_s // 2, 4 * C_s)
-            x = (x2 @ merge_w.T + merge_b).reshape(H_s // 2, W_s // 2, C_new)
-            H_s, W_s, C_s = x.shape
-            S = H_s * W_s
-
-        for b in range(stage_blocks[stage]):
-            x_flat = x.reshape(S, C_s)
-            pfx = f"vision_encoder.backbone.blocks.{block_idx}."
-
-            # LayerNorm
-            ln_w = W[pfx + "norm1.weight"]
-            ln_b = W[pfx + "norm1.bias"]
-            x_mean = x_flat.mean(axis=-1, keepdims=True)
-            x_var = x_flat.var(axis=-1, keepdims=True)
-            x_norm = (x_flat - x_mean) / np.sqrt(x_var + 1e-6)
-            x_norm = x_norm * ln_w + ln_b
-
-            # Self-attention (Q, K, V)
-            qkv = x_norm @ W[pfx + "attn.qkv.weight"].T + W[pfx + "attn.qkv.bias"]
-            HD = C_s // (stage_dims[stage] // 32)  # head_dim varies
-            n_head = C_s // HD if HD > 0 else 1
-            if n_head == 0:
-                n_head = 1
-                HD = C_s
-            Q = qkv[:, :C_s].reshape(S, n_head, HD)
-            K = qkv[:, C_s:2*C_s].reshape(S, n_head, HD)
-            V = qkv[:, 2*C_s:].reshape(S, n_head, HD)
-
-            scale = 1.0 / np.sqrt(HD)
-            Q_h = Q.transpose(1, 0, 2)
-            K_h = K.transpose(1, 2, 0)
-            V_h = V.transpose(1, 0, 2)
-            scores = Q_h @ K_h * scale
-            scores -= scores.max(axis=-1, keepdims=True)
-            exp_s = np.exp(scores)
-            attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
-            attn_out = (attn @ V_h).transpose(1, 0, 2).reshape(S, C_s)
-
-            proj = attn_out @ W[pfx + "attn.proj.weight"].T + W[pfx + "attn.proj.bias"]
-            x_flat = x_flat + proj
-
-            # FFN
-            ln2_w = W[pfx + "norm2.weight"]
-            ln2_b = W[pfx + "norm2.bias"]
-            x_mean2 = x_flat.mean(axis=-1, keepdims=True)
-            x_var2 = x_flat.var(axis=-1, keepdims=True)
-            x_norm2 = (x_flat - x_mean2) / np.sqrt(x_var2 + 1e-6)
-            x_norm2 = x_norm2 * ln2_w + ln2_b
-
-            fc1 = x_norm2 @ W[pfx + "mlp.fc1.weight"].T + W[pfx + "mlp.fc1.bias"]
-            fc1 = np.maximum(0, fc1)  # GELU approximation as ReLU for speed
-            fc2 = fc1 @ W[pfx + "mlp.fc2.weight"].T + W[pfx + "mlp.fc2.bias"]
-            x_flat = x_flat + fc2
-
-            x = x_flat.reshape(H_s, W_s, C_s)
-            block_idx += 1
-
-        stage_features[stage] = x.copy()
-
-    # FPN Neck
-    neck_outputs = {}
-    for stage in range(4):
-        feat = stage_features[stage]
-        H_f, W_f, C_f = feat.shape
-        neck_idx = stage
-        conv_w = W["vision_encoder.neck.convs.%d.weight" % neck_idx]
-        conv_b = W["vision_encoder.neck.convs.%d.bias" % neck_idx]
-        w_flat = conv_w.reshape(256, C_f)
-        feat_flat = feat.reshape(H_f * W_f, C_f)
-        proj = feat_flat @ w_flat.T + conv_b
-        neck_outputs[stage] = proj.reshape(H_f, W_f, 256)
-
-    no_mem = W["no_memory_embedding"].squeeze()
-    image_feat = neck_outputs[2] + no_mem
-    H_feat, W_feat = image_feat.shape[:2]
-    image_tokens = image_feat.reshape(H_feat * W_feat, 256)
-
+    image_tokens, H_feat, W_feat = _encode_image_hiera(W, img_chw)
     t_enc = time.time() - t0
     print(f"  Encoder: {t_enc:.1f}s ({H_feat}x{W_feat} features)")
 
