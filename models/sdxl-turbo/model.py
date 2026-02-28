@@ -27,6 +27,7 @@ from common.sdxl_unet import (
     encode_prompt, vae_decode, verify_with_random_weights,
     generate_image, load_pipeline_components, VAE_SCALE_FACTOR,
 )
+from common.utils import add_device_arg, apply_device_arg
 
 
 def main():
@@ -43,7 +44,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="output.png")
     parser.add_argument("--profile", action="store_true")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

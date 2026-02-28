@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 import numpy as np
 
 from common.model_base import WebGPUModel, _next_pow2
-from common.utils import load_weights, download_weights
+from common.utils import load_weights, download_weights, add_device_arg, apply_device_arg
 
 
 # Whisper configs
@@ -1085,7 +1085,9 @@ def main():
                         help="Verify pipeline with random weights")
     parser.add_argument("--audio", type=str, default=None,
                         help="Input audio path for transcription")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

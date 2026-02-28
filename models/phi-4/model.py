@@ -43,6 +43,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
+    add_device_arg, apply_device_arg,
 )
 
 
@@ -2096,7 +2097,9 @@ def main():
                              "(0=off, 1=per-layer, 4=every 4 layers, 32=single batch)")
     parser.add_argument("--use-dp4a", action="store_true",
                         help="Use DP4A (dot4I8Packed) for INT4 matmul")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 import numpy as np
 
 from common.model_base import WebGPUModel, _next_pow2
-from common.utils import load_weights, download_weights
+from common.utils import load_weights, download_weights, add_device_arg, apply_device_arg
 
 
 # SAM 2.1 tiny ViT config (simplified for demonstration)
@@ -1787,7 +1787,9 @@ def main():
     parser.add_argument("--point-y", type=int, default=None,
                         help="Prompt point Y coordinate")
     parser.add_argument("--output", type=str, default="mask_output.png")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

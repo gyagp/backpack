@@ -2,6 +2,7 @@
 Shared utilities for WebGPU model inference.
 
 Provides:
+  - add_device_arg() / apply_device_arg(): GPU device selection via --device
   - _parse_safetensors(): parse safetensors files into numpy arrays
   - load_weights(): load weights from npz files
   - download_weights(): generic HuggingFace weight downloader
@@ -17,6 +18,25 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# GPU device selection
+# ---------------------------------------------------------------------------
+
+def add_device_arg(parser):
+    """Add --device argument to an argparse parser for GPU selection.
+
+    Options: high (default), low (integrated), vulkan
+    """
+    parser.add_argument("--device", type=str, default=None,
+                        help="GPU: high (discrete, default), low (integrated), vulkan")
+
+
+def apply_device_arg(args):
+    """Set DAWN_GPU env var from --device arg. Call BEFORE creating model."""
+    if getattr(args, 'device', None) is not None:
+        os.environ["DAWN_GPU"] = args.device
 
 
 # ---------------------------------------------------------------------------

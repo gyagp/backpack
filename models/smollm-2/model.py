@@ -34,7 +34,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     _parse_safetensors, load_weights, download_weights,
-    load_tokenizer, generate,
+    load_tokenizer, generate, add_device_arg, apply_device_arg,
 )
 
 
@@ -1621,7 +1621,9 @@ def main():
     parser.add_argument("--decode-mode", type=str, default='auto',
                         choices=['auto', 'cpu', 'gpu'],
                         help="Decode mode: cpu, gpu, or auto (gpu for 1.7B+)")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

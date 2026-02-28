@@ -41,6 +41,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
+    add_device_arg, apply_device_arg,
 )
 
 
@@ -1183,7 +1184,9 @@ def main():
                         help="Decode mode: cpu or gpu (fast decode)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable profiling")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

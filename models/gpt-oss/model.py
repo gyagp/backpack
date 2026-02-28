@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 import numpy as np
 
 from common.model_base import WebGPUModel
-from common.utils import _parse_safetensors, load_tokenizer, generate
+from common.utils import _parse_safetensors, load_tokenizer, generate, add_device_arg, apply_device_arg
 from triton.backends.webgpu.dawn_runner import GPUBuffer
 
 # ---------------------------------------------------------------------------
@@ -876,7 +876,9 @@ def main():
                         help="Quick verification with real weights")
     parser.add_argument("--profile", action="store_true",
                         help="Profile a short generation and save HTML report")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

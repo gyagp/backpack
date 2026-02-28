@@ -35,6 +35,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
+    add_device_arg, apply_device_arg,
 )
 
 
@@ -531,7 +532,9 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--weights-dir", type=str, default=None)
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

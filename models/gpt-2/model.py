@@ -28,6 +28,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     _parse_safetensors, load_weights, download_weights, generate,
+    add_device_arg, apply_device_arg,
 )
 
 
@@ -393,7 +394,9 @@ def main():
                         help="Sampling temperature")
     parser.add_argument("--weights-dir", type=str, default=None,
                         help="Directory for cached weights")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()

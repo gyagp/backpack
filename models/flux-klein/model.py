@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 import numpy as np
 
 from common.model_base import WebGPUModel, _next_pow2
+from common.utils import add_device_arg, apply_device_arg
 from triton.backends.webgpu.dawn_runner import GPUBuffer
 
 # ---------------------------------------------------------------------------
@@ -1412,7 +1413,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="output.png")
     parser.add_argument("--profile", action="store_true")
+    add_device_arg(parser)
     args = parser.parse_args()
+    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()
