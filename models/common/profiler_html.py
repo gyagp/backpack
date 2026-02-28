@@ -199,6 +199,19 @@ def _compute_summary(cpu_events: List[CPUEvent],
         if e.name == "total" and "/" not in e.scope:
             step_times.append({"name": e.scope, "ms": round(e.duration_ms, 2)})
 
+    # Prefill breakdown: list sub-steps under prefill scope
+    prefill_breakdown = []
+    for e in cpu_events:
+        if e.name in ("total", "scope_total"):
+            continue
+        if e.scope == "prefill" and e.duration_ms > 0.01:
+            prefill_breakdown.append({
+                "name": e.name,
+                "ms": round(e.duration_ms, 2),
+            })
+    # Sort by time descending
+    prefill_breakdown.sort(key=lambda x: -x["ms"])
+
     # Op counts per phase (prefill vs decode)
     op_counts = _compute_op_counts(cpu_events, dispatch_events, steps_json)
 
@@ -207,6 +220,7 @@ def _compute_summary(cpu_events: List[CPUEvent],
             "total_gpu_hw_ms": round(total_gpu_hw_ms, 2),
             "cpu": cpu_summary, "gpu": gpu_summary,
             "gpu_hw": gpu_hw_summary, "steps": step_times,
+            "prefill_breakdown": prefill_breakdown,
             "op_counts": op_counts}
 
 
@@ -334,6 +348,9 @@ canvas { display:block; }
 <div id="timeline-wrap"><canvas id="c"></canvas></div>
 <div id="tooltip"></div>
 <div id="summary">
+  <div class="panel"><h2>Prefill Breakdown</h2><table id="prefill-tbl"><thead><tr>
+    <th>Step</th><th>Time (ms)</th><th></th>
+  </tr></thead><tbody></tbody></table></div>
   <div class="panel"><h2>CPU Ops</h2><table id="cpu-tbl"><thead><tr>
     <th>Op</th><th>Total</th><th>#</th><th>Avg</th><th>%</th><th></th>
   </tr></thead><tbody></tbody></table></div>
@@ -557,6 +574,19 @@ function fillTbl(id,data,tCol,aCol){
   }).join('');
 }
 fillTbl('cpu-tbl',S.cpu,'total_ms','avg_ms');
+
+// Prefill breakdown table
+(function(){
+  const pb=S.prefill_breakdown;
+  const tb=document.querySelector('#prefill-tbl tbody');
+  if(!pb||!pb.length){tb.innerHTML='<tr><td colspan="3" style="color:var(--fg3)">No data</td></tr>';return;}
+  const maxMs=pb[0].ms||1;
+  tb.innerHTML=pb.map(d=>{
+    const pct=(d.ms/maxMs*100).toFixed(0);
+    return`<tr><td>${d.name}</td><td class="r">${d.ms>=1?d.ms.toFixed(1):d.ms.toFixed(2)} ms</td>
+    <td><div class="bar" style="width:${Math.max(pct,1)}%;background:${oc(d.name)}"></div></td></tr>`;
+  }).join('');
+})();
 // Use HW timestamp summary if available, else CPU-timed dispatch summary
 fillTbl('gpu-tbl',S.gpu_hw&&S.gpu_hw.length?S.gpu_hw:S.gpu,'total_ms','avg_ms');
 
