@@ -654,6 +654,23 @@ class InferenceProfiler:
             self._gpu.reset()
         self._dispatch_events.clear()
 
+    def inject_init_events(self, phases: list):
+        """Inject pre-recorded init phase events into the timeline.
+
+        Called after enable_profiling() to add weight loading, model init,
+        and warmup phases that occurred before the profiler was created.
+
+        Args:
+            phases: list of (name, begin_ns, end_ns[, scope]) tuples.
+                    These appear as CPU events in the flamechart.
+                    If scope is omitted, defaults to "" (top-level).
+        """
+        for item in phases:
+            name, begin_ns, end_ns = item[0], item[1], item[2]
+            scope = item[3] if len(item) > 3 else ""
+            self._cpu._events.insert(0, CPUEvent(
+                name=name, scope=scope, begin_ns=begin_ns, end_ns=end_ns))
+
     def record_dispatch(self, name: str, begin_ns: int, end_ns: int):
         """Record a GPU dispatch event timed via CPU clock.
 
@@ -784,11 +801,18 @@ class InferenceProfiler:
 
             # Aggregate by operation type across layers
             agg: Dict[str, Tuple[float, int]] = {}  # name -> (total_ms, count)
+            # Init/structural phases that aren't per-token ops
+            _structural = {"total", "scope_total", "layers", "norm_lm_head",
+                           "fast_decode_init", "attn", "mlp",
+                           "weight_loading", "model_init", "kernel_compile",
+                           "weight_upload", "warmup", "kv_cache_alloc"}
             for key, times in op_times.items():
                 parts = key.split("/")
                 # Use the last part as the operation name
                 op_name = parts[-1] if parts else key
-                if op_name in ("total", "scope_total"):
+                if op_name in _structural:
+                    continue
+                if (op_name.startswith("L") and op_name[1:].isdigit()):
                     continue
                 if op_name not in agg:
                     agg[op_name] = (0.0, 0)

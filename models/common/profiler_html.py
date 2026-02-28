@@ -137,7 +137,9 @@ def _compute_summary(cpu_events: List[CPUEvent],
     total_cpu_ms = 0
     # Structural scope names that aren't real CPU kernels
     _structural = {"total", "scope_total", "layers", "norm_lm_head",
-                   "fast_decode_init", "attn", "mlp"}
+                   "fast_decode_init", "attn", "mlp",
+                   "weight_loading", "model_init", "kernel_compile",
+                   "weight_upload", "warmup", "kv_cache_alloc"}
     for e in cpu_events:
         if e.name in ("total", "scope_total"):
             if e.name == "total" and "/" not in e.scope:

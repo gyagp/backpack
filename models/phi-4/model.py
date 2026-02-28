@@ -258,6 +258,8 @@ class Phi4WebGPU(WebGPUModel):
         # Fused projection output sizes
         self.qkv_out = n_head * head_dim + 2 * n_kv_heads * head_dim
         self.gate_up_out = 2 * intermediate_size
+        self._init_phases = []  # (name, begin_ns, end_ns, scope) for profiling
+        _t0 = time.perf_counter_ns()
         super().__init__(
             weights, n_layer=n_layer, n_head=n_head, n_embd=n_embd,
             n_vocab=n_vocab,
@@ -269,9 +271,16 @@ class Phi4WebGPU(WebGPUModel):
             k_dimensions={n_embd, intermediate_size,
                           self.qkv_out, self.gate_up_out},
         )
+        _t1 = time.perf_counter_ns()
+        self._init_phases.append(("kernel_compile", _t0, _t1, "model_init"))
         self._precompute_rope_tables()
+        _t2 = time.perf_counter_ns()
         self._upload_weights_to_gpu()
+        _t3 = time.perf_counter_ns()
+        self._init_phases.append(("weight_upload", _t2, _t3, "model_init"))
         self._init_gpu_kv_cache()
+        _t4 = time.perf_counter_ns()
+        self._init_phases.append(("kv_cache_alloc", _t3, _t4, "model_init"))
 
     def _init_gpu_kv_cache(self):
         """Pre-allocate static GPU KV cache buffers for all layers.
@@ -2289,6 +2298,7 @@ def main():
 
     # Load weights — prefer quantized if available
     quantized = False
+    _t_weight_load_0 = time.perf_counter_ns()
     if os.path.exists(q4_path):
         print(f"Loading quantized weights from {q4_path}...")
         t0 = time.time()
@@ -2303,11 +2313,11 @@ def main():
         print("  TIP: Run with --quantize first to reduce memory 4x")
         weights = load_weights(npz_path)
         print(f"Loaded {len(weights)} weight tensors")
+    _t_weight_load_1 = time.perf_counter_ns()
 
     tokenizer = load_tokenizer(tokenizer_path)
 
-    import time as _mt
-    _model_t0 = _mt.perf_counter()
+    _t_model_init_0 = time.perf_counter_ns()
     model = Phi4WebGPU(
         weights,
         n_layer=config["n_layer"],
@@ -2322,8 +2332,8 @@ def main():
         partial_rotary_factor=config["partial_rotary_factor"],
         quantized=quantized,
         decode_mode=args.decode_mode)
-    _model_t1 = _mt.perf_counter()
-    print(f"Model init: {(_model_t1-_model_t0)*1000:.0f}ms")
+    _t_model_init_1 = time.perf_counter_ns()
+    print(f"Model init: {(_t_model_init_1-_t_model_init_0)/1e6:.0f}ms")
     model._batch_layers = args.batch_layers
     model._use_dp4a = getattr(args, 'use_dp4a', False)
 
@@ -2349,6 +2359,14 @@ def main():
         print(f"Profiling enabled (GPU timestamps: "
               f"{model.profiler.gpu_enabled})")
 
+        # Inject pre-recorded init timeline events
+        init_phases = [
+            ("weight_loading", _t_weight_load_0, _t_weight_load_1),
+            ("model_init", _t_model_init_0, _t_model_init_1),
+        ]
+        init_phases.extend(model._init_phases)
+        model.profiler.inject_init_events(init_phases)
+
         # Profile a short generation
         from common.profiler import InferenceProfiler
         tokenizer_loaded = load_tokenizer(tokenizer_path)
@@ -2359,6 +2377,10 @@ def main():
             for layer in model._gpu_kv_cache:
                 k, v, _ = model._gpu_kv_cache[layer]
                 model._gpu_kv_cache[layer] = (k, v, 0)
+
+        # Warmup forward: trigger D3D12 first-submit init (recorded in timeline)
+        with model.profiler.cpu("warmup"):
+            model.warmup()
 
         # Prefill with detailed timing
         import time as _time
