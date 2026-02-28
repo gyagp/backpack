@@ -17,13 +17,13 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | Model | Type | Params | Precision | Conformance | Performance | Status |
 |-------|------|--------|-----------|-------------|-------------|--------|
 | [**Flux-Klein**](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image Gen | 4B | FP16 | | 5.6s/step (512×512), DiT dual-stream |  |
-| [**Gemma-3**](https://huggingface.co/unsloth/gemma-3-2b) | LLM | 4B | FP16 | | | gated model |
+| [**Gemma-3**](https://huggingface.co/unsloth/gemma-3-2b) | LLM | 4B | FP16 | NA | NA | Gated model |
 | [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | PASS | 60ms TTFT, 97.5 tok/s decode | Done |
 | [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | PASS | 1.2s TTFT, 38.4 tok/s decode | Done |
 | [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | | 458ms TTFT, 124.6 tok/s decode | WIP |
 | [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | PASS | 148ms TTFT, 220 tok/s decode | Done |
 | [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | | 2.4s TTFT, 4.9 tok/s decode |  |
-| [**SAM-3**](https://huggingface.co/facebook/sam2.1-hiera-tiny) | Segmentation | 31M | FP16 | | 2.3s encoder + 33ms decoder (1024×1024) | gated model |
+| [**SAM-3**](https://huggingface.co/facebook/sam2.1-hiera-tiny) | Segmentation | 31M | FP16 | NA | NA | Gated model |
 | [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | PASS | 8.6s/step (512×512), 1-step or CFG | Done |
 | [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | PASS | 133ms TTFT, 208 tok/s decode | Done |
 | [**Whisper**](https://huggingface.co/openai/whisper-tiny) | Speech-to-Text | 39M | FP16 | PASS | 160ms encoder, 30 tok/s decode, 0.9s total | Done |
