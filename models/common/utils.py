@@ -27,10 +27,11 @@ import numpy as np
 def add_device_arg(parser):
     """Add --device argument to an argparse parser for GPU selection.
 
-    Options: high (default), low (integrated), vulkan
+    Options: high (discrete, default), low (integrated)
     """
     parser.add_argument("--device", type=str, default=None,
-                        help="GPU: high (discrete, default), low (integrated), vulkan")
+                        choices=["high", "low"],
+                        help="GPU: high (discrete, default), low (integrated)")
 
 
 def apply_device_arg(args):
