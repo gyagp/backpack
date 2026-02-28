@@ -1139,6 +1139,26 @@ class Phi4WebGPU(WebGPUModel):
 
         self._fast_decode_ready = True
 
+    def _free_cpu_weights(self):
+        """Free CPU copies of weights after GPU upload.
+
+        All layer weights and embedding are on GPU; CPU copies waste RAM.
+        Keeps only tokenizer-related data.
+        """
+        import gc
+        freed = 0
+        keys_to_del = []
+        for name in list(self.weights.keys()):
+            if name in ("embed_tokens.weight",):
+                continue  # Keep for CPU fallback paths
+            keys_to_del.append(name)
+        for name in keys_to_del:
+            freed += self.weights[name].nbytes
+            del self.weights[name]
+        gc.collect()
+        if freed > 0:
+            print(f"  Freed {freed / 1024 / 1024:.0f} MB CPU weight copies")
+
     def _warmup_fast_decode(self):
         """Eagerly initialize fast decode pipeline so that init cost
         is excluded from the decode timer in generate()."""
@@ -1150,6 +1170,9 @@ class Phi4WebGPU(WebGPUModel):
             self._init_fast_decode_dp4a()
         else:
             self._init_fast_decode()
+        # Free CPU weight copies — all weights are now on GPU
+        self._free_cpu_weights()
+        print("  Fast decode pipeline ready")
 
     def _init_fast_decode(self):
         """Pre-allocate buffers, bind groups, and params for fast decode.
@@ -1890,7 +1913,7 @@ class Phi4WebGPU(WebGPUModel):
         runner = self.cache.runner
         batch_layers = getattr(self, '_batch_layers', 4)
         use_batch = (batch_layers > 0
-                     and use_cache and self._decode_mode == 'gpu' and T == 1)
+                     and use_cache and self._decode_mode == 'gpu')
         if use_batch:
             runner.begin_batch()
 
@@ -2258,11 +2281,14 @@ def main():
         generated = list(tokens)
         next_logits = logits[-1, :].copy()
         for step in range(n_profile):
-            next_logits = next_logits / args.temperature
-            next_logits -= next_logits.max()
-            probs = np.exp(next_logits)
-            probs /= probs.sum()
-            next_token = int(np.random.choice(len(probs), p=probs))
+            if args.temperature > 0:
+                next_logits = next_logits / args.temperature
+                next_logits -= next_logits.max()
+                probs = np.exp(next_logits)
+                probs /= probs.sum()
+                next_token = int(np.random.choice(len(probs), p=probs))
+            else:
+                next_token = int(next_logits.argmax())
             generated.append(next_token)
 
             with model.profiler.step(f"decode_{step}"):
