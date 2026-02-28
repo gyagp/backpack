@@ -1318,6 +1318,10 @@ def run_interactive(image_path: str):
     W = {k: data[k].astype(np.float32) for k in data.files}
 
     # --- Load image ---
+    if not os.path.exists(image_path):
+        print(f"Error: Image not found: {image_path}")
+        print(f"  Try: python models/sam-3/model.py --image models/sam-3/test_image.jpg --interactive")
+        sys.exit(1)
     pil_img = PILImage.open(image_path).convert("RGB")
     W_orig, H_orig = pil_img.size
     img_resized = pil_img.resize((1024, 1024), PILImage.BILINEAR)
