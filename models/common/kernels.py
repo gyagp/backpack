@@ -1442,3 +1442,71 @@ def gptoss_gate_kernel(X, Y, N, BLOCK: tl.constexpr):
     y = (up + 1.0) * glu
 
     tl.store(Y + offs, y, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Embedding gather kernel (GPU-side token → embedding lookup)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def embed_gather_kernel(TokenId, Embedding, Out,
+                        stride_e,
+                        BLOCK_E: tl.constexpr):
+    """Gather one embedding row: Out[:] = Embedding[TokenId[0], :].
+
+    TokenId: *i32 buffer with a single token ID
+    Embedding: *fp32 (vocab_size, E) row-major embedding table
+    Out: *fp32 (E,) output buffer
+    stride_e: embedding dimension (E), passed as scalar
+
+    Grid: (1,) — single workgroup copies one row using a loop.
+    Uses fp32 for full precision.
+    """
+    token = tl.load(TokenId)
+    base = token * stride_e
+    for start in range(0, stride_e, BLOCK_E):
+        offs = start + tl.arange(0, BLOCK_E)
+        mask = offs < stride_e
+        row = tl.load(Embedding + base + offs, mask=mask)
+        tl.store(Out + offs, row, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Argmax kernel (GPU-side greedy sampling)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def argmax_kernel(Logits, TokenOut, N,
+                  BLOCK: tl.constexpr):
+    """Find argmax of a 1D fp32 logits buffer.
+
+    Logits: *fp32 (N,) logits
+    TokenOut: *i32 (1,) output token ID
+    N: total number of logits (vocab size)
+
+    Grid: (1,) — single workgroup scans all logits in blocks.
+    Two-pass: first find max value, then find its index.
+    """
+    # Pass 1: find global max value
+    global_max = -1e30
+    for start in range(0, N, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < N
+        vals = tl.load(Logits + offs, mask=mask, other=-1e30)
+        block_max = tl.max(vals)
+        global_max = tl.where(block_max > global_max, block_max, global_max)
+
+    # Pass 2: find first index matching global max
+    result_idx = 0
+    for start in range(0, N, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < N
+        vals = tl.load(Logits + offs, mask=mask, other=-1e30)
+        is_max = (vals == global_max) & mask
+        idx_or_n = tl.where(is_max, offs, N)
+        local_min = tl.min(idx_or_n)
+        result_idx = tl.where(local_min < result_idx, local_min, result_idx)
+        # short circuit: if we found it, we have the first one
+        result_idx = tl.where(result_idx > 0, result_idx, local_min)
+
+    tl.store(TokenOut, result_idx.to(tl.int32))

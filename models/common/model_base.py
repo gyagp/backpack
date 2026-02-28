@@ -50,6 +50,7 @@ from common.kernels import (
     linear_mxfp4_kernel, gptoss_gate_kernel,
     gqa_decode_attn_sink_kernel, add_scaled_kernel,
     qk_norm_rope_kernel,
+    embed_gather_kernel, argmax_kernel,
 )
 
 WEBGPU_TARGET = GPUTarget("webgpu", 0, 32)
@@ -1068,6 +1069,73 @@ class WebGPUModel:
             group_norm_kernel, self._gn_sig,
             {'BLOCK': GN_BLOCK}, num_warps=self._nw(GN_BLOCK))
         self._gn_block = GN_BLOCK
+
+    def _compile_embed_gather(self):
+        """Compile GPU embedding gather kernel (loop-based for large E)."""
+        LB = self.LOOP_BLOCK
+        self._embed_gather_sig = {
+            'TokenId': '*i32', 'Embedding': '*fp32', 'Out': '*fp32',
+            'stride_e': 'i32',
+            'BLOCK_E': 'constexpr',
+        }
+        self._embed_gather_result = self.cache.get_or_compile(
+            embed_gather_kernel, self._embed_gather_sig,
+            {'BLOCK_E': LB},
+            num_warps=self._nw(LB))
+
+    def _compile_argmax(self):
+        """Compile GPU argmax kernel for greedy sampling."""
+        ARGMAX_BLOCK = self.LOOP_BLOCK
+        self._argmax_sig = {
+            'Logits': '*fp32', 'TokenOut': '*i32', 'N': 'i32',
+            'BLOCK': 'constexpr',
+        }
+        self._argmax_result = self.cache.get_or_compile(
+            argmax_kernel, self._argmax_sig,
+            {'BLOCK': ARGMAX_BLOCK},
+            num_warps=self._nw(ARGMAX_BLOCK))
+
+    def _embed_gather(self, token_id_gpu, embedding_gpu, gpu_out=True):
+        """GPU embedding lookup: Out = Embedding[token_id, :].
+
+        token_id_gpu: GPUBuffer with single i32 token ID
+        embedding_gpu: GPUBuffer with (vocab, E) fp32 embedding table
+        Returns: GPUBuffer (1, E) or numpy (1, E)
+        """
+        E = self.n_embd
+        out = self.cache.run(
+            self._embed_gather_result, grid=(1,),
+            buffers={
+                'TokenId': token_id_gpu,
+                'Embedding': embedding_gpu,
+                'Out': np.zeros(E, dtype=np.float32),
+            },
+            scalars={'stride_e': E},
+            gpu_outputs={'Out'} if gpu_out else None)
+        if gpu_out:
+            gpu_buf = out['Out']
+            gpu_buf.shape = (1, E)
+            return gpu_buf
+        return out['Out'][:E].reshape(1, E)
+
+    def _argmax(self, logits_gpu, gpu_out=True):
+        """GPU argmax: TokenOut = argmax(Logits).
+
+        logits_gpu: GPUBuffer with (N,) fp32 logits
+        Returns: GPUBuffer with single i32 token, or int
+        """
+        N = self.n_vocab
+        out = self.cache.run(
+            self._argmax_result, grid=(1,),
+            buffers={
+                'Logits': logits_gpu,
+                'TokenOut': np.zeros(1, dtype=np.int32),
+            },
+            scalars={'N': N},
+            gpu_outputs={'TokenOut'} if gpu_out else None)
+        if gpu_out:
+            return out['TokenOut']
+        return int(out['TokenOut'][0])
 
     # --- Weight upload helpers ---
 

@@ -316,9 +316,11 @@ class Phi4WebGPU(WebGPUModel):
             self._rope_sin.ravel(), "rope_sin_table")
 
     def _compile_model_kernels(self):
-        """Compile Phi4 kernels: RMSNorm, SiLU*mul."""
+        """Compile Phi4 kernels: RMSNorm, SiLU*mul, embed gather, argmax."""
         self._compile_rms_norm()
         self._compile_silu_mul()
+        self._compile_embed_gather()
+        self._compile_argmax()
 
     def _upload_weights_to_gpu(self):
         """Upload shared weights to GPU. Linear projection weights are
@@ -359,6 +361,12 @@ class Phi4WebGPU(WebGPUModel):
         # Upload embed_tokens as fp16 for GPU lm_head (tied weights)
         if getattr(self, '_has_fp16_linear', False):
             self._upload_linear_weight_fp16(ekey, self.n_vocab, E)
+
+        # Upload embed_tokens as fp32 for GPU embedding gather
+        runner = self.cache.runner
+        wte_fp32 = self.weights[ekey].astype(np.float32).ravel()
+        self._gpu_weights["embed_tokens.weight.fp32"] = \
+            runner.upload_to_gpu(wte_fp32, "embed_tokens.weight.fp32")
 
         # Zero biases (tiny)
         self._upload_zero_bias("zero_bias_E", E)
@@ -1458,16 +1466,59 @@ class Phi4WebGPU(WebGPUModel):
             (pl_lmh, bg_lmh,     (lm_gx, lm_gy)),
         ]
 
+        # --- GPU embed gather + argmax for fully GPU-resident decode ---
+        # Token ID buffer (single i32, fed back between iterations)
+        token_id_buf = mkbuf('token_id', 4)
+
+        # Embed gather: token_id → x_buf
+        pl_eg, bgl_eg = get_pl(self._embed_gather_result)
+        nbb_eg = len(self._embed_gather_result.buffer_bindings)
+        embed_fp32 = self._gpu_weights["embed_tokens.weight.fp32"]
+        eg_p = mk_params('eg_p', self._embed_gather_result.param_fields,
+                          {'stride_e': E})
+        bg_eg = mk_bg(bgl_eg, [
+            (0, token_id_buf[0], token_id_buf[1]),
+            (1, embed_fp32.handle, embed_fp32.size),
+            (2, x_buf[0], x_buf[1]),
+            (nbb_eg, eg_p[0], eg_p[1])])
+
+        embed_dispatch = [(pl_eg, bg_eg, (1,))]
+
+        # Argmax: logits_buf → token_id_buf
+        pl_am, bgl_am = get_pl(self._argmax_result)
+        nbb_am = len(self._argmax_result.buffer_bindings)
+        am_p = mk_params('am_p', self._argmax_result.param_fields,
+                          {'N': self.n_vocab})
+        bg_am = mk_bg(bgl_am, [
+            (0, logits_buf[0], logits_buf[1]),
+            (1, token_id_buf[0], token_id_buf[1]),
+            (nbb_am, am_p[0], am_p[1])])
+
+        argmax_dispatch = [(pl_am, bg_am, (1,))]
+
         # Store for per-token use
         self._fd_x_h = x_buf[0]
+        self._fd_token_id_h = token_id_buf[0]
+        self._fd_token_id_sz = token_id_buf[1]
         self._fd_logits_h = logits_buf[0]
         self._fd_logits_sz = logits_buf[1]
         self._fd_rope_q_ph = rope_q_ph[0]
         self._fd_rope_kv_ph = rope_kv_ph[0]
         self._fd_attn_ph = attn_ph[0]
 
-        # Pre-compute the full batches list (avoid creating it each token)
-        self._fd_all_batches = layer_dispatches + [final_dispatches]
+        # Full pipeline with GPU embed + argmax
+        self._fd_all_batches = (
+            [embed_dispatch] +   # GPU embed gather
+            layer_dispatches +   # 32 transformer layers
+            [final_dispatches] + # final norm + lm_head
+            [argmax_dispatch]    # GPU argmax → token_id
+        )
+
+        # Legacy: dispatch list without embed/argmax for fallback
+        self._fd_batches_no_embed = (
+            layer_dispatches +
+            [final_dispatches]
+        )
 
         # Pre-allocated bytearrays for dynamic params (avoid per-token alloc)
         # rope_q: src_offset(i32)=0, pos(i32), half_rot(i32), pad(i32)
@@ -1488,25 +1539,24 @@ class Phi4WebGPU(WebGPUModel):
         self._fast_decode_ready = True
 
     def _decode_fast(self, token_ids, pos_offset):
-        """Fast decode: pre-recorded bind groups, minimal per-token overhead.
+        """Fast decode: fully GPU-resident with embed gather + argmax.
 
-        Bypasses per-dispatch Python layers (buffer alloc, bind group creation,
-        compute pass begin/end). Only updates dynamic params and submits.
+        Flow: write token_id → GPU embed → 32 layers → norm → lm_head → argmax
+        Only reads back 4 bytes (token ID) instead of 512KB (logits).
         """
         runner = self.cache.runner
-        wte = self.weights["embed_tokens.weight"]
+        import struct
 
-        # Embed + upload
-        x = wte[token_ids].ravel().astype(np.float32)
-        runner.write_buffer(self._fd_x_h, x.tobytes())
+        # Write token ID to GPU buffer (4 bytes)
+        runner.write_buffer(self._fd_token_id_h,
+                           struct.pack('<i', int(token_ids[0])))
 
-        # Dynamic params — pack_into pre-allocated bytearrays (no alloc)
+        # Dynamic params
         pos = pos_offset
         _, _, cur_len = self._gpu_kv_cache[0]
         cache_offset = cur_len * self.n_kv_heads * self.head_dim
         T_total = cur_len + 1
 
-        import struct
         struct.pack_into('<i', self._fd_rq_buf, 4, pos)
         runner.write_buffer(self._fd_rope_q_ph, bytes(self._fd_rq_buf))
 
@@ -1522,11 +1572,17 @@ class Phi4WebGPU(WebGPUModel):
             K, V, c = self._gpu_kv_cache[layer]
             self._gpu_kv_cache[layer] = (K, V, c + 1)
 
-        # Submit with CPU/GPU pipelining (per-layer batches)
-        logits = runner.submit_dispatches_pipelined(
+        # Submit full pipeline: embed → layers → norm → lm_head → argmax
+        # Read back token ID (4 bytes) instead of full logits (512KB)
+        token_id_np = runner.submit_dispatches_pipelined(
             self._fd_all_batches,
-            readback=(self._fd_logits_h, self._fd_logits_sz, np.float32))
-        return logits.reshape(1, self.n_vocab)
+            readback=(self._fd_token_id_h, self._fd_token_id_sz, np.int32))
+        next_token = int(token_id_np[0])
+
+        # Build logits with just the argmax token set (for generate() compatibility)
+        logits = np.full((1, self.n_vocab), -1e9, dtype=np.float32)
+        logits[0, next_token] = 1.0
+        return logits
 
     def _decode_gpu(self, x, layer, positions, pfx, p):
         """Fully GPU-resident decode: all operations stay on GPU.
