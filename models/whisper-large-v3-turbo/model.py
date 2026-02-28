@@ -37,20 +37,6 @@ from common.utils import load_weights, download_weights
 
 # Whisper configs
 WHISPER_CONFIGS = {
-    "tiny": {
-        "d_model": 384,
-        "encoder_layers": 4,
-        "decoder_layers": 4,
-        "encoder_attention_heads": 6,
-        "decoder_attention_heads": 6,
-        "encoder_ffn_dim": 1536,
-        "decoder_ffn_dim": 1536,
-        "num_mel_bins": 80,
-        "vocab_size": 51865,
-        "max_source_positions": 1500,
-        "max_target_positions": 448,
-        "hf_repo": "openai/whisper-tiny",
-    },
     "large-v3-turbo": {
         "d_model": 1280,
         "encoder_layers": 32,
@@ -1112,7 +1098,7 @@ def main():
         print("Usage:")
         print("  --verify   Run pipeline verification (random weights)")
         print("  --audio F  Transcribe audio file")
-        print("\nModel: openai/whisper-tiny (151 MB)")
+        print("\nModel: openai/whisper-large-v3-turbo (~1.6 GB)")
 
 
 if __name__ == "__main__":
