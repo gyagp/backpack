@@ -405,11 +405,20 @@ const OC={qkv_linear:'#7aa2f7',qkv:'#7aa2f7',gate_up:'#f7768e',down_proj:'#9ece6
   rope_q:'#ff9e64',rope_kv:'#ff9e64',upload_weights:'#414868'};
 function oc(n){if(OC[n])return OC[n];let h=0;for(let i=0;i<n.length;i++)h=(h*31+n.charCodeAt(i))&0xffffff;return`hsl(${h%360},55%,60%)`;}
 
-// Layout: 2 lanes — CPU (with step markers as background), GPU
-const LW=80, TH=20;
+// Layout: flamechart CPU lanes + 1 GPU lane
+const LW=80, TH=16;
 const CPU_Y=6;
-const GPU_Y=CPU_Y+TH+4;
-const CH=GPU_Y+TH+20;
+
+// Compute depth for each CPU event based on scope nesting
+// scope="" → depth 0, scope="prefill" → depth 0 (step), name inside → depth 1+
+cpu.forEach(e=>{
+  const parts = e.scope ? e.scope.split('/') : [];
+  e._depth = parts.length;
+});
+const maxCpuDepth = cpu.length ? Math.max(...cpu.map(e=>e._depth)) + 1 : 1;
+
+const GPU_Y = CPU_Y + maxCpuDepth * TH + 4;
+const CH = GPU_Y + TH + 20;
 // Merge GPU events: prefer HW timestamps, fall back to CPU-timed
 const gpuMerged=gpuHW.length?gpuHW:gpu;
 
@@ -468,9 +477,11 @@ function draw(){
   X.fillText('CPU',4,CPU_Y+14);
   X.fillText('GPU',4,GPU_Y+14);
 
-  // Lane bg
+  // Lane bg — multiple rows for CPU flamechart
   X.fillStyle='#1f2335';
-  X.fillRect(LW,CPU_Y,w-LW,TH);
+  for(let d=0;d<maxCpuDepth;d++){
+    X.fillRect(LW,CPU_Y+d*TH,w-LW,TH);
+  }
   X.fillRect(LW,GPU_Y,w-LW,TH);
 
   // Step markers as background bands in BOTH lanes
@@ -495,7 +506,17 @@ function draw(){
   }
 
   // CPU lane (ops on top of step bands)
-  drawLane(cpu, CPU_Y, e=>e.name);
+  // CPU flamechart: each event at its depth level
+  for(const e of cpu){
+    const n=e.name;
+    const y=CPU_Y+e._depth*TH;
+    const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);
+    if(x2<LW||x1>w)continue;
+    X.fillStyle=oc(n); X.fillRect(x1,y+1,bw,TH-2);
+    if(bw>20){X.fillStyle='#1a1b26';X.font='8px system-ui';
+      X.save();X.beginPath();X.rect(x1,y,bw,TH);X.clip();
+      X.fillText(n,x1+2,y+11);X.restore();}
+  }
 
   // GPU lane (merged: HW timestamps if available, else CPU-timed)
   drawLane(gpuMerged, GPU_Y, e=>e.name.split('/').pop());
@@ -539,8 +560,15 @@ addEventListener('mousemove',ev=>{
   if(drag){const dx=ev.clientX-dX,r=vE-vS;vS=dVS-dx/(C.clientWidth-LW)*r;vE=vS+r;draw();}
   const rc=C.getBoundingClientRect(),mx=ev.clientX-rc.left,my=ev.clientY-rc.top,t=x2t(mx);
   let hit=null;
-  if(my>=CPU_Y&&my<CPU_Y+TH){
-    for(const e of cpu)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={...e,type:'CPU'};break;}
+  const cpuBottom = CPU_Y + maxCpuDepth * TH;
+  if(my>=CPU_Y&&my<cpuBottom){
+    // Flamechart hit-test: find event at correct depth
+    const hitDepth = Math.floor((my - CPU_Y) / TH);
+    for(const e of cpu){
+      if(e._depth === hitDepth && t>=e.start_us&&t<=e.start_us+e.dur_us){
+        hit={...e,type:'CPU'};break;
+      }
+    }
     if(!hit){for(const s of steps)if(t>=s.start_us&&t<=s.start_us+s.dur_us){hit={name:s.name,dur_us:s.dur_us,type:'Step'};break;}}
   }else if(my>=GPU_Y&&my<GPU_Y+TH){
     for(const e of gpuMerged)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,dur_us:e.dur_us,type:gpuHW.length?'GPU (hw)':'GPU (sub)'};break;}
