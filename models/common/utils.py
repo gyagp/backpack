@@ -127,11 +127,29 @@ def load_weights_mmap(path: str) -> Dict[str, np.ndarray]:
 # Weight downloading
 # ---------------------------------------------------------------------------
 
+def _download_tokenizer(hf_repo: str, tokenizer_path: str, headers: dict = None):
+    """Download tokenizer.json from HuggingFace."""
+    import requests
+    if headers is None:
+        headers = {}
+    base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
+    tok_url = f"{base_url}/tokenizer.json"
+    print(f"Downloading tokenizer from {hf_repo}...")
+    resp = requests.get(tok_url, headers=headers)
+    resp.raise_for_status()
+    with open(tokenizer_path, 'wb') as f:
+        f.write(resp.content)
+    print(f"  Saved tokenizer to {tokenizer_path}")
+
+
 def download_weights(hf_repo: str, model_dir: str,
                      safetensors_files: list = None,
                      key_transform=None,
                      download_tokenizer: bool = True) -> Tuple[str, Optional[str]]:
     """Download model weights from HuggingFace and convert to npz.
+
+    Skips download entirely if converted weights already exist (weights.npz
+    or weights_q4.npz). Original safetensors are NOT required once converted.
 
     Args:
         hf_repo: HuggingFace repo ID (e.g. "openai-community/gpt2")
@@ -145,20 +163,34 @@ def download_weights(hf_repo: str, model_dir: str,
     Returns:
         (npz_path, tokenizer_path) — tokenizer_path is None if not downloaded
     """
-    import requests
-
     os.makedirs(model_dir, exist_ok=True)
     npz_path = os.path.join(model_dir, "weights.npz")
+    q4_path = os.path.join(model_dir, "weights_q4.npz")
     tokenizer_path = os.path.join(model_dir, "tokenizer.json") \
         if download_tokenizer else None
 
+    # Skip download if ANY converted weights exist in the directory
+    # (handles renamed files like gpt2_weights.npz, whisper_*_fp16.npz, etc.)
+    existing_npz = [f for f in os.listdir(model_dir) if f.endswith('.npz')] \
+        if os.path.isdir(model_dir) else []
+    if os.path.exists(npz_path) or os.path.exists(q4_path) or existing_npz:
+        found = npz_path if os.path.exists(npz_path) else \
+                q4_path if os.path.exists(q4_path) else \
+                os.path.join(model_dir, existing_npz[0])
+        print(f"Weights already cached at {found}")
+        if download_tokenizer and tokenizer_path and not os.path.exists(tokenizer_path):
+            _download_tokenizer(hf_repo, tokenizer_path)
+        elif download_tokenizer and tokenizer_path:
+            print(f"Tokenizer already cached at {tokenizer_path}")
+        return npz_path, tokenizer_path
+
+    import requests
     base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
 
     # Build auth headers if HF token is available
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
         "HUGGING_FACE_HUB_TOKEN")
     if not hf_token:
-        # Check cached token from huggingface-cli login
         token_file = os.path.join(
             os.path.expanduser("~"), ".cache", "huggingface", "token")
         if os.path.exists(token_file):
@@ -171,17 +203,7 @@ def download_weights(hf_repo: str, model_dir: str,
         if os.path.exists(tokenizer_path):
             print(f"Tokenizer already cached at {tokenizer_path}")
         else:
-            tok_url = f"{base_url}/tokenizer.json"
-            print(f"Downloading tokenizer from {hf_repo}...")
-            resp = requests.get(tok_url, headers=headers)
-            resp.raise_for_status()
-            with open(tokenizer_path, 'wb') as f:
-                f.write(resp.content)
-            print(f"  Saved tokenizer to {tokenizer_path}")
-
-    if os.path.exists(npz_path):
-        print(f"Weights already cached at {npz_path}")
-        return npz_path, tokenizer_path
+            _download_tokenizer(hf_repo, tokenizer_path, headers)
 
     if safetensors_files is None:
         safetensors_files = ["model.safetensors"]

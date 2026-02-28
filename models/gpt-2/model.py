@@ -262,10 +262,11 @@ def download_gpt2_weights(model_dir: str = None) -> str:
     )
     # Rename to expected filename
     expected = os.path.join(model_dir, "gpt2_weights.npz")
+    if os.path.exists(expected):
+        return expected
     if npz_path != expected and os.path.exists(npz_path):
-        if not os.path.exists(expected):
-            os.rename(npz_path, expected)
-        npz_path = expected
+        os.rename(npz_path, expected)
+        return expected
     return npz_path
 
 
