@@ -6,6 +6,9 @@ __pycache__/
 dist/
 build/
 
+# Temporary debug files
+*.npy
+
 # Third party repos (cloned separately)
 third_party/triton-windows/
 third_party/dawn/
