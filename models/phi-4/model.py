@@ -735,7 +735,9 @@ class Phi4WebGPU(WebGPUModel):
         """GPU-resident prefill: all ops on GPU, no per-layer readbacks."""
         from common.model_base import GPUBuffer
 
-        if self._profiling: self._begin_cpu(f"L{layer}")
+        if self._profiling:
+            self._begin_cpu(f"L{layer}")
+            self.profiler._cpu.push_scope(f"L{layer}")
 
         x_is_gpu = isinstance(x, GPUBuffer)
         T = (x.shape[0] if x.shape else 1) if x_is_gpu else x.shape[0]
@@ -753,7 +755,7 @@ class Phi4WebGPU(WebGPUModel):
             x.shape = (T, self.n_embd)
 
         # 1. RMSNorm
-        if self._profiling: self._begin_cpu(f"L{layer}/attn")
+        if self._profiling: self._begin_cpu(f"attn")
         if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
@@ -843,10 +845,10 @@ class Phi4WebGPU(WebGPUModel):
         # 7. Residual add (in-place to avoid toggle pool aliasing)
         if self._profiling: self._set_gpu_op(f"L{layer}/res1")
         self._add_inplace(x, o_out)
-        if self._profiling: self._end_cpu(f"L{layer}/attn")
+        if self._profiling: self._end_cpu(f"attn")
 
         # 8. RMSNorm
-        if self._profiling: self._begin_cpu(f"L{layer}/mlp")
+        if self._profiling: self._begin_cpu(f"mlp")
         if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
         rn2 = self._rms_norm(
             x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
@@ -861,8 +863,10 @@ class Phi4WebGPU(WebGPUModel):
         self._add_inplace(x, mlp)
 
         if self._profiling: self._clear_gpu_op()
-        if self._profiling: self._end_cpu(f"L{layer}/mlp")
-        if self._profiling: self._end_cpu(f"L{layer}")
+        if self._profiling: self._end_cpu(f"mlp")
+        if self._profiling:
+            self.profiler._cpu.pop_scope()
+            self._end_cpu(f"L{layer}")
         return x
 
     # ------------------------------------------------------------------
@@ -1937,7 +1941,9 @@ class Phi4WebGPU(WebGPUModel):
         if use_batch:
             runner.begin_batch()
 
-        if self._profiling: self._begin_cpu("layers")
+        if self._profiling:
+            self._begin_cpu("layers")
+            self.profiler._cpu.push_scope("layers")
         _t1 = _t.perf_counter()
         for layer in range(self.n_layer):
             x = self._transformer_block(x, layer, use_cache=use_cache,
@@ -1954,7 +1960,9 @@ class Phi4WebGPU(WebGPUModel):
         if use_batch and runner.is_batching:
             runner.end_batch()
         _times["layers (32)"] = (_t.perf_counter() - _t1) * 1000
-        if self._profiling: self._end_cpu("layers")
+        if self._profiling:
+            self.profiler._cpu.pop_scope()
+            self._end_cpu("layers")
 
         # Final RMSNorm + LM head
         if self._profiling: self._begin_cpu("norm_lm_head")
