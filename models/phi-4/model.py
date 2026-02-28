@@ -294,6 +294,21 @@ class Phi4WebGPU(WebGPUModel):
                 np.zeros(buf_size, dtype=np.float32), f"kv_cache_V_{i}")
             self._gpu_kv_cache[i] = (k_buf, v_buf, 0)
 
+    def warmup(self):
+        """Run a dummy forward pass to trigger D3D12 first-submit init.
+
+        The D3D12 backend lazily creates pipeline state objects on the
+        first actual compute pass submission (~800ms). Running a single
+        token through all layers pays this cost upfront so the real
+        prefill sees fast submits.
+        """
+        self.forward(np.array([1], dtype=np.int32), use_cache=True, pos_offset=0)
+        # Reset KV cache after warmup
+        self.kv_cache = None
+        for layer in self._gpu_kv_cache:
+            k, v, _ = self._gpu_kv_cache[layer]
+            self._gpu_kv_cache[layer] = (k, v, 0)
+
     def _precompute_rope_tables(self):
         """Pre-compute RoPE cos/sin tables for all positions up to MAX_SEQ_LEN.
 
@@ -1941,14 +1956,9 @@ class Phi4WebGPU(WebGPUModel):
 
         wte = self.weights["embed_tokens.weight"]
 
-        import time as _t
-        _times = {}
-        _t0 = _t.perf_counter()
-
         if self._profiling: self._begin_cpu("embed")
         x = wte[token_ids]
         if self._profiling: self._end_cpu("embed")
-        _times["embed"] = (_t.perf_counter() - _t0) * 1000
 
         positions = np.arange(pos_offset, pos_offset + T, dtype=np.int32)
 
@@ -1970,7 +1980,6 @@ class Phi4WebGPU(WebGPUModel):
         if self._profiling:
             self._begin_cpu("layers")
             self.profiler._cpu.push_scope("layers")
-        _t1 = _t.perf_counter()
         for layer in range(self.n_layer):
             x = self._transformer_block(x, layer, use_cache=use_cache,
                                         positions=positions)
@@ -1985,18 +1994,30 @@ class Phi4WebGPU(WebGPUModel):
         # Flush any remaining dispatches
         if use_batch and runner.is_batching:
             runner.end_batch()
-        _times["layers (32)"] = (_t.perf_counter() - _t1) * 1000
         if self._profiling:
             self.profiler._cpu.pop_scope()
             self._end_cpu("layers")
 
         # Final RMSNorm + LM head
+        # During prefill (T>1), only the last token's logits are needed
+        # for next-token sampling. Slice to T=1 to use the fast wide kernel
+        # (avoids 4-chunk readback for N=200064).
         if self._profiling: self._begin_cpu("norm_lm_head")
         if self._profiling:
             self._set_gpu_op("final_norm")
         # Check if GPU lm_head is available (fp16 embed weights uploaded)
         gpu_lm_head = ("embed_tokens.weight.fp16" in self._gpu_weights
                        and isinstance(x, GPUBuffer))
+        # Slice to last token for prefill (only last logits needed)
+        if T > 1 and isinstance(x, GPUBuffer) and use_cache:
+            runner = self.cache.runner
+            last_offset = (T - 1) * self.n_embd * 4  # fp32
+            last_size = self.n_embd * 4
+            x = runner.gpu_slice(x, last_offset, last_size,
+                                 "__prefill_last_hidden")
+            x.shape = (1, self.n_embd)
+        elif T > 1 and not isinstance(x, GPUBuffer) and use_cache:
+            x = x[-1:, :]  # numpy slice
         if isinstance(x, GPUBuffer):
             # GPU-resident path: keep on GPU if we'll do GPU lm_head
             x = self._rms_norm(x, self._gpu_weights["norm.weight"],
@@ -2024,8 +2045,6 @@ class Phi4WebGPU(WebGPUModel):
             if self._profiling: self._end_cpu("lm_head")
         if self._profiling: self._end_cpu("norm_lm_head")
 
-        _times["norm + lm_head"] = (_t.perf_counter() - _t1 - _times["layers (32)"] / 1000) * 1000
-        self._prefill_times = _times
         return logits
 
 
@@ -2351,11 +2370,7 @@ def main():
         t1 = _time.perf_counter()
 
         # Print per-phase timing from the forward pass
-        if hasattr(model, '_prefill_times'):
-            for name, ms in model._prefill_times.items():
-                print(f"  {name:22s} {ms:.1f}ms")
-        else:
-            print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
+        print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
 
         # Warmup fast decode (uploads all layer weights + creates bind groups)
         t2 = _time.perf_counter()
@@ -2392,6 +2407,12 @@ def main():
 
         model.save_profile(_SCRIPT_DIR, "Phi-4 mini")
         return
+
+    # Warmup forward: trigger D3D12 first-submit initialization
+    import time as _wt
+    _w0 = _wt.perf_counter()
+    model.warmup()
+    print(f"Warmup forward: {(_wt.perf_counter()-_w0)*1000:.0f}ms")
 
     generate(model, args.prompt, tokenizer,
              max_tokens=args.max_tokens,
