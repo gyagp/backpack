@@ -755,17 +755,25 @@ class Phi4WebGPU(WebGPUModel):
             x.shape = (T, self.n_embd)
 
         # 1. RMSNorm
-        if self._profiling: self._begin_cpu(f"attn")
+        if self._profiling:
+            self._begin_cpu(f"L{layer}")
+            self.profiler._cpu.push_scope(f"L{layer}")
+
+        # 1. RMSNorm
+        if self._profiling: self._begin_cpu("norm1")
         if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
+        if self._profiling: self._end_cpu("norm1")
 
         # 2. QKV projection (stays on GPU)
+        if self._profiling: self._begin_cpu("qkv")
         if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
         qkv = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
                          self._gpu_weights["zero_bias_QKV"], self.qkv_out,
                          gpu_out=True)
+        if self._profiling: self._end_cpu("qkv")
 
         # Pre-build per-token cos/sin tables (same for all layers)
         if not hasattr(self, '_prefill_cos_cache') or \
@@ -779,6 +787,7 @@ class Phi4WebGPU(WebGPUModel):
         sin_data = self._prefill_sin
 
         # 3. GPU RoPE Q
+        if self._profiling: self._begin_cpu("rope_q")
         if self._profiling: self._set_gpu_op(f"L{layer}/rope_q")
         q_rope_out = self.cache.run(
             self._rope_prefill_result, grid=(T, n_head),
@@ -793,8 +802,10 @@ class Phi4WebGPU(WebGPUModel):
             gpu_outputs={'Y'})
         q_rope = q_rope_out['Y']
         q_rope.shape = (T, n_head, BHD)
+        if self._profiling: self._end_cpu("rope_q")
 
         # 4. GPU RoPE K + V scatter to KV cache
+        if self._profiling: self._begin_cpu("rope_kv")
         if self._profiling: self._set_gpu_op(f"L{layer}/rope_kv")
         K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
         self.cache.run(
@@ -812,8 +823,10 @@ class Phi4WebGPU(WebGPUModel):
             },
             gpu_outputs={'K_cache', 'V_cache'})
         self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
+        if self._profiling: self._end_cpu("rope_kv")
 
         # 5. Multi-head causal attention
+        if self._profiling: self._begin_cpu("attn_kern")
         if self._profiling: self._set_gpu_op(f"L{layer}/attn")
         scale = float(1.0 / np.sqrt(HD))
         attn_result = self.cache.run(
@@ -834,38 +847,46 @@ class Phi4WebGPU(WebGPUModel):
             gpu_outputs={'Out'})
         attn_gpu = attn_result['Out']
         attn_gpu.shape = (T, n_head * HD)
+        if self._profiling: self._end_cpu("attn_kern")
 
         # 6. O projection
+        if self._profiling: self._begin_cpu("o_proj")
         if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o_bias = self._gpu_weights.get("zero_bias_QO",
                                         self._gpu_weights["zero_bias_E"])
         o_out = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
                            o_bias, self.n_embd, gpu_out=True)
+        if self._profiling: self._end_cpu("o_proj")
 
-        # 7. Residual add (in-place to avoid toggle pool aliasing)
+        # 7. Residual add
+        if self._profiling: self._begin_cpu("res1")
         if self._profiling: self._set_gpu_op(f"L{layer}/res1")
         self._add_inplace(x, o_out)
-        if self._profiling: self._end_cpu(f"attn")
+        if self._profiling: self._end_cpu("res1")
 
         # 8. RMSNorm
-        if self._profiling: self._begin_cpu(f"mlp")
+        if self._profiling: self._begin_cpu("norm2")
         if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
         rn2 = self._rms_norm(
             x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
             gpu_out=True)
+        if self._profiling: self._end_cpu("norm2")
 
-        # 9. MLP (fused gate_up + silu_mul + down)
+        # 9. MLP
+        if self._profiling: self._begin_cpu("mlp_kern")
         if self._profiling: self._set_gpu_op(f"L{layer}/mlp")
         mlp = self._mlp_block(rn2, layer, gpu_out=True)
+        if self._profiling: self._end_cpu("mlp_kern")
 
-        # 10. Residual add (in-place)
+        # 10. Residual add
+        if self._profiling: self._begin_cpu("res2")
         if self._profiling: self._set_gpu_op(f"L{layer}/res2")
         self._add_inplace(x, mlp)
+        if self._profiling: self._end_cpu("res2")
 
         if self._profiling: self._clear_gpu_op()
-        if self._profiling: self._end_cpu(f"mlp")
         if self._profiling:
-            self.profiler._cpu.pop_scope()
+            self.profiler._cpu.pop_scope()  # pop L{layer}
             self._end_cpu(f"L{layer}")
         return x
 
