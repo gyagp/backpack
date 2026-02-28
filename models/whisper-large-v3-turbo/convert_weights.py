@@ -1,9 +1,9 @@
-"""Convert Whisper-Tiny weights from safetensors to fp16 npz for WebGPU.
+"""Convert Whisper Large V3 Turbo weights from safetensors to fp16 npz for WebGPU.
 
-Downloads from openai/whisper-tiny (151 MB, not gated).
+Downloads from openai/whisper-large-v3-turbo (~1.6 GB).
 
 Usage:
-    python python/examples/webgpu/whisper/convert_weights.py
+    python models/whisper-large-v3-turbo/convert_weights.py
 
 Extracts encoder + decoder weights, converts to fp16 numpy.
 """
@@ -12,7 +12,7 @@ import sys
 import numpy as np
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_HF_REPO = "openai/whisper-tiny"
+_HF_REPO = "openai/whisper-large-v3-turbo"
 
 
 def convert():
@@ -54,7 +54,7 @@ def convert():
 
     out_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "whisper_tiny_fp16.npz")
+    out_path = os.path.join(out_dir, "whisper_large_v3_turbo_fp16.npz")
     print(f"Saving to {out_path}...")
     np.savez(out_path, **np_tensors)
     print(f"Done! File: {os.path.getsize(out_path) / (1024**2):.1f} MB")

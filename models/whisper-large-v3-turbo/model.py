@@ -1,11 +1,11 @@
 """
-Whisper-Tiny speech-to-text inference on WebGPU via Triton.
+Whisper Large V3 Turbo speech-to-text inference on WebGPU via Triton.
 
 Demonstrates encoder-decoder transformer inference for automatic speech
 recognition using Triton kernels compiled to WGSL and executed on WebGPU
 via Dawn.
 
-Whisper-Tiny architecture:
+Whisper architecture (configurable):
   Encoder: Conv1d(80→384, k=3, s=1) → GELU → Conv1d(384→384, k=3, s=2) → GELU
            → sinusoidal positional embedding → 4 transformer layers → LayerNorm
   Decoder: token embedding + learned positional embedding → 4 transformer layers
@@ -35,7 +35,7 @@ from common.model_base import WebGPUModel, _next_pow2
 from common.utils import load_weights, download_weights
 
 
-# Whisper tiny config
+# Whisper configs
 WHISPER_CONFIGS = {
     "tiny": {
         "d_model": 384,
@@ -50,6 +50,20 @@ WHISPER_CONFIGS = {
         "max_source_positions": 1500,
         "max_target_positions": 448,
         "hf_repo": "openai/whisper-tiny",
+    },
+    "large-v3-turbo": {
+        "d_model": 1280,
+        "encoder_layers": 32,
+        "decoder_layers": 4,
+        "encoder_attention_heads": 20,
+        "decoder_attention_heads": 20,
+        "encoder_ffn_dim": 5120,
+        "decoder_ffn_dim": 5120,
+        "num_mel_bins": 128,
+        "vocab_size": 51866,
+        "max_source_positions": 1500,
+        "max_target_positions": 448,
+        "hf_repo": "openai/whisper-large-v3-turbo",
     },
 }
 
@@ -514,7 +528,7 @@ class WhisperWebGPU(WebGPUModel):
 def verify_with_random_weights():
     """Verify Whisper pipeline with small random weights."""
     print("=" * 60)
-    print("Whisper-Tiny WebGPU Pipeline Verification (random weights)")
+    print("Whisper WebGPU Pipeline Verification (random weights)")
     print("=" * 60)
 
     # Use smaller sequence lengths for faster verification
@@ -655,7 +669,7 @@ def verify_with_random_weights():
           f"heads={n_head}")
     print(f"  mel_bins={mel_bins}, vocab={vocab_size}")
 
-    config = WHISPER_CONFIGS["tiny"]
+    config = WHISPER_CONFIGS["large-v3-turbo"]
     model = WhisperWebGPU(
         weights, d_model=D,
         encoder_layers=encoder_layers, decoder_layers=decoder_layers,
@@ -843,14 +857,14 @@ def verify_with_random_weights():
 # ---------------------------------------------------------------------------
 
 def run_full_inference(audio_path: str):
-    """Run Whisper-Tiny transcription fully on Triton WebGPU — no PyTorch.
+    """Run Whisper Large V3 Turbo transcription fully on Triton WebGPU — no PyTorch.
 
     All operations (mel spectrogram, encoder, decoder) run on WebGPU/numpy.
     """
-    print("=== Whisper-Tiny — Full Triton WebGPU ===")
+    print("=== Whisper Large V3 Turbo — Full Triton WebGPU ===")
 
     # --- Load weights ---
-    npz_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "whisper_tiny_fp16.npz")
+    npz_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "whisper_large_v3_turbo_fp16.npz")
     if not os.path.exists(npz_path):
         print(f"Weights not found: {npz_path}")
         print("Run:  python models/whisper/convert_weights.py")
@@ -868,15 +882,18 @@ def run_full_inference(audio_path: str):
     audio_sec = len(audio) / 16000
     print(f"  Audio: {audio_sec:.1f}s at 16kHz ({len(audio)} samples)")
 
+    # --- Config ---
+    config = {k: v for k, v in WHISPER_CONFIGS["large-v3-turbo"].items() if k != "hf_repo"}
+
     # --- Mel spectrogram (no librosa, pure numpy) ---
+    n_mels = config.get("num_mel_bins", 128)
     print("  Computing mel spectrogram...")
     t0 = time.time()
-    mel = _compute_mel_spectrogram(audio)
+    mel = _compute_mel_spectrogram(audio, n_mels=n_mels)
     t_mel = time.time() - t0
     print(f"  Mel: {mel.shape} in {t_mel*1000:.0f}ms")
 
     # --- Create model ---
-    config = {k: v for k, v in WHISPER_CONFIGS["tiny"].items() if k != "hf_repo"}
     model = WhisperWebGPU(weights, **config)
     print("  Model created")
 
@@ -1061,7 +1078,7 @@ def _decode_tokens(token_ids, weights=None):
 
     try:
         from transformers import WhisperTokenizer
-        tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-tiny")
+        tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3-turbo")
         return tokenizer.decode(token_ids, skip_special_tokens=True)
     except ImportError:
         pass
@@ -1077,7 +1094,7 @@ def _decode_tokens(token_ids, weights=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Whisper-Tiny on WebGPU via Triton")
+        description="Whisper Large V3 Turbo on WebGPU via Triton")
     parser.add_argument("--verify", action="store_true",
                         help="Verify pipeline with random weights")
     parser.add_argument("--audio", type=str, default=None,
@@ -1091,7 +1108,7 @@ def main():
     if args.audio:
         run_full_inference(args.audio)
     else:
-        print("Whisper-Tiny speech-to-text on WebGPU")
+        print("Whisper Large V3 Turbo speech-to-text on WebGPU")
         print("Usage:")
         print("  --verify   Run pipeline verification (random weights)")
         print("  --audio F  Transcribe audio file")
