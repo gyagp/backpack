@@ -1623,9 +1623,16 @@ class Phi4WebGPU(WebGPUModel):
 
         # Submit full pipeline: embed → layers → norm → lm_head → argmax
         # Read back token ID (4 bytes) instead of full logits (512KB)
+        if self._profiling:
+            import time as _dt
+            _d0 = _dt.perf_counter_ns()
         token_id_np = runner.submit_dispatches_pipelined(
             self._fd_all_batches,
-            readback=(self._fd_token_id_h, self._fd_token_id_sz, np.int32))
+            readback=(self._fd_token_id_h, self._fd_token_id_sz, np.int32),
+            profiler=self.profiler if self._profiling else None)
+        if self._profiling:
+            _d1 = _dt.perf_counter_ns()
+            self.profiler.record_dispatch("fast_decode", _d0, _d1)
         next_token = int(token_id_np[0])
 
         # Build logits with just the argmax token set (for generate() compatibility)
