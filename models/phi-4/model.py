@@ -1822,7 +1822,9 @@ class Phi4WebGPU(WebGPUModel):
                 return self._decode_cpu(x, layer, positions, pfx, p)
         elif use_cache and self._decode_mode == 'gpu':
             # GPU-resident prefill: all ops on GPU, no readbacks
+            if self._profiling: self._begin_cpu("weight_check")
             self._upload_layer_weights(layer)
+            if self._profiling: self._end_cpu("weight_check")
             return self._prefill_gpu(x, layer, positions, pfx, p)
         else:
             # === PREFILL PATH (original) ===
@@ -1974,7 +1976,9 @@ class Phi4WebGPU(WebGPUModel):
                                         positions=positions)
             # Flush batch every N layers: submit to GPU and start next batch
             if use_batch and runner.is_batching and (layer + 1) % batch_layers == 0:
+                if self._profiling: self._begin_cpu("submit")
                 runner.end_batch()
+                if self._profiling: self._end_cpu("submit")
                 if layer + 1 < self.n_layer:
                     runner.begin_batch()
 
