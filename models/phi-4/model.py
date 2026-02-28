@@ -1930,6 +1930,7 @@ class Phi4WebGPU(WebGPUModel):
         if use_batch:
             runner.begin_batch()
 
+        if self._profiling: self._begin_cpu("layers")
         _t1 = _t.perf_counter()
         for layer in range(self.n_layer):
             x = self._transformer_block(x, layer, use_cache=use_cache,
@@ -1944,8 +1945,10 @@ class Phi4WebGPU(WebGPUModel):
         if use_batch and runner.is_batching:
             runner.end_batch()
         _times["layers (32)"] = (_t.perf_counter() - _t1) * 1000
+        if self._profiling: self._end_cpu("layers")
 
-        # Final RMSNorm
+        # Final RMSNorm + LM head
+        if self._profiling: self._begin_cpu("norm_lm_head")
         if self._profiling:
             self._set_gpu_op("final_norm")
         # Check if GPU lm_head is available (fp16 embed weights uploaded)
@@ -1976,6 +1979,7 @@ class Phi4WebGPU(WebGPUModel):
             if self._profiling: self._begin_cpu("lm_head")
             logits = np.float32(x @ wte.T)
             if self._profiling: self._end_cpu("lm_head")
+        if self._profiling: self._end_cpu("norm_lm_head")
 
         _times["norm + lm_head"] = (_t.perf_counter() - _t1 - _times["layers (32)"] / 1000) * 1000
         self._prefill_times = _times
@@ -2308,8 +2312,9 @@ def main():
 
         # Warmup fast decode (uploads all layer weights + creates bind groups)
         t2 = _time.perf_counter()
-        if hasattr(model, '_warmup_fast_decode'):
-            model._warmup_fast_decode()
+        with model.profiler.cpu("fast_decode_init"):
+            if hasattr(model, '_warmup_fast_decode'):
+                model._warmup_fast_decode()
         t3 = _time.perf_counter()
         print(f"  Fast decode init:   {(t3 - t2)*1000:.1f}ms")
         print(f"  Total TTFT:         {(t3 - t0)*1000:.1f}ms")
