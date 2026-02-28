@@ -377,6 +377,14 @@ class Phi4WebGPU(WebGPUModel):
             self._upload_zero_bias("zero_bias_QO", qo_dim)
         self._upload_zero_bias("zero_bias_GU", self.gate_up_out)
 
+        # Eagerly upload all layer weights (eliminates per-layer upload during prefill)
+        import time as _t
+        t_upload = _t.perf_counter()
+        for layer in range(self.n_layer):
+            self._upload_layer_weights(layer)
+        print(f"  Uploaded all {self.n_layer} layer weights in "
+              f"{(_t.perf_counter() - t_upload)*1000:.0f}ms")
+
         self._print_gpu_weight_stats()
 
     def _dequantize_all_weights(self):
