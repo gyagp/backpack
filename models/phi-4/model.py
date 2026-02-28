@@ -735,6 +735,8 @@ class Phi4WebGPU(WebGPUModel):
         """GPU-resident prefill: all ops on GPU, no per-layer readbacks."""
         from common.model_base import GPUBuffer
 
+        if self._profiling: self._begin_cpu(f"L{layer}")
+
         x_is_gpu = isinstance(x, GPUBuffer)
         T = (x.shape[0] if x.shape else 1) if x_is_gpu else x.shape[0]
         HD = self.head_dim
@@ -751,6 +753,7 @@ class Phi4WebGPU(WebGPUModel):
             x.shape = (T, self.n_embd)
 
         # 1. RMSNorm
+        if self._profiling: self._begin_cpu(f"L{layer}/attn")
         if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
@@ -840,8 +843,10 @@ class Phi4WebGPU(WebGPUModel):
         # 7. Residual add (in-place to avoid toggle pool aliasing)
         if self._profiling: self._set_gpu_op(f"L{layer}/res1")
         self._add_inplace(x, o_out)
+        if self._profiling: self._end_cpu(f"L{layer}/attn")
 
         # 8. RMSNorm
+        if self._profiling: self._begin_cpu(f"L{layer}/mlp")
         if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
         rn2 = self._rms_norm(
             x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
@@ -856,6 +861,8 @@ class Phi4WebGPU(WebGPUModel):
         self._add_inplace(x, mlp)
 
         if self._profiling: self._clear_gpu_op()
+        if self._profiling: self._end_cpu(f"L{layer}/mlp")
+        if self._profiling: self._end_cpu(f"L{layer}")
         return x
 
     # ------------------------------------------------------------------
@@ -1937,7 +1944,9 @@ class Phi4WebGPU(WebGPUModel):
                                         positions=positions)
             # Flush batch every N layers: submit to GPU and start next batch
             if use_batch and runner.is_batching and (layer + 1) % batch_layers == 0:
+                if self._profiling: self._begin_cpu(f"batch_submit_{(layer+1)//batch_layers}")
                 runner.end_batch()
+                if self._profiling: self._end_cpu(f"batch_submit_{(layer+1)//batch_layers}")
                 if layer + 1 < self.n_layer:
                     runner.begin_batch()
 
