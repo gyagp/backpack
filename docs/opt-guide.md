@@ -364,7 +364,7 @@ Init:
   Thread 4: compile silu_mul_fused (N=17408)
   ...
   barrier: wait for all pipelines
-  
+
 Prefill:
   All pipelines already cached → zero compilation during forward
 ```
@@ -832,7 +832,45 @@ def _free_large_cpu_weights(self):
     import gc; gc.collect()
 ```
 
-### 4.3 Buffer Reuse with Size-Class Pooling
+### 4.3 Memory-Mapped Weight Loading
+
+Loading weights from disk via `np.load()` reads the entire npz file
+into RAM before any tensor is accessed.  For large models (10–20 GB),
+this adds 3–10 seconds of startup latency.
+
+**Solution (implemented)**: Use `np.load(path, mmap_mode='r')` to
+memory-map the file.  The OS maps the file into virtual address space
+without reading it; pages are loaded on-demand as individual weight
+tensors are accessed during GPU upload.
+
+```python
+# Slow: reads entire 18 GB file into RAM
+data = np.load("weights_q4.npz")
+
+# Fast: memory-maps, loads pages on demand
+data = np.load("weights_q4.npz", mmap_mode='r')
+```
+
+**Benefits**:
+- **Near-instant startup**: `np.load()` returns immediately; actual
+  I/O happens lazily during GPU upload
+- **Lower peak RAM**: Only pages currently being uploaded are resident;
+  the OS can evict pages after `wgpuQueueWriteBuffer` consumes them
+- **Sequential I/O**: GPU upload iterates weights in order, producing
+  a sequential disk read pattern that the OS prefetcher optimizes
+
+**Caveats**:
+- **Read-only**: Mmap'd arrays are immutable.  Operations that modify
+  weights (e.g., `w.astype(np.float32)`, `w + 1.0`) create copies —
+  which is fine since we need fp32 copies for GPU upload anyway.
+- **Compressed npz**: `mmap_mode` doesn't work with compressed npz
+  files (`np.savez_compressed`).  Use uncompressed `np.savez` for
+  weight files.  The `load_weights_mmap()` utility in `common/utils.py`
+  handles this with an automatic fallback.
+
+All models now use `mmap_mode='r'` by default for weight loading.
+
+### 4.4 Buffer Reuse with Size-Class Pooling
 
 GPU buffer allocation (`wgpuDeviceCreateBuffer`) is expensive.  The
 dawn runner caches buffers by `(name, size, usage)`, but exact-size
@@ -852,7 +890,7 @@ The toggle-pool already alternates between two buffers per `(name, size)`
 to prevent read-write aliasing.  With size-class pooling, more
 allocations map to the same `(name, rounded_size)` key.
 
-### 4.4 Intermediate Buffer Lifetime Analysis
+### 4.5 Intermediate Buffer Lifetime Analysis
 
 Beyond size-class pooling, full **lifetime analysis** of intermediate
 tensors can dramatically reduce memory pressure.  Because neural network
@@ -871,7 +909,7 @@ smallest available memory slot, minimizing total allocation.
 Full lifetime analysis across the entire layer DAG could further reduce
 allocation count.
 
-### 4.5 Pre-Allocated Working Buffers
+### 4.6 Pre-Allocated Working Buffers
 
 For operations with known maximum sizes (e.g., MoE accumulator, KV
 cache), pre-allocate buffers at init time and reuse via
@@ -886,7 +924,7 @@ self._moe_acc_gpu = runner.upload_to_gpu(zeros(E), "moe_acc")
 runner.write_buffer(self._moe_x_gpu.handle, data.tobytes())
 ```
 
-### 4.6 Memory Pool with Smart Heuristics
+### 4.7 Memory Pool with Smart Heuristics
 
 Balancing performance and memory usage requires a managed memory pool
 rather than allocate-on-demand / destroy-on-free.  Key principles:

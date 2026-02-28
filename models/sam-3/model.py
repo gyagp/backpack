@@ -953,7 +953,7 @@ def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
 
     print("  Loading weights...")
     t0 = time.time()
-    data = np.load(npz_path)
+    data = np.load(npz_path, mmap_mode='r')
     W = {k: data[k].astype(np.float32) for k in data.files}
     print(f"  Loaded {len(W)} tensors in {(time.time()-t0)*1000:.0f}ms")
 

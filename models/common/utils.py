@@ -67,9 +67,39 @@ def _parse_safetensors(path: str) -> Dict[str, np.ndarray]:
 
 
 def load_weights(path: str) -> Dict[str, np.ndarray]:
-    """Load weights from npz file."""
-    data = np.load(path)
+    """Load weights from npz file (memory-mapped for fast startup)."""
+    data = np.load(path, mmap_mode='r')
     return {k: data[k].astype(np.float32) for k in data.files}
+
+
+def load_weights_mmap(path: str) -> Dict[str, np.ndarray]:
+    """Load weights from npz via memory-mapping for fast startup.
+
+    Memory-mapping avoids reading the entire file into RAM upfront.
+    Instead, pages are loaded on-demand as weights are accessed (e.g.,
+    during GPU upload).  This can reduce weight loading time from
+    seconds to near-instant for large models (10–20 GB).
+
+    The returned arrays are read-only memory-mapped views.  They must
+    be copied before modification (e.g., quantization, dtype cast).
+    GPU upload (wgpuQueueWriteBuffer) reads directly from the mapped
+    pages, so the OS page cache provides the I/O.
+
+    Usage:
+        weights = load_weights_mmap("weights_q4.npz")
+        # weights[k] is a read-only mmap view — fast to iterate
+        model = Model(weights)  # GPU upload reads from mmap on demand
+
+    Falls back to regular np.load if mmap is not supported (e.g.,
+    compressed npz).
+    """
+    try:
+        data = np.load(path, mmap_mode='r')
+        return {k: data[k] for k in data.files}
+    except ValueError:
+        # Compressed npz doesn't support mmap — fall back to regular load
+        data = np.load(path)
+        return {k: data[k] for k in data.files}
 
 
 # ---------------------------------------------------------------------------

@@ -858,7 +858,7 @@ def run_full_inference(audio_path: str):
 
     print("  Loading weights...")
     t0 = time.time()
-    data = np.load(npz_path)
+    data = np.load(npz_path, mmap_mode='r')
     weights = {k: data[k].astype(np.float32) for k in data.files}
     print(f"  Loaded {len(weights)} tensors in {(time.time()-t0)*1000:.0f}ms")
 

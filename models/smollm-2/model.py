@@ -164,7 +164,7 @@ def quantize_smollm2_weights(weights: Dict[str, np.ndarray],
 
 def load_quantized_weights(path: str) -> Dict[str, np.ndarray]:
     """Load quantized weights from npz."""
-    data = np.load(path)
+    data = np.load(path, mmap_mode='r')
     return {k: data[k] for k in data.files}
 
 
@@ -348,7 +348,7 @@ class SmolLM2WebGPU(WebGPUModel):
 
         INT4 quantized: uploads packed INT4 + fp16 scales/zeros for GPU dequant.
         fp16 mode: uploads weights as fp16 (2× bandwidth reduction).
-        fp32 fallback: uploads as fp32. 
+        fp32 fallback: uploads as fp32.
         """
         E = self.n_embd
         IM = self.intermediate_size

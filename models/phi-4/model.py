@@ -199,8 +199,8 @@ def quantize_model_weights(weights: Dict[str, np.ndarray],
 
 
 def load_quantized_weights(path: str) -> Dict[str, np.ndarray]:
-    """Load quantized weights from npz."""
-    data = np.load(path)
+    """Load quantized weights from npz (memory-mapped for fast startup)."""
+    data = np.load(path, mmap_mode='r')
     return {k: data[k] for k in data.files}
 
 

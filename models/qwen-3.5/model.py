@@ -1595,7 +1595,11 @@ def verify_with_random_weights():
     ssm_d_state = 8
     ssm_conv_kernel = 4
     ssm_dim = ssm_n_heads * ssm_head_dim  # 32
-    ssm_qkv_dim = ssm_dim + 2 * (ssm_n_groups * ssm_d_state)  # 32+32=64
+    # GDN: key_dim = n_groups * d_state = 16, value_dim = n_heads * head_dim = 32
+    # conv_dim = key_dim*2 + value_dim = 64
+    gdn_key_dim = ssm_n_groups * ssm_d_state
+    gdn_value_dim = ssm_n_heads * ssm_head_dim
+    ssm_qkv_dim = gdn_key_dim * 2 + gdn_value_dim
 
     np.random.seed(42)
     weights = {}
@@ -1636,7 +1640,7 @@ def verify_with_random_weights():
             weights[pfx + "self_attn.k_norm.weight"] = np.ones(
                 head_dim, dtype=np.float32)
         else:
-            # Linear attention (Mamba-2 SSM) layer
+            # GatedDeltaNet linear attention layer
             weights[pfx + "linear_attn.in_proj_qkv.weight"] = np.random.randn(
                 ssm_qkv_dim, n_embd).astype(np.float32) * 0.02
             weights[pfx + "linear_attn.in_proj_z.weight"] = np.random.randn(
@@ -1651,6 +1655,10 @@ def verify_with_random_weights():
                 ssm_n_heads).astype(np.float32) * 0.1
             weights[pfx + "linear_attn.dt_bias"] = np.zeros(
                 ssm_n_heads, dtype=np.float32)
+            weights[pfx + "linear_attn.in_proj_a.weight"] = np.random.randn(
+                ssm_n_heads, n_embd).astype(np.float32) * 0.02
+            weights[pfx + "linear_attn.in_proj_b.weight"] = np.random.randn(
+                ssm_n_heads, n_embd).astype(np.float32) * 0.02
 
     print(f"\nModel: {n_layer} layers (3 SSM + 1 full attn), "
           f"{n_head} Q heads, {n_kv_heads} KV heads, "
@@ -1742,7 +1750,7 @@ def bench_with_random_weights():
     ssm_d_state = 16
     ssm_conv_kernel = 4
     ssm_dim = ssm_n_heads * ssm_head_dim
-    ssm_qkv_dim = ssm_dim + 2 * (ssm_n_groups * ssm_d_state)
+    ssm_qkv_dim = (ssm_n_groups * ssm_d_state) * 2 + ssm_dim
 
     np.random.seed(42)
     weights = {}
@@ -1750,13 +1758,13 @@ def bench_with_random_weights():
         n_vocab, n_embd).astype(np.float32) * 0.02
     weights["lm_head.weight"] = np.random.randn(
         n_vocab, n_embd).astype(np.float32) * 0.02
-    weights["norm.weight"] = np.ones(n_embd, dtype=np.float32)
+    weights["norm.weight"] = np.zeros(n_embd, dtype=np.float32)
 
     for i in range(n_layer):
         pfx = f"layers.{i}."
-        weights[pfx + "input_layernorm.weight"] = np.ones(
+        weights[pfx + "input_layernorm.weight"] = np.zeros(
             n_embd, dtype=np.float32)
-        weights[pfx + "post_attention_layernorm.weight"] = np.ones(
+        weights[pfx + "post_attention_layernorm.weight"] = np.zeros(
             n_embd, dtype=np.float32)
         weights[pfx + "mlp.gate_proj.weight"] = np.random.randn(
             intermediate_size, n_embd).astype(np.float32) * 0.02
@@ -1775,9 +1783,9 @@ def bench_with_random_weights():
                 kv_dim, n_embd).astype(np.float32) * 0.02
             weights[pfx + "self_attn.o_proj.weight"] = np.random.randn(
                 n_embd, qo_dim).astype(np.float32) * 0.02
-            weights[pfx + "self_attn.q_norm.weight"] = np.ones(
+            weights[pfx + "self_attn.q_norm.weight"] = np.zeros(
                 head_dim, dtype=np.float32)
-            weights[pfx + "self_attn.k_norm.weight"] = np.ones(
+            weights[pfx + "self_attn.k_norm.weight"] = np.zeros(
                 head_dim, dtype=np.float32)
         else:
             weights[pfx + "linear_attn.in_proj_qkv.weight"] = np.random.randn(
@@ -1794,6 +1802,10 @@ def bench_with_random_weights():
                 ssm_n_heads).astype(np.float32) * 0.1
             weights[pfx + "linear_attn.dt_bias"] = np.zeros(
                 ssm_n_heads, dtype=np.float32)
+            weights[pfx + "linear_attn.in_proj_a.weight"] = np.random.randn(
+                ssm_n_heads, n_embd).astype(np.float32) * 0.02
+            weights[pfx + "linear_attn.in_proj_b.weight"] = np.random.randn(
+                ssm_n_heads, n_embd).astype(np.float32) * 0.02
 
     model = Qwen35WebGPU(
         weights, n_layer=n_layer, n_head=n_head, n_kv_heads=n_kv_heads,
@@ -1927,7 +1939,7 @@ def main():
     # Load weights (prefer quantized if available)
     if os.path.exists(q4_path):
         print(f"Loading quantized weights from {q4_path}...")
-        weights = {k: v for k, v in np.load(q4_path).items()}
+        weights = {k: v for k, v in np.load(q4_path, mmap_mode='r').items()}
         quantized = True
     else:
         npz_path, _ = download_qwen35_weights(weights_dir)

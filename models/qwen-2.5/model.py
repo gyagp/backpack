@@ -1232,7 +1232,7 @@ def main():
     quantized = False
     if os.path.exists(q4_path):
         print(f"Loading quantized weights from {q4_path}")
-        data = np.load(q4_path)
+        data = np.load(q4_path, mmap_mode='r')
         weights = {k: data[k] for k in data.files}
         quantized = True
     else:

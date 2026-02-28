@@ -944,7 +944,7 @@ def main():
         convert()
 
     t0 = time.time()
-    weights = dict(np.load(npz_path))
+    weights = dict(np.load(npz_path, mmap_mode='r'))
     print(f"  Loaded {len(weights)} tensors in {time.time()-t0:.1f}s")
 
     print("\n=== Initializing WebGPU model ===")

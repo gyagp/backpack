@@ -56,7 +56,7 @@ def main():
 
     print("Loading UNet weights...")
     t0 = time.perf_counter()
-    data = np.load(wp)
+    data = np.load(wp, mmap_mode='r')
     weights = {k: data[k] for k in data.files}
     print(f"  {len(weights)} tensors in {time.perf_counter()-t0:.1f}s")
 
