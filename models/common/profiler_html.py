@@ -106,8 +106,12 @@ def generate_html_report(profiler: InferenceProfiler,
     summary = _compute_summary(cpu_events, dispatch_events, gpu_timestamps,
                                 steps_json)
 
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     replacements = {
         "{{TITLE}}": title,
+        "{{TIMESTAMP}}": timestamp,
         "{{CPU_EVENTS}}": json.dumps(cpu_json),
         "{{GPU_EVENTS}}": json.dumps(gpu_json),
         "{{GPU_HW_EVENTS}}": json.dumps(gpu_hw_json),
@@ -316,6 +320,7 @@ canvas { display:block; }
 <body>
 <header>
   <h1>{{TITLE}}</h1>
+  <span class="chip" id="timestamp-chip" style="background:#555;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">{{TIMESTAMP}}</span>
   <span class="chip" id="gpu-chip"></span>
   <span class="chip" id="backend-chip"></span>
 </header>
