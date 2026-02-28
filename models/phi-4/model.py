@@ -1221,11 +1221,15 @@ class Phi4WebGPU(WebGPUModel):
         pl_q4, bgl_q4 = runner.get_pipeline_info(
             WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, [])
 
-        # Fused residual+RMSNorm kernel (disabled: doesn't improve perf)
-        has_add_rn = False
-        if has_add_rn:
-            pl_arn, bgl_arn = get_pl(self._add_rn_result)
-            nbb_arn = len(self._add_rn_result.buffer_bindings)
+        # Fused residual+RMSNorm kernel: x += residual; y = rms_norm(x)
+        # Saves 1 dispatch per layer (res1 + norm2 → single kernel)
+        has_add_rn = True
+        pl_arn, bgl_arn = get_pl(self._add_rn_result)
+        nbb_arn = len(self._add_rn_result.buffer_bindings)
+
+        # Fused RoPE Q + K scatter + V copy (2 dispatches → 1)
+        pl_fused_rope, bgl_fused_rope = get_pl(self._fused_rope_result)
+        nbb_fused_rope = len(self._fused_rope_result.buffer_bindings)
 
         nbb_rn   = len(self._rn_result.buffer_bindings)
         nbb_rope = len(self._rope_result.buffer_bindings)
@@ -1244,10 +1248,9 @@ class Phi4WebGPU(WebGPUModel):
         rn_p = mk_params('rn_p', self._rn_result.param_fields,
                           {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
 
-        # Fused add+norm params (same structure but different kernel)
-        if has_add_rn:
-            arn_p = mk_params('arn_p', self._add_rn_result.param_fields,
-                              {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
+        # Fused add+norm params 
+        arn_p = mk_params('arn_p', self._add_rn_result.param_fields,
+                          {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
 
         # WGSL Q4 params — one per projection shape
         def mk_wq4_params(name, K_val, N_val):
@@ -1269,6 +1272,7 @@ class Phi4WebGPU(WebGPUModel):
         rope_q_ph = mkbuf('ropeq_p', 16)
         rope_kv_ph = mkbuf('ropekv_p', 20)
         attn_ph = mkbuf('attn_p', 20)
+        fused_rope_ph = mkbuf('fused_rope_p', 24)
 
         # --- 4. Global buffer handles ---
         cos_h, cos_sz = self._rope_cos_gpu.handle, self._rope_cos_gpu.size
@@ -1393,6 +1397,15 @@ class Phi4WebGPU(WebGPUModel):
                 (5, proj_out[0], proj_out[1]),
                 (6, oproj_p[0], oproj_p[1])])
 
+            # Fused RoPE Q + K scatter + V copy (replaces separate rope_q + rope_kv)
+            bg_fused_rope = mk_bg(bgl_fused_rope, [
+                (0, qkv_out[0], qkv_out[1]),
+                (1, q_rot[0], q_rot[1]),
+                (2, Kc.handle, Kc.size),
+                (3, Vc.handle, Vc.size),
+                (4, cos_h, cos_sz), (5, sin_h, sin_sz),
+                (nbb_fused_rope, fused_rope_ph[0], fused_rope_ph[1])])
+
             if has_add_rn:
                 # Fused res1+norm2: x += proj_out; norm_out = rms_norm(x)
                 bg_arn2 = mk_bg(bgl_arn, [
@@ -1430,37 +1443,21 @@ class Phi4WebGPU(WebGPUModel):
                 (5, proj_out[0], proj_out[1]),
                 (6, down_p[0], down_p[1])])
 
-            # WGSL Q4 grid: (T=1, ceil(N/TILE_N)) with workgroup_size=256
+            # Fused dispatch list: 10 dispatches per layer (was 12)
+            # Fusions: rope_q+rope_kv→fused_rope, res1+norm2→add_rn
             if has_add_rn:
                 layer_dispatches.append([
-                    (pl_rn,   bg_n1,     (1,)),         # norm1
-                    (pl_q4,   bg_qkv,    (1, (qkv_N + TILE_N - 1) // TILE_N)),
-                    (pl_rope, bg_rope_q,  (n_head,)),    # rope_q
-                    (pl_rkv,  bg_rkv,    (n_kv,)),       # rope_kv
-                    (pl_attn, bg_att,    (n_head,)),      # attn
-                    (pl_q4,   bg_op,     (1, (E + TILE_N - 1) // TILE_N)),
-                    (pl_arn,  bg_arn2,   (1,)),           # fused res1+norm2
-                    (pl_q4,   bg_gu,     (1, (2 * IM + TILE_N - 1) // TILE_N)),
-                    (pl_silu, bg_silu,   silu_g),          # silu_mul
-                    (pl_q4,   bg_dn,     (1, (E + TILE_N - 1) // TILE_N)),
-                    (pl_aip,  bg_res,    aip_g),           # res2
+                    (pl_rn,         bg_n1,          (1,)),         # norm1
+                    (pl_q4,         bg_qkv,         (1, (qkv_N + TILE_N - 1) // TILE_N)),  # qkv
+                    (pl_fused_rope, bg_fused_rope,  (n_head + n_kv,)),  # fused rope_q+kv (n_head+n_kv workgroups)
+                    (pl_attn,       bg_att,         (n_head,)),    # attn
+                    (pl_q4,         bg_op,          (1, (E + TILE_N - 1) // TILE_N)),       # o_proj
+                    (pl_arn,        bg_arn2,         (1,)),         # fused res1+norm2
+                    (pl_q4,         bg_gu,          (1, (2 * IM + TILE_N - 1) // TILE_N)),  # gate_up
+                    (pl_silu,       bg_silu,         silu_g),       # silu_mul
+                    (pl_q4,         bg_dn,          (1, (E + TILE_N - 1) // TILE_N)),       # down
+                    (pl_aip,        bg_res,          aip_g),        # res2
                 ])
-            else:
-                layer_dispatches.append([
-                    (pl_rn,   bg_n1,    (1,)),         # norm1
-                    (pl_q4,   bg_qkv,   (1, (qkv_N + TILE_N - 1) // TILE_N)),
-                    (pl_rope, bg_rope_q, (n_head,)),   # rope_q
-                    (pl_rkv,  bg_rkv,   (n_kv,)),      # rope_kv
-                    (pl_attn, bg_att,   (n_head,)),     # attn
-                    (pl_q4,   bg_op,    (1, (E + TILE_N - 1) // TILE_N)),
-                    (pl_aip,  bg_res,   aip_g),         # res1
-                    (pl_rn,   bg_n2,    (1,)),          # norm2
-                    (pl_q4,   bg_gu,    (1, (2 * IM + TILE_N - 1) // TILE_N)),
-                    (pl_silu, bg_silu,  silu_g),         # silu_mul
-                    (pl_q4,   bg_dn,    (1, (E + TILE_N - 1) // TILE_N)),
-                    (pl_aip,  bg_res,   aip_g),          # res2
-                ])
-
         final_dispatches = [
             (pl_rn,  bg_final_rn, (1,)),
             (pl_lmh, bg_lmh,     (lm_gx, lm_gy)),
@@ -1502,8 +1499,7 @@ class Phi4WebGPU(WebGPUModel):
         self._fd_token_id_sz = token_id_buf[1]
         self._fd_logits_h = logits_buf[0]
         self._fd_logits_sz = logits_buf[1]
-        self._fd_rope_q_ph = rope_q_ph[0]
-        self._fd_rope_kv_ph = rope_kv_ph[0]
+        self._fd_fused_rope_ph = fused_rope_ph[0]
         self._fd_attn_ph = attn_ph[0]
 
         # Full pipeline with GPU embed + argmax
@@ -1521,14 +1517,10 @@ class Phi4WebGPU(WebGPUModel):
         )
 
         # Pre-allocated bytearrays for dynamic params (avoid per-token alloc)
-        # rope_q: src_offset(i32)=0, pos(i32), half_rot(i32), pad(i32)
-        self._fd_rq_buf = bytearray(16)
-        struct.pack_into('<i', self._fd_rq_buf, 0, 0)         # src_offset
-        struct.pack_into('<i', self._fd_rq_buf, 8, half_rot)
-        # rope_kv: q_size(i32), kv_size(i32), pos(i32), half_rot(i32), cache_offset(i32)
-        self._fd_rkv_buf = bytearray(20)
-        struct.pack_into('<ii', self._fd_rkv_buf, 0, q_size, kv_size)
-        struct.pack_into('<i', self._fd_rkv_buf, 12, half_rot)
+        # fused_rope: n_head(i32), q_size(i32), kv_size(i32), pos(i32), half_rot(i32), cache_offset(i32)
+        self._fd_fused_rope_buf = bytearray(24)
+        struct.pack_into('<iii', self._fd_fused_rope_buf, 0, n_head, q_size, kv_size)
+        struct.pack_into('<i', self._fd_fused_rope_buf, 16, half_rot)
         # attn: kv_stride(i32), n_rep(i32), T_total(i32), scale(f32), neg_inf(f32)
         self._fd_attn_buf = bytearray(20)
         struct.pack_into('<ii', self._fd_attn_buf, 0, n_kv * HD, n_rep)
@@ -1557,12 +1549,10 @@ class Phi4WebGPU(WebGPUModel):
         cache_offset = cur_len * self.n_kv_heads * self.head_dim
         T_total = cur_len + 1
 
-        struct.pack_into('<i', self._fd_rq_buf, 4, pos)
-        runner.write_buffer(self._fd_rope_q_ph, bytes(self._fd_rq_buf))
-
-        struct.pack_into('<i', self._fd_rkv_buf, 8, pos)
-        struct.pack_into('<i', self._fd_rkv_buf, 16, cache_offset)
-        runner.write_buffer(self._fd_rope_kv_ph, bytes(self._fd_rkv_buf))
+        # Fused RoPE params: n_head, q_size, kv_size already packed; update pos + cache_offset
+        struct.pack_into('<i', self._fd_fused_rope_buf, 12, pos)
+        struct.pack_into('<i', self._fd_fused_rope_buf, 20, cache_offset)
+        runner.write_buffer(self._fd_fused_rope_ph, bytes(self._fd_fused_rope_buf))
 
         struct.pack_into('<i', self._fd_attn_buf, 8, T_total)
         runner.write_buffer(self._fd_attn_ph, bytes(self._fd_attn_buf))
