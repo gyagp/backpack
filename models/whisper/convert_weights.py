@@ -52,7 +52,7 @@ def convert():
     print(f"  Converted {len(np_tensors)} tensors")
     print(f"  Total size: {total_bytes / (1024**2):.1f} MB")
 
-    out_dir = os.path.join(_SCRIPT_DIR, "weights")
+    out_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "whisper_tiny_fp16.npz")
     print(f"Saving to {out_path}...")

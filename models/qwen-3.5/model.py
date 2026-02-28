@@ -1377,7 +1377,7 @@ def download_qwen35_weights(model_dir: str = None) -> Tuple[str, str]:
     config = QWEN35_CONFIG
     hf_repo = config["hf_repo"]
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     def qwen35_key_transform(key, arr):
         new_key = key
@@ -1417,7 +1417,7 @@ def download_and_quantize_streaming(weights_dir: str = None):
     config = QWEN35_CONFIG
     hf_repo = config["hf_repo"]
     if weights_dir is None:
-        weights_dir = os.path.join(_SCRIPT_DIR, "weights")
+        weights_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     os.makedirs(weights_dir, exist_ok=True)
 
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
@@ -1937,7 +1937,7 @@ def main():
         return
 
     config = QWEN35_CONFIG
-    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "weights")
+    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
 
     if args.quantize:

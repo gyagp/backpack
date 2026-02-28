@@ -1420,7 +1420,7 @@ def main():
 
     # --- Full inference ---
     import torch
-    weights_dir = os.path.join(_SCRIPT_DIR, "weights")
+    weights_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     hf_cache = os.path.join(weights_dir, "hf_cache")
 
     # Step 1: Load text encoder and encode prompt

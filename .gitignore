@@ -1,5 +1,4 @@
 # Ignore weight files
-models/*/weights/
 *.npz
 *.safetensors
 
@@ -15,11 +14,6 @@ build/
 *.png
 profile.html
 
-# Log files
-*.log
-triton-build*.log
-triton-err.log
-
 # Third party repos (cloned separately)
 third_party/triton-windows/
 third_party/dawn/
@@ -31,4 +25,5 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-logs/
+gitignore/
+.venv/

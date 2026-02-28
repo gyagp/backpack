@@ -990,7 +990,7 @@ def download_qwen_weights(model_size: str = "0.5B",
     config = QWEN_CONFIGS[model_size]
     hf_repo = config["hf_repo"]
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     def qwen_key_transform(key, arr):
         new_key = key.replace("model.", "")
@@ -1190,7 +1190,7 @@ def main():
         sys.exit(0 if success else 1)
 
     config = QWEN_CONFIGS[args.model]
-    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "weights")
+    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     npz_path, tokenizer_path = download_qwen_weights(
         args.model, weights_dir)
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
@@ -1273,7 +1273,7 @@ def main():
     if args.profile:
         model.profiler.report()
         from common.profiler_html import generate_html_report
-        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
+        profile_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "profile.html")
         runner = model.cache.runner
         generate_html_report(
             model.profiler,

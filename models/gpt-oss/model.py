@@ -612,7 +612,7 @@ class GptOssWebGPU(WebGPUModel):
 def download_gptoss_weights(model_dir: str = None):
     """Download GPT-OSS-20B weights from HuggingFace."""
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     import requests
 
     os.makedirs(model_dir, exist_ok=True)

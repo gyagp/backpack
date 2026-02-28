@@ -241,7 +241,7 @@ class GPT2WebGPU(WebGPUModel):
 def download_gpt2_weights(model_dir: str = None) -> str:
     """Download GPT-2 (124M) weights from HuggingFace and convert to npz."""
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     def gpt2_key_transform(key, arr):
         """Rename and transpose GPT-2 weights."""

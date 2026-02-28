@@ -850,7 +850,7 @@ def run_full_inference(audio_path: str):
     print("=== Whisper-Tiny — Full Triton WebGPU ===")
 
     # --- Load weights ---
-    npz_path = os.path.join(_SCRIPT_DIR, "weights", "whisper_tiny_fp16.npz")
+    npz_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "whisper_tiny_fp16.npz")
     if not os.path.exists(npz_path):
         print(f"Weights not found: {npz_path}")
         print("Run:  python models/whisper/convert_weights.py")
@@ -1052,7 +1052,7 @@ def _decode_tokens(token_ids, weights=None):
     """Decode Whisper token IDs to text."""
     try:
         from tokenizers import Tokenizer
-        tok_path = os.path.join(_SCRIPT_DIR, "weights", "tokenizer.json")
+        tok_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "tokenizer.json")
         if os.path.exists(tok_path):
             tokenizer = Tokenizer.from_file(tok_path)
             return tokenizer.decode(token_ids)

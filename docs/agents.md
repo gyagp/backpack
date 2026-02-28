@@ -71,7 +71,10 @@ Key principles:
 models/<name>/
   model.py              # Main model — WebGPUModel subclass
   convert_weights.py    # Weight converter (HF → npz)
-  weights/              # Downloaded/converted weights (gitignored)
+
+# Note on original models and generated artifacts:
+# Original huggingface safetensors and out .npz weights should all be created under gitignore/models/<name>/. Any intermediate results (like output images, profiling HTML, logs) and downloaded/converted weights
+# MUST be stored under gitignore/models/<name>/ to keep the working tree clean.
 
 models/assets/            # Shared test assets (images, audio, video)
   test_image.jpg          # General-purpose test image

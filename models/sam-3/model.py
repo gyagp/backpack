@@ -1124,7 +1124,7 @@ def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
     print("=== SAM 2.1 — Full Triton WebGPU ===")
 
     # --- Load weights ---
-    npz_path = os.path.join(_SCRIPT_DIR, "weights", "sam2_hiera_tiny.npz")
+    npz_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "sam2_hiera_tiny.npz")
     if not os.path.exists(npz_path):
         print(f"Weights not found: {npz_path}")
         print("Run:  python models/sam-3/convert_weights.py")
@@ -1497,7 +1497,7 @@ def run_interactive(image_path: str):
     print("=== SAM 2.1 Interactive Mode ===")
 
     # --- Load weights ---
-    npz_path = os.path.join(_SCRIPT_DIR, "weights", "sam2_hiera_tiny.npz")
+    npz_path = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "sam2_hiera_tiny.npz")
     if not os.path.exists(npz_path):
         print(f"Weights not found: {npz_path}")
         print("Run:  python models/sam-3/convert_weights.py")

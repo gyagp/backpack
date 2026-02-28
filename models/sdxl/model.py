@@ -43,11 +43,11 @@ def main():
         success = verify_with_random_weights()
         sys.exit(0 if success else 1)
 
-    hf_dir = os.path.join(_SCRIPT_DIR, "weights", "hf_cache")
+    hf_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "hf_cache")
     components = load_pipeline_components(hf_dir)
     tokenizer, tokenizer_2, text_encoder, text_encoder_2, vae = components
 
-    wp = os.path.join(_SCRIPT_DIR, "weights", "unet_fp16.npz")
+    wp = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "unet_fp16.npz")
     if not os.path.exists(wp):
         print(f"UNet weights not found: {wp}")
         sys.exit(1)

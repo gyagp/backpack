@@ -1897,7 +1897,7 @@ def download_phi4_weights(model_size: str = "mini",
     config = PHI4_CONFIGS[model_size]
     hf_repo = config["hf_repo"]
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     def phi4_key_transform(key, arr):
         new_key = key.replace("model.", "")
@@ -2103,7 +2103,7 @@ def main():
         sys.exit(0 if success else 1)
 
     config = PHI4_CONFIGS["mini"]
-    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "weights")
+    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     # Download if needed
     npz_path, tokenizer_path = download_phi4_weights("mini", weights_dir)

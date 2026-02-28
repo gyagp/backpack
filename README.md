@@ -69,8 +69,8 @@ backpack/
 ```powershell
 git clone https://github.com/gyagp/backpack.git
 cd backpack
-.\build.ps1          # Full setup: deps, clone, build Dawn, build triton
-.\build.ps1 verify   # Verify the pipeline works
+python build.py          # Full setup: deps, clone, build Dawn, build triton
+python build.py verify   # Verify the pipeline works
 ```
 
 The build script automates everything — MSVC detection, repo cloning, Dawn build, triton build, and deployment. It skips steps that are already done, so it's safe to re-run.
@@ -78,14 +78,14 @@ The build script automates everything — MSVC detection, repo cloning, Dawn bui
 Individual targets are available for partial builds:
 
 ```powershell
-.\build.ps1 help           # Show all targets
-.\build.ps1 dawn           # Rebuild Dawn only
-.\build.ps1 triton         # Rebuild triton only
-.\build.ps1 clean          # Remove all build artifacts
-.\build.ps1 info           # Show build status
+python build.py help           # Show all targets
+python build.py dawn           # Rebuild Dawn only
+python build.py triton         # Rebuild triton only
+python build.py clean          # Remove all build artifacts
+python build.py info           # Show build status
 ```
 
-### Manual Steps (if not using build.ps1)
+### Manual Steps (if not using build.py)
 
 <details>
 <summary>Click to expand manual setup steps</summary>

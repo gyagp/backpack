@@ -17,7 +17,7 @@
 #   make verify         # Run GPT-2 verification
 #
 # On Windows without GNU Make, use the PowerShell equivalents shown in each
-# target's recipe, or run: .\build.ps1 <target>
+# target's recipe, or run: python build.py <target>
 
 # ===========================================================================
 # Configuration

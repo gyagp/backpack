@@ -1427,7 +1427,7 @@ def download_smollm2_weights(model_size: str = "135M",
     config = SMOLLM2_CONFIGS[model_size]
     hf_repo = config["hf_repo"]
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights", model_size)
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", model_size)
 
     def smollm2_key_transform(key, arr):
         """Strip 'model.' prefix, handle tied weights."""

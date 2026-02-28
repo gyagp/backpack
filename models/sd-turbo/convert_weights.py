@@ -17,7 +17,7 @@ import numpy as np
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
-_WEIGHTS_DIR = os.path.join(_SCRIPT_DIR, "weights", "hf_cache")
+_WEIGHTS_DIR = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights", "hf_cache")
 
 
 def convert():
@@ -71,7 +71,7 @@ def convert():
         np_tensors[new_name] = arr
         total_bytes += arr.nbytes
 
-    out_dir = os.path.join(_SCRIPT_DIR, "weights")
+    out_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "unet_fp16.npz")
     print(f"Saving {len(np_tensors)} tensors ({total_bytes // (1024**2)} MB) "

@@ -329,7 +329,7 @@ def download_gemma_weights(model_size: str = "2B",
     config = GEMMA_CONFIGS[model_size]
     hf_repo = config["hf_repo"]
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     def gemma_key_transform(key, arr):
         new_key = key.replace("model.", "")
