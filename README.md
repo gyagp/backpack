@@ -20,7 +20,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | [**Gemma-3**](https://huggingface.co/unsloth/gemma-3-2b) | LLM | 4B | FP16 | NA | NA | Gated model |
 | [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | PASS | 60ms TTFT, 97.5 tok/s decode | Done |
 | [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | PASS | 1.2s TTFT, 38.4 tok/s decode | Done |
-| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | PASS | 1.8s TTFT, 107 tok/s decode | Done |
+| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | PASS | 1.3s TTFT, 119 tok/s decode | Done |
 | [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | PASS | 148ms TTFT, 220 tok/s decode | Done |
 | [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | | 2.4s TTFT, 4.9 tok/s decode |  |
 | [**SAM-3**](https://huggingface.co/facebook/sam3) | Segmentation | 31M | FP16 | NA | NA | Gated model |
