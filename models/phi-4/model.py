@@ -1950,19 +1950,7 @@ class Phi4WebGPU(WebGPUModel):
                                         positions=positions)
             # Flush batch every N layers: submit to GPU and start next batch
             if use_batch and runner.is_batching and (layer + 1) % batch_layers == 0:
-                batch_n = (layer+1)//batch_layers
-                if self._profiling:
-                    self._begin_cpu(f"batch_submit_{batch_n}")
-                    import time as _bt
-                    _bs0 = _bt.perf_counter()
                 runner.end_batch()
-                if self._profiling:
-                    _bs1 = _bt.perf_counter()
-                    _bms = (_bs1 - _bs0) * 1000
-                    self._end_cpu(f"batch_submit_{batch_n}")
-                    if _bms > 10:
-                        print(f"    batch_submit_{batch_n}: {_bms:.0f}ms "
-                              f"(layers {layer-batch_layers+2}-{layer+1})")
                 if layer + 1 < self.n_layer:
                     runner.begin_batch()
 
