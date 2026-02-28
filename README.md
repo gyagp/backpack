@@ -20,23 +20,23 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **Phi-4** | LLM | 3.8B | INT4 | 458ms TTFT, 124.6 tok/s decode | WIP |
 | **Qwen-2.5** | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s decode | Done |
 | **Qwen-3.5** | LLM | 27B | INT4 | 2.4s TTFT, 4.9 tok/s decode |  |
+| **Gemma-3** | LLM | 4B | FP16 | | gated model |
 | **SmolLM-2** | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s decode | Done |
 | **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 38.4 tok/s decode | Done |
 | **Whisper** | Speech-to-Text | 39M | FP16 | 160ms encoder, 30 tok/s decode, 0.9s total | Done |
-| **SAM-3** | Segmentation | 31M | FP16 | 2.3s encoder + 33ms decoder (1024×1024) |  |
+| **SAM-3** | Segmentation | 31M | FP16 | 2.3s encoder + 33ms decoder (1024×1024) | gated model |
 | **Flux-Klein** | Image Gen | 4B | FP16 | 5.6s/step (512×512), DiT dual-stream |  |
 | **SD-Turbo** | Image Gen | ~5B | FP16 | 7.1s/step (512×512), 1-step distilled |  |
 | **Z-Image-Turbo** | Image Gen | ~12B | FP16 | 24s/step (512×512), DiT + Qwen3 |  |
 | **SDXL** | Image Gen | ~5B | FP16 | 7.3s/step (512×512), 14.5s with CFG |  |
 
 ## Project Structure
-
 ```
 backpack/
 ├── models/           # Model implementations
 │   ├── common/       # Shared kernels, base classes, utilities
 │   ├── gpt-2/        # GPT-2 inference
-│   ├── gemma/        # Google Gemma
+│   ├── gemma-3/      # Google Gemma 3
 │   ├── phi-4/        # Microsoft Phi-4
 │   ├── qwen-2.5/     # Alibaba Qwen 2.5
 │   └── ...           # More models

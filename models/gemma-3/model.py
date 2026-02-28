@@ -1,10 +1,10 @@
 """
-Gemma 2 inference on WebGPU via Triton.
+Gemma 3 inference on WebGPU via Triton.
 
 Demonstrates Google's Gemma-family LLM inference using Triton kernels compiled
 to WGSL and executed on the GPU through Dawn's D3D12/Vulkan/Metal backend.
 
-Gemma 2 is a LLaMA-family model featuring:
+Gemma 3 is a LLaMA-family model featuring:
   - RoPE (rotary position embeddings)
   - RMSNorm (root mean square normalization) with pre AND post norms
   - GQA (grouped query attention)
@@ -45,7 +45,7 @@ GEMMA_CONFIGS = {
         "n_embd": 2304, "intermediate_size": 9216,
         "n_vocab": 256000, "rope_theta": 10000.0,
         "rms_norm_eps": 1e-6, "head_dim": 256,
-        "hf_repo": "unsloth/gemma-2-2b",
+        "hf_repo": "unsloth/gemma-3-2b",
         "query_pre_attn_scalar": 256,  # = head_dim
         "attn_logit_softcapping": 50.0,
         "final_logit_softcapping": 30.0,
@@ -54,7 +54,7 @@ GEMMA_CONFIGS = {
 
 
 class GemmaWebGPU(WebGPUModel):
-    """Gemma 2 inference on WebGPU via Triton kernels.
+    """Gemma 3 inference on WebGPU via Triton kernels.
 
     Key differences from SmolLM2/LLaMA:
     - GeGLU activation (GELU * up) instead of SwiGLU (SiLU * up)
@@ -220,7 +220,7 @@ class GemmaWebGPU(WebGPUModel):
             for h in range(n_head):
                 kv_h = h // n_rep
                 scores = (Q[0, h, :] @ K_full[:, kv_h, :].T) * scale
-                # Gemma-2 attention logit soft-capping
+                # gemma-3 attention logit soft-capping
                 if self.attn_logit_softcapping:
                     cap = self.attn_logit_softcapping
                     scores = np.tanh(scores / cap) * cap
@@ -234,7 +234,7 @@ class GemmaWebGPU(WebGPUModel):
                 kv_h = h // n_rep
                 # CPU-based attention with non-standard scale
                 scores = Q[:, h, :] @ K_full[:, kv_h, :].T * scale
-                # Gemma-2 attention logit soft-capping
+                # gemma-3 attention logit soft-capping
                 if self.attn_logit_softcapping:
                     cap = self.attn_logit_softcapping
                     scores = np.tanh(scores / cap) * cap
@@ -294,7 +294,7 @@ class GemmaWebGPU(WebGPUModel):
     def forward(self, token_ids: np.ndarray,
                 use_cache: bool = False,
                 pos_offset: int = 0) -> np.ndarray:
-        """Run Gemma 2 forward pass."""
+        """Run Gemma 3 forward pass."""
         T = len(token_ids)
         wte = self.weights["embed_tokens.weight"]
         # Gemma normalizes embeddings by sqrt(hidden_size)
@@ -311,7 +311,7 @@ class GemmaWebGPU(WebGPUModel):
             x, self._gpu_weights["embed_tokens.weight"],
             self._gpu_weights["zero_bias_V"], self.n_vocab)
 
-        # Gemma-2 final logit soft-capping
+        # gemma-3 final logit soft-capping
         if self.final_logit_softcapping:
             cap = self.final_logit_softcapping
             logits = np.tanh(logits / cap) * cap
@@ -352,9 +352,9 @@ def download_gemma_weights(model_size: str = "2B",
 # ---------------------------------------------------------------------------
 
 def verify_with_random_weights():
-    """Verify Gemma 2 pipeline with small random weights."""
+    """Verify Gemma 3 pipeline with small random weights."""
     print("=" * 60)
-    print("Gemma 2 WebGPU Pipeline Verification (random weights)")
+    print("Gemma 3 WebGPU Pipeline Verification (random weights)")
     print("=" * 60)
 
     n_layer, n_head, n_kv_heads = 2, 4, 2
@@ -519,7 +519,7 @@ def verify_with_random_weights():
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Gemma 2 on WebGPU via Triton")
+        description="Gemma 3 on WebGPU via Triton")
     parser.add_argument("--verify", action="store_true",
                         help="Verify pipeline with random weights")
     parser.add_argument("--model", type=str, default="2B",
