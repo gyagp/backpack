@@ -354,6 +354,7 @@ canvas { display:block; }
   <button onclick="resetZoom()">Reset</button>
   <button onclick="zoomIn()">+ Zoom</button>
   <button onclick="zoomOut()">- Zoom</button>
+  <span id="phase-toggles" style="display:inline-flex;gap:4px;margin-left:8px"></span>
   <span class="range" id="range-label"></span>
 </div>
 <div id="timeline-wrap"><canvas id="c"></canvas></div>
@@ -434,6 +435,59 @@ let allS=cpu.map(e=>e.start_us).concat(gpuMerged.map(e=>e.start_us)).concat(step
 let allE=cpu.map(e=>e.start_us+e.dur_us).concat(gpuMerged.map(e=>e.start_us+e.dur_us)).concat(steps.map(e=>e.start_us+e.dur_us));
 let gMin=allS.length?Math.min(...allS):0, gMax=allE.length?Math.max(...allE):1000;
 
+// --- Phase toggle filtering ---
+// Identify top-level phases: depth-0 CPU events + step groups (prefill, decode)
+const _initPhases = ['imports','download_check','weight_loading','model_init','warmup'];
+const _phases = [];  // {name, start_us, end_us, on}
+for(const e of cpu){
+  if(e._depth===0 && _initPhases.includes(e.name)){
+    _phases.push({name:e.name, start_us:e.start_us, end_us:e.start_us+e.dur_us, on:true});
+  }
+}
+// Add prefill and decode as phase groups
+const pfStep = steps.find(s=>s.name==='prefill');
+if(pfStep) _phases.push({name:'prefill', start_us:pfStep.start_us, end_us:pfStep.start_us+pfStep.dur_us, on:true});
+const decSteps = steps.filter(s=>s.name.startsWith('decode'));
+if(decSteps.length){
+  const ds=Math.min(...decSteps.map(s=>s.start_us));
+  const de=Math.max(...decSteps.map(s=>s.start_us+s.dur_us));
+  _phases.push({name:'decode', start_us:ds, end_us:de, on:true});
+}
+_phases.sort((a,b)=>a.start_us-b.start_us);
+
+// Render toggle buttons
+const _ptDiv=document.getElementById('phase-toggles');
+function renderToggles(){
+  _ptDiv.innerHTML=_phases.map((p,i)=>{
+    const bg=p.on?'#3b4261':'#1a1b26';
+    const fg=p.on?'#c0caf5':'#565f89';
+    const dur=p.end_us-p.start_us;
+    const lb=dur>=1e6?(dur/1e6).toFixed(1)+'s':dur>=1e3?(dur/1e3).toFixed(0)+'ms':dur.toFixed(0)+'us';
+    return`<button onclick="togglePhase(${i})" style="background:${bg};color:${fg};border:1px solid #3b4261;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px">${p.name} <span style="color:#565f89">${lb}</span></button>`;
+  }).join('');
+}
+renderToggles();
+
+function togglePhase(idx){
+  _phases[idx].on=!_phases[idx].on;
+  // Auto-zoom to visible phases
+  const vis=_phases.filter(p=>p.on);
+  if(vis.length){
+    vS=Math.min(...vis.map(p=>p.start_us))-100;
+    vE=Math.max(...vis.map(p=>p.end_us))+100;
+  }
+  renderToggles();draw();
+}
+
+function isEventVisible(start_us, dur_us){
+  if(_phases.every(p=>p.on))return true;
+  const es=start_us, ee=start_us+dur_us;
+  for(const p of _phases){
+    if(!p.on && es>=p.start_us-1 && ee<=p.end_us+1)return false;
+  }
+  return true;
+}
+
 let vS=gMin, vE=gMax, drag=false, dX=0, dVS=0;
 
 function resize(){
@@ -454,6 +508,7 @@ function niceStep(r,mx){
 function drawLane(events, y, getName){
   const w=C.clientWidth;
   for(const e of events){
+    if(!isEventVisible(e.start_us, e.dur_us))continue;
     const n=getName?getName(e):e.name;
     const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);
     if(x2<LW||x1>w)continue;
@@ -494,6 +549,7 @@ function draw(){
 
   // Step markers as background bands + flamechart bars at depth 0
   for(const s of steps){
+    if(!isEventVisible(s.start_us, s.dur_us))continue;
     const x1=t2x(s.start_us),x2=t2x(s.start_us+s.dur_us),bw=Math.max(x2-x1,1);
     if(x2<LW||x1>w)continue;
     const isPrefill=s.name==='prefill';
@@ -520,6 +576,7 @@ function draw(){
   // CPU lane (ops on top of step bands)
   // CPU flamechart: each event at its depth level
   for(const e of cpu){
+    if(!isEventVisible(e.start_us, e.dur_us))continue;
     const n=e.name;
     const y=CPU_Y+e._depth*TH;
     const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);
@@ -600,7 +657,14 @@ addEventListener('mousemove',ev=>{
 });
 addEventListener('mouseup',()=>{drag=false;W.classList.remove('dragging');});
 
-function resetZoom(){vS=gMin;vE=gMax;draw();}
+function resetZoom(){
+  const vis=_phases.filter(p=>p.on);
+  if(vis.length && !_phases.every(p=>p.on)){
+    vS=Math.min(...vis.map(p=>p.start_us))-100;
+    vE=Math.max(...vis.map(p=>p.end_us))+100;
+  }else{vS=gMin;vE=gMax;}
+  draw();
+}
 function zoomIn(){const m=(vS+vE)/2,r=(vE-vS)/2;vS=m-r/2;vE=m+r/2;draw();}
 function zoomOut(){const m=(vS+vE)/2,r=(vE-vS)*2;vS=m-r/2;vE=m+r/2;draw();}
 
