@@ -413,8 +413,12 @@ class SDXLWebGPU(WebGPUModel):
         return h  # (1, TED)
 
     def _resnet_block(self, x, temb, pfx, ch_in, ch):
-        """ResNet block: GN → SiLU → Conv → +time → GN → SiLU → Conv."""
+        """ResNet block: GN → SiLU → Conv → +time → GN → SiLU → Conv.
+
+        Batches GPU dispatches where possible to reduce CPU overhead.
+        """
         C, H, W = x.shape
+        runner = self.cache.runner
         h = self._group_norm(x, pfx + "norm1.weight", pfx + "norm1.bias")
 
         # Detect if conv weights are 3×3 or 1×1
@@ -422,7 +426,7 @@ class SDXLWebGPU(WebGPUModel):
         use_conv2d = (conv1_w.ndim == 4 and conv1_w.shape[2] > 1)
 
         if use_conv2d:
-            # 3×3 path: apply SiLU on spatial tensor, then conv2d
+            # 3×3 path: SiLU is GPU, conv2d does im2col(CPU)+matmul(GPU)
             h_flat = h.transpose(1, 2, 0).reshape(H * W, C)
             h_flat = self._silu_act(h_flat)
             h = h_flat.reshape(H, W, C).transpose(2, 0, 1)
@@ -430,13 +434,41 @@ class SDXLWebGPU(WebGPUModel):
                              pfx + "conv1.bias", ch)
         else:
             h_flat = h.transpose(1, 2, 0).reshape(H * W, C)
+            # Batch SiLU + conv1 + temb_proj
+            runner.begin_batch()
             h_flat = self._silu_act(h_flat)
             h_flat = self._linear_w(h_flat, pfx + "conv1.weight",
                                     pfx + "conv1.bias", N=ch, K=C,
                                     gpu_out=True)
-            if isinstance(h_flat, GPUBuffer):
-                h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
+            temb_silu = self._silu_act(temb) if temb.ndim == 2 else \
+                (temb * (1.0 / (1.0 + np.exp(-temb))))
+            temb_proj_gpu = self._linear_w(
+                temb_silu, pfx + "temb.weight", pfx + "temb.bias",
+                N=ch, K=self.time_emb_dim, gpu_out=True)
+            rb = runner.end_batch(readback_buffers=[h_flat, temb_proj_gpu])
+            h_flat = rb[id(h_flat)].reshape(H * W, ch)
             h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
+            temb_proj = rb[id(temb_proj_gpu)].ravel()
+            h = h + temb_proj[:, None, None]
+
+            h = self._group_norm(h, pfx + "norm2.weight", pfx + "norm2.bias")
+
+            h_flat = h.transpose(1, 2, 0).reshape(H * W, ch)
+            h_flat = self._silu_act(h_flat)
+            h_flat = self._linear_w(h_flat, pfx + "conv2.weight",
+                                    pfx + "conv2.bias", N=ch, K=ch)
+            h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
+
+            # Skip projection
+            if ch_in != ch:
+                proj_name = pfx + "proj.weight"
+                if proj_name in self.weights:
+                    proj_w = self.weights[proj_name]
+                    if proj_w.ndim == 4 and proj_w.shape[2] > 1:
+                        x = self._conv2d(x, proj_name, pfx + "proj.bias", ch)
+                    else:
+                        x = self._conv1x1(x, proj_name, pfx + "proj.bias", ch)
+            return x + h
 
         # Time conditioning: SiLU(temb) → Linear → broadcast add
         temb_silu = self._silu_act(temb) if temb.ndim == 2 else \
@@ -454,15 +486,6 @@ class SDXLWebGPU(WebGPUModel):
             h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
             h = self._conv2d(h, pfx + "conv2.weight",
                              pfx + "conv2.bias", ch)
-        else:
-            h_flat = h.transpose(1, 2, 0).reshape(H * W, ch)
-            h_flat = self._silu_act(h_flat)
-            h_flat = self._linear_w(h_flat, pfx + "conv2.weight",
-                                    pfx + "conv2.bias", N=ch, K=ch,
-                                    gpu_out=True)
-            if isinstance(h_flat, GPUBuffer):
-                h_flat = self.cache.runner.readback(h_flat).reshape(H * W, ch)
-            h = h_flat.reshape(H, W, ch).transpose(2, 0, 1)
 
         # Skip projection (handles both 1×1 and 3×3)
         if ch_in != ch:
@@ -478,18 +501,30 @@ class SDXLWebGPU(WebGPUModel):
     def _self_attn(self, x_flat, ch, prefix):
         """Self-attention on flat spatial tokens (S, C).
 
-        Uses GPU full multi-head attention kernel.
+        Batches QKV projections into a single GPU submission, then runs
+        the GPU multi-head attention kernel.
         """
+        from common.model_base import GPUBuffer
         S, C = x_flat.shape
         hd = self._head_dim
         n_head = ch // hd
+        runner = self.cache.runner
 
-        q = self._linear_w(x_flat, prefix + "to_q.weight",
-                           prefix + "to_q.bias", N=ch, K=C)
-        k = self._linear_w(x_flat, prefix + "to_k.weight",
-                           prefix + "to_k.bias", N=ch, K=C)
-        v = self._linear_w(x_flat, prefix + "to_v.weight",
-                           prefix + "to_v.bias", N=ch, K=C)
+        # Batch QKV projections
+        runner.begin_batch()
+        q_gpu = self._linear_w(x_flat, prefix + "to_q.weight",
+                               prefix + "to_q.bias", N=ch, K=C,
+                               gpu_out=True)
+        k_gpu = self._linear_w(x_flat, prefix + "to_k.weight",
+                               prefix + "to_k.bias", N=ch, K=C,
+                               gpu_out=True)
+        v_gpu = self._linear_w(x_flat, prefix + "to_v.weight",
+                               prefix + "to_v.bias", N=ch, K=C,
+                               gpu_out=True)
+        rb = runner.end_batch(readback_buffers=[q_gpu, k_gpu, v_gpu])
+        q = rb[id(q_gpu)].reshape(S, ch)
+        k = rb[id(k_gpu)].reshape(S, ch)
+        v = rb[id(v_gpu)].reshape(S, ch)
 
         Q = q.reshape(S, n_head, hd).astype(np.float32)
         K_t = k.reshape(S, n_head, hd).astype(np.float32)
@@ -503,20 +538,31 @@ class SDXLWebGPU(WebGPUModel):
         return out
 
     def _cross_attn(self, x_flat, context, ch, prefix):
-        """Cross-attention: Q from x, K/V from context."""
+        """Cross-attention: Q from x, K/V from context.
+
+        Batches Q/K/V projections into a single GPU submission.
+        """
         S, C = x_flat.shape
         S_ctx = context.shape[0]
         hd = self._head_dim
         n_head = ch // hd
+        runner = self.cache.runner
 
-        q = self._linear_w(x_flat, prefix + "to_q.weight",
-                           prefix + "to_q.bias", N=ch, K=C)
-        k = self._linear_w(context, prefix + "to_k.weight",
-                           prefix + "to_k.bias", N=ch,
-                           K=self.context_dim)
-        v = self._linear_w(context, prefix + "to_v.weight",
-                           prefix + "to_v.bias", N=ch,
-                           K=self.context_dim)
+        # Batch Q/K/V projections
+        runner.begin_batch()
+        q_gpu = self._linear_w(x_flat, prefix + "to_q.weight",
+                               prefix + "to_q.bias", N=ch, K=C,
+                               gpu_out=True)
+        k_gpu = self._linear_w(context, prefix + "to_k.weight",
+                               prefix + "to_k.bias", N=ch,
+                               K=self.context_dim, gpu_out=True)
+        v_gpu = self._linear_w(context, prefix + "to_v.weight",
+                               prefix + "to_v.bias", N=ch,
+                               K=self.context_dim, gpu_out=True)
+        rb = runner.end_batch(readback_buffers=[q_gpu, k_gpu, v_gpu])
+        q = rb[id(q_gpu)].reshape(S, ch)
+        k = rb[id(k_gpu)].reshape(S_ctx, ch)
+        v = rb[id(v_gpu)].reshape(S_ctx, ch)
 
         Q = q.reshape(S, n_head, hd).astype(np.float32)
         K_t = k.reshape(S_ctx, n_head, hd).astype(np.float32)

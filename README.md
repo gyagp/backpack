@@ -26,7 +26,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **Whisper** | Speech-to-Text | 39M | FP16 | 160ms encoder, 30 tok/s decode, 0.9s total | Done |
 | **SAM-3** | Segmentation | 31M | FP16 | 2.3s encoder + 33ms decoder (1024×1024) | gated model |
 | **Flux-Klein** | Image Gen | 4B | FP16 | 5.6s/step (512×512), DiT dual-stream |  |
-| **SD-Turbo** | Image Gen | ~5B | FP16 | 7.1s/step (512×512), 1-step distilled |  |
+| **SD-Turbo** | Image Gen | ~5B | FP16 | 7.1s/step (512×512), 1-step distilled | Done |
 | **Z-Image-Turbo** | Image Gen | ~12B | FP16 | 24s/step (512×512), DiT + Qwen3 |  |
 | **SDXL** | Image Gen | ~5B | FP16 | 7.3s/step (512×512), 14.5s with CFG |  |
 
