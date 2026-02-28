@@ -1295,6 +1295,337 @@ def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
     print(f"  Total:         {(t_enc + t_decode)*1000:.0f}ms")
 
 
+def run_interactive(image_path: str):
+    """Interactive SAM segmentation: hover mouse to see masks in real-time.
+
+    Encodes the image once, then runs the fast mask decoder (~33ms) on
+    each mouse position to show the predicted mask overlaid on the image.
+    """
+    from PIL import Image as PILImage
+    import tkinter as tk
+
+    print("=== SAM 2.1 Interactive Mode ===")
+
+    # --- Load weights ---
+    npz_path = os.path.join(_SCRIPT_DIR, "weights", "sam2_hiera_tiny.npz")
+    if not os.path.exists(npz_path):
+        print(f"Weights not found: {npz_path}")
+        print("Run:  python models/sam-3/convert_weights.py")
+        sys.exit(1)
+
+    print("  Loading weights...")
+    data = np.load(npz_path, mmap_mode='r')
+    W = {k: data[k].astype(np.float32) for k in data.files}
+
+    # --- Load image ---
+    pil_img = PILImage.open(image_path).convert("RGB")
+    W_orig, H_orig = pil_img.size
+    img_resized = pil_img.resize((1024, 1024), PILImage.BILINEAR)
+    img_arr = np.array(img_resized, dtype=np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_arr = (img_arr - mean) / std
+    img_chw = img_arr.transpose(2, 0, 1)
+    print(f"  Image: {W_orig}x{H_orig}")
+
+    # --- Encode image ONCE ---
+    print("  Encoding image (this takes a few seconds)...")
+    # Reuse the encoder from run_webgpu_inference
+    # We need to run the full Hiera encoder inline
+    t0 = time.time()
+
+    # Patch embedding
+    pe_w = W["vision_encoder.backbone.patch_embed.projection.weight"]
+    pe_b = W["vision_encoder.backbone.patch_embed.projection.bias"]
+    C_out, C_in, kH, kW = pe_w.shape
+    stride_pe = 4
+    pad = 3
+    _, iH, iW = img_chw.shape
+    img_padded = np.pad(img_chw, ((0,0),(pad,pad),(pad,pad)), mode='constant')
+    _, pH, pW = img_padded.shape
+    oH = (pH - kH) // stride_pe + 1
+    oW = (pW - kW) // stride_pe + 1
+    from numpy.lib.stride_tricks import as_strided
+    s = img_padded.strides
+    col = as_strided(img_padded,
+        shape=(oH, oW, C_in, kH, kW),
+        strides=(s[1]*stride_pe, s[2]*stride_pe, s[0], s[1], s[2]))
+    col_2d = col.reshape(oH * oW, C_in * kH * kW)
+    w_2d = pe_w.reshape(C_out, C_in * kH * kW)
+    x = (col_2d @ w_2d.T + pe_b).reshape(oH, oW, C_out)
+
+    # Hiera blocks
+    stage_dims = [96, 192, 384, 768]
+    stage_blocks = [1, 2, 7, 2]
+    block_idx = 0
+    stage_features = {}
+
+    for stage in range(4):
+        H_s, W_s, C_s = x.shape
+        S = H_s * W_s
+
+        if stage > 0:
+            merge_w = W[f"vision_encoder.backbone.blocks.{block_idx}.dim_reduce.weight"]
+            merge_b = W[f"vision_encoder.backbone.blocks.{block_idx}.dim_reduce.bias"]
+            C_new = stage_dims[stage]
+            x2 = x.reshape(H_s // 2, 2, W_s // 2, 2, C_s)
+            x2 = x2.transpose(0, 2, 1, 3, 4).reshape(H_s // 2 * W_s // 2, 4 * C_s)
+            x = (x2 @ merge_w.T + merge_b).reshape(H_s // 2, W_s // 2, C_new)
+            H_s, W_s, C_s = x.shape
+            S = H_s * W_s
+
+        for b in range(stage_blocks[stage]):
+            x_flat = x.reshape(S, C_s)
+            pfx = f"vision_encoder.backbone.blocks.{block_idx}."
+
+            # LayerNorm
+            ln_w = W[pfx + "norm1.weight"]
+            ln_b = W[pfx + "norm1.bias"]
+            x_mean = x_flat.mean(axis=-1, keepdims=True)
+            x_var = x_flat.var(axis=-1, keepdims=True)
+            x_norm = (x_flat - x_mean) / np.sqrt(x_var + 1e-6)
+            x_norm = x_norm * ln_w + ln_b
+
+            # Self-attention (Q, K, V)
+            qkv = x_norm @ W[pfx + "attn.qkv.weight"].T + W[pfx + "attn.qkv.bias"]
+            HD = C_s // (stage_dims[stage] // 32)  # head_dim varies
+            n_head = C_s // HD if HD > 0 else 1
+            if n_head == 0:
+                n_head = 1
+                HD = C_s
+            Q = qkv[:, :C_s].reshape(S, n_head, HD)
+            K = qkv[:, C_s:2*C_s].reshape(S, n_head, HD)
+            V = qkv[:, 2*C_s:].reshape(S, n_head, HD)
+
+            scale = 1.0 / np.sqrt(HD)
+            Q_h = Q.transpose(1, 0, 2)
+            K_h = K.transpose(1, 2, 0)
+            V_h = V.transpose(1, 0, 2)
+            scores = Q_h @ K_h * scale
+            scores -= scores.max(axis=-1, keepdims=True)
+            exp_s = np.exp(scores)
+            attn = exp_s / exp_s.sum(axis=-1, keepdims=True)
+            attn_out = (attn @ V_h).transpose(1, 0, 2).reshape(S, C_s)
+
+            proj = attn_out @ W[pfx + "attn.proj.weight"].T + W[pfx + "attn.proj.bias"]
+            x_flat = x_flat + proj
+
+            # FFN
+            ln2_w = W[pfx + "norm2.weight"]
+            ln2_b = W[pfx + "norm2.bias"]
+            x_mean2 = x_flat.mean(axis=-1, keepdims=True)
+            x_var2 = x_flat.var(axis=-1, keepdims=True)
+            x_norm2 = (x_flat - x_mean2) / np.sqrt(x_var2 + 1e-6)
+            x_norm2 = x_norm2 * ln2_w + ln2_b
+
+            fc1 = x_norm2 @ W[pfx + "mlp.fc1.weight"].T + W[pfx + "mlp.fc1.bias"]
+            fc1 = np.maximum(0, fc1)  # GELU approximation as ReLU for speed
+            fc2 = fc1 @ W[pfx + "mlp.fc2.weight"].T + W[pfx + "mlp.fc2.bias"]
+            x_flat = x_flat + fc2
+
+            x = x_flat.reshape(H_s, W_s, C_s)
+            block_idx += 1
+
+        stage_features[stage] = x.copy()
+
+    # FPN Neck
+    neck_outputs = {}
+    for stage in range(4):
+        feat = stage_features[stage]
+        H_f, W_f, C_f = feat.shape
+        neck_idx = stage
+        conv_w = W["vision_encoder.neck.convs.%d.weight" % neck_idx]
+        conv_b = W["vision_encoder.neck.convs.%d.bias" % neck_idx]
+        w_flat = conv_w.reshape(256, C_f)
+        feat_flat = feat.reshape(H_f * W_f, C_f)
+        proj = feat_flat @ w_flat.T + conv_b
+        neck_outputs[stage] = proj.reshape(H_f, W_f, 256)
+
+    no_mem = W["no_memory_embedding"].squeeze()
+    image_feat = neck_outputs[2] + no_mem
+    H_feat, W_feat = image_feat.shape[:2]
+    image_tokens = image_feat.reshape(H_feat * W_feat, 256)
+
+    t_enc = time.time() - t0
+    print(f"  Encoder: {t_enc:.1f}s ({H_feat}x{W_feat} features)")
+
+    # Pre-load decoder weights and create decoder
+    webgpu_decoder = SAMMaskDecoderWebGPU(W)
+    pe_weight = W["prompt_encoder.point_embed.weight"]
+    pos_enc_w = W["prompt_encoder.shared_embedding.positional_embedding"]
+    iou_token = W["mask_decoder.iou_token.weight"]
+    mask_tokens = W["mask_decoder.mask_tokens.weight"]
+
+    # Pre-load hypernetwork weights
+    hyper_weights = {}
+    for i in range(4):
+        pfx = "mask_decoder.output_hypernetworks_mlps.%d." % i
+        hyper_weights[i] = {
+            'proj_in_w': W[pfx + "proj_in.weight"],
+            'proj_in_b': W[pfx + "proj_in.bias"],
+            'layers_0_w': W[pfx + "layers.0.weight"],
+            'layers_0_b': W[pfx + "layers.0.bias"],
+            'proj_out_w': W[pfx + "proj_out.weight"],
+            'proj_out_b': W[pfx + "proj_out.bias"],
+        }
+    iou_head = {
+        'proj_in_w': W["mask_decoder.iou_prediction_head.proj_in.weight"],
+        'proj_in_b': W["mask_decoder.iou_prediction_head.proj_in.bias"],
+        'layers_0_w': W["mask_decoder.iou_prediction_head.layers.0.weight"],
+        'layers_0_b': W["mask_decoder.iou_prediction_head.layers.0.bias"],
+        'proj_out_w': W["mask_decoder.iou_prediction_head.proj_out.weight"],
+        'proj_out_b': W["mask_decoder.iou_prediction_head.proj_out.bias"],
+    }
+
+    def decode_point(px_orig, py_orig):
+        """Run mask decoder for a single point. Returns (mask_resized, iou_score)."""
+        # Prompt encoding
+        point_embed_raw = pe_weight[1]  # foreground
+        px_norm = px_orig / W_orig * 2 - 1
+        py_norm = py_orig / H_orig * 2 - 1
+        coords = np.array([px_norm, py_norm], dtype=np.float32)
+        pos_enc = coords[:, None] * pos_enc_w
+        pos_feat = np.concatenate([np.sin(pos_enc), np.cos(pos_enc)],
+                                  axis=-1).ravel()[:256]
+        point_embedding = (point_embed_raw + pos_feat).reshape(1, 256)
+        decoder_tokens = np.concatenate(
+            [point_embedding, iou_token, mask_tokens], axis=0)
+
+        # Decoder
+        output_tokens, image_output = webgpu_decoder.forward(
+            decoder_tokens, image_tokens)
+
+        # Mask prediction
+        mask_out = output_tokens[2:6]
+        image_spatial = image_output.reshape(H_feat, W_feat, 256)
+        masks = np.zeros((4, H_feat, W_feat), dtype=np.float32)
+        for i in range(4):
+            hw = hyper_weights[i]
+            h = mask_out[i:i+1]
+            h = np.maximum(0, h @ hw['proj_in_w'].T + hw['proj_in_b'])
+            h = np.maximum(0, h @ hw['layers_0_w'].T + hw['layers_0_b'])
+            hyper_out = (h @ hw['proj_out_w'].T + hw['proj_out_b']).ravel()
+            masks[i] = (image_spatial[..., :len(hyper_out)] @ hyper_out
+                       ).reshape(H_feat, W_feat)
+
+        # IoU prediction
+        iou_tok = output_tokens[1:2]
+        iou_h = np.maximum(0, iou_tok @ iou_head['proj_in_w'].T +
+                           iou_head['proj_in_b'])
+        iou_h = np.maximum(0, iou_h @ iou_head['layers_0_w'].T +
+                           iou_head['layers_0_b'])
+        iou_scores = (iou_h @ iou_head['proj_out_w'].T +
+                      iou_head['proj_out_b']).ravel()
+
+        best_idx = np.argmax(iou_scores)
+        mask = masks[best_idx]
+        mask_binary = (mask > 0).astype(np.uint8) * 255
+        mask_resized = np.array(PILImage.fromarray(mask_binary).resize(
+            (W_orig, H_orig), PILImage.NEAREST))
+        return mask_resized, iou_scores[best_idx]
+
+    # --- Warm up decoder ---
+    print("  Warming up decoder...")
+    _, _ = decode_point(W_orig // 2, H_orig // 2)
+    print("  Ready! Opening interactive window...")
+
+    # --- Tkinter interactive UI ---
+    # Scale image to fit screen (max 800px wide)
+    display_max = 800
+    scale = min(display_max / W_orig, display_max / H_orig, 1.0)
+    disp_w = int(W_orig * scale)
+    disp_h = int(H_orig * scale)
+    pil_display = pil_img.resize((disp_w, disp_h), PILImage.BILINEAR)
+    img_display = np.array(pil_display)
+
+    root = tk.Tk()
+    root.title(f"SAM 2.1 Interactive — {os.path.basename(image_path)}")
+
+    canvas = tk.Canvas(root, width=disp_w, height=disp_h)
+    canvas.pack()
+
+    # Convert base image to PhotoImage
+    from PIL import ImageTk
+    base_photo = ImageTk.PhotoImage(pil_display)
+    canvas_img = canvas.create_image(0, 0, anchor=tk.NW, image=base_photo)
+
+    # Status label
+    status = tk.Label(root, text="Move mouse over image to segment",
+                      font=("Consolas", 10))
+    status.pack()
+
+    # Throttle: only decode every N ms
+    last_decode_time = [0.0]
+    current_photo = [base_photo]  # prevent GC
+
+    def on_mouse_move(event):
+        now = time.time()
+        if now - last_decode_time[0] < 0.05:  # 50ms throttle
+            return
+        last_decode_time[0] = now
+
+        # Convert display coords to original image coords
+        orig_x = int(event.x / scale)
+        orig_y = int(event.y / scale)
+        if orig_x < 0 or orig_x >= W_orig or orig_y < 0 or orig_y >= H_orig:
+            return
+
+        t0 = time.time()
+        mask_resized, iou = decode_point(orig_x, orig_y)
+        dt = time.time() - t0
+
+        # Create overlay
+        overlay = img_display.copy()
+        mask_disp = np.array(PILImage.fromarray(mask_resized).resize(
+            (disp_w, disp_h), PILImage.NEAREST))
+        mask_bool = mask_disp > 128
+        overlay[mask_bool] = (
+            overlay[mask_bool] * 0.5 +
+            np.array([0, 180, 0], dtype=np.uint8) * 0.5
+        ).astype(np.uint8)
+
+        # Draw point
+        r = max(2, disp_w // 200)
+        cx, cy = event.x, event.y
+        overlay[max(0,cy-r):min(disp_h,cy+r),
+                max(0,cx-r):min(disp_w,cx+r)] = [255, 0, 0]
+
+        # Update canvas
+        pil_overlay = PILImage.fromarray(overlay)
+        photo = ImageTk.PhotoImage(pil_overlay)
+        canvas.itemconfig(canvas_img, image=photo)
+        current_photo[0] = photo  # prevent GC
+
+        pos_pct = (mask_resized > 128).sum() * 100 / mask_resized.size
+        status.config(
+            text=f"({orig_x}, {orig_y})  IoU={iou:.2f}  "
+                 f"Mask={pos_pct:.1f}%  Decode={dt*1000:.0f}ms")
+
+    def on_click(event):
+        """Save current mask on click."""
+        orig_x = int(event.x / scale)
+        orig_y = int(event.y / scale)
+        mask_resized, iou = decode_point(orig_x, orig_y)
+
+        # Save overlay with original resolution
+        img_orig = np.array(pil_img)
+        img_orig[mask_resized > 128] = (
+            img_orig[mask_resized > 128] * 0.5 +
+            np.array([0, 255, 0]) * 0.5).astype(np.uint8)
+        r = max(3, min(W_orig, H_orig) // 100)
+        img_orig[max(0,orig_y-r):min(H_orig,orig_y+r),
+                 max(0,orig_x-r):min(W_orig,orig_x+r)] = [255, 0, 0]
+        out_path = os.path.join(_SCRIPT_DIR, "mask_output.png")
+        PILImage.fromarray(img_orig).save(out_path)
+        status.config(text=f"Saved to {out_path}  "
+                           f"Point=({orig_x},{orig_y})  IoU={iou:.2f}")
+
+    canvas.bind("<Motion>", on_mouse_move)
+    canvas.bind("<Button-1>", on_click)
+
+    root.mainloop()
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
@@ -1303,6 +1634,8 @@ def main():
                         help="Verify pipeline with random weights")
     parser.add_argument("--image", type=str, default=None,
                         help="Input image path for segmentation")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Interactive mode: hover to see masks")
     parser.add_argument("--point-x", type=int, default=None,
                         help="Prompt point X coordinate")
     parser.add_argument("--point-y", type=int, default=None,
@@ -1315,17 +1648,22 @@ def main():
         sys.exit(0 if success else 1)
 
     if args.image:
-        point = None
-        if args.point_x is not None and args.point_y is not None:
-            point = (args.point_x, args.point_y)
-        run_webgpu_inference(args.image, point=point, output=args.output)
+        if args.interactive:
+            run_interactive(args.image)
+        else:
+            point = None
+            if args.point_x is not None and args.point_y is not None:
+                point = (args.point_x, args.point_y)
+            run_webgpu_inference(args.image, point=point, output=args.output)
     else:
         print("SAM 2.1 image segmentation on WebGPU")
         print("Usage:")
         print("  --verify              Run pipeline verification (random weights)")
         print("  --image IMG           Run segmentation on image")
+        print("  --interactive         Interactive hover-to-segment mode")
         print("  --point-x X --point-y Y  Prompt point (default: center)")
         print("\nExample:")
+        print("  python model.py --image photo.jpg --interactive")
         print("  python model.py --image photo.jpg --point-x 256 --point-y 256")
         print("\nModel: facebook/sam2.1-hiera-tiny (155 MB)")
 
