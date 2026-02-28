@@ -50,7 +50,7 @@ from common.kernels import (
     linear_mxfp4_kernel, gptoss_gate_kernel,
     gqa_decode_attn_sink_kernel, add_scaled_kernel,
     qk_norm_rope_kernel,
-    embed_gather_kernel, argmax_kernel,
+    embed_gather_kernel, embed_gather_fp16_kernel, argmax_kernel,
 )
 
 WEBGPU_TARGET = GPUTarget("webgpu", 0, 32)
@@ -1087,6 +1087,17 @@ class WebGPUModel:
             embed_gather_kernel, self._embed_gather_sig,
             {'BLOCK_E': LB},
             num_warps=self._nw(LB))
+        # fp16 variant: reads fp16 embedding, outputs fp32
+        if getattr(self, '_has_fp16_linear', False):
+            self._embed_gather_fp16_sig = {
+                'TokenId': '*i32', 'Embedding': '*fp16', 'Out': '*fp32',
+                'stride_e': 'i32',
+                'BLOCK_E': 'constexpr',
+            }
+            self._embed_gather_fp16_result = self.cache.get_or_compile(
+                embed_gather_fp16_kernel, self._embed_gather_fp16_sig,
+                {'BLOCK_E': LB},
+                num_warps=self._nw(LB))
 
     def _compile_argmax(self):
         """Compile GPU argmax kernel for greedy sampling."""

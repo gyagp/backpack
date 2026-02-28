@@ -1471,6 +1471,29 @@ def embed_gather_kernel(TokenId, Embedding, Out,
         tl.store(Out + offs, row, mask=mask)
 
 
+@triton.jit
+def embed_gather_fp16_kernel(TokenId, Embedding, Out,
+                            stride_e,
+                            BLOCK_E: tl.constexpr):
+    """Gather one embedding row from fp16 table, output fp32.
+
+    TokenId: *i32 buffer with a single token ID
+    Embedding: *fp16 (vocab_size, E) row-major embedding table
+    Out: *fp32 (E,) output buffer
+    stride_e: embedding dimension (E), passed as scalar
+
+    Grid: (1,) — single workgroup copies one row using a loop.
+    Reads fp16, converts to fp32 for output.
+    """
+    token = tl.load(TokenId)
+    base = token * stride_e
+    for start in range(0, stride_e, BLOCK_E):
+        offs = start + tl.arange(0, BLOCK_E)
+        mask = offs < stride_e
+        row = tl.load(Embedding + base + offs, mask=mask).to(tl.float32)
+        tl.store(Out + offs, row, mask=mask)
+
+
 # ---------------------------------------------------------------------------
 # Argmax kernel (GPU-side greedy sampling)
 # ---------------------------------------------------------------------------

@@ -390,11 +390,12 @@ class Phi4WebGPU(WebGPUModel):
         if getattr(self, '_has_fp16_linear', False):
             self._upload_linear_weight_fp16(ekey, self.n_vocab, E)
 
-        # Upload embed_tokens as fp32 for GPU embedding gather
-        runner = self.cache.runner
-        wte_fp32 = self.weights[ekey].astype(np.float32).ravel()
-        self._gpu_weights["embed_tokens.weight.fp32"] = \
-            runner.upload_to_gpu(wte_fp32, "embed_tokens.weight.fp32")
+        # GPU embedding gather uses fp16 when available (saves 2.3GB upload)
+        if not getattr(self, '_has_fp16_linear', False):
+            runner = self.cache.runner
+            wte_fp32 = self.weights[ekey].astype(np.float32).ravel()
+            self._gpu_weights["embed_tokens.weight.fp32"] = \
+                runner.upload_to_gpu(wte_fp32, "embed_tokens.weight.fp32")
 
         # Zero biases (tiny)
         self._upload_zero_bias("zero_bias_E", E)
@@ -1554,15 +1555,20 @@ class Phi4WebGPU(WebGPUModel):
         # Token ID buffer (single i32, fed back between iterations)
         token_id_buf = mkbuf('token_id', 4)
 
-        # Embed gather: token_id → x_buf
-        pl_eg, bgl_eg = get_pl(self._embed_gather_result)
-        nbb_eg = len(self._embed_gather_result.buffer_bindings)
-        embed_fp32 = self._gpu_weights["embed_tokens.weight.fp32"]
-        eg_p = mk_params('eg_p', self._embed_gather_result.param_fields,
+        # Embed gather: token_id → x_buf (use fp16 embed when available)
+        if hasattr(self, '_embed_gather_fp16_result'):
+            _eg_result = self._embed_gather_fp16_result
+            _eg_embed = self._gpu_weights["embed_tokens.weight.fp16"]
+        else:
+            _eg_result = self._embed_gather_result
+            _eg_embed = self._gpu_weights["embed_tokens.weight.fp32"]
+        pl_eg, bgl_eg = get_pl(_eg_result)
+        nbb_eg = len(_eg_result.buffer_bindings)
+        eg_p = mk_params('eg_p', _eg_result.param_fields,
                           {'stride_e': E})
         bg_eg = mk_bg(bgl_eg, [
             (0, token_id_buf[0], token_id_buf[1]),
-            (1, embed_fp32.handle, embed_fp32.size),
+            (1, _eg_embed.handle, _eg_embed.size),
             (2, x_buf[0], x_buf[1]),
             (nbb_eg, eg_p[0], eg_p[1])])
 
