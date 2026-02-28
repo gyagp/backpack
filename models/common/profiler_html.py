@@ -574,15 +574,19 @@ addEventListener('mousemove',ev=>{
         hit={...e,type:'CPU'};break;
       }
     }
-    if(!hit){for(const s of steps)if(t>=s.start_us&&t<=s.start_us+s.dur_us){hit={name:s.name,dur_us:s.dur_us,type:'Step'};break;}}
+    if(!hit){for(const s of steps)if(t>=s.start_us&&t<=s.start_us+s.dur_us){hit={name:s.name,start_us:s.start_us,dur_us:s.dur_us,type:'Step'};break;}}
   }else if(my>=GPU_Y&&my<GPU_Y+TH){
-    for(const e of gpuMerged)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,dur_us:e.dur_us,type:gpuHW.length?'GPU (hw)':'GPU (sub)'};break;}
+    for(const e of gpuMerged)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,start_us:e.start_us,dur_us:e.dur_us,type:gpuHW.length?'GPU (hw)':'GPU (sub)'};break;}
   }
   if(hit){
-    const d=hit.dur_us>=1000?(hit.dur_us/1000).toFixed(2)+' ms':hit.dur_us.toFixed(1)+' us';
+    function fmt(us){return us>=1e6?(us/1e6).toFixed(3)+' s':us>=1000?(us/1000).toFixed(2)+' ms':us.toFixed(1)+' us';}
+    const d=fmt(hit.dur_us);
+    const s=fmt(hit.start_us);
+    const e=fmt(hit.start_us+hit.dur_us);
     let h=`<b>${hit.name}</b>`;
     if(hit.scope)h+=`<br><span class="dim">${hit.scope}</span>`;
     h+=`<br>${hit.type}: ${d}`;
+    h+=`<br><span class="dim">${s} → ${e}</span>`;
     TT.innerHTML=h;TT.style.display='block';
     TT.style.left=(ev.clientX+12)+'px';TT.style.top=(ev.clientY-10)+'px';
   }else TT.style.display='none';
