@@ -1619,6 +1619,63 @@ def run_interactive(image_path: str):
     canvas.bind("<Motion>", on_mouse_move)
     canvas.bind("<Button-1>", on_click)
 
+    # --- "Open Image" button ---
+    def on_open_image():
+        from tkinter import filedialog
+        nonlocal pil_img, W_orig, H_orig, img_chw, image_tokens, H_feat, W_feat
+        nonlocal scale, disp_w, disp_h, pil_display, img_display, base_photo
+
+        path = filedialog.askopenfilename(
+            title="Open Image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+
+        status.config(text=f"Loading {os.path.basename(path)}...")
+        root.update()
+
+        # Load and preprocess new image
+        pil_img = PILImage.open(path).convert("RGB")
+        W_orig, H_orig = pil_img.size
+        img_1024 = pil_img.resize((1024, 1024), PILImage.BILINEAR)
+        img_f = np.array(img_1024, dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std_v = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img_chw = ((img_f - mean) / std_v).transpose(2, 0, 1)
+
+        # Re-encode
+        status.config(text="Encoding image...")
+        root.update()
+        t0 = time.time()
+        image_tokens, H_feat, W_feat = _encode_image_hiera(W, img_chw)
+        t_enc = time.time() - t0
+
+        # Update display
+        scale = min(display_max / W_orig, display_max / H_orig, 1.0)
+        disp_w = int(W_orig * scale)
+        disp_h = int(H_orig * scale)
+        pil_display = pil_img.resize((disp_w, disp_h), PILImage.BILINEAR)
+        img_display = np.array(pil_display)
+        base_photo = ImageTk.PhotoImage(pil_display)
+        canvas.config(width=disp_w, height=disp_h)
+        canvas.itemconfig(canvas_img, image=base_photo)
+        current_photo[0] = base_photo
+
+        root.title(f"SAM 2.1 Interactive — {os.path.basename(path)}")
+        status.config(
+            text=f"Loaded {os.path.basename(path)} "
+                 f"({W_orig}x{H_orig}) — encoded in {t_enc:.1f}s")
+
+    btn_frame = tk.Frame(root)
+    btn_frame.pack(fill=tk.X, pady=2)
+    open_btn = tk.Button(btn_frame, text="📂 Open Image", command=on_open_image,
+                         font=("Segoe UI", 10))
+    open_btn.pack(side=tk.LEFT, padx=5)
+    help_lbl = tk.Label(btn_frame, text="Hover=segment  Click=save  ",
+                        font=("Consolas", 9), fg="gray")
+    help_lbl.pack(side=tk.RIGHT, padx=5)
+
     root.mainloop()
 
 
@@ -1643,10 +1700,30 @@ def main():
         success = verify_with_random_weights()
         sys.exit(0 if success else 1)
 
-    if args.image:
-        if args.interactive:
-            run_interactive(args.image)
-        else:
+    if args.interactive:
+        # Interactive mode — image arg is optional (can open via dialog)
+        img = args.image
+        if not img:
+            # Try default test image
+            default = os.path.join(_SCRIPT_DIR, "..", "assets", "test_image.jpg")
+            if os.path.exists(default):
+                img = default
+            else:
+                # Open file dialog
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                img = filedialog.askopenfilename(
+                    title="Select Image for SAM Segmentation",
+                    filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                               ("All files", "*.*")])
+                root.destroy()
+                if not img:
+                    print("No image selected.")
+                    sys.exit(0)
+        run_interactive(img)
+    elif args.image:
             point = None
             if args.point_x is not None and args.point_y is not None:
                 point = (args.point_x, args.point_y)
@@ -1659,6 +1736,7 @@ def main():
         print("  --interactive         Interactive hover-to-segment mode")
         print("  --point-x X --point-y Y  Prompt point (default: center)")
         print("\nExample:")
+        print("  python model.py --interactive")
         print("  python model.py --image photo.jpg --interactive")
         print("  python model.py --image photo.jpg --point-x 256 --point-y 256")
         print("\nModel: facebook/sam2.1-hiera-tiny (155 MB)")
