@@ -1496,17 +1496,18 @@ def argmax_kernel(Logits, TokenOut, N,
         block_max = tl.max(vals)
         global_max = tl.where(block_max > global_max, block_max, global_max)
 
-    # Pass 2: find first index matching global max
-    result_idx = 0
+    # Pass 2: find first index matching global max (use N+1 as sentinel)
+    sentinel = N + 1
+    result_idx = sentinel
     for start in range(0, N, BLOCK):
         offs = start + tl.arange(0, BLOCK)
         mask = offs < N
         vals = tl.load(Logits + offs, mask=mask, other=-1e30)
         is_max = (vals == global_max) & mask
-        idx_or_n = tl.where(is_max, offs, N)
-        local_min = tl.min(idx_or_n)
+        idx_or_sentinel = tl.where(is_max, offs, sentinel)
+        local_min = tl.min(idx_or_sentinel)
         result_idx = tl.where(local_min < result_idx, local_min, result_idx)
-        # short circuit: if we found it, we have the first one
-        result_idx = tl.where(result_idx > 0, result_idx, local_min)
 
+    # Clamp to valid range (safety)
+    result_idx = tl.where(result_idx >= N, 0, result_idx)
     tl.store(TokenOut, result_idx.to(tl.int32))

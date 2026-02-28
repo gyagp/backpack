@@ -1899,7 +1899,7 @@ class Phi4WebGPU(WebGPUModel):
         #   batch_layers=4 : every 4 layers (8 submits of ~48 dispatches)
         #   batch_layers=32: single batch (1 submit, no overlap)
         runner = self.cache.runner
-        batch_layers = getattr(self, '_batch_layers', 0)
+        batch_layers = getattr(self, '_batch_layers', 4)
         use_batch = (batch_layers > 0
                      and use_cache and self._decode_mode == 'gpu' and T == 1)
         if use_batch:
