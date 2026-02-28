@@ -35,6 +35,8 @@ import sys
 import time
 from typing import Dict, Tuple
 
+_t_script_start = time.perf_counter_ns()
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 
@@ -45,6 +47,8 @@ from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
     add_device_arg, apply_device_arg,
 )
+
+_t_imports_done = time.perf_counter_ns()
 
 
 # ---------------------------------------------------------------------------
@@ -2278,8 +2282,10 @@ def main():
     weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
 
     # Download if needed
+    _t_download_0 = time.perf_counter_ns()
     npz_path, tokenizer_path = download_phi4_weights("mini", weights_dir)
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
+    _t_download_1 = time.perf_counter_ns()
 
     # Quantize mode: convert fp32 → INT4 + fp16
     if args.quantize:
@@ -2361,6 +2367,8 @@ def main():
 
         # Inject pre-recorded init timeline events
         init_phases = [
+            ("imports", _t_script_start, _t_imports_done),
+            ("download_check", _t_download_0, _t_download_1),
             ("weight_loading", _t_weight_load_0, _t_weight_load_1),
             ("model_init", _t_model_init_0, _t_model_init_1),
         ]

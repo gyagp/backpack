@@ -138,6 +138,7 @@ def _compute_summary(cpu_events: List[CPUEvent],
     # Structural scope names that aren't real CPU kernels
     _structural = {"total", "scope_total", "layers", "norm_lm_head",
                    "fast_decode_init", "attn", "mlp",
+                   "imports", "download_check",
                    "weight_loading", "model_init", "kernel_compile",
                    "weight_upload", "warmup", "kv_cache_alloc"}
     for e in cpu_events:

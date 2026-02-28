@@ -804,6 +804,7 @@ class InferenceProfiler:
             # Init/structural phases that aren't per-token ops
             _structural = {"total", "scope_total", "layers", "norm_lm_head",
                            "fast_decode_init", "attn", "mlp",
+                           "imports", "download_check",
                            "weight_loading", "model_init", "kernel_compile",
                            "weight_upload", "warmup", "kv_cache_alloc"}
             for key, times in op_times.items():
