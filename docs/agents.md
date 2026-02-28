@@ -72,6 +72,10 @@ models/<name>/
   model.py              # Main model — WebGPUModel subclass
   convert_weights.py    # Weight converter (HF → npz)
   weights/              # Downloaded/converted weights (gitignored)
+
+models/assets/            # Shared test assets (images, audio, video)
+  test_image.jpg          # General-purpose test image
+  test_speech.wav         # Speech clip for Whisper
 ```
 
 ## Git Conventions
