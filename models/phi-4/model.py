@@ -1802,7 +1802,7 @@ class Phi4WebGPU(WebGPUModel):
 
         # Fast decode path: pre-recorded bind groups, 3 ctypes calls/dispatch
         if (T == 1 and use_cache and self._decode_mode == 'gpu'
-                and not _p
+                and not self._profiling
                 and getattr(self, '_use_q4_gpu', False)):
             if getattr(self, '_use_dp4a', False):
                 # DP4A fast decode: WGSL Q4 kernel with pre-compiled pipeline
