@@ -610,12 +610,14 @@ def run_full_inference(image_path: str, point: Tuple[int, int] = None,
     print("  Running mask decoder transformer (WebGPU)...")
     image_tokens = feat.reshape(C_feat, S_img).T.astype(np.float32)  # (S_img, 256)
 
-    # Add image positional encoding (learnable, from no_memory_embedding or dense PE)
-    # For simplicity, use zero PE (not critical for quality)
+    # Dense positional encoding for image features
+    image_pe = _get_dense_pe(
+        W["prompt_encoder.shared_embedding.positional_embedding"],
+        H_feat, W_feat)
 
     t0 = time.time()
     output_tokens, image_output = webgpu_decoder.forward(
-        decoder_tokens, image_tokens)
+        decoder_tokens, image_tokens, image_pe=image_pe, query_pe=decoder_tokens)
     t_decode = time.time() - t0
     print(f"  Mask decoder: {t_decode*1000:.1f}ms (WebGPU)")
 
@@ -808,11 +810,13 @@ class SAMMaskDecoderWebGPU:
                                K=self.attn_dim)
         return out
 
-    def forward(self, tokens, image_tokens):
-        """Run mask decoder transformer.
+    def forward(self, tokens, image_tokens, image_pe=None, query_pe=None):
+        """Run mask decoder transformer (matches HF Sam2TwoWayTransformer).
 
         tokens: (N_tok, 256) - decoder tokens (point + iou + mask)
         image_tokens: (S_img, 256) - image features
+        image_pe: (S_img, 256) - dense positional encoding for image
+        query_pe: (N_tok, 256) - point embedding (same as tokens input)
 
         Returns:
             output_tokens: (N_tok, 256)
@@ -820,60 +824,104 @@ class SAMMaskDecoderWebGPU:
         """
         queries = tokens.copy()
         keys = image_tokens.copy()
+        if query_pe is None:
+            query_pe = np.zeros_like(queries)
+        if image_pe is None:
+            image_pe = np.zeros_like(keys)
 
         for layer in range(self.n_layers):
             pfx = f"mask_decoder.transformer.layers.{layer}."
 
-            # Self-attention on tokens
-            qn = self._layer_norm(queries, pfx + "layer_norm1.weight",
-                                  pfx + "layer_norm1.bias")
-            q = self._linear(qn, pfx + "self_attn.q_proj.weight",
-                             pfx + "self_attn.q_proj.bias", self.n_embd)
-            k = self._linear(qn, pfx + "self_attn.k_proj.weight",
-                             pfx + "self_attn.k_proj.bias", self.n_embd)
-            v = self._linear(qn, pfx + "self_attn.v_proj.weight",
-                             pfx + "self_attn.v_proj.bias", self.n_embd)
-            attn_out = self._attention(q, k, v, self.n_head)
-            attn_out = self._linear(attn_out, pfx + "self_attn.o_proj.weight",
-                                    pfx + "self_attn.o_proj.bias", self.n_embd)
-            queries = queries + attn_out
+            # 1. Self-attention on tokens
+            # Layer 0: skip_first_layer_pe (no PE added to Q/K)
+            if layer == 0:
+                q_sa = self._linear(queries, pfx + "self_attn.q_proj.weight",
+                                    pfx + "self_attn.q_proj.bias", self.n_embd)
+                k_sa = self._linear(queries, pfx + "self_attn.k_proj.weight",
+                                    pfx + "self_attn.k_proj.bias", self.n_embd)
+                v_sa = self._linear(queries, pfx + "self_attn.v_proj.weight",
+                                    pfx + "self_attn.v_proj.bias", self.n_embd)
+                attn_out = self._attention(q_sa, k_sa, v_sa, self.n_head)
+                attn_out = self._linear(attn_out, pfx + "self_attn.o_proj.weight",
+                                        pfx + "self_attn.o_proj.bias", self.n_embd)
+                queries = queries + attn_out
+            else:
+                q_pe = queries + query_pe
+                q_sa = self._linear(q_pe, pfx + "self_attn.q_proj.weight",
+                                    pfx + "self_attn.q_proj.bias", self.n_embd)
+                k_sa = self._linear(q_pe, pfx + "self_attn.k_proj.weight",
+                                    pfx + "self_attn.k_proj.bias", self.n_embd)
+                v_sa = self._linear(queries, pfx + "self_attn.v_proj.weight",
+                                    pfx + "self_attn.v_proj.bias", self.n_embd)
+                attn_out = self._attention(q_sa, k_sa, v_sa, self.n_head)
+                attn_out = self._linear(attn_out, pfx + "self_attn.o_proj.weight",
+                                        pfx + "self_attn.o_proj.bias", self.n_embd)
+                queries = queries + attn_out
+            queries = self._layer_norm(queries, pfx + "layer_norm1.weight",
+                                       pfx + "layer_norm1.bias")
 
-            # Cross-attention: token → image
-            qn = self._layer_norm(queries, pfx + "layer_norm2.weight",
-                                  pfx + "layer_norm2.bias")
-            kn = self._layer_norm(keys, pfx + "layer_norm3.weight",
-                                  pfx + "layer_norm3.bias")
-            cross_out = self._cross_attn(
-                qn, kn, pfx + "cross_attn_token_to_image.",
-                token_to_image=True)
+            # 2. Cross-attention: tokens → image (Q=tokens+queryPE, K=keys+imagePE, V=keys)
+            q_ca = queries + query_pe
+            k_ca = keys + image_pe
+            q_proj = self._linear(q_ca, pfx + "cross_attn_token_to_image.q_proj.weight",
+                                  pfx + "cross_attn_token_to_image.q_proj.bias", self.attn_dim)
+            k_proj = self._linear(k_ca, pfx + "cross_attn_token_to_image.k_proj.weight",
+                                  pfx + "cross_attn_token_to_image.k_proj.bias", self.attn_dim)
+            v_proj = self._linear(keys, pfx + "cross_attn_token_to_image.v_proj.weight",
+                                  pfx + "cross_attn_token_to_image.v_proj.bias", self.attn_dim)
+            cross_out = self._attention(q_proj, k_proj, v_proj, self.n_head)
+            cross_out = self._linear(cross_out, pfx + "cross_attn_token_to_image.o_proj.weight",
+                                     pfx + "cross_attn_token_to_image.o_proj.bias", self.n_embd,
+                                     K=self.attn_dim)
             queries = queries + cross_out
+            queries = self._layer_norm(queries, pfx + "layer_norm2.weight",
+                                       pfx + "layer_norm2.bias")
 
-            # MLP on tokens
-            qn = self._layer_norm(queries, pfx + "layer_norm4.weight",
-                                  pfx + "layer_norm4.bias")
-            h = self._linear(qn, pfx + "mlp.proj_in.weight",
-                             pfx + "mlp.proj_in.bias", self.mlp_dim)
-            h = np.maximum(0, h)  # ReLU
-            h = self._linear(h, pfx + "mlp.proj_out.weight",
-                             pfx + "mlp.proj_out.bias", self.n_embd,
-                             K=self.mlp_dim)
-            queries = queries + h
+            # 3. MLP on tokens
+            mlp_out = self._linear(queries, pfx + "mlp.proj_in.weight",
+                                   pfx + "mlp.proj_in.bias", self.mlp_dim)
+            mlp_out = np.maximum(0, mlp_out)  # ReLU
+            mlp_out = self._linear(mlp_out, pfx + "mlp.proj_out.weight",
+                                   pfx + "mlp.proj_out.bias", self.n_embd,
+                                   K=self.mlp_dim)
+            queries = queries + mlp_out
+            queries = self._layer_norm(queries, pfx + "layer_norm3.weight",
+                                       pfx + "layer_norm3.bias")
 
-            # Cross-attention: image → token
-            cross_out_img = self._cross_attn(
-                queries, kn, pfx + "cross_attn_image_to_token.",
-                token_to_image=False)
-            keys = keys + cross_out_img
+            # 4. Cross-attention: image → tokens (Q=keys+imagePE, K=queries+queryPE, V=queries)
+            q_ca2 = keys + image_pe
+            k_ca2 = queries + query_pe
+            q_proj2 = self._linear(q_ca2, pfx + "cross_attn_image_to_token.q_proj.weight",
+                                   pfx + "cross_attn_image_to_token.q_proj.bias", self.attn_dim)
+            k_proj2 = self._linear(k_ca2, pfx + "cross_attn_image_to_token.k_proj.weight",
+                                   pfx + "cross_attn_image_to_token.k_proj.bias", self.attn_dim)
+            v_proj2 = self._linear(queries, pfx + "cross_attn_image_to_token.v_proj.weight",
+                                   pfx + "cross_attn_image_to_token.v_proj.bias", self.attn_dim)
+            cross_img = self._attention(q_proj2, k_proj2, v_proj2, self.n_head)
+            cross_img = self._linear(cross_img, pfx + "cross_attn_image_to_token.o_proj.weight",
+                                     pfx + "cross_attn_image_to_token.o_proj.bias", self.n_embd,
+                                     K=self.attn_dim)
+            keys = keys + cross_img
+            keys = self._layer_norm(keys, pfx + "layer_norm4.weight",
+                                    pfx + "layer_norm4.bias")
 
-        # Final cross-attention
+        # Final cross-attention: tokens → image
         fpfx = "mask_decoder.transformer."
-        qn = self._layer_norm(queries,
-                              fpfx + "layer_norm_final_attn.weight",
-                              fpfx + "layer_norm_final_attn.bias")
-        final_out = self._cross_attn(
-            qn, keys, fpfx + "final_attn_token_to_image.",
-            token_to_image=True)
+        q_final = queries + query_pe
+        k_final = keys + image_pe
+        q_f = self._linear(q_final, fpfx + "final_attn_token_to_image.q_proj.weight",
+                           fpfx + "final_attn_token_to_image.q_proj.bias", self.attn_dim)
+        k_f = self._linear(k_final, fpfx + "final_attn_token_to_image.k_proj.weight",
+                           fpfx + "final_attn_token_to_image.k_proj.bias", self.attn_dim)
+        v_f = self._linear(keys, fpfx + "final_attn_token_to_image.v_proj.weight",
+                           fpfx + "final_attn_token_to_image.v_proj.bias", self.attn_dim)
+        final_out = self._attention(q_f, k_f, v_f, self.n_head)
+        final_out = self._linear(final_out, fpfx + "final_attn_token_to_image.o_proj.weight",
+                                 fpfx + "final_attn_token_to_image.o_proj.bias", self.n_embd,
+                                 K=self.attn_dim)
         queries = queries + final_out
+        queries = self._layer_norm(queries, fpfx + "layer_norm_final_attn.weight",
+                                   fpfx + "layer_norm_final_attn.bias")
 
         return queries, keys
 
@@ -889,6 +937,22 @@ def _layer_norm_np(x, w, b, eps=1e-6):
     # Use (E[x^2] - E[x]^2) = var formula — single pass, faster for large arrays
     var = (x32 * x32).mean(axis=-1, keepdims=True) - mean * mean
     return (x32 - mean) * (1.0 / np.sqrt(var + eps)) * w + b
+
+
+def _get_dense_pe(pe_weight, H, W):
+    """Generate dense positional encoding for image features.
+
+    pe_weight: (2, 128) — shared_embedding.positional_embedding
+    H, W: spatial dimensions of image features (e.g. 64, 64)
+    Returns: (H*W, 256) sinusoidal positional encoding
+    """
+    grid_y, grid_x = np.mgrid[0:H, 0:W].astype(np.float32)
+    grid_x = (grid_x + 0.5) / W
+    grid_y = (grid_y + 0.5) / H
+    coords = np.stack([grid_x, grid_y], axis=-1)  # (H, W, 2)
+    proj = coords @ pe_weight.astype(np.float32) * (2 * np.pi)  # (H, W, 128)
+    pe = np.concatenate([np.sin(proj), np.cos(proj)], axis=-1)  # (H, W, 256)
+    return pe.reshape(H * W, 256)
 
 
 def _gelu_np(x):
@@ -1345,8 +1409,12 @@ def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
     print("  Running mask decoder (WebGPU)...")
     webgpu_decoder = SAMMaskDecoderWebGPU(W)
 
+    # Dense positional encoding for image features
+    image_pe = _get_dense_pe(pos_enc_w, H_feat, W_feat)
+
     t0 = time.time()
-    output_tokens, image_output = webgpu_decoder.forward(decoder_tokens, image_tokens)
+    output_tokens, image_output = webgpu_decoder.forward(
+        decoder_tokens, image_tokens, image_pe=image_pe, query_pe=decoder_tokens)
     t_decode = time.time() - t0
     print(f"    Mask decoder: {t_decode*1000:.1f}ms")
 
@@ -1449,6 +1517,7 @@ def run_interactive(image_path: str):
     webgpu_decoder = SAMMaskDecoderWebGPU(W)
     pe_weight = W["prompt_encoder.point_embed.weight"]
     pos_enc_w = W["prompt_encoder.shared_embedding.positional_embedding"]
+    image_pe = _get_dense_pe(pos_enc_w, H_feat, W_feat)
     iou_token = W["mask_decoder.iou_token.weight"]
     mask_tokens = W["mask_decoder.mask_tokens.weight"]
 
@@ -1487,9 +1556,10 @@ def run_interactive(image_path: str):
         decoder_tokens = np.concatenate(
             [point_embedding, iou_token, mask_tokens], axis=0)
 
-        # Decoder
+        # Decoder (with dense PE and query PE)
         output_tokens, image_output = webgpu_decoder.forward(
-            decoder_tokens, image_tokens)
+            decoder_tokens, image_tokens,
+            image_pe=image_pe, query_pe=decoder_tokens)
 
         # Mask prediction
         mask_out = output_tokens[2:6]
@@ -1624,6 +1694,7 @@ def run_interactive(image_path: str):
         from tkinter import filedialog
         nonlocal pil_img, W_orig, H_orig, img_chw, image_tokens, H_feat, W_feat
         nonlocal scale, disp_w, disp_h, pil_display, img_display, base_photo
+        nonlocal image_pe
 
         path = filedialog.askopenfilename(
             title="Open Image",
@@ -1649,6 +1720,7 @@ def run_interactive(image_path: str):
         root.update()
         t0 = time.time()
         image_tokens, H_feat, W_feat = _encode_image_hiera(W, img_chw)
+        image_pe = _get_dense_pe(pos_enc_w, H_feat, W_feat)
         t_enc = time.time() - t0
 
         # Update display
