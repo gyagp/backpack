@@ -158,7 +158,10 @@ cmake -S . -B build -G Ninja `
     -DDAWN_BUILD_PROTOBUF=OFF `
     -DDAWN_WERROR=OFF `
     -DTINT_BUILD_CMD_TOOLS=OFF `
-    -DTINT_BUILD_TESTS=OFF
+    -DTINT_BUILD_TESTS=OFF `
+    -DDAWN_ENABLE_SPIRV_VALIDATION=OFF `
+    -DDAWN_DXC_ENABLE_ASSERTS_IN_NDEBUG=OFF `
+    -DTINT_ENABLE_IR_VALIDATION=OFF
 
 # Build (10-30 minutes)
 cmake --build build --target webgpu_dawn --target dxcompiler

@@ -178,7 +178,11 @@ def invoke_dawn():
         "-DTINT_BUILD_BENCHMARKS=OFF",
         "-DTINT_BUILD_IR_BINARY=OFF",
         "-DTINT_BUILD_TINTD=OFF",
-        "-DTINT_ENABLE_INSTALL=OFF"
+        "-DTINT_ENABLE_INSTALL=OFF",
+        # Disable validation for performance
+        "-DDAWN_ENABLE_SPIRV_VALIDATION=OFF",
+        "-DDAWN_DXC_ENABLE_ASSERTS_IN_NDEBUG=OFF",
+        "-DTINT_ENABLE_IR_VALIDATION=OFF"
     ]
     if not run_cmd(" ".join(cmake_args), check=False):
         write_error("Dawn CMake configure failed")
