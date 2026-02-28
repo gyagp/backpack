@@ -26,7 +26,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | [**SAM-3**](https://huggingface.co/facebook/sam3) | Segmentation | 31M | FP16 | NA | NA | Gated model |
 | [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | PASS | 8.6s/step (512×512), 1-step or CFG | Done |
 | [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | PASS | 133ms TTFT, 208 tok/s decode | Done |
-| [**Whisper**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech-to-Text | 809M | FP16 | PASS | 7.9s encoder, 6.4 tok/s decode, 11s total | Done |
+| [**Whisper Large V3 Turbo**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech-to-Text | 809M | FP16 | PASS | 7.9s encoder, 6.4 tok/s decode, 11s total | Done |
 | [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | | 24s/step (512×512), DiT + Qwen3 |  |
 
 ## Project Structure
