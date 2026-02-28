@@ -175,12 +175,29 @@ class ZImageTurboWebGPU(WebGPUModel):
         )
 
         self._upload_weights_to_gpu()
+        self._precompute_caches()
 
     def _compile_model_kernels(self):
         """Compile Z-Image-specific kernels."""
         self._compile_layer_norm()
         self._compile_silu_mul()
         self._compile_full_attn()
+
+    def _precompute_caches(self):
+        """Pre-cache fp32 norm weights and zero biases."""
+        # Pre-upload zero biases for common sizes
+        runner = self.cache.runner
+        self._zero_biases = {}
+        for sz in (DIM, FF_DIM, DIM * 6, DIM * 3, DIM * 2,
+                   IN_CHANNELS * PATCH_SIZE * PATCH_SIZE, CAP_FEAT_DIM):
+            self._zero_biases[sz] = runner.upload_to_gpu(
+                np.zeros(sz, dtype=np.float32), f"zero_bias_{sz}")
+
+        # Pre-cache fp32 conversions of norm weights
+        self._fp32_cache = {}
+        for name, w in self.weights.items():
+            if "norm" in name and w.ndim == 1 and w.dtype == np.float16:
+                self._fp32_cache[name] = w.astype(np.float32)
 
     def _upload_weights_to_gpu(self):
         """Upload all weights to GPU."""
@@ -207,14 +224,24 @@ class ZImageTurboWebGPU(WebGPUModel):
         """Get weight as GPUBuffer."""
         return self._gpu_weights[name]
 
+    def _get_fp32(self, name: str):
+        """Get weight as fp32 (using pre-cached conversion if available)."""
+        cached = self._fp32_cache.get(name)
+        if cached is not None:
+            return cached
+        w = self.weights[name]
+        return w.astype(np.float32) if w.dtype != np.float32 else w
+
     def _linear_proj(self, x, weight_name: str, out_features: int,
                      gpu_out: bool = False):
         """Bias-free linear projection using fp16 weights."""
         w = self._w(weight_name)
         T = x.shape[0] if not isinstance(x, GPUBuffer) else x.shape[0]
         K = x.shape[1] if not isinstance(x, GPUBuffer) else x.shape[1]
-        zero_bias = np.zeros(out_features, dtype=np.float32)
-        return self._linear_fp16w(x, w, zero_bias, out_features, K=K,
+        bias = self._zero_biases.get(out_features)
+        if bias is None:
+            bias = np.zeros(out_features, dtype=np.float32)
+        return self._linear_fp16w(x, w, bias, out_features, K=K,
                                   gpu_out=gpu_out)
 
     def _linear_with_bias(self, x, weight_name: str, bias_name: str,
@@ -232,16 +259,18 @@ class ZImageTurboWebGPU(WebGPUModel):
     # ------------------------------------------------------------------
 
     def _compute_temb(self, timestep: float) -> np.ndarray:
-        """Compute timestep embedding: sinusoidal → MLP."""
+        """Compute timestep embedding: sinusoidal → MLP (CPU for tiny vectors)."""
         t_scaled = np.array([timestep * T_SCALE], dtype=np.float32)
         t_proj = get_timestep_embedding(t_scaled, TIMESTEP_DIM)  # (1, 256)
 
-        # t_embedder MLP: Linear → SiLU → Linear
-        t_emb = self._linear_with_bias(
-            t_proj, "t_embedder.mlp.0.weight", "t_embedder.mlp.0.bias", DIM)
+        # t_embedder MLP on CPU (tiny: 1×256 → 1×3840)
+        w1 = self._get_fp32("t_embedder.mlp.0.weight")
+        b1 = self._get_fp32("t_embedder.mlp.0.bias")
+        t_emb = t_proj @ w1.T + b1
         t_emb = t_emb * (1.0 / (1.0 + np.exp(-t_emb)))  # SiLU
-        t_emb = self._linear_with_bias(
-            t_emb, "t_embedder.mlp.2.weight", "t_embedder.mlp.2.bias", DIM)
+        w2 = self._get_fp32("t_embedder.mlp.2.weight")
+        b2 = self._get_fp32("t_embedder.mlp.2.bias")
+        t_emb = t_emb @ w2.T + b2
         return t_emb  # (1, DIM)
 
     # ------------------------------------------------------------------
@@ -259,7 +288,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         """
         # RMSNorm
         x = rms_norm_cpu(caption_embeds,
-                         self.weights["cap_embedder.0.weight"].astype(np.float32),
+                         self._get_fp32("cap_embedder.0.weight"),
                          NORM_EPS)
         # Linear projection to DIM
         x = self._linear_with_bias(x,
@@ -298,7 +327,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         # --- Attention ---
         # Pre-norm (attention_norm1 = RMSNorm pre-attn)
         norm_x = rms_norm_cpu(
-            x, self.weights[f"{pfx}.attention_norm1.weight"].astype(np.float32),
+            x, self._get_fp32(f"{pfx}.attention_norm1.weight"),
             NORM_EPS)
         # Apply adaLN: (1 + scale) * norm + shift
         norm_x = (1.0 + scale_attn) * norm_x + shift_attn
@@ -315,10 +344,10 @@ class ZImageTurboWebGPU(WebGPUModel):
 
         # QK-norm
         q = rms_norm_cpu(q,
-                         self.weights[f"{pfx}.attention.norm_q.weight"].astype(np.float32),
+                         self._get_fp32(f"{pfx}.attention.norm_q.weight"),
                          NORM_EPS)
         k = rms_norm_cpu(k,
-                         self.weights[f"{pfx}.attention.norm_k.weight"].astype(np.float32),
+                         self._get_fp32(f"{pfx}.attention.norm_k.weight"),
                          NORM_EPS)
 
         # Apply RoPE
@@ -335,7 +364,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         # Post-norm (attention_norm2 = RMSNorm post-attn)
         attn_out = rms_norm_cpu(
             attn_out,
-            self.weights[f"{pfx}.attention_norm2.weight"].astype(np.float32),
+            self._get_fp32(f"{pfx}.attention_norm2.weight"),
             NORM_EPS)
 
         # Residual with gating
@@ -344,7 +373,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         # --- Feed-forward (SwiGLU) ---
         # Pre-norm (ffn_norm1)
         norm_x = rms_norm_cpu(
-            x, self.weights[f"{pfx}.ffn_norm1.weight"].astype(np.float32),
+            x, self._get_fp32(f"{pfx}.ffn_norm1.weight"),
             NORM_EPS)
         norm_x = (1.0 + scale_ff) * norm_x + shift_ff
 
@@ -359,7 +388,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         # Post-norm (ffn_norm2)
         ff_out = rms_norm_cpu(
             ff_out,
-            self.weights[f"{pfx}.ffn_norm2.weight"].astype(np.float32),
+            self._get_fp32(f"{pfx}.ffn_norm2.weight"),
             NORM_EPS)
 
         x = x + gate_ff * ff_out
@@ -380,7 +409,7 @@ class ZImageTurboWebGPU(WebGPUModel):
 
         # Pre-norm → attention
         norm_x = rms_norm_cpu(
-            x, self.weights[f"{pfx}.attention_norm1.weight"].astype(np.float32),
+            x, self._get_fp32(f"{pfx}.attention_norm1.weight"),
             NORM_EPS)
 
         T = norm_x.shape[0]
@@ -393,10 +422,10 @@ class ZImageTurboWebGPU(WebGPUModel):
         v = v.reshape(T, n_head, HD)
 
         q = rms_norm_cpu(q,
-                         self.weights[f"{pfx}.attention.norm_q.weight"].astype(np.float32),
+                         self._get_fp32(f"{pfx}.attention.norm_q.weight"),
                          NORM_EPS)
         k = rms_norm_cpu(k,
-                         self.weights[f"{pfx}.attention.norm_k.weight"].astype(np.float32),
+                         self._get_fp32(f"{pfx}.attention.norm_k.weight"),
                          NORM_EPS)
 
         q = apply_rotary_emb(q, cos, sin)
@@ -409,13 +438,13 @@ class ZImageTurboWebGPU(WebGPUModel):
         # Post-norm
         attn_out = rms_norm_cpu(
             attn_out,
-            self.weights[f"{pfx}.attention_norm2.weight"].astype(np.float32),
+            self._get_fp32(f"{pfx}.attention_norm2.weight"),
             NORM_EPS)
         x = x + attn_out
 
         # FFN
         norm_x = rms_norm_cpu(
-            x, self.weights[f"{pfx}.ffn_norm1.weight"].astype(np.float32),
+            x, self._get_fp32(f"{pfx}.ffn_norm1.weight"),
             NORM_EPS)
 
         gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
@@ -427,7 +456,7 @@ class ZImageTurboWebGPU(WebGPUModel):
 
         ff_out = rms_norm_cpu(
             ff_out,
-            self.weights[f"{pfx}.ffn_norm2.weight"].astype(np.float32),
+            self._get_fp32(f"{pfx}.ffn_norm2.weight"),
             NORM_EPS)
         x = x + ff_out
         return x
@@ -456,7 +485,7 @@ class ZImageTurboWebGPU(WebGPUModel):
 
         # Attention
         norm_x = rms_norm_cpu(
-            x, self.weights[f"{pfx}.attention_norm1.weight"].astype(np.float32),
+            x, self._get_fp32(f"{pfx}.attention_norm1.weight"),
             NORM_EPS)
         norm_x = (1.0 + scale_attn) * norm_x + shift_attn
 
@@ -470,10 +499,10 @@ class ZImageTurboWebGPU(WebGPUModel):
         v = v.reshape(T, n_head, HD)
 
         q = rms_norm_cpu(q,
-                         self.weights[f"{pfx}.attention.norm_q.weight"].astype(np.float32),
+                         self._get_fp32(f"{pfx}.attention.norm_q.weight"),
                          NORM_EPS)
         k = rms_norm_cpu(k,
-                         self.weights[f"{pfx}.attention.norm_k.weight"].astype(np.float32),
+                         self._get_fp32(f"{pfx}.attention.norm_k.weight"),
                          NORM_EPS)
 
         q = apply_rotary_emb(q, cos, sin)
@@ -485,13 +514,13 @@ class ZImageTurboWebGPU(WebGPUModel):
 
         attn_out = rms_norm_cpu(
             attn_out,
-            self.weights[f"{pfx}.attention_norm2.weight"].astype(np.float32),
+            self._get_fp32(f"{pfx}.attention_norm2.weight"),
             NORM_EPS)
         x = x + gate_attn * attn_out
 
         # FFN
         norm_x = rms_norm_cpu(
-            x, self.weights[f"{pfx}.ffn_norm1.weight"].astype(np.float32),
+            x, self._get_fp32(f"{pfx}.ffn_norm1.weight"),
             NORM_EPS)
         norm_x = (1.0 + scale_ff) * norm_x + shift_ff
 
@@ -504,7 +533,7 @@ class ZImageTurboWebGPU(WebGPUModel):
 
         ff_out = rms_norm_cpu(
             ff_out,
-            self.weights[f"{pfx}.ffn_norm2.weight"].astype(np.float32),
+            self._get_fp32(f"{pfx}.ffn_norm2.weight"),
             NORM_EPS)
         x = x + gate_ff * ff_out
         return x
@@ -955,17 +984,7 @@ def main():
     print(f"\n  Saved to {args.output}")
 
     if args.profile:
-        model.profiler.report()
-        from common.profiler_html import generate_html_report
-        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
-        runner = model.cache.runner
-        generate_html_report(
-            model.profiler,
-            output_path=profile_path,
-            title=f"Z-Image-Turbo — {runner.adapter_info.get('description', 'GPU')}",
-            adapter_info=runner.adapter_info,
-            memory_info=model.get_memory_info())
-        print(f"HTML profile: {profile_path}")
+        model.save_profile(_SCRIPT_DIR, "Z-Image-Turbo")
 
 
 if __name__ == "__main__":

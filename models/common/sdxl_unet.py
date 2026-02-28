@@ -156,6 +156,18 @@ class SDXLWebGPU(WebGPUModel):
             ch_dims.add(model_channels * mult)
         if context_dim > 0:
             ch_dims.add(context_dim)
+        # Add conv2d K dimensions (C_in * kH * kW) for GPU matmul
+        # Also scan 2D weights for FFN and other K dimensions
+        for name, w in weights.items():
+            if w.ndim == 4 and w.size >= 256:
+                K_flat = w.size // w.shape[0]
+                ch_dims.add(K_flat)
+            elif w.ndim == 2 and w.size >= 256:
+                ch_dims.add(w.shape[0])  # N dimension
+                ch_dims.add(w.shape[1])  # K dimension
+                # GEGLU half-dimension
+                if "ff.net.0.proj" in name:
+                    ch_dims.add(w.shape[0] // 2)
 
         super().__init__(
             weights,
@@ -189,6 +201,20 @@ class SDXLWebGPU(WebGPUModel):
                     w32 = w.astype(np.float32) if w.dtype != np.float32 else w
                     self._gpu_weights[name] = self.cache.runner.upload_to_gpu(
                         w32, name)
+            elif w.ndim == 4 and w.size >= 256:
+                # 4D conv weights → reshape to 2D for GPU matmul
+                C_out = w.shape[0]
+                K_flat = w.size // C_out
+                w_2d = w.reshape(C_out, K_flat)
+                rname = name + ".2d"
+                if has_fp16:
+                    fp16 = w_2d.astype(np.float16) if w_2d.dtype != np.float16 else w_2d
+                    self._gpu_weights[rname] = self.cache.runner.upload_to_gpu(
+                        fp16, rname)
+                else:
+                    w32 = w_2d.astype(np.float32) if w_2d.dtype != np.float32 else w_2d
+                    self._gpu_weights[rname] = self.cache.runner.upload_to_gpu(
+                        w32, rname)
             elif w.ndim == 1:
                 w32 = w.astype(np.float32) if w.dtype != np.float32 else w
                 self._gpu_weights[name] = self.cache.runner.upload_to_gpu(
@@ -302,10 +328,17 @@ class SDXLWebGPU(WebGPUModel):
         col_2d = col.reshape(H_out * W_out, C_in * kH * kW)
 
         # matmul with kernel reshaped to (C_out, C_in*kH*kW)
-        w_2d = w.reshape(C_out, C_in * kH * kW).astype(np.float32)
-        out = col_2d.astype(np.float32) @ w_2d.T  # (H_out*W_out, C_out)
-        if b is not None:
-            out = out + b
+        K_flat = C_in * kH * kW
+        rname = w_name + ".2d"
+        col_32 = col_2d.astype(np.float32)
+        if rname in self._gpu_weights:
+            out = self._linear_w(col_32, rname, b_name,
+                                 N=C_out, K=K_flat)
+        else:
+            w_2d = w.reshape(C_out, K_flat).astype(np.float32)
+            out = col_32 @ w_2d.T
+            if b is not None:
+                out = out + b
         return out.reshape(H_out, W_out, C_out).transpose(2, 0, 1)
 
     # ------------------------------------------------------------------

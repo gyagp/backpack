@@ -207,6 +207,16 @@ class FluxKleinWebGPU(WebGPUModel):
         self._ln_zeros = self.cache.runner.upload_to_gpu(
             np.zeros(HIDDEN_DIM, dtype=np.float32), "ln_zeros")
 
+        # Pre-upload zero biases for all needed output sizes
+        runner = self.cache.runner
+        self._zero_biases = {}
+        for sz in (IN_CHANNELS, HIDDEN_DIM, HIDDEN_DIM * 2,
+                   FF_DIM, FF_DIM * 2,
+                   3 * HIDDEN_DIM, 3 * HIDDEN_DIM + 2 * FF_DIM,
+                   HIDDEN_DIM + FF_DIM, JOINT_ATTN_DIM):
+            self._zero_biases[sz] = runner.upload_to_gpu(
+                np.zeros(sz, dtype=np.float32), f"zero_bias_{sz}")
+
         self._upload_weights_to_gpu()
         self._split_single_block_weights()
         self._split_double_block_weights()
@@ -356,12 +366,27 @@ class FluxKleinWebGPU(WebGPUModel):
         After uploading + splitting, only small 1D norm weights are
         needed on CPU (for _qk_norm_rope calls).  Free everything else
         to reclaim ~7 GB of CPU memory.
+        Keeps small temb/modulation weights on CPU for fast CPU matmul.
         """
+        # Keep small weights on CPU for efficient CPU matmul
+        keep = {
+            "time_guidance_embed.timestep_embedder.linear_1.weight",
+            "time_guidance_embed.timestep_embedder.linear_2.weight",
+            "norm_out.linear.weight",
+            "double_stream_modulation_img.linear.weight",
+            "double_stream_modulation_txt.linear.weight",
+            "single_stream_modulation.linear.weight",
+        }
         large = [k for k, v in self.weights.items()
-                 if isinstance(v, np.ndarray) and v.ndim >= 2]
+                 if isinstance(v, np.ndarray) and v.ndim >= 2
+                 and k not in keep]
         for k in large:
             del self.weights[k]
         import gc; gc.collect()
+        # Pre-convert kept weights to fp32 for CPU matmul
+        for k in keep:
+            if k in self.weights and self.weights[k].dtype != np.float32:
+                self.weights[k] = self.weights[k].astype(np.float32)
         print(f"  Freed {len(large)} large CPU weight arrays")
 
     # ------------------------------------------------------------------
@@ -379,8 +404,10 @@ class FluxKleinWebGPU(WebGPUModel):
         # Bias-free model (all bias=False)
         T = x.shape[0] if not isinstance(x, GPUBuffer) else x.shape[0]
         K = x.shape[1] if not isinstance(x, GPUBuffer) else x.shape[1]
-        zero_bias = np.zeros(out_features, dtype=np.float32)
-        return self._linear_fp16w(x, w, zero_bias, out_features, K=K,
+        bias = self._zero_biases.get(out_features)
+        if bias is None:
+            bias = np.zeros(out_features, dtype=np.float32)
+        return self._linear_fp16w(x, w, bias, out_features, K=K,
                                   gpu_out=gpu_out)
 
     def _layer_norm_no_affine(self, x, gpu_out: bool = False):
@@ -402,12 +429,22 @@ class FluxKleinWebGPU(WebGPUModel):
         # Sinusoidal projection
         t_proj = get_timestep_embedding(t_scaled, TIMESTEP_CHANNELS)  # (1, 256)
 
-        # Timestep MLP: Linear → SiLU → Linear
-        t_emb = self._linear(t_proj, "time_guidance_embed.timestep_embedder.linear_1.weight",
-                             HIDDEN_DIM)  # (1, 3072)
-        t_emb = t_emb * (1.0 / (1.0 + np.exp(-t_emb)))  # SiLU on CPU
-        t_emb = self._linear(t_emb, "time_guidance_embed.timestep_embedder.linear_2.weight",
-                             HIDDEN_DIM)
+        # Timestep MLP on CPU (tiny vectors, faster than GPU dispatch)
+        w1 = self.weights.get("time_guidance_embed.timestep_embedder.linear_1.weight")
+        w2 = self.weights.get("time_guidance_embed.timestep_embedder.linear_2.weight")
+        if w1 is not None and w2 is not None:
+            t_emb = t_proj @ w1.T  # (1, 3072)
+            t_emb = t_emb * (1.0 / (1.0 + np.exp(-t_emb)))  # SiLU
+            t_emb = t_emb @ w2.T  # (1, 3072)
+        else:
+            # Fallback to GPU path
+            t_emb = self._linear(t_proj,
+                                 "time_guidance_embed.timestep_embedder.linear_1.weight",
+                                 HIDDEN_DIM)
+            t_emb = t_emb * (1.0 / (1.0 + np.exp(-t_emb)))  # SiLU
+            t_emb = self._linear(t_emb,
+                                 "time_guidance_embed.timestep_embedder.linear_2.weight",
+                                 HIDDEN_DIM)
 
         return t_emb  # (1, 3072)
 
@@ -423,7 +460,12 @@ class FluxKleinWebGPU(WebGPUModel):
         """
         mod = temb * (1.0 / (1.0 + np.exp(-temb)))  # SiLU
         out_dim = HIDDEN_DIM * 3 * num_param_sets
-        mod = self._linear(mod, weight_name, out_dim)  # (1, out_dim)
+        # CPU matmul for small temb (1×3072) × (out_dim×3072)^T
+        w = self.weights.get(weight_name)
+        if w is not None:
+            mod = mod @ w.T
+        else:
+            mod = self._linear(mod, weight_name, out_dim)
 
         # Chunk into num_param_sets groups of 3, each (1, D)
         chunks = np.split(mod, 3 * num_param_sets, axis=-1)
@@ -912,7 +954,12 @@ class FluxKleinWebGPU(WebGPUModel):
         # AdaLayerNormContinuous: LayerNorm → SiLU(temb) → Linear → scale + shift
         norm_x = layer_norm_cpu(hidden_states, EPS)
         emb = temb * (1.0 / (1.0 + np.exp(-temb)))  # SiLU
-        emb = self._linear(emb, "norm_out.linear.weight", HIDDEN_DIM * 2)
+        # norm_out linear on CPU (tiny: 1×3072 → 1×6144)
+        w = self.weights.get("norm_out.linear.weight")
+        if w is not None:
+            emb = emb @ w.T
+        else:
+            emb = self._linear(emb, "norm_out.linear.weight", HIDDEN_DIM * 2)
         scale, shift = np.split(emb, 2, axis=-1)
         norm_x = norm_x * (1.0 + scale) + shift
 
@@ -1042,10 +1089,11 @@ class FluxKleinWebGPU(WebGPUModel):
                 concat_cos, concat_sin, i,
                 gpu_state=True,
                 _profile=(_profile and i < 3))
-            if _profile: _labels.append(_mark(f"single_{i}"))
         # Submit batch and readback in one shot
+        if _profile: _labels.append(_mark("single_record"))
         rb_results = runner.end_batch(readback_buffers=[hs_gpu])
         hidden_states = rb_results[id(hs_gpu)].reshape(hs_gpu.shape)
+        if _profile: _labels.append(_mark("single_exec"))
 
         # 8. Remove text tokens
         hidden_states = hidden_states[T_txt:]

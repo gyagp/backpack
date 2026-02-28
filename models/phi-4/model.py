@@ -671,47 +671,46 @@ class Phi4WebGPU(WebGPUModel):
         else:
             x_np = x
 
-        _p = p and p.enabled
 
-        if _p: p._cpu.begin("rms_norm_1")
+        if self._profiling: self._begin_cpu("rms_norm_1")
         rn1 = self._rms_norm_cpu(x_np, pfx + "input_layernorm.weight")
-        if _p: p._cpu.end("rms_norm_1")
+        if self._profiling: self._end_cpu("rms_norm_1")
 
-        if _p: p._cpu.begin("qkv_linear")
+        if self._profiling: self._begin_cpu("qkv_linear")
         qkv = self._cpu_matmul(rn1, pfx + "self_attn.qkv_proj.weight",
                                self.qkv_out, self.n_embd)
-        if _p: p._cpu.end("qkv_linear")
+        if self._profiling: self._end_cpu("qkv_linear")
 
-        if _p: p._cpu.begin("attention_cpu")
+        if self._profiling: self._begin_cpu("attention_cpu")
         attn_out = self._decode_attention(qkv, layer, positions)
-        if _p: p._cpu.end("attention_cpu")
+        if self._profiling: self._end_cpu("attention_cpu")
 
-        if _p: p._cpu.begin("o_proj")
+        if self._profiling: self._begin_cpu("o_proj")
         o_out = self._cpu_matmul(attn_out, pfx + "self_attn.o_proj.weight",
                                  self.n_embd, self.n_head * self.head_dim)
-        if _p: p._cpu.end("o_proj")
+        if self._profiling: self._end_cpu("o_proj")
 
-        if _p: p._cpu.begin("res_add_norm")
+        if self._profiling: self._begin_cpu("res_add_norm")
         x_np = x_np + o_out
         rn2 = self._rms_norm_cpu(x_np, pfx + "post_attention_layernorm.weight")
-        if _p: p._cpu.end("res_add_norm")
+        if self._profiling: self._end_cpu("res_add_norm")
 
-        if _p: p._cpu.begin("gate_up")
+        if self._profiling: self._begin_cpu("gate_up")
         gate_up = self._cpu_matmul(rn2, pfx + "mlp.gate_up_proj.weight",
                                    self.gate_up_out, self.n_embd)
-        if _p: p._cpu.end("gate_up")
+        if self._profiling: self._end_cpu("gate_up")
 
-        if _p: p._cpu.begin("silu_mul_cpu")
+        if self._profiling: self._begin_cpu("silu_mul_cpu")
         IM = self.intermediate_size
         gate = gate_up[0, :IM]
         up = gate_up[0, IM:]
         h = (gate / (1.0 + np.exp(-gate)) * up).reshape(1, IM)
-        if _p: p._cpu.end("silu_mul_cpu")
+        if self._profiling: self._end_cpu("silu_mul_cpu")
 
-        if _p: p._cpu.begin("down_proj")
+        if self._profiling: self._begin_cpu("down_proj")
         mlp_out = self._cpu_matmul(h, pfx + "mlp.down_proj.weight",
                                    self.n_embd, IM)
-        if _p: p._cpu.end("down_proj")
+        if self._profiling: self._end_cpu("down_proj")
 
         return x_np + mlp_out
 
@@ -727,7 +726,6 @@ class Phi4WebGPU(WebGPUModel):
         BHD = self._attn_bhd
         half_rot = self.rotary_dim // 2
 
-        _p = p and p.enabled
 
         # Ensure x is on GPU (first layer gets numpy embedding)
         if not x_is_gpu:
@@ -736,13 +734,13 @@ class Phi4WebGPU(WebGPUModel):
             x.shape = (T, self.n_embd)
 
         # 1. RMSNorm
-        if _p: self.cache._gpu_op_name = f"L{layer}/norm1"
+        if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
 
         # 2. QKV projection (stays on GPU)
-        if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
         qkv = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
                          self._gpu_weights["zero_bias_QKV"], self.qkv_out,
                          gpu_out=True)
@@ -759,7 +757,7 @@ class Phi4WebGPU(WebGPUModel):
         sin_data = self._prefill_sin
 
         # 3. GPU RoPE Q
-        if _p: self.cache._gpu_op_name = f"L{layer}/rope_q"
+        if self._profiling: self._set_gpu_op(f"L{layer}/rope_q")
         q_rope_out = self.cache.run(
             self._rope_prefill_result, grid=(T, n_head),
             buffers={
@@ -775,7 +773,7 @@ class Phi4WebGPU(WebGPUModel):
         q_rope.shape = (T, n_head, BHD)
 
         # 4. GPU RoPE K + V scatter to KV cache
-        if _p: self.cache._gpu_op_name = f"L{layer}/rope_kv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/rope_kv")
         K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
         self.cache.run(
             self._rope_kv_prefill_result, grid=(T, n_kv),
@@ -794,7 +792,7 @@ class Phi4WebGPU(WebGPUModel):
         self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
 
         # 5. Multi-head causal attention
-        if _p: self.cache._gpu_op_name = f"L{layer}/attn"
+        if self._profiling: self._set_gpu_op(f"L{layer}/attn")
         scale = float(1.0 / np.sqrt(HD))
         attn_result = self.cache.run(
             self._mh_attn_result, grid=(T, n_head),
@@ -816,31 +814,31 @@ class Phi4WebGPU(WebGPUModel):
         attn_gpu.shape = (T, n_head * HD)
 
         # 6. O projection
-        if _p: self.cache._gpu_op_name = f"L{layer}/o_proj"
+        if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o_bias = self._gpu_weights.get("zero_bias_QO",
                                         self._gpu_weights["zero_bias_E"])
         o_out = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
                            o_bias, self.n_embd, gpu_out=True)
 
         # 7. Residual add (in-place to avoid toggle pool aliasing)
-        if _p: self.cache._gpu_op_name = f"L{layer}/res1"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res1")
         self._add_inplace(x, o_out)
 
         # 8. RMSNorm
-        if _p: self.cache._gpu_op_name = f"L{layer}/norm2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
         rn2 = self._rms_norm(
             x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
             gpu_out=True)
 
         # 9. MLP (fused gate_up + silu_mul + down)
-        if _p: self.cache._gpu_op_name = f"L{layer}/mlp"
+        if self._profiling: self._set_gpu_op(f"L{layer}/mlp")
         mlp = self._mlp_block(rn2, layer, gpu_out=True)
 
         # 10. Residual add (in-place)
-        if _p: self.cache._gpu_op_name = f"L{layer}/res2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res2")
         self._add_inplace(x, mlp)
 
-        if _p: self.cache._gpu_op_name = None
+        if self._profiling: self._clear_gpu_op()
         return x
 
     # ------------------------------------------------------------------
@@ -1539,7 +1537,6 @@ class Phi4WebGPU(WebGPUModel):
         # Ensure layer weights are on GPU
         self._upload_layer_weights(layer)
 
-        _p = p and p.enabled
         HD = self.head_dim
         E = self.n_embd
         n_head = self.n_head
@@ -1560,19 +1557,19 @@ class Phi4WebGPU(WebGPUModel):
             x_gpu = x
 
         # 1. GPU RMSNorm (input layernorm)
-        if _p: self.cache._gpu_op_name = f"L{layer}/norm1"
+        if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x_gpu, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
 
         # 2. QKV projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
         qkv_gpu = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
                              self._gpu_weights["zero_bias_QKV"],
                              self.qkv_out, gpu_out=True)
 
         # 3. GPU RoPE for Q heads
-        if _p: self.cache._gpu_op_name = f"L{layer}/rope_q"
+        if self._profiling: self._set_gpu_op(f"L{layer}/rope_q")
         q_rot_out = self.cache.run(
             self._rope_result, grid=(n_head,),
             buffers={
@@ -1593,7 +1590,7 @@ class Phi4WebGPU(WebGPUModel):
         K_cache_gpu, V_cache_gpu, cur_len = self._gpu_kv_cache[layer]
         cache_offset = cur_len * n_kv * HD
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/rope_kv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/rope_kv")
         self.cache.run(
             self._rope_kv_result, grid=(n_kv,),
             buffers={
@@ -1616,7 +1613,7 @@ class Phi4WebGPU(WebGPUModel):
         self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T_total)
 
         # 5. GPU GQA decode attention
-        if _p: self.cache._gpu_op_name = f"L{layer}/attn"
+        if self._profiling: self._set_gpu_op(f"L{layer}/attn")
         scale = np.float32(1.0 / np.sqrt(HD))
         kv_stride = n_kv * HD
         attn_out = self.cache.run(
@@ -1641,38 +1638,38 @@ class Phi4WebGPU(WebGPUModel):
         # 6. O projection → stays on GPU
         o_bias = self._gpu_weights.get("zero_bias_QO",
                                        self._gpu_weights["zero_bias_E"])
-        if _p: self.cache._gpu_op_name = f"L{layer}/o_proj"
+        if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o_gpu = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
                            o_bias, E, gpu_out=True)
 
         # 7. Residual add: x += o_proj (in-place)
-        if _p: self.cache._gpu_op_name = f"L{layer}/res1"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res1")
         self._add_inplace(x_gpu, o_gpu)
 
         # 8. GPU RMSNorm (post-attention layernorm)
-        if _p: self.cache._gpu_op_name = f"L{layer}/norm2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
         rn2 = self._rms_norm(
             x_gpu, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
             gpu_out=True)
 
         # 9. Gate_up projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/gate_up"
+        if self._profiling: self._set_gpu_op(f"L{layer}/gate_up")
         gate_up_gpu = self._proj(rn2, pfx + "mlp.gate_up_proj.weight",
                                  self._gpu_weights["zero_bias_GU"],
                                  self.gate_up_out, gpu_out=True)
 
         # 10. SiLU*mul → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/silu_mul"
+        if self._profiling: self._set_gpu_op(f"L{layer}/silu_mul")
         h_gpu = self._silu_mul_fused(gate_up_gpu, IM, gpu_out=True)
 
         # 11. Down projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/down"
+        if self._profiling: self._set_gpu_op(f"L{layer}/down")
         down_gpu = self._proj(h_gpu, pfx + "mlp.down_proj.weight",
                               self._gpu_weights["zero_bias_E"],
                               E, K=IM, gpu_out=True)
 
         # 12. Residual add: x += down (in-place)
-        if _p: self.cache._gpu_op_name = f"L{layer}/res2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res2")
         self._add_inplace(x_gpu, down_gpu)
 
         x_gpu.shape = (1, E)
@@ -1800,8 +1797,6 @@ class Phi4WebGPU(WebGPUModel):
                 pos_offset: int = 0) -> np.ndarray:
         """Run Phi-4 mini forward pass."""
         from common.model_base import GPUBuffer
-        p = self.profiler
-        _p = p and p.enabled
 
         T = len(token_ids)
 
@@ -1824,9 +1819,9 @@ class Phi4WebGPU(WebGPUModel):
 
         wte = self.weights["embed_tokens.weight"]
 
-        if _p: p._cpu.begin("embed")
+        if self._profiling: self._begin_cpu("embed")
         x = wte[token_ids]
-        if _p: p._cpu.end("embed")
+        if self._profiling: self._end_cpu("embed")
 
         positions = np.arange(pos_offset, pos_offset + T, dtype=np.int32)
 
@@ -1859,8 +1854,8 @@ class Phi4WebGPU(WebGPUModel):
             runner.end_batch()
 
         # Final RMSNorm
-        if _p:
-            self.cache._gpu_op_name = "final_norm"
+        if self._profiling:
+            self._set_gpu_op("final_norm")
         # Check if GPU lm_head is available (fp16 embed weights uploaded)
         gpu_lm_head = ("embed_tokens.weight.fp16" in self._gpu_weights
                        and isinstance(x, GPUBuffer))
@@ -1872,23 +1867,23 @@ class Phi4WebGPU(WebGPUModel):
             x = self._rms_norm_cpu(x, "norm.weight")
         else:
             x = self._rms_norm(x, self._gpu_weights["norm.weight"])
-        if _p:
-            self.cache._gpu_op_name = None
+        if self._profiling:
+            self._clear_gpu_op()
 
         # LM head (tied with embed_tokens)
         if gpu_lm_head:
-            if _p:
-                self.cache._gpu_op_name = "lm_head"
+            if self._profiling:
+                self._set_gpu_op("lm_head")
             logits = self._linear_fp16w(
                 x, self._gpu_weights["embed_tokens.weight.fp16"],
                 self._gpu_weights["zero_bias_V"], self.n_vocab,
                 K=self.n_embd)
-            if _p:
-                self.cache._gpu_op_name = None
+            if self._profiling:
+                self._clear_gpu_op()
         else:
-            if _p: p._cpu.begin("lm_head")
+            if self._profiling: self._begin_cpu("lm_head")
             logits = np.float32(x @ wte.T)
-            if _p: p._cpu.end("lm_head")
+            if self._profiling: self._end_cpu("lm_head")
         return logits
 
 
@@ -2189,7 +2184,6 @@ def main():
 
         # Profile a short generation
         from common.profiler import InferenceProfiler
-        from common.profiler_html import generate_html_report
         tokenizer_loaded = load_tokenizer(tokenizer_path)
         tokens = tokenizer_loaded.encode(args.prompt)
         token_ids = np.array(tokens, dtype=np.int32)
@@ -2224,19 +2218,7 @@ def main():
                 with model.profiler.cpu("sampling"):
                     next_logits = logits[-1, :].copy()
 
-        model.profiler.finish()
-        model.profiler.report()
-
-        # Generate HTML timeline report
-        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
-        generate_html_report(
-            model.profiler,
-            output_path=profile_path,
-            title=f"Phi-4 mini — {adapter.get('description', 'GPU')} ({adapter.get('backend', '')})",
-            adapter_info=adapter,
-            memory_info=model.get_memory_info())
-
-        model.disable_profiling()
+        model.save_profile(_SCRIPT_DIR, "Phi-4 mini")
         return
 
     generate(model, args.prompt, tokenizer,

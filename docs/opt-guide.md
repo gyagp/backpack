@@ -338,6 +338,71 @@ WebGPU compute shaders have specific constraints compared to CUDA:
   from multiple threads to the same address can silently lose data.
   Guard scalar stores with `if local_id.x == 0u { ... }`.
 
+### 2.8 Async Pipeline Creation
+
+GPU compute pipeline creation (`createComputePipeline`) is **synchronous
+and expensive** — each call blocks the CPU while the driver compiles the
+shader.  For LLMs with 20–64 layers and 5–10 distinct kernels, this
+means 50–200 blocking compilations at model init, adding 200–800 ms
+of startup latency.
+
+**The problem**: During prefill, every layer's first dispatch triggers
+pipeline creation if not cached.  With synchronous creation, the CPU
+stalls on each new pipeline, serializing compilation with execution.
+
+**Solution (implemented in common)**: The `WebGPUModel._warmup_gpu_pipelines()`
+method in `model_base.py` now uses **parallel async compilation** via
+`DawnRunner.prefetch_pipelines_async()`.  All compiled kernel specs are
+collected and submitted to a thread pool.  Each worker calls
+`_get_or_create_pipeline()` concurrently; all compilations overlap:
+
+```
+Init:
+  Thread 1: compile rms_norm_loop (BLOCK=128)
+  Thread 2: compile linear_loop_fp16w (K=5120)
+  Thread 3: compile linear_q4 (K=5120)
+  Thread 4: compile silu_mul_fused (N=17408)
+  ...
+  barrier: wait for all pipelines
+  
+Prefill:
+  All pipelines already cached → zero compilation during forward
+```
+
+This reduces total warm-up time from `sum(compile_times)` (serial) to
+`max(compile_times)` (parallel).  For models with 20+ unique kernel
+configs, this is a 5–10× init speedup.
+
+All models inherit this automatically from `WebGPUModel` — no per-model
+code needed.  The warm-up runs at the end of `_compile_kernels()`, before
+weight upload begins.
+
+**How it works under the hood**:
+
+1. `_warmup_gpu_pipelines()` scans all `self.*_result` attributes
+   (compiled Triton results with `.wgsl`).
+2. Collects `(wgsl, buffer_bindings, param_fields)` specs.
+3. Calls `runner.prefetch_pipelines_async(specs)` which:
+   - Deduplicates by WGSL hash
+   - Submits uncached pipelines to a `ThreadPoolExecutor`
+   - Each worker calls `wgpuDeviceCreateComputePipeline` (releases GIL)
+   - Waits for all to complete
+
+```python
+# model_base.py — _warmup_gpu_pipelines()
+specs = [(r.wgsl, r.buffer_bindings, r.param_fields)
+         for r in all_compiled_results]
+runner.prefetch_pipelines_async(specs)  # parallel compilation
+```
+
+**Why threading works**: Dawn's D3D12 backend delegates to `dxcapi.dll`
+(DirectX Shader Compiler) which is thread-safe.  Python threading works
+because pipeline creation releases the GIL during the native C call.
+
+**Future**: For even lower latency, overlap pipeline warm-up with weight
+upload by running them concurrently in separate threads.  Currently
+warm-up completes before upload begins.
+
 ---
 
 ## 3. Profiling
@@ -434,28 +499,88 @@ per-op timing alone cannot:
    near-identical kernel times regardless of compute intensity,
    the kernel is memory-bound. Fix: fp16 weights, quantization.
 
-### 3.3 Per-Layer Profiling with CPU Scopes
+### 3.3 CPU Profiling Requirements
 
-For decode-path optimization, the profiler also integrates directly
-into model code via CPU scopes:
+The CPU timeline in the profiler report must show **where CPU cycles
+are actually spent** — not just top-level phase labels like `prefill`
+or `decode_0`.  These phase wrappers tell you nothing about which
+operation is the bottleneck.
 
-```python
-# In _decode_cpu() or _transformer_block():
-p = self.profiler
-if p and p.enabled:
-    p._cpu.begin("rms_norm_1")
-    rn1 = self._rms_norm_cpu(x, ...)
-    p._cpu.end("rms_norm_1")
-
-    p._cpu.begin("qkv_linear")
-    qkv = self._cpu_matmul(rn1, ...)
-    p._cpu.end("qkv_linear")
+**Bad output** (useless for optimization):
+```
+--- CPU Timeline ---
+  Operation                         Total  Count      Avg      %
+  prefill                        2163.57ms     1x 2163.565ms   0.0%
+  decode_1                        249.93ms     1x 249.927ms   0.0%
+  decode_2                        204.09ms     1x 204.091ms   0.0%
+  ...
 ```
 
-This produces per-op timing within each layer, making it easy to see
-which operation is the bottleneck (matmul vs. attention vs. norm).
+**Good output** (actionable):
+```
+--- CPU Timeline ---
+  Operation                         Total  Count      Avg      %
+  attn_qk                         892.3ms   512x   1.743ms  42.1%
+  attn_sv                         340.1ms   512x   0.664ms  16.1%
+  rms_norm                        201.4ms  1024x   0.197ms   9.5%
+  ssm_scan                        188.7ms   384x   0.491ms   8.9%
+  cpu_matmul                      156.2ms   128x   1.221ms   7.4%
+  rope                             89.3ms   512x   0.174ms   4.2%
+  sampling                         38.9ms    20x   1.948ms   1.8%
+  ...
+```
 
-### 3.4 Identifying Bottlenecks
+**How to instrument**: Wrap every meaningful CPU operation with
+scoped profiler calls.  Use consistent operation names across layers
+so the report aggregates them:
+
+```python
+def _decode_cpu(self, x, layer, positions):
+    _p = self.profiler and self.profiler.enabled
+    _cpu = self.profiler._cpu if _p else None
+
+    if _p: _cpu.begin(f"L{layer}/rms_norm")
+    rn1 = self._rms_norm_vec(x, ...)
+    if _p: _cpu.end(f"L{layer}/rms_norm")
+
+    if _p: _cpu.begin(f"L{layer}/attn_qk")
+    scores = Q @ K.T * scale
+    if _p: _cpu.end(f"L{layer}/attn_qk")
+
+    if _p: _cpu.begin(f"L{layer}/ssm_scan")
+    state[:] = A_disc * state + x_dt * B
+    if _p: _cpu.end(f"L{layer}/ssm_scan")
+```
+
+The report automatically strips the `L{i}/` prefix and aggregates
+by operation name — so `L0/rms_norm` through `L63/rms_norm` all
+roll up into a single `rms_norm` row with total time and count.
+
+### 3.4 Phase Markers (Prefill vs Decode)
+
+The `generate()` function in `common/utils.py` wraps inference in
+two phases:
+
+| Phase | What happens | Profiler scope |
+|-------|-------------|----------------|
+| **Prefill** | Process full prompt (T tokens), populate KV cache, produce 1st token | `prefill/forward` |
+| **Decode** | Autoregressive generation, one token at a time (T=1) | `decode_{step}/forward` |
+
+The profiler's CPU timeline shows these as nested scopes.  The
+**Hotspot Analysis** section lists them ranked by wall-clock time.
+Use this to quickly see how much time is spent in prefill vs decode,
+but drill into the per-op breakdown (§3.3) for actual optimization.
+
+**Interpreting the phases**:
+- **Prefill-dominated** (TTFT >> decode/token): Optimize GPU kernels
+  for large-T matmuls (norm, QKV, MLP projections).
+- **Decode-dominated** (decode/token is the bottleneck): Optimize the
+  T=1 CPU path — vectorize attention, cache fp32 weight conversions,
+  batch GPU projections.
+- **Sampling overhead**: If `sampling` appears high (> 5ms/token),
+  consider pre-allocating buffers or reducing top-k.
+
+### 3.5 Identifying Bottlenecks
 
 Use `--profile` to generate both a console report and an interactive
 HTML timeline (`profile.html` in the model folder).
@@ -469,7 +594,66 @@ The profiler tracks:
 - **GPU timeline**: WebGPU timestamp queries (if `TimestampQuery` feature
   is available)
 
-### 3.5 What to Look For
+### 3.6 GPU Kernel Naming (Required)
+
+Every model **must** annotate its GPU dispatches with descriptive names
+via `self.cache._gpu_op_name` so the profiler report shows a per-kernel
+breakdown instead of a flat `gpu_dispatch` aggregate.  Without this,
+profiling output is useless for identifying bottlenecks.
+
+**Pattern** (zero overhead when profiling is disabled):
+
+```python
+_p = self.profiler and self.profiler.enabled if hasattr(self, 'profiler') else False
+
+# Before each GPU dispatch, set the name:
+if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
+qkv = self._proj(x, pfx + "qkv_proj.weight", ...)
+
+# After the last GPU op in a block, clear it:
+if _p: self.cache._gpu_op_name = None
+```
+
+**Naming convention**:
+
+| Name pattern | Operation |
+|-------------|-----------|
+| `L{i}/norm1` | Pre-attention RMSNorm/LayerNorm |
+| `L{i}/norm2` | Post-attention RMSNorm/LayerNorm |
+| `L{i}/qkv` | Fused QKV projection |
+| `L{i}/o_proj` | Attention output projection |
+| `L{i}/rope_q`, `L{i}/rope_kv` | RoPE kernels |
+| `L{i}/attn` | Attention kernel |
+| `L{i}/gate_up` | MLP gate+up projection |
+| `L{i}/silu_mul` | SiLU·mul activation |
+| `L{i}/down` | MLP down projection |
+| `L{i}/res1`, `L{i}/res2` | Residual adds |
+| `L{i}/res1+norm2` | Fused residual add + norm |
+| `L{i}/ssm_qkv` | SSM input projection (Mamba-2) |
+| `L{i}/ssm_z` | SSM gate projection |
+| `L{i}/ssm_out` | SSM output projection |
+| `final_norm` | Final layer norm |
+| `lm_head` | LM head projection |
+
+This produces output like:
+
+```
+--- GPU Dispatches (CPU-timed) ---
+  Operation                         Total  Count      Avg      %
+  ------------------------------ -------- ------ -------- ------
+  norm1                          1164.33ms    64x  18.193ms  63.4%
+  ssm_out                         145.18ms   480x   0.302ms   7.9%
+  ssm_qkv                         143.50ms   480x   0.299ms   7.8%
+  gate_up                          95.52ms   640x   0.149ms   5.2%
+  qkv                              92.42ms   176x   0.525ms   5.0%
+  ...
+```
+
+**Requirement**: Any new model must include `_gpu_op_name` annotations
+before submitting for review.  The profiler report must show named
+kernels, not a single `gpu_dispatch` entry.
+
+### 3.7 What to Look For
 
 1. **Dispatch overhead dominating**: If CPU time per op is mostly
    dispatch overhead (encode → submit → fence → readback), consider
@@ -514,7 +698,7 @@ The profiler tracks:
    level dispatches to a single pipelined submit of pre-recorded
    commands, eliminating virtually all CPU-GPU bubbles.
 
-### 3.6 Key Metrics
+### 3.8 Key Metrics
 
 | Metric | How to compute | Target |
 |--------|---------------|--------|
@@ -523,7 +707,34 @@ The profiler tracks:
 | Dispatch overhead ratio | dispatch_overhead / total_time | < 10% |
 | GPU occupancy | active_threads / max_threads | > 50% |
 
-### 3.7 TPS Measurement Methodology
+### 3.9 Profiling Timestamps
+
+Every profiling run **must** include a timestamp so results can be
+compared across optimization iterations.  The profiler report and
+HTML output should record when the profiling was captured.
+
+```
+======================================================================
+  INFERENCE PROFILING REPORT
+  2026-02-28 14:32:05  |  Qwen3.5-27B  |  NVIDIA RTX 4090
+======================================================================
+```
+
+When recording optimization results (e.g., in `opt-history.md`), always
+include:
+
+| Field | Example |
+|-------|---------|
+| **Date** | 2026-02-28 |
+| **Commit / change** | Pre-cache fp32 SSM weights |
+| **TTFT** | 2190ms |
+| **Decode tok/s** | 4.9 |
+| **GPU adapter** | NVIDIA RTX 4090 (D3D12) |
+
+This makes it possible to track regressions and attribute improvements
+to specific changes over time.
+
+### 3.10 TPS Measurement Methodology
 
 The `generate()` function uses two timers:
 
@@ -582,7 +793,46 @@ norm = self._rms_norm(x, w, gpu_out=True)      # returns GPUBuffer
 qkv = self._linear_fp16w(norm, w, b, N, K, gpu_out=True)  # no upload
 ```
 
-### 4.2 Buffer Reuse with Size-Class Pooling
+### 4.2 Don't Keep CPU Copies of Weights
+
+After uploading weights to GPU, **free the CPU copy** to reclaim RAM.
+Weights are only needed on GPU at inference time — keeping a redundant
+numpy array wastes memory (often 2–12 GB depending on model size).
+
+```python
+# Upload to GPU
+self._gpu_weights[name] = runner.upload_to_gpu(w_fp16, name)
+
+# Free CPU copy — it's no longer needed
+del self.weights[name]
+```
+
+For large models this is critical: Qwen3.5-27B uploads 12 GB of INT4
+weights to GPU.  Without freeing CPU copies, peak RAM is 24 GB (12 GB
+GPU + 12 GB CPU) instead of 12 GB.
+
+**Exceptions** — keep CPU copies only when:
+- The weight is used in a CPU code path (e.g., `lm_head` for CPU matmul
+  when the vocab is too large for GPU, or small norm weights used in
+  CPU-side RMSNorm during T=1 decode)
+- The weight is needed for on-the-fly transformations (e.g., im2col
+  reshape for conv2d)
+
+Use `_free_large_cpu_weights()` after all uploads are complete to batch
+the cleanup:
+
+```python
+def _free_large_cpu_weights(self):
+    keep = {"lm_head.weight"}  # needed for CPU matmul
+    large = [k for k, v in self.weights.items()
+             if isinstance(v, np.ndarray) and v.ndim >= 2
+             and k not in keep]
+    for k in large:
+        del self.weights[k]
+    import gc; gc.collect()
+```
+
+### 4.3 Buffer Reuse with Size-Class Pooling
 
 GPU buffer allocation (`wgpuDeviceCreateBuffer`) is expensive.  The
 dawn runner caches buffers by `(name, size, usage)`, but exact-size
@@ -602,7 +852,7 @@ The toggle-pool already alternates between two buffers per `(name, size)`
 to prevent read-write aliasing.  With size-class pooling, more
 allocations map to the same `(name, rounded_size)` key.
 
-### 4.3 Intermediate Buffer Lifetime Analysis
+### 4.4 Intermediate Buffer Lifetime Analysis
 
 Beyond size-class pooling, full **lifetime analysis** of intermediate
 tensors can dramatically reduce memory pressure.  Because neural network
@@ -621,7 +871,7 @@ smallest available memory slot, minimizing total allocation.
 Full lifetime analysis across the entire layer DAG could further reduce
 allocation count.
 
-### 4.4 Pre-Allocated Working Buffers
+### 4.5 Pre-Allocated Working Buffers
 
 For operations with known maximum sizes (e.g., MoE accumulator, KV
 cache), pre-allocate buffers at init time and reuse via
@@ -636,7 +886,7 @@ self._moe_acc_gpu = runner.upload_to_gpu(zeros(E), "moe_acc")
 runner.write_buffer(self._moe_x_gpu.handle, data.tobytes())
 ```
 
-### 4.5 Memory Pool with Smart Heuristics
+### 4.6 Memory Pool with Smart Heuristics
 
 Balancing performance and memory usage requires a managed memory pool
 rather than allocate-on-demand / destroy-on-free.  Key principles:

@@ -321,6 +321,80 @@ class WebGPUModel:
             self.cache.profiler = None
             self.profiler = None
 
+    # ------------------------------------------------------------------
+    # Profiling helpers — zero overhead when profiling is disabled
+    # ------------------------------------------------------------------
+
+    @property
+    def _profiling(self) -> bool:
+        """True when profiling is active. Use in model code as:
+            if self._profiling: ...
+        """
+        p = self.profiler
+        return p is not None and p.enabled
+
+    def _set_gpu_op(self, name: str):
+        """Set the GPU operation name for the next dispatch(es).
+
+        Must be called before KernelCache.run() so the profiler records
+        the dispatch under this name.  Call _clear_gpu_op() after the
+        last dispatch in a block.
+
+        Usage:
+            self._set_gpu_op(f"L{layer}/qkv")
+            result = self._proj(x, ...)
+            self._clear_gpu_op()
+        """
+        self.cache._gpu_op_name = name
+
+    def _clear_gpu_op(self):
+        """Clear the GPU operation name (reset to default 'gpu_dispatch')."""
+        self.cache._gpu_op_name = None
+
+    def _begin_cpu(self, name: str):
+        """Begin a CPU profiling scope.
+
+        Usage:
+            self._begin_cpu(f"L{layer}/rms_norm")
+            result = self._rms_norm_cpu(x, ...)
+            self._end_cpu(f"L{layer}/rms_norm")
+        """
+        self.profiler._cpu.begin(name)
+
+    def _end_cpu(self, name: str):
+        """End a CPU profiling scope."""
+        self.profiler._cpu.end(name)
+
+    def save_profile(self, script_dir: str, model_name: str):
+        """Generate profiling report (console + HTML) and disable profiling.
+
+        Call after inference is complete:
+            if args.profile:
+                model.save_profile(_SCRIPT_DIR, "Phi-4 mini")
+
+        Generates:
+          1. Console profiling report
+          2. HTML timeline at {script_dir}/profile.html
+        """
+        if not self.profiler:
+            return
+        if hasattr(self.profiler, 'finish'):
+            self.profiler.finish()
+        self.profiler.report()
+
+        from common.profiler_html import generate_html_report
+        profile_path = os.path.join(script_dir, "profile.html")
+        runner = self.cache.runner
+        adapter = runner.adapter_info
+        generate_html_report(
+            self.profiler,
+            output_path=profile_path,
+            title=f"{model_name} — {adapter.get('description', 'GPU')}",
+            adapter_info=adapter,
+            memory_info=self.get_memory_info())
+        print(f"HTML profile: {profile_path}")
+        self.disable_profiling()
+
     def get_memory_info(self) -> dict:
         """Collect GPU and CPU memory usage statistics for profiling."""
         runner = self.cache.runner
@@ -656,28 +730,43 @@ class WebGPUModel:
     def _warmup_gpu_pipelines(self):
         """Pre-create GPU pipelines for all compiled Triton kernels.
 
+        Uses parallel async compilation via prefetch_pipelines_async()
+        to overlap shader compilations across threads.  This reduces
+        warm-up time from sum(compile_times) to max(compile_times).
+
         Without this, GPU shader compilation happens lazily during the
         first forward() pass (prefill), adding ~100ms per unique kernel.
-        By warming them up here, prefill only pays the cost of GPU
-        compute, not shader compilation.
         """
         import time
         t0 = time.perf_counter()
         runner = self.cache.runner
-        count = 0
+
+        # Collect all compiled kernel specs
+        specs = []
         for attr_name in dir(self):
             if not attr_name.endswith('_result'):
                 continue
             result = getattr(self, attr_name, None)
             if result is None:
                 continue
-            # Compiled Triton results have .wgsl, .buffer_bindings, .param_fields
             if hasattr(result, 'wgsl') and hasattr(result, 'buffer_bindings'):
-                runner.get_pipeline_info(
-                    result.wgsl, result.buffer_bindings, result.param_fields)
+                specs.append((result.wgsl, result.buffer_bindings,
+                              result.param_fields))
+
+        # Use async parallel compilation if available, else serial fallback
+        if hasattr(runner, 'prefetch_pipelines_async') and len(specs) > 1:
+            count = runner.prefetch_pipelines_async(specs)
+            # Some specs may already be cached; count only new compilations
+            if count == 0:
+                count = len(specs)  # all were cached
+        else:
+            count = 0
+            for wgsl, bbs, pfs in specs:
+                runner.get_pipeline_info(wgsl, bbs, pfs)
                 count += 1
+
         t1 = time.perf_counter()
-        print(f"  Warmed {count} GPU pipelines in {(t1-t0)*1000:.0f}ms")
+        print(f"  Warmed {len(specs)} GPU pipelines in {(t1-t0)*1000:.0f}ms")
 
     def _compile_fp16_act_kernels(self):
         """Compile fp16 I/O variants of hot-path kernels.

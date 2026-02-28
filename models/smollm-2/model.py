@@ -507,54 +507,52 @@ class SmolLM2WebGPU(WebGPUModel):
         pfx = f"layers.{layer}."
         E = self.n_embd
         IM = self.intermediate_size
-        p = self.profiler
-        _p = p and p.enabled
 
         # RMSNorm 1 (CPU)
-        if _p: p._cpu.begin(f"L{layer}/rms_norm_1")
+        if self._profiling: self._begin_cpu(f"L{layer}/rms_norm_1")
         rn1 = self._rms_norm_cpu(x_np, pfx + "input_layernorm.weight")
-        if _p: p._cpu.end(f"L{layer}/rms_norm_1")
+        if self._profiling: self._end_cpu(f"L{layer}/rms_norm_1")
 
         # Fused QKV linear (CPU)
-        if _p: p._cpu.begin(f"L{layer}/qkv_linear")
+        if self._profiling: self._begin_cpu(f"L{layer}/qkv_linear")
         qkv = self._cpu_matmul(rn1, pfx + "self_attn.qkv_proj.weight",
                                self.qkv_out, E)
-        if _p: p._cpu.end(f"L{layer}/qkv_linear")
+        if self._profiling: self._end_cpu(f"L{layer}/qkv_linear")
 
         # Attention (CPU, vectorized multi-head)
-        if _p: p._cpu.begin(f"L{layer}/attention")
+        if self._profiling: self._begin_cpu(f"L{layer}/attention")
         attn_out = self._decode_attention(qkv, layer, positions)
-        if _p: p._cpu.end(f"L{layer}/attention")
+        if self._profiling: self._end_cpu(f"L{layer}/attention")
 
         # O projection (CPU)
-        if _p: p._cpu.begin(f"L{layer}/o_proj")
+        if self._profiling: self._begin_cpu(f"L{layer}/o_proj")
         o_out = self._cpu_matmul(attn_out, pfx + "self_attn.o_proj.weight",
                                  E, self.n_head * self.head_dim)
-        if _p: p._cpu.end(f"L{layer}/o_proj")
+        if self._profiling: self._end_cpu(f"L{layer}/o_proj")
 
         # Residual + RMSNorm 2 (CPU)
-        if _p: p._cpu.begin(f"L{layer}/res_norm")
+        if self._profiling: self._begin_cpu(f"L{layer}/res_norm")
         x_np = x_np + o_out
         rn2 = self._rms_norm_cpu(x_np, pfx + "post_attention_layernorm.weight")
-        if _p: p._cpu.end(f"L{layer}/res_norm")
+        if self._profiling: self._end_cpu(f"L{layer}/res_norm")
 
         # Fused gate+up linear (CPU)
-        if _p: p._cpu.begin(f"L{layer}/gate_up")
+        if self._profiling: self._begin_cpu(f"L{layer}/gate_up")
         gate_up = self._cpu_matmul(rn2, pfx + "mlp.gate_up_proj.weight",
                                    self.gate_up_out, E)
-        if _p: p._cpu.end(f"L{layer}/gate_up")
+        if self._profiling: self._end_cpu(f"L{layer}/gate_up")
 
         # SiLU*mul (CPU)
-        if _p: p._cpu.begin(f"L{layer}/silu_mul")
+        if self._profiling: self._begin_cpu(f"L{layer}/silu_mul")
         gate = gate_up[0, :IM]
         up = gate_up[0, IM:]
         h = (gate / (1.0 + np.exp(-gate)) * up).reshape(1, IM)
-        if _p: p._cpu.end(f"L{layer}/silu_mul")
+        if self._profiling: self._end_cpu(f"L{layer}/silu_mul")
 
         # Down projection (CPU)
-        if _p: p._cpu.begin(f"L{layer}/down_proj")
+        if self._profiling: self._begin_cpu(f"L{layer}/down_proj")
         mlp_out = self._cpu_matmul(h, pfx + "mlp.down_proj.weight", E, IM)
-        if _p: p._cpu.end(f"L{layer}/down_proj")
+        if self._profiling: self._end_cpu(f"L{layer}/down_proj")
 
         return x_np + mlp_out
 
@@ -575,8 +573,6 @@ class SmolLM2WebGPU(WebGPUModel):
         """
         from common.model_base import GPUBuffer
         runner = self.cache.runner
-        p = self.profiler
-        _p = p and p.enabled
 
         HD = self.head_dim
         E = self.n_embd
@@ -601,7 +597,7 @@ class SmolLM2WebGPU(WebGPUModel):
         # 1. GPU RMSNorm (only for first layer; subsequent layers
         #    get norm from the fused res+norm at end of previous layer)
         if not hasattr(self, '_decode_norm_out') or layer == 0:
-            if _p: self.cache._gpu_op_name = f"L{layer}/norm1"
+            if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
             rn1 = self._rms_norm(
                 x_gpu, self._gpu_weights[pfx + "input_layernorm.weight"],
                 gpu_out=True)
@@ -609,7 +605,7 @@ class SmolLM2WebGPU(WebGPUModel):
             rn1 = self._decode_norm_out
 
         # 2. QKV projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
         qkv_gpu = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
                              self._gpu_weights["zero_bias_QKV"],
                              self.qkv_out, gpu_out=True)
@@ -618,7 +614,7 @@ class SmolLM2WebGPU(WebGPUModel):
         K_cache_gpu, V_cache_gpu, cur_len = self._gpu_kv_cache[layer]
         cache_offset = cur_len * n_kv * HD
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/fused_rope"
+        if self._profiling: self._set_gpu_op(f"L{layer}/fused_rope")
         fused_out = self.cache.run(
             self._fused_rope_result, grid=(n_head + n_kv,),
             buffers={
@@ -644,7 +640,7 @@ class SmolLM2WebGPU(WebGPUModel):
         self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T_total)
 
         # 4. GPU GQA decode attention
-        if _p: self.cache._gpu_op_name = f"L{layer}/attn"
+        if self._profiling: self._set_gpu_op(f"L{layer}/attn")
         scale = np.float32(1.0 / np.sqrt(HD))
         kv_stride = n_kv * HD
         attn_out = self.cache.run(
@@ -667,31 +663,31 @@ class SmolLM2WebGPU(WebGPUModel):
         attn_gpu.shape = (1, n_head * HD)
 
         # 5. O projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/o_proj"
+        if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o_gpu = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
                            self._gpu_weights["zero_bias_E"],
                            E, gpu_out=True)
 
         # 6. Fused residual add + RMSNorm (1 dispatch instead of 2)
         #    x += o_proj; norm2 = rms_norm(x)
-        if _p: self.cache._gpu_op_name = f"L{layer}/res_norm2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res_norm2")
         rn2 = self._add_rms_norm(
             x_gpu, o_gpu,
             self._gpu_weights[pfx + "post_attention_layernorm.weight"],
             gpu_out=True)
 
         # 7. Gate_up projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/gate_up"
+        if self._profiling: self._set_gpu_op(f"L{layer}/gate_up")
         gate_up_gpu = self._proj(rn2, pfx + "mlp.gate_up_proj.weight",
                                  self._gpu_weights["zero_bias_GU"],
                                  self.gate_up_out, gpu_out=True)
 
         # 8. SiLU*mul → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/silu_mul"
+        if self._profiling: self._set_gpu_op(f"L{layer}/silu_mul")
         h_gpu = self._silu_mul_fused(gate_up_gpu, IM, gpu_out=True)
 
         # 9. Down projection → stays on GPU
-        if _p: self.cache._gpu_op_name = f"L{layer}/down"
+        if self._profiling: self._set_gpu_op(f"L{layer}/down")
         down_gpu = self._proj(h_gpu, pfx + "mlp.down_proj.weight",
                               self._gpu_weights["zero_bias_E"],
                               E, K=IM, gpu_out=True)
@@ -700,18 +696,18 @@ class SmolLM2WebGPU(WebGPUModel):
         #     (saves 1 dispatch by combining res2 + next layer's norm1)
         if layer < self.n_layer - 1:
             next_pfx = f"layers.{layer + 1}."
-            if _p: self.cache._gpu_op_name = f"L{layer}/res_norm_next"
+            if self._profiling: self._set_gpu_op(f"L{layer}/res_norm_next")
             self._decode_norm_out = self._add_rms_norm(
                 x_gpu, down_gpu,
                 self._gpu_weights[next_pfx + "input_layernorm.weight"],
                 gpu_out=True)
         else:
             # Last layer: just residual add (final norm done in forward())
-            if _p: self.cache._gpu_op_name = f"L{layer}/res2"
+            if self._profiling: self._set_gpu_op(f"L{layer}/res2")
             self._add_inplace(x_gpu, down_gpu)
             self._decode_norm_out = None
 
-        if _p: self.cache._gpu_op_name = None
+        if self._profiling: self._clear_gpu_op()
         x_gpu.shape = (1, E)
         return x_gpu
 
@@ -1089,17 +1085,15 @@ class SmolLM2WebGPU(WebGPUModel):
         runner = self.cache.runner
         wte = self.weights["embed_tokens.weight"]
         import struct
-        p = self.profiler
-        _p = p and p.enabled
 
         # Embed + upload
-        if _p: p._cpu.begin("fast_decode/embed")
+        if self._profiling: self._begin_cpu("fast_decode/embed")
         x = wte[token_ids].ravel().astype(np.float32)
         runner.write_buffer(self._fd_x_h, x.tobytes())
-        if _p: p._cpu.end("fast_decode/embed")
+        if self._profiling: self._end_cpu("fast_decode/embed")
 
         # Dynamic params
-        if _p: p._cpu.begin("fast_decode/params")
+        if self._profiling: self._begin_cpu("fast_decode/params")
         pos = pos_offset
         _, _, cur_len = self._gpu_kv_cache[0]
         cache_offset = cur_len * self.n_kv_heads * self.head_dim
@@ -1112,13 +1106,15 @@ class SmolLM2WebGPU(WebGPUModel):
 
         struct.pack_into('<i', self._fd_attn_buf, 8, T_total)
         runner.write_buffer(self._fd_attn_ph, bytes(self._fd_attn_buf))
-        if _p: p._cpu.end("fast_decode/params")
+        if self._profiling: self._end_cpu("fast_decode/params")
 
         # Update KV cache counters
         for layer in range(self.n_layer):
             K, V, c = self._gpu_kv_cache[layer]
             self._gpu_kv_cache[layer] = (K, V, c + 1)
 
+        _p = self._profiling
+        p = self.profiler
         if _p:
             # Profiling path: per-group submit with CPU+GPU timeline events
             # and link_ids connecting CPU recording to GPU execution
@@ -1726,7 +1722,6 @@ def main():
         print(f"Profiling enabled (GPU timestamps: "
               f"{model.profiler.gpu_enabled})")
 
-        from common.profiler_html import generate_html_report
         tokens = tokenizer.encode(args.prompt)
         token_ids = np.array(tokens, dtype=np.int32)
         model.kv_cache = None
@@ -1756,20 +1751,7 @@ def main():
                 with model.profiler.cpu("sampling"):
                     next_logits = logits[-1, :].copy()
 
-        model.profiler.finish()
-        model.profiler.report()
-
-        # Generate HTML timeline report
-        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
-        generate_html_report(
-            model.profiler,
-            output_path=profile_path,
-            title=f"SmolLM2-{args.model} — {adapter.get('description', 'GPU')} ({adapter.get('backend', '')})",
-            adapter_info=adapter,
-            memory_info=model.get_memory_info())
-        print(f"\nHTML profile: {profile_path}")
-
-        model.disable_profiling()
+        model.save_profile(_SCRIPT_DIR, f"SmolLM2-{args.model}")
         return
 
     # Generate

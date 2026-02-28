@@ -407,7 +407,6 @@ class GptOssWebGPU(WebGPUModel):
         """
         pfx = f"layers.{layer}."
         E = self.n_embd
-        _p = self.profiler and self.profiler.enabled
         HD = self.head_dim
         n_head = self.n_head
         n_kv = self.n_kv_heads
@@ -416,12 +415,12 @@ class GptOssWebGPU(WebGPUModel):
         q_size = n_head * HD
         kv_size = n_kv * HD
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/norm1"
+        if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x_gpu, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
         qkv_gpu = self._linear_fp16w(
             rn1,
             self._gpu_weights[pfx + "self_attn.qkv_proj.weight.fp16"],
@@ -429,7 +428,7 @@ class GptOssWebGPU(WebGPUModel):
             self.qkv_out, K=E, gpu_out=True)
 
         # Fused RoPE Q + RoPE K + scatter KV (saves 1 dispatch)
-        if _p: self.cache._gpu_op_name = f"L{layer}/rope_qkv"
+        if self._profiling: self._set_gpu_op(f"L{layer}/rope_qkv")
         K_cache_gpu, V_cache_gpu, cur_len = self._gpu_kv_cache[layer]
         cache_offset = cur_len * n_kv * HD
         rope_out = self.cache.run(
@@ -452,7 +451,7 @@ class GptOssWebGPU(WebGPUModel):
         T_total = cur_len + 1
         self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T_total)
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/attn"
+        if self._profiling: self._set_gpu_op(f"L{layer}/attn")
         is_sliding = (LAYER_TYPES[layer] == "sliding_attention")
         kv_start = max(0, T_total - self.SLIDING_WINDOW) if is_sliding else 0
         T_win = T_total - kv_start
@@ -476,7 +475,7 @@ class GptOssWebGPU(WebGPUModel):
         attn_gpu = attn_out['Out']
         attn_gpu.shape = (1, n_head * HD)
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/o_proj"
+        if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o_gpu = self._linear_fp16w(
             attn_gpu,
             self._gpu_weights[pfx + "self_attn.o_proj.weight.fp16"],
@@ -484,7 +483,7 @@ class GptOssWebGPU(WebGPUModel):
             E, K=self.q_dim, gpu_out=True)
 
         # Fused residual add + RMSNorm (saves 1 dispatch vs separate ops)
-        if _p: self.cache._gpu_op_name = f"L{layer}/res1+norm2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res1+norm2")
         rn2 = self._add_rms_norm(
             x_gpu, o_gpu,
             self._gpu_weights[pfx + "post_attention_layernorm.weight"],
@@ -498,11 +497,10 @@ class GptOssWebGPU(WebGPUModel):
 
         Dispatches: 4×(gate_up, gate, down, add_scaled) + res2
         """
-        _p = self.profiler and self.profiler.enabled
-        if _p: self.cache._gpu_op_name = f"L{layer}/moe"
+        if self._profiling: self._set_gpu_op(f"L{layer}/moe")
         moe_out_gpu = self._moe_block(norm_cpu, layer)
 
-        if _p: self.cache._gpu_op_name = f"L{layer}/res2"
+        if self._profiling: self._set_gpu_op(f"L{layer}/res2")
         self._add_inplace(x_gpu, moe_out_gpu)
 
         return x_gpu
@@ -532,8 +530,8 @@ class GptOssWebGPU(WebGPUModel):
         x_gpu = self._moe_phase(x_gpu, norm_cpu, layer)
         runner.end_batch()
 
-        if self.profiler and self.profiler.enabled:
-            self.cache._gpu_op_name = None
+        if self._profiling:
+            self._clear_gpu_op()
         x_gpu.shape = (1, E)
         return x_gpu
 
@@ -593,18 +591,17 @@ class GptOssWebGPU(WebGPUModel):
             x = x_t  # only keep last token's output
 
         # Final RMSNorm
-        _p = self.profiler and self.profiler.enabled
-        if _p: self.cache._gpu_op_name = "final_norm"
+        if self._profiling: self._set_gpu_op("final_norm")
         x = self._rms_norm(x, self._gpu_weights["norm.weight"])
 
         # LM head (GPU fp16)
-        if _p: self.cache._gpu_op_name = "lm_head"
+        if self._profiling: self._set_gpu_op("lm_head")
         logits = self._linear_fp16w(
             x, self._gpu_weights["lm_head.weight.fp16"],
             self._gpu_weights["zero_bias_V"],
             self.n_vocab, K=self.n_embd)
 
-        if _p: self.cache._gpu_op_name = None
+        if self._profiling: self._clear_gpu_op()
         return logits
 
 
@@ -930,24 +927,12 @@ def main():
 
         # Profile a short generation
         from common.profiler import InferenceProfiler
-        from common.profiler_html import generate_html_report
         tokenizer = load_tokenizer(tokenizer_path)
         generate(model, args.prompt, tokenizer=tokenizer,
                  max_tokens=min(args.max_tokens, 10),
                  temperature=args.temperature)
 
-        adapter = runner.adapter_info
-        model.profiler.report()
-
-        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
-        generate_html_report(
-            model.profiler,
-            output_path=profile_path,
-            title=f"GPT-OSS-20B \u2014 {adapter.get('description', 'GPU')} ({adapter.get('backend', '')})",
-            adapter_info=adapter,
-            memory_info=model.get_memory_info())
-
-        model.disable_profiling()
+        model.save_profile(_SCRIPT_DIR, "GPT-OSS-20B")
         return
 
     # Generate text

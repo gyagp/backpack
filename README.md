@@ -19,7 +19,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | **GPT-2** | LLM | 124M | FP32 | 60ms TTFT, 97.5 tok/s decode | Done |
 | **Phi-4** | LLM | 3.8B | INT4 | 458ms TTFT, 124.6 tok/s decode | WIP |
 | **Qwen-2.5** | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s decode | Done |
-| **Qwen-3.5** | LLM | 27B | INT4 | 1.7s TTFT, 4.4 tok/s decode |  |
+| **Qwen-3.5** | LLM | 27B | INT4 | 2.4s TTFT, 4.9 tok/s decode |  |
 | **SmolLM-2** | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s decode | Done |
 | **GPT-OSS** | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 38.4 tok/s decode | Done |
 | **Whisper** | Speech-to-Text | 39M | FP16 | 160ms encoder, 30 tok/s decode, 0.9s total | Done |

@@ -78,7 +78,7 @@ def main():
     print(f"\nSaved to {out}")
 
     if args.profile:
-        model.profiler.report()
+        model.save_profile(_SCRIPT_DIR, "SD-Turbo")
 
 
 if __name__ == "__main__":
