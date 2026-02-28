@@ -735,13 +735,21 @@ class Qwen35WebGPU(WebGPUModel):
                                 K=E, gpu_out=True)
             if self._profiling: self._clear_gpu_op()
             rb = runner.end_batch(readback_buffers=[qkv_gpu, z_gpu])
-            qkv = rb[id(qkv_gpu)].reshape(1, self.ssm_qkv_dim)
+            qkv_interleaved = rb[id(qkv_gpu)].reshape(1, self.ssm_qkv_dim)
             z = rb[id(z_gpu)].reshape(1, self.ssm_dim)
         else:
-            qkv = self._cpu_matmul(x_np, pfx + "in_proj_qkv.weight",
+            qkv_interleaved = self._cpu_matmul(x_np, pfx + "in_proj_qkv.weight",
                                    self.ssm_qkv_dim, E)
             z = self._cpu_matmul(x_np, pfx + "in_proj_z.weight",
                                  self.ssm_dim, E)
+
+        # De-interleave: 16 groups × (Q[128]|K[128]|V[384]) → contiguous Q|K|V
+        per_group = hk + hk + v_per_k * hv  # 640
+        qkv_g = qkv_interleaved[0].reshape(n_k, per_group)
+        q_part = qkv_g[:, :hk].ravel()
+        k_part = qkv_g[:, hk:2*hk].ravel()
+        v_part = qkv_g[:, 2*hk:].ravel()
+        qkv_flat = np.concatenate([q_part, k_part, v_part])
 
         # 2. Compute a, b projections (for decay and gate)
         a_w = self._fp32_cache.get(pfx + "in_proj_a.weight",
@@ -764,7 +772,6 @@ class Qwen35WebGPU(WebGPUModel):
             if conv_w_raw.dtype == np.float16:
                 conv_w_raw = conv_w_raw.astype(np.float32)
             conv_w = conv_w_raw.reshape(conv_dim, kernel_size)
-        qkv_flat = qkv[0]
         x_conv = (conv_state * conv_w[:, :kernel_size - 1].T).sum(axis=0) + \
                  qkv_flat * conv_w[:, kernel_size - 1]
         conv_state[:-1] = conv_state[1:]
@@ -773,13 +780,10 @@ class Qwen35WebGPU(WebGPUModel):
         # Apply SiLU to conv output (reference: activation="silu" in conv1d)
         x_conv = x_conv * (1.0 / (1.0 + np.exp(-x_conv)))
 
-        # 4. Split into Q, K, V (interleaved by k-head groups)
-        # Layout: 16 groups × (Q[128] | K[128] | V[3×128])
-        per_group = hk + hk + v_per_k * hv  # 640
-        x_grouped = x_conv.reshape(n_k, per_group)
-        q = x_grouped[:, :hk]                    # (16, 128)
-        k = x_grouped[:, hk:2*hk]                # (16, 128)
-        v = x_grouped[:, 2*hk:].reshape(n_v, hv)  # (48, 128)
+        # 4. Split Q, K, V (contiguous layout)
+        q = x_conv[:key_dim].reshape(n_k, hk)              # (16, 128)
+        k = x_conv[key_dim:key_dim*2].reshape(n_k, hk)     # (16, 128)
+        v = x_conv[key_dim*2:].reshape(n_v, hv)             # (48, 128)
 
         # L2 normalize Q and K
         q = q / (np.sqrt(np.sum(q ** 2, axis=-1, keepdims=True)) + 1e-6)
@@ -878,12 +882,21 @@ class Qwen35WebGPU(WebGPUModel):
         val_dim = self.gdn_value_dim  # 6144
         v_per_k = self.gdn_v_per_k    # 3
 
-        # 1. QKV projection
+        # 1. QKV projection (output is INTERLEAVED by k-head groups)
         if self._profiling: self._set_gpu_op(f"L{layer}/ssm_qkv")
-        qkv = self._proj(
+        qkv_interleaved = self._proj(
             x, pfx + "in_proj_qkv.weight",
             "zero_bias_SSM_QKV", self.ssm_qkv_dim,
             K=E)
+
+        # De-interleave: 16 groups × (Q[128]|K[128]|V[384]) → contiguous Q[2048]|K[2048]|V[6144]
+        # The conv1d weights were trained with contiguous Q|K|V channel layout.
+        per_group = hk + hk + v_per_k * hv  # 640
+        qkv_g = qkv_interleaved.reshape(T, n_k, per_group)
+        q_part = qkv_g[:, :, :hk].reshape(T, key_dim)
+        k_part = qkv_g[:, :, hk:2*hk].reshape(T, key_dim)
+        v_part = qkv_g[:, :, 2*hk:].reshape(T, val_dim)
+        qkv = np.concatenate([q_part, k_part, v_part], axis=1)
 
         # 2. Compute a, b projections from original input
         if isinstance(x, GPUBuffer):
@@ -930,13 +943,10 @@ class Qwen35WebGPU(WebGPUModel):
         # Apply SiLU to conv output
         x_conv = x_conv * (1.0 / (1.0 + np.exp(-x_conv)))
 
-        # 4. Split Q, K, V (interleaved by k-head groups)
-        # Layout per token: 16 groups × (Q[128] | K[128] | V[3×128])
-        per_group = hk + hk + v_per_k * hv  # 640
-        x_grouped = x_conv.reshape(T, n_k, per_group)
-        q = x_grouped[:, :, :hk]                    # (T, 16, 128)
-        k = x_grouped[:, :, hk:2*hk]                # (T, 16, 128)
-        v = x_grouped[:, :, 2*hk:].reshape(T, n_v, hv)  # (T, 48, 128)
+        # 4. Split Q, K, V (CONTIGUOUS layout after de-interleaving)
+        q = x_conv[:, :key_dim].reshape(T, n_k, hk)              # (T, 16, 128)
+        k = x_conv[:, key_dim:key_dim*2].reshape(T, n_k, hk)     # (T, 16, 128)
+        v = x_conv[:, key_dim*2:].reshape(T, n_v, hv)             # (T, 48, 128)
 
         # L2 normalize Q and K
         q = q / (np.sqrt(np.sum(q ** 2, axis=-1, keepdims=True)) + 1e-6)
