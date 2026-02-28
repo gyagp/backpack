@@ -735,21 +735,16 @@ class Qwen35WebGPU(WebGPUModel):
                                 K=E, gpu_out=True)
             if self._profiling: self._clear_gpu_op()
             rb = runner.end_batch(readback_buffers=[qkv_gpu, z_gpu])
-            qkv_interleaved = rb[id(qkv_gpu)].reshape(1, self.ssm_qkv_dim)
+            qkv = rb[id(qkv_gpu)].reshape(1, self.ssm_qkv_dim)
             z = rb[id(z_gpu)].reshape(1, self.ssm_dim)
         else:
-            qkv_interleaved = self._cpu_matmul(x_np, pfx + "in_proj_qkv.weight",
+            qkv = self._cpu_matmul(x_np, pfx + "in_proj_qkv.weight",
                                    self.ssm_qkv_dim, E)
             z = self._cpu_matmul(x_np, pfx + "in_proj_z.weight",
                                  self.ssm_dim, E)
 
-        # De-interleave: 16 groups × (Q[128]|K[128]|V[384]) → contiguous Q|K|V
-        per_group = hk + hk + v_per_k * hv  # 640
-        qkv_g = qkv_interleaved[0].reshape(n_k, per_group)
-        q_part = qkv_g[:, :hk].ravel()
-        k_part = qkv_g[:, hk:2*hk].ravel()
-        v_part = qkv_g[:, 2*hk:].ravel()
-        qkv_flat = np.concatenate([q_part, k_part, v_part])
+        # Weights are stored in contiguous Q|K|V order
+        qkv_flat = qkv[0]  # (10240,)
 
         # 2. Compute a, b projections (for decay and gate)
         a_w = self._fp32_cache.get(pfx + "in_proj_a.weight",
@@ -882,21 +877,12 @@ class Qwen35WebGPU(WebGPUModel):
         val_dim = self.gdn_value_dim  # 6144
         v_per_k = self.gdn_v_per_k    # 3
 
-        # 1. QKV projection (output is INTERLEAVED by k-head groups)
+        # 1. QKV projection (weights stored in contiguous Q|K|V order)
         if self._profiling: self._set_gpu_op(f"L{layer}/ssm_qkv")
-        qkv_interleaved = self._proj(
+        qkv = self._proj(
             x, pfx + "in_proj_qkv.weight",
             "zero_bias_SSM_QKV", self.ssm_qkv_dim,
             K=E)
-
-        # De-interleave: 16 groups × (Q[128]|K[128]|V[384]) → contiguous Q[2048]|K[2048]|V[6144]
-        # The conv1d weights were trained with contiguous Q|K|V channel layout.
-        per_group = hk + hk + v_per_k * hv  # 640
-        qkv_g = qkv_interleaved.reshape(T, n_k, per_group)
-        q_part = qkv_g[:, :, :hk].reshape(T, key_dim)
-        k_part = qkv_g[:, :, hk:2*hk].reshape(T, key_dim)
-        v_part = qkv_g[:, :, 2*hk:].reshape(T, val_dim)
-        qkv = np.concatenate([q_part, k_part, v_part], axis=1)
 
         # 2. Compute a, b projections from original input
         if isinstance(x, GPUBuffer):
@@ -1545,6 +1531,19 @@ def download_and_quantize_streaming(weights_dir: str = None):
 
             if new_key in linear_keys and val.ndim == 2:
                 N, K = val.shape
+                # De-interleave SSM QKV weights to contiguous Q|K|V layout
+                # before quantization (better per-group accuracy)
+                if 'linear_attn.in_proj_qkv.weight' in new_key:
+                    n_k_h = config["ssm_n_groups"]    # 16
+                    hk_d = config["ssm_d_state"]      # 128
+                    v_pk = config["ssm_n_heads"] // n_k_h  # 3
+                    pg = hk_d + hk_d + v_pk * config["ssm_head_dim"]  # 640
+                    g = val.reshape(n_k_h, pg, K)
+                    val = np.concatenate([
+                        g[:, :hk_d, :].reshape(-1, K),          # Q
+                        g[:, hk_d:2*hk_d, :].reshape(-1, K),    # K
+                        g[:, 2*hk_d:, :].reshape(-1, K),         # V
+                    ], axis=0)
                 q_packed, scales, zeros = quantize_int4(val)
                 all_quantized[new_key + ".q4"] = q_packed
                 all_quantized[new_key + ".scales"] = scales
