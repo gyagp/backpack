@@ -2287,6 +2287,8 @@ def main():
 
     tokenizer = load_tokenizer(tokenizer_path)
 
+    import time as _mt
+    _model_t0 = _mt.perf_counter()
     model = Phi4WebGPU(
         weights,
         n_layer=config["n_layer"],
@@ -2301,6 +2303,8 @@ def main():
         partial_rotary_factor=config["partial_rotary_factor"],
         quantized=quantized,
         decode_mode=args.decode_mode)
+    _model_t1 = _mt.perf_counter()
+    print(f"Model init: {(_model_t1-_model_t0)*1000:.0f}ms")
     model._batch_layers = args.batch_layers
     model._use_dp4a = getattr(args, 'use_dp4a', False)
 
