@@ -599,16 +599,21 @@ def run_full_inference(image_path: str, point: Tuple[int, int] = None,
     pos_feat = pos_feat[:256]
     point_embedding = (point_embed_raw + pos_feat).reshape(1, 256)
 
-    # Mask decoder tokens: iou_token + mask_tokens (5 tokens total)
-    iou_token = decoder_weights["mask_decoder.iou_token.weight"]  # (1, 256)
-    mask_tokens = decoder_weights["mask_decoder.mask_tokens.weight"]  # (4, 256)
-    # Prepend point embedding, then iou + mask tokens
-    decoder_tokens = np.concatenate(
-        [point_embedding, iou_token, mask_tokens], axis=0)  # (6, 256)
+    # Token order: [obj_score, iou, mask_tokens(4), point_emb]
+    obj_score_token = decoder_weights["mask_decoder.obj_score_token.weight"]
+    iou_token = decoder_weights["mask_decoder.iou_token.weight"]
+    mask_tokens = decoder_weights["mask_decoder.mask_tokens.weight"]
+    output_tokens_list = np.concatenate([obj_score_token, iou_token, mask_tokens], axis=0)
+    decoder_tokens = np.concatenate([output_tokens_list, point_embedding], axis=0)  # (8, 256)
 
     # --- Mask decoder transformer (WebGPU) ---
     print("  Running mask decoder transformer (WebGPU)...")
-    image_tokens = feat.reshape(C_feat, S_img).T.astype(np.float32)  # (S_img, 256)
+    image_tokens = feat.reshape(C_feat, S_img).T.astype(np.float32)
+    # Add no_mask_embed (dense prompt embedding)
+    no_mask_embed = decoder_weights.get("prompt_encoder.no_mask_embed.weight",
+                                        W.get("prompt_encoder.no_mask_embed.weight"))
+    if no_mask_embed is not None:
+        image_tokens = image_tokens + no_mask_embed.reshape(1, 256)
 
     # Dense positional encoding for image features
     image_pe = _get_dense_pe(
@@ -1403,9 +1408,16 @@ def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
     pos_feat = np.concatenate([np.sin(pos_enc), np.cos(pos_enc)], axis=-1).ravel()[:256]
     point_embedding = (point_embed_raw + pos_feat).reshape(1, 256)
 
+    # Token order matches HF: [obj_score, iou, mask_tokens(4), point_emb]
+    obj_score_token = W["mask_decoder.obj_score_token.weight"]
     iou_token = W["mask_decoder.iou_token.weight"]
     mask_tokens = W["mask_decoder.mask_tokens.weight"]
-    decoder_tokens = np.concatenate([point_embedding, iou_token, mask_tokens], axis=0)
+    output_tokens = np.concatenate([obj_score_token, iou_token, mask_tokens], axis=0)
+    decoder_tokens = np.concatenate([output_tokens, point_embedding], axis=0)  # (8, 256)
+
+    # Add no_mask_embed (dense prompt) to image features (HF line 53)
+    no_mask_embed = W["prompt_encoder.no_mask_embed.weight"].reshape(1, 256)
+    image_tokens = image_tokens + no_mask_embed  # broadcast add
 
     # ================================================================
     # MASK DECODER TRANSFORMER (WebGPU)
@@ -1522,8 +1534,13 @@ def run_interactive(image_path: str):
     pe_weight = W["prompt_encoder.point_embed.weight"]
     pos_enc_w = W["prompt_encoder.shared_embedding.positional_embedding"]
     image_pe = _get_dense_pe(pos_enc_w, H_feat, W_feat)
+    obj_score_token = W["mask_decoder.obj_score_token.weight"]
     iou_token = W["mask_decoder.iou_token.weight"]
     mask_tokens = W["mask_decoder.mask_tokens.weight"]
+    output_tokens_base = np.concatenate([obj_score_token, iou_token, mask_tokens], axis=0)
+    no_mask_embed = W["prompt_encoder.no_mask_embed.weight"].reshape(1, 256)
+    # Add no_mask_embed to image tokens (dense prompt embedding)
+    image_tokens = image_tokens + no_mask_embed
 
     # Pre-load hypernetwork weights
     hyper_weights = {}
@@ -1558,7 +1575,7 @@ def run_interactive(image_path: str):
                                   axis=-1).ravel()[:256]
         point_embedding = (point_embed_raw + pos_feat).reshape(1, 256)
         decoder_tokens = np.concatenate(
-            [point_embedding, iou_token, mask_tokens], axis=0)
+            [output_tokens_base, point_embedding], axis=0)  # (8, 256)
 
         # Decoder (with dense PE and query PE)
         output_tokens, image_output = webgpu_decoder.forward(
