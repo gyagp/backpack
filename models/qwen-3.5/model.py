@@ -2524,26 +2524,33 @@ def main():
     if args.profile:
         model.enable_profiling()
         print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
-        # Inject pre-recorded init events
-        init_phases = [
-            ("imports", _t_script_start, _t_imports_done),
-            ("weight_loading", _t_weight_load_0, _t_weight_load_1),
-            ("model_init", _t_model_init_0, _t_model_init_1),
-        ]
-        if hasattr(model, '_init_phases'):
-            init_phases.extend(model._init_phases)
-        model.profiler.inject_init_events(init_phases)
 
     # Warmup
     import time as _wt
     _w0 = _wt.perf_counter()
     model.forward(np.array([1], dtype=np.int32), use_cache=True, pos_offset=0)
+    # Reset caches without reallocating GPU buffers
     model.kv_cache = None
     if hasattr(model, '_gpu_kv_cache'):
         for layer in model._gpu_kv_cache:
             k, v, _ = model._gpu_kv_cache[layer]
             model._gpu_kv_cache[layer] = (k, v, 0)
-    model._init_ssm_state()
+    # Zero GPU SSM state (without reallocating)
+    runner = model.cache.runner
+    n_v = model.gdn_n_v_heads
+    hk = model.gdn_head_k_dim
+    hv = model.gdn_head_v_dim
+    conv_dim = model.ssm_qkv_dim
+    conv_hist = model.ssm_conv_kernel - 1
+    for layer in list(model._ssm_gpu_states.keys()):
+        state_zeros = np.zeros(n_v * hk * hv, dtype=np.float32)
+        runner.write_buffer(model._ssm_gpu_states[layer].handle,
+                           state_zeros.tobytes())
+        conv_zeros = np.zeros(conv_hist * conv_dim, dtype=np.float32)
+        runner.write_buffer(model._ssm_gpu_conv_states[layer].handle,
+                           conv_zeros.tobytes())
+    model._ssm_states = {}
+    model._ssm_conv_states = {}
     print(f"Warmup: {(_wt.perf_counter()-_w0)*1000:.0f}ms")
 
     generate(model, args.prompt, tokenizer,
