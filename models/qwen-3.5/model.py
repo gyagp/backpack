@@ -349,14 +349,52 @@ class Qwen35WebGPU(WebGPUModel):
     def _proj(self, x, weight_name, bias_key, out_features,
               K=None, gpu_out=False):
         """Linear projection using best available kernel (Q4/fp16/fp32)."""
+        from common.model_base import GPUBuffer
         # INT4 GPU path
         q4_key = weight_name + ".q4.gpu"
         if q4_key in self._gpu_weights:
+            w_q4 = self._gpu_weights[q4_key]
+            scales = self._gpu_weights[weight_name + ".scales.gpu"]
+            zeros = self._gpu_weights[weight_name + ".zeros.gpu"]
+            bias = self._gpu_weights[bias_key]
+            N = out_features
+
+            # Use wide kernel for large N (> MAX_DISPATCH_DIM)
+            if N > self.MAX_DISPATCH_DIM:
+                x_is_gpu = isinstance(x, GPUBuffer)
+                if x_is_gpu:
+                    T = x.shape[0] if x.shape else 1
+                    if K is None:
+                        K = x.shape[1] if (x.shape and len(x.shape) > 1) else self.n_embd
+                else:
+                    T = x.shape[0]
+                    if K is None:
+                        K = x.shape[1]
+                n_groups = K // 128
+                stride_w_q4 = K // 8
+                grid_y = self.MAX_DISPATCH_DIM
+                grid_x = (N + grid_y - 1) // grid_y
+                out = self.cache.run(
+                    self._linear_q4_wide_result, grid=(grid_x, grid_y),
+                    buffers={
+                        'X': x if x_is_gpu else x.ravel(),
+                        'W_Q4': w_q4, 'Scales': scales, 'Zeros': zeros,
+                        'Bias': bias,
+                        'Y': np.zeros(N, dtype=np.float32),
+                    },
+                    scalars={'K': K, 'stride_x': K,
+                             'stride_w_q4': stride_w_q4,
+                             'n_groups': n_groups, 'N': N,
+                             'grid_y': grid_y},
+                    gpu_outputs={'Y'} if gpu_out else None)
+                if gpu_out:
+                    gpu_buf = out['Y']
+                    gpu_buf.shape = (1, N)
+                    return gpu_buf
+                return out['Y'].reshape(1, N)
+
             return self._linear_q4(
-                x, self._gpu_weights[q4_key],
-                self._gpu_weights[weight_name + ".scales.gpu"],
-                self._gpu_weights[weight_name + ".zeros.gpu"],
-                self._gpu_weights[bias_key], out_features,
+                x, w_q4, scales, zeros, bias, N,
                 K=K, gpu_out=gpu_out)
         # fp16 path
         fp16_name = weight_name + ".fp16"
@@ -520,20 +558,10 @@ class Qwen35WebGPU(WebGPUModel):
         # Final norm
         self._upload_norm_weight("norm.weight")
 
-        # Embed/LM head: keep on CPU to save VRAM.
-        # embed_tokens is only used for token lookup (CPU).
-        # lm_head runs as CPU matmul (avoids 4.8 GB GPU upload for
-        # 248K vocab × 5120 × 2 = 2.4 GB each).
-        # Ensure lm_head weights are fp32 for CPU matmul.
-        lm_w = self.weights.get("lm_head.weight")
-        if lm_w is not None and lm_w.dtype == np.float16:
-            self.weights["lm_head.weight"] = lm_w.astype(np.float32)
-
-        # LM head stays on CPU (2.4 GB fp16 won't fit alongside 12.3 GB layer weights)
-        # Keep in fp32 for fast CPU matmul (avoids fp16→fp32 cast overhead)
-        lm_w = self.weights.get("lm_head.weight")
-        if lm_w is not None and lm_w.dtype == np.float16:
-            self.weights["lm_head.weight"] = lm_w.astype(np.float32)
+        # LM head: upload as INT4 if quantized (saves ~2.1 GB vs fp16)
+        # INT4: ~300 MB instead of 2.4 GB fp16
+        _ul("lm_head.weight", self.n_vocab, E)
+        self._upload_zero_bias("zero_bias_V", self.n_vocab)
 
         # Zero biases
         self._upload_zero_bias("zero_bias_E", E)
@@ -1321,11 +1349,14 @@ class Qwen35WebGPU(WebGPUModel):
         x = self._rms_norm(x, self._gpu_weights["norm.weight"])
         if self._profiling: self._clear_gpu_op()
 
-        # LM head on CPU (2.4 GB won't fit in 16GB VRAM alongside 12.3 GB weights)
-        lm_w = self.weights["lm_head.weight"]  # fp32, pre-cast at init
+        # LM head on GPU (INT4 quantized, ~300 MB)
         if T > 1 and use_cache:
             x = x[-1:]  # only last token logits needed for prefill
-        logits = np.float32(x @ lm_w.T)
+        if self._profiling: self._set_gpu_op("lm_head")
+        logits = self._proj(
+            x, "lm_head.weight", "zero_bias_V", self.n_vocab,
+            K=self.n_embd)
+        if self._profiling: self._clear_gpu_op()
         return logits
 
 
@@ -1359,6 +1390,9 @@ def quantize_model_weights(weights: Dict[str, np.ndarray],
                 pfx + "linear_attn.in_proj_z.weight",
                 pfx + "linear_attn.out_proj.weight",
             ])
+
+    # Also quantize lm_head to save 2.4 GB VRAM (248K×5120 fp16 → ~300 MB INT4)
+    linear_keys.add("lm_head.weight")
 
     total_orig = 0
     total_quant = 0
