@@ -1659,21 +1659,34 @@ class Qwen35WebGPU(WebGPUModel):
         return x_np + mlp_out
 
     def _transformer_block_prefill(self, x, layer, use_cache, positions):
-        """Prefill path (T>1): uses original attention/SSM blocks."""
+        """GPU path for all T values. Uses GPU attention/SSM for T=1 decode."""
         from common.model_base import GPUBuffer
         pfx = f"layers.{layer}."
+        T = (x.shape[0] if x.shape else 1) if isinstance(x, GPUBuffer) else x.shape[0]
+        runner = self.cache.runner
+        use_batch = (T == 1 and use_cache and getattr(self, '_use_q4_gpu', False))
 
+        # Phase 1: Norm1 (batch with attention QKV if possible)
+        if use_batch:
+            runner.begin_batch()
         if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
+        if use_batch:
+            runner.end_batch()
 
+        # Phase 2: Attention or SSM (handles own batching/readbacks internally)
         if LAYER_TYPES[layer] == "full_attention":
             attn = self._attention_block(rn1, layer, use_cache=use_cache,
                                          positions=positions)
         else:
             attn = self._linear_attention_block(rn1, layer,
                                                 use_cache=use_cache)
+
+        # Phase 3: Residual + norm2 + MLP (all GPU, batch together)
+        if use_batch:
+            runner.begin_batch()
 
         use_fused = (hasattr(self, '_add_rn_result') and
                      isinstance(x, GPUBuffer) and isinstance(attn, GPUBuffer))
@@ -1695,6 +1708,10 @@ class Qwen35WebGPU(WebGPUModel):
         if self._profiling: self._set_gpu_op(f"L{layer}/res2")
         x = self._add(x, mlp, gpu_out=True)
         if self._profiling: self._clear_gpu_op()
+
+        if use_batch and runner.is_batching:
+            runner.end_batch()
+
         return x
 
     def _transformer_block(self, x, layer: int,
