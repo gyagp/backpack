@@ -33,9 +33,8 @@ Requirements:
 import os
 import sys
 import time
+from contextlib import nullcontext
 from typing import Dict, Tuple
-
-_t_script_start = time.perf_counter_ns()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
@@ -45,10 +44,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg, profile_model,
 )
-
-_t_imports_done = time.perf_counter_ns()
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +200,8 @@ def quantize_model_weights(weights: Dict[str, np.ndarray],
 
 
 def load_quantized_weights(path: str) -> Dict[str, np.ndarray]:
-    """Load quantized weights from npz (memory-mapped for fast startup)."""
-    data = np.load(path, mmap_mode='r')
+    """Load quantized weights from npz."""
+    data = np.load(path)
     return {k: data[k] for k in data.files}
 
 
@@ -253,17 +249,18 @@ class Phi4WebGPU(WebGPUModel):
                  partial_rotary_factor: float = 0.75,
                  max_seq_len: int = 2048,
                  quantized: bool = False,
-                 decode_mode: str = 'cpu'):
+                 decode_mode: str = 'cpu',
+                 gpu_only_weights: bool = True):
         self.partial_rotary_factor = partial_rotary_factor
         self.rotary_dim = int(head_dim * partial_rotary_factor)
         self.MAX_SEQ_LEN = max_seq_len
         self._quantized = quantized
         self._decode_mode = decode_mode  # 'cpu' or 'gpu'
+        self._gpu_only_weights = bool(gpu_only_weights and decode_mode == 'gpu')
+        self._profile_deep_decode = False
         # Fused projection output sizes
         self.qkv_out = n_head * head_dim + 2 * n_kv_heads * head_dim
         self.gate_up_out = 2 * intermediate_size
-        self._init_phases = []  # (name, begin_ns, end_ns, scope) for profiling
-        _t0 = time.perf_counter_ns()
         super().__init__(
             weights, n_layer=n_layer, n_head=n_head, n_embd=n_embd,
             n_vocab=n_vocab,
@@ -275,16 +272,12 @@ class Phi4WebGPU(WebGPUModel):
             k_dimensions={n_embd, intermediate_size,
                           self.qkv_out, self.gate_up_out},
         )
-        _t1 = time.perf_counter_ns()
-        self._init_phases.append(("kernel_compile", _t0, _t1, "model_init"))
         self._precompute_rope_tables()
-        _t2 = time.perf_counter_ns()
         self._upload_weights_to_gpu()
-        _t3 = time.perf_counter_ns()
-        self._init_phases.append(("weight_upload", _t2, _t3, "model_init"))
         self._init_gpu_kv_cache()
-        _t4 = time.perf_counter_ns()
-        self._init_phases.append(("kv_cache_alloc", _t3, _t4, "model_init"))
+        if self._gpu_only_weights:
+            self._upload_all_layer_weights()
+            self._release_cpu_weight_cache()
 
     def _init_gpu_kv_cache(self):
         """Pre-allocate static GPU KV cache buffers for all layers.
@@ -306,21 +299,6 @@ class Phi4WebGPU(WebGPUModel):
             v_buf = runner.upload_to_gpu(
                 np.zeros(buf_size, dtype=np.float32), f"kv_cache_V_{i}")
             self._gpu_kv_cache[i] = (k_buf, v_buf, 0)
-
-    def warmup(self):
-        """Run a dummy forward pass to trigger D3D12 first-submit init.
-
-        The D3D12 backend lazily creates pipeline state objects on the
-        first actual compute pass submission (~800ms). Running a single
-        token through all layers pays this cost upfront so the real
-        prefill sees fast submits.
-        """
-        self.forward(np.array([1], dtype=np.int32), use_cache=True, pos_offset=0)
-        # Reset KV cache after warmup
-        self.kv_cache = None
-        for layer in self._gpu_kv_cache:
-            k, v, _ = self._gpu_kv_cache[layer]
-            self._gpu_kv_cache[layer] = (k, v, 0)
 
     def _precompute_rope_tables(self):
         """Pre-compute RoPE cos/sin tables for all positions up to MAX_SEQ_LEN.
@@ -344,11 +322,9 @@ class Phi4WebGPU(WebGPUModel):
             self._rope_sin.ravel(), "rope_sin_table")
 
     def _compile_model_kernels(self):
-        """Compile Phi4 kernels: RMSNorm, SiLU*mul, embed gather, argmax."""
+        """Compile Phi4 kernels: RMSNorm, SiLU*mul."""
         self._compile_rms_norm()
         self._compile_silu_mul()
-        self._compile_embed_gather()
-        self._compile_argmax()
 
     def _upload_weights_to_gpu(self):
         """Upload shared weights to GPU. Linear projection weights are
@@ -390,13 +366,6 @@ class Phi4WebGPU(WebGPUModel):
         if getattr(self, '_has_fp16_linear', False):
             self._upload_linear_weight_fp16(ekey, self.n_vocab, E)
 
-        # GPU embedding gather uses fp16 when available (saves 2.3GB upload)
-        if not getattr(self, '_has_fp16_linear', False):
-            runner = self.cache.runner
-            wte_fp32 = self.weights[ekey].astype(np.float32).ravel()
-            self._gpu_weights["embed_tokens.weight.fp32"] = \
-                runner.upload_to_gpu(wte_fp32, "embed_tokens.weight.fp32")
-
         # Zero biases (tiny)
         self._upload_zero_bias("zero_bias_E", E)
         self._upload_zero_bias("zero_bias_V", self.n_vocab)
@@ -405,14 +374,6 @@ class Phi4WebGPU(WebGPUModel):
         if qo_dim != E:
             self._upload_zero_bias("zero_bias_QO", qo_dim)
         self._upload_zero_bias("zero_bias_GU", self.gate_up_out)
-
-        # Eagerly upload all layer weights (eliminates per-layer upload during prefill)
-        import time as _t
-        t_upload = _t.perf_counter()
-        for layer in range(self.n_layer):
-            self._upload_layer_weights(layer)
-        print(f"  Uploaded all {self.n_layer} layer weights in "
-              f"{(_t.perf_counter() - t_upload)*1000:.0f}ms")
 
         self._print_gpu_weight_stats()
 
@@ -484,6 +445,22 @@ class Phi4WebGPU(WebGPUModel):
             else:
                 if name not in self._gpu_weights:
                     self._upload_linear_weight(name, N, K)
+
+    def _upload_all_layer_weights(self):
+        """Upload all per-layer projection weights to GPU eagerly."""
+        for layer in range(self.n_layer):
+            self._upload_layer_weights(layer)
+
+    def _release_cpu_weight_cache(self):
+        """Release CPU-side weight tensors after all required GPU uploads.
+
+        Keeps only GPU buffers in `self._gpu_weights` for inference.
+        """
+        import gc
+        n_tensors = len(self.weights)
+        self.weights = {}
+        gc.collect()
+        print(f"  Released CPU weight cache ({n_tensors} tensors) [GPU-only mode]")
 
     def _release_layer_weights(self, layer: int):
         """Release linear projection weight GPU buffers for a layer."""
@@ -717,57 +694,53 @@ class Phi4WebGPU(WebGPUModel):
         else:
             x_np = x
 
+        _p = p and p.enabled
 
-        if self._profiling: self._begin_cpu("rms_norm_1")
+        if _p: p._cpu.begin("rms_norm_1")
         rn1 = self._rms_norm_cpu(x_np, pfx + "input_layernorm.weight")
-        if self._profiling: self._end_cpu("rms_norm_1")
+        if _p: p._cpu.end("rms_norm_1")
 
-        if self._profiling: self._begin_cpu("qkv_linear")
+        if _p: p._cpu.begin("qkv_linear")
         qkv = self._cpu_matmul(rn1, pfx + "self_attn.qkv_proj.weight",
                                self.qkv_out, self.n_embd)
-        if self._profiling: self._end_cpu("qkv_linear")
+        if _p: p._cpu.end("qkv_linear")
 
-        if self._profiling: self._begin_cpu("attention_cpu")
+        if _p: p._cpu.begin("attention_cpu")
         attn_out = self._decode_attention(qkv, layer, positions)
-        if self._profiling: self._end_cpu("attention_cpu")
+        if _p: p._cpu.end("attention_cpu")
 
-        if self._profiling: self._begin_cpu("o_proj")
+        if _p: p._cpu.begin("o_proj")
         o_out = self._cpu_matmul(attn_out, pfx + "self_attn.o_proj.weight",
                                  self.n_embd, self.n_head * self.head_dim)
-        if self._profiling: self._end_cpu("o_proj")
+        if _p: p._cpu.end("o_proj")
 
-        if self._profiling: self._begin_cpu("res_add_norm")
+        if _p: p._cpu.begin("res_add_norm")
         x_np = x_np + o_out
         rn2 = self._rms_norm_cpu(x_np, pfx + "post_attention_layernorm.weight")
-        if self._profiling: self._end_cpu("res_add_norm")
+        if _p: p._cpu.end("res_add_norm")
 
-        if self._profiling: self._begin_cpu("gate_up")
+        if _p: p._cpu.begin("gate_up")
         gate_up = self._cpu_matmul(rn2, pfx + "mlp.gate_up_proj.weight",
                                    self.gate_up_out, self.n_embd)
-        if self._profiling: self._end_cpu("gate_up")
+        if _p: p._cpu.end("gate_up")
 
-        if self._profiling: self._begin_cpu("silu_mul_cpu")
+        if _p: p._cpu.begin("silu_mul_cpu")
         IM = self.intermediate_size
         gate = gate_up[0, :IM]
         up = gate_up[0, IM:]
         h = (gate / (1.0 + np.exp(-gate)) * up).reshape(1, IM)
-        if self._profiling: self._end_cpu("silu_mul_cpu")
+        if _p: p._cpu.end("silu_mul_cpu")
 
-        if self._profiling: self._begin_cpu("down_proj")
+        if _p: p._cpu.begin("down_proj")
         mlp_out = self._cpu_matmul(h, pfx + "mlp.down_proj.weight",
                                    self.n_embd, IM)
-        if self._profiling: self._end_cpu("down_proj")
+        if _p: p._cpu.end("down_proj")
 
         return x_np + mlp_out
 
     def _prefill_gpu(self, x, layer, positions, pfx, p):
         """GPU-resident prefill: all ops on GPU, no per-layer readbacks."""
         from common.model_base import GPUBuffer
-
-        _prof = self._profiling
-        if _prof:
-            self._begin_cpu(f"L{layer}")
-            self.profiler._cpu.push_scope(f"L{layer}")
 
         x_is_gpu = isinstance(x, GPUBuffer)
         T = (x.shape[0] if x.shape else 1) if x_is_gpu else x.shape[0]
@@ -777,6 +750,7 @@ class Phi4WebGPU(WebGPUModel):
         BHD = self._attn_bhd
         half_rot = self.rotary_dim // 2
 
+        _p = p and p.enabled
 
         # Ensure x is on GPU (first layer gets numpy embedding)
         if not x_is_gpu:
@@ -785,134 +759,133 @@ class Phi4WebGPU(WebGPUModel):
             x.shape = (T, self.n_embd)
 
         # 1. RMSNorm
-        if self._profiling: self._begin_cpu("norm1")
-        if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
-        rn1 = self._rms_norm(
-            x, self._gpu_weights[pfx + "input_layernorm.weight"],
-            gpu_out=True)
-        if self._profiling: self._end_cpu("norm1")
+        stage_ctx = p.cpu("norm1") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/norm1"
+            rn1 = self._rms_norm(
+                x, self._gpu_weights[pfx + "input_layernorm.weight"],
+                gpu_out=True)
 
         # 2. QKV projection (stays on GPU)
-        if self._profiling: self._begin_cpu("qkv")
-        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
-        qkv = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
-                         self._gpu_weights["zero_bias_QKV"], self.qkv_out,
-                         gpu_out=True)
-        if self._profiling: self._end_cpu("qkv")
+        stage_ctx = p.cpu("qkv") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
+            qkv = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
+                             self._gpu_weights["zero_bias_QKV"], self.qkv_out,
+                             gpu_out=True)
 
         # Pre-build per-token cos/sin tables (same for all layers)
-        if not hasattr(self, '_prefill_cos_cache') or \
-                self._prefill_cos_cache_key != tuple(positions):
-            self._prefill_cos = np.ascontiguousarray(
-                self._rope_cos[positions], dtype=np.float32).ravel()
-            self._prefill_sin = np.ascontiguousarray(
-                self._rope_sin[positions], dtype=np.float32).ravel()
-            self._prefill_cos_cache_key = tuple(positions)
+        stage_ctx = p.cpu("rope_tables") if _p else nullcontext()
+        with stage_ctx:
+            if not hasattr(self, '_prefill_cos_cache') or \
+                    self._prefill_cos_cache_key != tuple(positions):
+                self._prefill_cos = np.ascontiguousarray(
+                    self._rope_cos[positions], dtype=np.float32).ravel()
+                self._prefill_sin = np.ascontiguousarray(
+                    self._rope_sin[positions], dtype=np.float32).ravel()
+                self._prefill_cos_cache_key = tuple(positions)
         cos_data = self._prefill_cos
         sin_data = self._prefill_sin
 
         # 3. GPU RoPE Q
-        if self._profiling: self._begin_cpu("rope_q")
-        if self._profiling: self._set_gpu_op(f"L{layer}/rope_q")
-        q_rope_out = self.cache.run(
-            self._rope_prefill_result, grid=(T, n_head),
-            buffers={
-                'X': qkv, 'Y': np.zeros(T * n_head * BHD, dtype=np.float32),
-                'Cos': cos_data, 'Sin': sin_data,
-            },
-            scalars={
-                'x_offset': 0, 'x_stride_t': self.qkv_out,
-                'y_stride_t': n_head * BHD, 'half_rot': half_rot,
-            },
-            gpu_outputs={'Y'})
-        q_rope = q_rope_out['Y']
-        q_rope.shape = (T, n_head, BHD)
-        if self._profiling: self._end_cpu("rope_q")
+        stage_ctx = p.cpu("rope_q") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/rope_q"
+            q_rope_out = self.cache.run(
+                self._rope_prefill_result, grid=(T, n_head),
+                buffers={
+                    'X': qkv, 'Y': np.zeros(T * n_head * BHD, dtype=np.float32),
+                    'Cos': cos_data, 'Sin': sin_data,
+                },
+                scalars={
+                    'x_offset': 0, 'x_stride_t': self.qkv_out,
+                    'y_stride_t': n_head * BHD, 'half_rot': half_rot,
+                },
+                gpu_outputs={'Y'})
+            q_rope = q_rope_out['Y']
+            q_rope.shape = (T, n_head, BHD)
 
         # 4. GPU RoPE K + V scatter to KV cache
-        if self._profiling: self._begin_cpu("rope_kv")
-        if self._profiling: self._set_gpu_op(f"L{layer}/rope_kv")
         K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
-        self.cache.run(
-            self._rope_kv_prefill_result, grid=(T, n_kv),
-            buffers={
-                'QKV': qkv,
-                'K_cache': K_cache_gpu, 'V_cache': V_cache_gpu,
-                'Cos': cos_data, 'Sin': sin_data,
-            },
-            scalars={
-                'q_size': n_head * HD, 'kv_size': n_kv * HD,
-                'qkv_stride_t': self.qkv_out,
-                'cache_stride_t': n_kv * HD,
-                'half_rot': half_rot,
-            },
-            gpu_outputs={'K_cache', 'V_cache'})
-        self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
-        if self._profiling: self._end_cpu("rope_kv")
+        stage_ctx = p.cpu("rope_kv") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/rope_kv"
+            self.cache.run(
+                self._rope_kv_prefill_result, grid=(T, n_kv),
+                buffers={
+                    'QKV': qkv,
+                    'K_cache': K_cache_gpu, 'V_cache': V_cache_gpu,
+                    'Cos': cos_data, 'Sin': sin_data,
+                },
+                scalars={
+                    'q_size': n_head * HD, 'kv_size': n_kv * HD,
+                    'qkv_stride_t': self.qkv_out,
+                    'cache_stride_t': n_kv * HD,
+                    'half_rot': half_rot,
+                },
+                gpu_outputs={'K_cache', 'V_cache'})
+            self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
 
         # 5. Multi-head causal attention
-        if self._profiling: self._begin_cpu("attn_kern")
-        if self._profiling: self._set_gpu_op(f"L{layer}/attn")
         scale = float(1.0 / np.sqrt(HD))
-        attn_result = self.cache.run(
-            self._mh_attn_result, grid=(T, n_head),
-            buffers={
-                'Q': q_rope,
-                'K': K_cache_gpu, 'V': V_cache_gpu,
-                'Out': np.zeros(T * n_head * BHD, dtype=np.float32),
-            },
-            scalars={
-                'stride_q_t': n_head * BHD, 'stride_q_h': BHD,
-                'stride_k_t': n_kv * BHD, 'stride_k_h': BHD,
-                'stride_v_t': n_kv * BHD, 'stride_v_h': BHD,
-                'stride_o_t': n_head * BHD, 'stride_o_h': BHD,
-                'n_rep': self.n_rep, 'scale': scale,
-                'neg_inf': float(-1e9),
-            },
-            gpu_outputs={'Out'})
-        attn_gpu = attn_result['Out']
-        attn_gpu.shape = (T, n_head * HD)
-        if self._profiling: self._end_cpu("attn_kern")
+        stage_ctx = p.cpu("attn") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/attn"
+            attn_result = self.cache.run(
+                self._mh_attn_result, grid=(T, n_head),
+                buffers={
+                    'Q': q_rope,
+                    'K': K_cache_gpu, 'V': V_cache_gpu,
+                    'Out': np.zeros(T * n_head * BHD, dtype=np.float32),
+                },
+                scalars={
+                    'stride_q_t': n_head * BHD, 'stride_q_h': BHD,
+                    'stride_k_t': n_kv * BHD, 'stride_k_h': BHD,
+                    'stride_v_t': n_kv * BHD, 'stride_v_h': BHD,
+                    'stride_o_t': n_head * BHD, 'stride_o_h': BHD,
+                    'n_rep': self.n_rep, 'scale': scale,
+                    'neg_inf': float(-1e9),
+                },
+                gpu_outputs={'Out'})
+            attn_gpu = attn_result['Out']
+            attn_gpu.shape = (T, n_head * HD)
 
         # 6. O projection
-        if self._profiling: self._begin_cpu("o_proj")
-        if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o_bias = self._gpu_weights.get("zero_bias_QO",
                                         self._gpu_weights["zero_bias_E"])
-        o_out = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
-                           o_bias, self.n_embd, gpu_out=True)
-        if self._profiling: self._end_cpu("o_proj")
+        stage_ctx = p.cpu("o_proj") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/o_proj"
+            o_out = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
+                               o_bias, self.n_embd, gpu_out=True)
 
-        # 7. Residual add
-        if self._profiling: self._begin_cpu("res1")
-        if self._profiling: self._set_gpu_op(f"L{layer}/res1")
-        self._add_inplace(x, o_out)
-        if self._profiling: self._end_cpu("res1")
+        # 7. Residual add (in-place to avoid toggle pool aliasing)
+        stage_ctx = p.cpu("res1") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/res1"
+            self._add_inplace(x, o_out)
 
         # 8. RMSNorm
-        if self._profiling: self._begin_cpu("norm2")
-        if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
-        rn2 = self._rms_norm(
-            x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
-            gpu_out=True)
-        if self._profiling: self._end_cpu("norm2")
+        stage_ctx = p.cpu("norm2") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/norm2"
+            rn2 = self._rms_norm(
+                x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
+                gpu_out=True)
 
-        # 9. MLP
-        if self._profiling: self._begin_cpu("mlp_kern")
-        if self._profiling: self._set_gpu_op(f"L{layer}/mlp")
-        mlp = self._mlp_block(rn2, layer, gpu_out=True)
-        if self._profiling: self._end_cpu("mlp_kern")
+        # 9. MLP (fused gate_up + silu_mul + down)
+        stage_ctx = p.cpu("mlp") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/mlp"
+            mlp = self._mlp_block(rn2, layer, gpu_out=True)
 
-        # 10. Residual add
-        if self._profiling: self._begin_cpu("res2")
-        if self._profiling: self._set_gpu_op(f"L{layer}/res2")
-        self._add_inplace(x, mlp)
-        if self._profiling: self._end_cpu("res2")
+        # 10. Residual add (in-place)
+        stage_ctx = p.cpu("res2") if _p else nullcontext()
+        with stage_ctx:
+            if _p: self.cache._gpu_op_name = f"L{layer}/res2"
+            self._add_inplace(x, mlp)
 
-        if self._profiling: self._clear_gpu_op()
-        if _prof:
-            self.profiler._cpu.pop_scope()  # pop L{layer}
-            self._end_cpu(f"L{layer}")
+        if _p: self.cache._gpu_op_name = None
         return x
 
     # ------------------------------------------------------------------
@@ -927,10 +900,23 @@ class Phi4WebGPU(WebGPUModel):
         (X, W_Q4, Scales, Zeros, Bias, Y, _params_) with workgroup_size=32.
         """
         import struct
-        from common.wgsl_kernels import WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, pack_dp4a_params, TILE_N
+        from common.wgsl_kernels import (
+            WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, pack_dp4a_params, TILE_N,
+            WGSL_FP16_GEMM_KERNEL, FP16_GEMM_BINDINGS, pack_fp16_gemm_params,
+            FP16_GEMM_TILE_N,
+            WGSL_EMBED_GATHER_KERNEL, EMBED_GATHER_BINDINGS,
+            pack_embed_gather_params,
+            WGSL_ARGMAX_STAGE1_KERNEL, ARGMAX_STAGE1_BINDINGS,
+            WGSL_ARGMAX_STAGE2_KERNEL, ARGMAX_STAGE2_BINDINGS,
+            WGSL_TOPK_FUSED_KERNEL, TOPK_FUSED_BINDINGS,
+            WGSL_TOPK_SAMPLE_KERNEL, TOPK_SAMPLE_BINDINGS,
+            pack_argmax_stage1_params, pack_argmax_stage2_params,
+            pack_topk_sample_params,
+        )
         runner = self.cache.runner
 
-        # Ensure all layer weights are on GPU before building bind groups
+        # Fast decode pre-records bind groups for all layers, so ensure
+        # per-layer projection weights are uploaded up front.
         for layer in range(self.n_layer):
             self._upload_layer_weights(layer)
 
@@ -976,6 +962,23 @@ class Phi4WebGPU(WebGPUModel):
         def get_pl(r):
             return runner.get_pipeline_info(
                 r.wgsl, r.buffer_bindings, r.param_fields)
+
+        pipeline_specs = [
+            (self._rn_result.wgsl, self._rn_result.buffer_bindings, self._rn_result.param_fields),
+            (self._rope_result.wgsl, self._rope_result.buffer_bindings, self._rope_result.param_fields),
+            (self._rope_kv_result.wgsl, self._rope_kv_result.buffer_bindings, self._rope_kv_result.param_fields),
+            (self._gqa_attn_result.wgsl, self._gqa_attn_result.buffer_bindings, self._gqa_attn_result.param_fields),
+            (self._add_ip_result.wgsl, self._add_ip_result.buffer_bindings, self._add_ip_result.param_fields),
+            (self._smf_result.wgsl, self._smf_result.buffer_bindings, self._smf_result.param_fields),
+            (WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, []),
+            (WGSL_FP16_GEMM_KERNEL, FP16_GEMM_BINDINGS, []),
+            (WGSL_EMBED_GATHER_KERNEL, EMBED_GATHER_BINDINGS, []),
+            (WGSL_ARGMAX_STAGE1_KERNEL, ARGMAX_STAGE1_BINDINGS, []),
+            (WGSL_TOPK_FUSED_KERNEL, TOPK_FUSED_BINDINGS, []),
+            (WGSL_TOPK_SAMPLE_KERNEL, TOPK_SAMPLE_BINDINGS, []),
+        ]
+        if hasattr(runner, 'prefetch_pipelines_async'):
+            runner.prefetch_pipelines_async(pipeline_specs)
 
         pl_rn,   bgl_rn   = get_pl(self._rn_result)
         pl_rope, bgl_rope = get_pl(self._rope_result)
@@ -1066,19 +1069,27 @@ class Phi4WebGPU(WebGPUModel):
             (nbb_rn, rn_p[0], rn_p[1])])
 
         logits_buf = mkbuf('logits', self.n_vocab * 4)
-        pl_lmh, bgl_lmh = get_pl(self._linear_fp16w_wide_result)
-        nbb_lmh = len(self._linear_fp16w_wide_result.buffer_bindings)
-        lm_gy = self.MAX_DISPATCH_DIM
-        lm_gx = (self.n_vocab + lm_gy - 1) // lm_gy
-        lmh_p = mk_params('lmh_p', self._linear_fp16w_wide_result.param_fields,
-                           {'K': E, 'stride_x': E, 'stride_w': E,
-                            'N': self.n_vocab, 'grid_y': lm_gy})
+        pl_lmh, bgl_lmh = runner.get_pipeline_info(
+            WGSL_FP16_GEMM_KERNEL, FP16_GEMM_BINDINGS, [])
+        nbb_lmh = len(FP16_GEMM_BINDINGS)
+        lm_gx = 1
+        lm_gy = (self.n_vocab + FP16_GEMM_TILE_N - 1) // FP16_GEMM_TILE_N
+        lmh_data = pack_fp16_gemm_params(E, self.n_vocab)
+        lmh_p = mkbuf('lmh_p', len(lmh_data) * 4)
+        runner.write_buffer(lmh_p[0], lmh_data.tobytes())
         bg_lmh = mk_bg(bgl_lmh, [
             (0, norm_out[0], norm_out[1]),
             (1, lm_w.handle, lm_w.size),
             (2, bias_v.handle, bias_v.size),
             (3, logits_buf[0], logits_buf[1]),
-            (nbb_lmh, lmh_p[0], lmh_p[1])])
+            (4, lmh_p[0], lmh_p[1])])
+
+        # Token embedding gather (GPU): token id -> x buffer
+        pl_emb, bgl_emb = runner.get_pipeline_info(
+            WGSL_EMBED_GATHER_KERNEL, EMBED_GATHER_BINDINGS, [])
+        emb_p_data = pack_embed_gather_params(E, self.n_vocab)
+        emb_p = mkbuf('emb_p', len(emb_p_data) * 4)
+        runner.write_buffer(emb_p[0], emb_p_data.tobytes())
 
         # Per-layer bind groups using WGSL Q4 kernel
         layer_dispatches = []
@@ -1182,13 +1193,137 @@ class Phi4WebGPU(WebGPUModel):
             (pl_lmh, bg_lmh,     (lm_gx, lm_gy)),
         ]
 
+        # Optional GPU greedy sampling: argmax(logits) in two passes.
+        argmax_groups = (self.n_vocab + 255) // 256
+        argmax_vals = mkbuf('argmax_vals', argmax_groups * 4)
+        argmax_idx = mkbuf('argmax_idx', argmax_groups * 4)
+        out_token = mkbuf('out_token', 4)
+        topk_max = 64
+        topk_idx = mkbuf('topk_idx', topk_max * 4)
+        topk_val = mkbuf('topk_val', topk_max * 4)
+
+        pl_am1, bgl_am1 = runner.get_pipeline_info(
+            WGSL_ARGMAX_STAGE1_KERNEL, ARGMAX_STAGE1_BINDINGS, [])
+        pl_am2, bgl_am2 = runner.get_pipeline_info(
+            WGSL_ARGMAX_STAGE2_KERNEL, ARGMAX_STAGE2_BINDINGS, [])
+        pl_tkf, bgl_tkf = runner.get_pipeline_info(
+            WGSL_TOPK_FUSED_KERNEL, TOPK_FUSED_BINDINGS, [])
+        pl_tks, bgl_tks = runner.get_pipeline_info(
+            WGSL_TOPK_SAMPLE_KERNEL, TOPK_SAMPLE_BINDINGS, [])
+
+        am1_data = pack_argmax_stage1_params(self.n_vocab)
+        am1_p = mkbuf('argmax1_p', len(am1_data) * 4)
+        runner.write_buffer(am1_p[0], am1_data.tobytes())
+        am2_data = pack_argmax_stage2_params(argmax_groups)
+        am2_p = mkbuf('argmax2_p', len(am2_data) * 4)
+        runner.write_buffer(am2_p[0], am2_data.tobytes())
+        tks_data = pack_topk_sample_params(1, 1.0, 0)
+        tks_p = mkbuf('topks_p', len(tks_data) * 4)
+        runner.write_buffer(tks_p[0], tks_data.tobytes())
+
+        bg_am1 = mk_bg(bgl_am1, [
+            (0, logits_buf[0], logits_buf[1]),
+            (1, argmax_vals[0], argmax_vals[1]),
+            (2, argmax_idx[0], argmax_idx[1]),
+            (3, am1_p[0], am1_p[1]),
+        ])
+        bg_emb = mk_bg(bgl_emb, [
+            (0, out_token[0], out_token[1]),
+            (1, lm_w.handle, lm_w.size),
+            (2, x_buf[0], x_buf[1]),
+            (3, emb_p[0], emb_p[1]),
+        ])
+        bg_am2 = mk_bg(bgl_am2, [
+            (0, argmax_vals[0], argmax_vals[1]),
+            (1, argmax_idx[0], argmax_idx[1]),
+            (2, out_token[0], out_token[1]),
+            (3, am2_p[0], am2_p[1]),
+        ])
+        bg_tks = mk_bg(bgl_tks, [
+            (0, topk_idx[0], topk_idx[1]),
+            (1, topk_val[0], topk_val[1]),
+            (2, out_token[0], out_token[1]),
+            (3, tks_p[0], tks_p[1]),
+        ])
+
+        topk_prefix_batches = []
+        topk_prefix_dispatch_names = []
+        for k in range(1, topk_max + 1):
+            tkf_data = np.array([self.n_vocab, argmax_groups, k], dtype=np.uint32)
+            tkf_p = mkbuf(f'topkf_p_{k}', len(tkf_data) * 4)
+            runner.write_buffer(tkf_p[0], tkf_data.tobytes())
+            bg_tkf = mk_bg(bgl_tkf, [
+                (0, logits_buf[0], logits_buf[1]),
+                (1, argmax_vals[0], argmax_vals[1]),
+                (2, argmax_idx[0], argmax_idx[1]),
+                (3, topk_idx[0], topk_idx[1]),
+                (4, topk_val[0], topk_val[1]),
+                (5, tkf_p[0], tkf_p[1]),
+            ])
+            topk_prefix_batches.append([
+                [(pl_am1, bg_am1, (argmax_groups,))],
+                [(pl_tkf, bg_tkf, (1,))],
+                [(pl_tks, bg_tks, (1,))],
+            ])
+            topk_prefix_dispatch_names.append(["argmax_stage1", f"topk_fused_k{k}", "topk_sample"])
+
+        sample_dispatches = [
+            (pl_am1, bg_am1, (argmax_groups,)),
+            (pl_am2, bg_am2, (1,)),
+        ]
+
         self._fd_x_h = x_buf[0]
         self._fd_logits_h = logits_buf[0]
         self._fd_logits_sz = logits_buf[1]
+        self._fd_out_token_h = out_token[0]
+        self._fd_out_token_sz = out_token[1]
+        self._fd_argmax_vals_h = argmax_vals[0]
+        self._fd_argmax_vals_sz = argmax_vals[1]
+        self._fd_argmax_idx_h = argmax_idx[0]
+        self._fd_argmax_idx_sz = argmax_idx[1]
+        self._fd_topk_idx_h = topk_idx[0]
+        self._fd_topk_idx_sz = topk_idx[1]
+        self._fd_topk_val_h = topk_val[0]
+        self._fd_topk_val_sz = topk_val[1]
+        self._fd_topk_max = topk_max
+        self._fd_topk_sample_params_h = tks_p[0]
+        self._fd_topk_rng_state = int(time.time_ns()) & 0xFFFFFFFF
         self._fd_rope_q_ph = rope_q_ph[0]
         self._fd_rope_kv_ph = rope_kv_ph[0]
         self._fd_attn_ph = attn_ph[0]
-        self._fd_all_batches = layer_dispatches + [final_dispatches]
+        embed_dispatches = [(pl_emb, bg_emb, ((E + 255) // 256,))]
+        self._fd_all_batches = [embed_dispatches] + layer_dispatches + [final_dispatches]
+        self._fd_all_batches_sample = [embed_dispatches] + layer_dispatches + [final_dispatches + sample_dispatches]
+        self._fd_topk_prefix_batches = topk_prefix_batches
+        self._fd_topk_prefix_dispatch_names = topk_prefix_dispatch_names
+        self._fd_sample_only_batches = [
+            [sample_dispatches[0]],
+            [sample_dispatches[1]],
+        ]
+
+        fd_dispatch_names_base = ["embed_lookup"]
+        for layer in range(self.n_layer):
+            prefix = f"L{layer}"
+            fd_dispatch_names_base.extend([
+                f"{prefix}/norm1",
+                f"{prefix}/qkv",
+                f"{prefix}/rope_q",
+                f"{prefix}/rope_kv",
+                f"{prefix}/attn",
+                f"{prefix}/o_proj",
+                f"{prefix}/res1",
+                f"{prefix}/norm2",
+                f"{prefix}/gate_up",
+                f"{prefix}/silu_mul",
+                f"{prefix}/down",
+                f"{prefix}/res2",
+            ])
+        fd_dispatch_names_base.extend(["final_norm", "lm_head"])
+        self._fd_dispatch_names_base = fd_dispatch_names_base
+        self._fd_dispatch_names_sample = fd_dispatch_names_base + [
+            "argmax_stage1", "argmax_stage2"
+        ]
+        self._fd_have_token_gpu = False
 
         self._fd_rq_buf = bytearray(16)
         struct.pack_into('<i', self._fd_rq_buf, 0, 0)
@@ -1204,26 +1339,6 @@ class Phi4WebGPU(WebGPUModel):
 
         self._fast_decode_ready = True
 
-    def _free_cpu_weights(self):
-        """Free CPU copies of weights after GPU upload.
-
-        All layer weights and embedding are on GPU; CPU copies waste RAM.
-        Keeps only tokenizer-related data.
-        """
-        import gc
-        freed = 0
-        keys_to_del = []
-        for name in list(self.weights.keys()):
-            if name in ("embed_tokens.weight",):
-                continue  # Keep for CPU fallback paths
-            keys_to_del.append(name)
-        for name in keys_to_del:
-            freed += self.weights[name].nbytes
-            del self.weights[name]
-        gc.collect()
-        if freed > 0:
-            print(f"  Freed {freed / 1024 / 1024:.0f} MB CPU weight copies")
-
     def _warmup_fast_decode(self):
         """Eagerly initialize fast decode pipeline so that init cost
         is excluded from the decode timer in generate()."""
@@ -1235,9 +1350,6 @@ class Phi4WebGPU(WebGPUModel):
             self._init_fast_decode_dp4a()
         else:
             self._init_fast_decode()
-        # Free CPU weight copies — all weights are now on GPU
-        self._free_cpu_weights()
-        print("  Fast decode pipeline ready")
 
     def _init_fast_decode(self):
         """Pre-allocate buffers, bind groups, and params for fast decode.
@@ -1249,7 +1361,8 @@ class Phi4WebGPU(WebGPUModel):
         import struct
         runner = self.cache.runner
 
-        # Ensure all layer weights are on GPU before building bind groups
+        # Fast decode pre-records bind groups for all layers, so ensure
+        # per-layer projection weights are uploaded up front.
         for layer in range(self.n_layer):
             self._upload_layer_weights(layer)
 
@@ -1296,6 +1409,43 @@ class Phi4WebGPU(WebGPUModel):
             return runner.get_pipeline_info(
                 r.wgsl, r.buffer_bindings, r.param_fields)
 
+        # Use WGSL Q4/fp16/argmax/embed helper kernels in fast decode.
+        from common.wgsl_kernels import (
+            WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, pack_dp4a_params, TILE_N,
+            WGSL_FP16_GEMM_KERNEL, FP16_GEMM_BINDINGS, pack_fp16_gemm_params,
+            FP16_GEMM_TILE_N,
+            WGSL_EMBED_GATHER_KERNEL, EMBED_GATHER_BINDINGS,
+            pack_embed_gather_params,
+            WGSL_ARGMAX_STAGE1_KERNEL, ARGMAX_STAGE1_BINDINGS,
+            WGSL_ARGMAX_STAGE2_KERNEL, ARGMAX_STAGE2_BINDINGS,
+            pack_argmax_stage1_params, pack_argmax_stage2_params,
+        )
+
+        # Fused residual+RMSNorm kernel (disabled: doesn't improve perf)
+        has_add_rn = False
+
+        pipeline_specs = [
+            (self._rn_result.wgsl, self._rn_result.buffer_bindings, self._rn_result.param_fields),
+            (self._rope_result.wgsl, self._rope_result.buffer_bindings, self._rope_result.param_fields),
+            (self._rope_kv_result.wgsl, self._rope_kv_result.buffer_bindings, self._rope_kv_result.param_fields),
+            (self._gqa_attn_result.wgsl, self._gqa_attn_result.buffer_bindings, self._gqa_attn_result.param_fields),
+            (self._add_ip_result.wgsl, self._add_ip_result.buffer_bindings, self._add_ip_result.param_fields),
+            (self._smf_result.wgsl, self._smf_result.buffer_bindings, self._smf_result.param_fields),
+            (WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, []),
+            (WGSL_FP16_GEMM_KERNEL, FP16_GEMM_BINDINGS, []),
+            (WGSL_EMBED_GATHER_KERNEL, EMBED_GATHER_BINDINGS, []),
+            (WGSL_ARGMAX_STAGE1_KERNEL, ARGMAX_STAGE1_BINDINGS, []),
+            (WGSL_ARGMAX_STAGE2_KERNEL, ARGMAX_STAGE2_BINDINGS, []),
+        ]
+        if has_add_rn:
+            pipeline_specs.append(
+                (self._add_rn_result.wgsl,
+                 self._add_rn_result.buffer_bindings,
+                 self._add_rn_result.param_fields)
+            )
+        if hasattr(runner, 'prefetch_pipelines_async'):
+            runner.prefetch_pipelines_async(pipeline_specs)
+
         pl_rn,   bgl_rn   = get_pl(self._rn_result)
         pl_rope, bgl_rope = get_pl(self._rope_result)
         pl_rkv,  bgl_rkv  = get_pl(self._rope_kv_result)
@@ -1305,19 +1455,11 @@ class Phi4WebGPU(WebGPUModel):
 
         # Use WGSL Q4 kernel for matmul (faster than Triton Q4:
         # TILE_N=8 multi-output, native subgroupAdd, fewer workgroups)
-        from common.wgsl_kernels import WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, pack_dp4a_params, TILE_N
         pl_q4, bgl_q4 = runner.get_pipeline_info(
             WGSL_Q4_DP4A_KERNEL, Q4_DP4A_BINDINGS, [])
-
-        # Fused residual+RMSNorm kernel: x += residual; y = rms_norm(x)
-        # Saves 1 dispatch per layer (res1 + norm2 → single kernel)
-        has_add_rn = True
-        pl_arn, bgl_arn = get_pl(self._add_rn_result)
-        nbb_arn = len(self._add_rn_result.buffer_bindings)
-
-        # Fused RoPE Q + K scatter + V copy (2 dispatches → 1)
-        pl_fused_rope, bgl_fused_rope = get_pl(self._fused_rope_result)
-        nbb_fused_rope = len(self._fused_rope_result.buffer_bindings)
+        if has_add_rn:
+            pl_arn, bgl_arn = get_pl(self._add_rn_result)
+            nbb_arn = len(self._add_rn_result.buffer_bindings)
 
         nbb_rn   = len(self._rn_result.buffer_bindings)
         nbb_rope = len(self._rope_result.buffer_bindings)
@@ -1336,9 +1478,10 @@ class Phi4WebGPU(WebGPUModel):
         rn_p = mk_params('rn_p', self._rn_result.param_fields,
                           {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
 
-        # Fused add+norm params
-        arn_p = mk_params('arn_p', self._add_rn_result.param_fields,
-                          {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
+        # Fused add+norm params (same structure but different kernel)
+        if has_add_rn:
+            arn_p = mk_params('arn_p', self._add_rn_result.param_fields,
+                              {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
 
         # WGSL Q4 params — one per projection shape
         def mk_wq4_params(name, K_val, N_val):
@@ -1360,7 +1503,6 @@ class Phi4WebGPU(WebGPUModel):
         rope_q_ph = mkbuf('ropeq_p', 16)
         rope_kv_ph = mkbuf('ropekv_p', 20)
         attn_ph = mkbuf('attn_p', 20)
-        fused_rope_ph = mkbuf('fused_rope_p', 24)
 
         # --- 4. Global buffer handles ---
         cos_h, cos_sz = self._rope_cos_gpu.handle, self._rope_cos_gpu.size
@@ -1405,20 +1547,20 @@ class Phi4WebGPU(WebGPUModel):
             (nbb_rn, rn_p[0], rn_p[1])])
 
         logits_buf = mkbuf('logits', self.n_vocab * 4)
-
-        pl_lmh,  bgl_lmh  = get_pl(self._linear_fp16w_wide_result)
-        nbb_lmh  = len(self._linear_fp16w_wide_result.buffer_bindings)
-        lm_gy = self.MAX_DISPATCH_DIM
-        lm_gx = (self.n_vocab + lm_gy - 1) // lm_gy
-        lmh_p = mk_params('lmh_p', self._linear_fp16w_wide_result.param_fields,
-                           {'K': E, 'stride_x': E, 'stride_w': E,
-                            'N': self.n_vocab, 'grid_y': lm_gy})
+        pl_lmh, bgl_lmh = runner.get_pipeline_info(
+            WGSL_FP16_GEMM_KERNEL, FP16_GEMM_BINDINGS, [])
+        nbb_lmh = len(FP16_GEMM_BINDINGS)
+        lm_gx = 1
+        lm_gy = (self.n_vocab + FP16_GEMM_TILE_N - 1) // FP16_GEMM_TILE_N
+        lmh_data = pack_fp16_gemm_params(E, self.n_vocab)
+        lmh_p = mkbuf('lmh_p', len(lmh_data) * 4)
+        runner.write_buffer(lmh_p[0], lmh_data.tobytes())
         bg_lmh = mk_bg(bgl_lmh, [
             (0, norm_out[0], norm_out[1]),
             (1, lm_w.handle, lm_w.size),
             (2, bias_v.handle, bias_v.size),
             (3, logits_buf[0], logits_buf[1]),
-            (nbb_lmh, lmh_p[0], lmh_p[1])])
+            (4, lmh_p[0], lmh_p[1])])
 
         # Per-layer bind groups
         layer_dispatches = []
@@ -1485,15 +1627,6 @@ class Phi4WebGPU(WebGPUModel):
                 (5, proj_out[0], proj_out[1]),
                 (6, oproj_p[0], oproj_p[1])])
 
-            # Fused RoPE Q + K scatter + V copy (replaces separate rope_q + rope_kv)
-            bg_fused_rope = mk_bg(bgl_fused_rope, [
-                (0, qkv_out[0], qkv_out[1]),
-                (1, q_rot[0], q_rot[1]),
-                (2, Kc.handle, Kc.size),
-                (3, Vc.handle, Vc.size),
-                (4, cos_h, cos_sz), (5, sin_h, sin_sz),
-                (nbb_fused_rope, fused_rope_ph[0], fused_rope_ph[1])])
-
             if has_add_rn:
                 # Fused res1+norm2: x += proj_out; norm_out = rms_norm(x)
                 bg_arn2 = mk_bg(bgl_arn, [
@@ -1531,89 +1664,116 @@ class Phi4WebGPU(WebGPUModel):
                 (5, proj_out[0], proj_out[1]),
                 (6, down_p[0], down_p[1])])
 
-            # Fused dispatch list: 10 dispatches per layer (was 12)
-            # Fusions: rope_q+rope_kv→fused_rope, res1+norm2→add_rn
+            # WGSL Q4 grid: (T=1, ceil(N/TILE_N)) with workgroup_size=256
             if has_add_rn:
                 layer_dispatches.append([
-                    (pl_rn,         bg_n1,          (1,)),         # norm1
-                    (pl_q4,         bg_qkv,         (1, (qkv_N + TILE_N - 1) // TILE_N)),  # qkv
-                    (pl_fused_rope, bg_fused_rope,  (n_head + n_kv,)),  # fused rope_q+kv (n_head+n_kv workgroups)
-                    (pl_attn,       bg_att,         (n_head,)),    # attn
-                    (pl_q4,         bg_op,          (1, (E + TILE_N - 1) // TILE_N)),       # o_proj
-                    (pl_arn,        bg_arn2,         (1,)),         # fused res1+norm2
-                    (pl_q4,         bg_gu,          (1, (2 * IM + TILE_N - 1) // TILE_N)),  # gate_up
-                    (pl_silu,       bg_silu,         silu_g),       # silu_mul
-                    (pl_q4,         bg_dn,          (1, (E + TILE_N - 1) // TILE_N)),       # down
-                    (pl_aip,        bg_res,          aip_g),        # res2
+                    (pl_rn,   bg_n1,     (1,)),         # norm1
+                    (pl_q4,   bg_qkv,    (1, (qkv_N + TILE_N - 1) // TILE_N)),
+                    (pl_rope, bg_rope_q,  (n_head,)),    # rope_q
+                    (pl_rkv,  bg_rkv,    (n_kv,)),       # rope_kv
+                    (pl_attn, bg_att,    (n_head,)),      # attn
+                    (pl_q4,   bg_op,     (1, (E + TILE_N - 1) // TILE_N)),
+                    (pl_arn,  bg_arn2,   (1,)),           # fused res1+norm2
+                    (pl_q4,   bg_gu,     (1, (2 * IM + TILE_N - 1) // TILE_N)),
+                    (pl_silu, bg_silu,   silu_g),          # silu_mul
+                    (pl_q4,   bg_dn,     (1, (E + TILE_N - 1) // TILE_N)),
+                    (pl_aip,  bg_res,    aip_g),           # res2
                 ])
+            else:
+                layer_dispatches.append([
+                    (pl_rn,   bg_n1,    (1,)),         # norm1
+                    (pl_q4,   bg_qkv,   (1, (qkv_N + TILE_N - 1) // TILE_N)),
+                    (pl_rope, bg_rope_q, (n_head,)),   # rope_q
+                    (pl_rkv,  bg_rkv,   (n_kv,)),      # rope_kv
+                    (pl_attn, bg_att,   (n_head,)),     # attn
+                    (pl_q4,   bg_op,    (1, (E + TILE_N - 1) // TILE_N)),
+                    (pl_aip,  bg_res,   aip_g),         # res1
+                    (pl_rn,   bg_n2,    (1,)),          # norm2
+                    (pl_q4,   bg_gu,    (1, (2 * IM + TILE_N - 1) // TILE_N)),
+                    (pl_silu, bg_silu,  silu_g),         # silu_mul
+                    (pl_q4,   bg_dn,    (1, (E + TILE_N - 1) // TILE_N)),
+                    (pl_aip,  bg_res,   aip_g),          # res2
+                ])
+
         final_dispatches = [
             (pl_rn,  bg_final_rn, (1,)),
             (pl_lmh, bg_lmh,     (lm_gx, lm_gy)),
         ]
 
-        # --- GPU embed gather + argmax for fully GPU-resident decode ---
-        # Token ID buffer (single i32, fed back between iterations)
-        token_id_buf = mkbuf('token_id', 4)
+        # Optional GPU greedy sampling: argmax(logits) in two passes.
+        argmax_groups = (self.n_vocab + 255) // 256
+        argmax_vals = mkbuf('argmax_vals', argmax_groups * 4)
+        argmax_idx = mkbuf('argmax_idx', argmax_groups * 4)
+        out_token = mkbuf('out_token', 4)
 
-        # Embed gather: token_id → x_buf (use fp16 embed when available)
-        if hasattr(self, '_embed_gather_fp16_result'):
-            _eg_result = self._embed_gather_fp16_result
-            _eg_embed = self._gpu_weights["embed_tokens.weight.fp16"]
-        else:
-            _eg_result = self._embed_gather_result
-            _eg_embed = self._gpu_weights["embed_tokens.weight.fp32"]
-        pl_eg, bgl_eg = get_pl(_eg_result)
-        nbb_eg = len(_eg_result.buffer_bindings)
-        eg_p = mk_params('eg_p', _eg_result.param_fields,
-                          {'stride_e': E})
-        bg_eg = mk_bg(bgl_eg, [
-            (0, token_id_buf[0], token_id_buf[1]),
-            (1, _eg_embed.handle, _eg_embed.size),
-            (2, x_buf[0], x_buf[1]),
-            (nbb_eg, eg_p[0], eg_p[1])])
+        pl_am1, bgl_am1 = runner.get_pipeline_info(
+            WGSL_ARGMAX_STAGE1_KERNEL, ARGMAX_STAGE1_BINDINGS, [])
+        pl_am2, bgl_am2 = runner.get_pipeline_info(
+            WGSL_ARGMAX_STAGE2_KERNEL, ARGMAX_STAGE2_BINDINGS, [])
 
-        embed_dispatch = [(pl_eg, bg_eg, (1,))]
+        am1_data = pack_argmax_stage1_params(self.n_vocab)
+        am1_p = mkbuf('argmax1_p', len(am1_data) * 4)
+        runner.write_buffer(am1_p[0], am1_data.tobytes())
+        am2_data = pack_argmax_stage2_params(argmax_groups)
+        am2_p = mkbuf('argmax2_p', len(am2_data) * 4)
+        runner.write_buffer(am2_p[0], am2_data.tobytes())
 
-        # Argmax: logits_buf → token_id_buf
-        pl_am, bgl_am = get_pl(self._argmax_result)
-        nbb_am = len(self._argmax_result.buffer_bindings)
-        am_p = mk_params('am_p', self._argmax_result.param_fields,
-                          {'N': self.n_vocab})
-        bg_am = mk_bg(bgl_am, [
+        bg_am1 = mk_bg(bgl_am1, [
             (0, logits_buf[0], logits_buf[1]),
-            (1, token_id_buf[0], token_id_buf[1]),
-            (nbb_am, am_p[0], am_p[1])])
+            (1, argmax_vals[0], argmax_vals[1]),
+            (2, argmax_idx[0], argmax_idx[1]),
+            (3, am1_p[0], am1_p[1]),
+        ])
+        bg_am2 = mk_bg(bgl_am2, [
+            (0, argmax_vals[0], argmax_vals[1]),
+            (1, argmax_idx[0], argmax_idx[1]),
+            (2, out_token[0], out_token[1]),
+            (3, am2_p[0], am2_p[1]),
+        ])
 
-        argmax_dispatch = [(pl_am, bg_am, (1,))]
+        sample_dispatches = [
+            (pl_am1, bg_am1, (argmax_groups,)),
+            (pl_am2, bg_am2, (1,)),
+        ]
+
+        # GPU embed gather: token_id → embedding in x_buf
+        # Shares `out_token` buffer with argmax output so the previous
+        # token id is ready for embedding gather on the next step.
+        pl_emb, bgl_emb = runner.get_pipeline_info(
+            WGSL_EMBED_GATHER_KERNEL, EMBED_GATHER_BINDINGS, [])
+        emb_data = pack_embed_gather_params(E, self.n_vocab)
+        emb_p = mkbuf('emb_p', len(emb_data) * 4)
+        runner.write_buffer(emb_p[0], emb_data.tobytes())
+        bg_emb = mk_bg(bgl_emb, [
+            (0, out_token[0], out_token[1]),
+            (1, lm_w.handle, lm_w.size),
+            (2, x_buf[0], x_buf[1]),
+            (3, emb_p[0], emb_p[1])])
 
         # Store for per-token use
         self._fd_x_h = x_buf[0]
-        self._fd_token_id_h = token_id_buf[0]
-        self._fd_token_id_sz = token_id_buf[1]
         self._fd_logits_h = logits_buf[0]
         self._fd_logits_sz = logits_buf[1]
-        self._fd_fused_rope_ph = fused_rope_ph[0]
+        self._fd_out_token_h = out_token[0]
+        self._fd_out_token_sz = out_token[1]
+        self._fd_rope_q_ph = rope_q_ph[0]
+        self._fd_rope_kv_ph = rope_kv_ph[0]
         self._fd_attn_ph = attn_ph[0]
 
-        # Full pipeline with GPU embed + argmax
-        self._fd_all_batches = (
-            [embed_dispatch] +   # GPU embed gather
-            layer_dispatches +   # 32 transformer layers
-            [final_dispatches] + # final norm + lm_head
-            [argmax_dispatch]    # GPU argmax → token_id
-        )
-
-        # Legacy: dispatch list without embed/argmax for fallback
-        self._fd_batches_no_embed = (
-            layer_dispatches +
-            [final_dispatches]
-        )
+        # Pre-compute the full batches list (avoid creating it each token)
+        embed_dispatches = [(pl_emb, bg_emb, ((E + 255) // 256,))]
+        self._fd_all_batches = [embed_dispatches] + layer_dispatches + [final_dispatches]
+        self._fd_all_batches_sample = [embed_dispatches] + layer_dispatches + [final_dispatches + sample_dispatches]
 
         # Pre-allocated bytearrays for dynamic params (avoid per-token alloc)
-        # fused_rope: n_head(i32), q_size(i32), kv_size(i32), pos(i32), half_rot(i32), cache_offset(i32)
-        self._fd_fused_rope_buf = bytearray(24)
-        struct.pack_into('<iii', self._fd_fused_rope_buf, 0, n_head, q_size, kv_size)
-        struct.pack_into('<i', self._fd_fused_rope_buf, 16, half_rot)
+        # rope_q: src_offset(i32)=0, pos(i32), half_rot(i32), pad(i32)
+        self._fd_rq_buf = bytearray(16)
+        struct.pack_into('<i', self._fd_rq_buf, 0, 0)         # src_offset
+        struct.pack_into('<i', self._fd_rq_buf, 8, half_rot)
+        # rope_kv: q_size(i32), kv_size(i32), pos(i32), half_rot(i32), cache_offset(i32)
+        self._fd_rkv_buf = bytearray(20)
+        struct.pack_into('<ii', self._fd_rkv_buf, 0, q_size, kv_size)
+        struct.pack_into('<i', self._fd_rkv_buf, 12, half_rot)
         # attn: kv_stride(i32), n_rep(i32), T_total(i32), scale(f32), neg_inf(f32)
         self._fd_attn_buf = bytearray(20)
         struct.pack_into('<ii', self._fd_attn_buf, 0, n_kv * HD, n_rep)
@@ -1621,31 +1781,64 @@ class Phi4WebGPU(WebGPUModel):
             float(np.float32(1.0 / np.sqrt(HD))),
             float(np.float32(-1e9)))
 
+        self._fd_have_token_gpu = False
+
+        # Dispatch names for profiling
+        fd_dispatch_names_base = ["embed_lookup"]
+        for layer in range(self.n_layer):
+            prefix = f"L{layer}"
+            fd_dispatch_names_base.extend([
+                f"{prefix}/norm1",
+                f"{prefix}/qkv",
+                f"{prefix}/rope_q",
+                f"{prefix}/rope_kv",
+                f"{prefix}/attn",
+                f"{prefix}/o_proj",
+                f"{prefix}/res1",
+                f"{prefix}/norm2",
+                f"{prefix}/gate_up",
+                f"{prefix}/silu_mul",
+                f"{prefix}/down",
+                f"{prefix}/res2",
+            ])
+        fd_dispatch_names_base.extend(["final_norm", "lm_head"])
+        self._fd_dispatch_names_base = fd_dispatch_names_base
+        self._fd_dispatch_names_sample = fd_dispatch_names_base + [
+            "argmax_stage1", "argmax_stage2"
+        ]
+
         self._fast_decode_ready = True
 
-    def _decode_fast(self, token_ids, pos_offset):
-        """Fast decode: fully GPU-resident with embed gather + argmax.
+    def _decode_fast(self, token_ids, pos_offset, return_token=False,
+                     return_top_k=0, sample_temperature=0.0):
+        """Fast decode: pre-recorded bind groups, minimal per-token overhead.
 
-        Flow: write token_id → GPU embed → 32 layers → norm → lm_head → argmax
-        Only reads back 4 bytes (token ID) instead of 512KB (logits).
+        Bypasses per-dispatch Python layers (buffer alloc, bind group creation,
+        compute pass begin/end). Only updates dynamic params and submits.
         """
         runner = self.cache.runner
-        import struct
+        # Token id input for GPU embedding gather
+        if token_ids is not None:
+            tid = int(np.asarray(token_ids, dtype=np.int32).reshape(-1)[0])
+            tok = np.array([tid], dtype=np.uint32)
+            runner.write_buffer(self._fd_out_token_h, tok.tobytes())
+            self._fd_have_token_gpu = True
+        elif not getattr(self, '_fd_have_token_gpu', False):
+            raise RuntimeError("Fast decode GPU token input is not initialized")
 
-        # Write token ID to GPU buffer (4 bytes)
-        runner.write_buffer(self._fd_token_id_h,
-                           struct.pack('<i', int(token_ids[0])))
-
-        # Dynamic params
+        # Dynamic params — pack_into pre-allocated bytearrays (no alloc)
         pos = pos_offset
         _, _, cur_len = self._gpu_kv_cache[0]
         cache_offset = cur_len * self.n_kv_heads * self.head_dim
         T_total = cur_len + 1
 
-        # Fused RoPE params: n_head, q_size, kv_size already packed; update pos + cache_offset
-        struct.pack_into('<i', self._fd_fused_rope_buf, 12, pos)
-        struct.pack_into('<i', self._fd_fused_rope_buf, 20, cache_offset)
-        runner.write_buffer(self._fd_fused_rope_ph, bytes(self._fd_fused_rope_buf))
+        import struct
+        struct.pack_into('<i', self._fd_rq_buf, 4, pos)
+        runner.write_buffer(self._fd_rope_q_ph, bytes(self._fd_rq_buf))
+
+        struct.pack_into('<i', self._fd_rkv_buf, 8, pos)
+        struct.pack_into('<i', self._fd_rkv_buf, 16, cache_offset)
+        runner.write_buffer(self._fd_rope_kv_ph, bytes(self._fd_rkv_buf))
 
         struct.pack_into('<i', self._fd_attn_buf, 8, T_total)
         runner.write_buffer(self._fd_attn_ph, bytes(self._fd_attn_buf))
@@ -1655,24 +1848,228 @@ class Phi4WebGPU(WebGPUModel):
             K, V, c = self._gpu_kv_cache[layer]
             self._gpu_kv_cache[layer] = (K, V, c + 1)
 
-        # Submit full pipeline: embed → layers → norm → lm_head → argmax
-        # Read back token ID (4 bytes) instead of full logits (512KB)
-        if self._profiling:
-            import time as _dt
-            _d0 = _dt.perf_counter_ns()
-        token_id_np = runner.submit_dispatches_pipelined(
-            self._fd_all_batches,
-            readback=(self._fd_token_id_h, self._fd_token_id_sz, np.int32),
-            profiler=self.profiler if self._profiling else None)
-        if self._profiling:
-            _d1 = _dt.perf_counter_ns()
-            self.profiler.record_dispatch("fast_decode", _d0, _d1)
-        next_token = int(token_id_np[0])
+        want_top_k = int(return_top_k) > 0
+        top_k = 0
+        use_gpu_topk_sample = False
+        if want_top_k:
+            top_k = min(int(return_top_k), int(getattr(self, '_fd_topk_max', 64)), self.n_vocab)
+            use_gpu_topk_sample = return_token and top_k > 0 and float(sample_temperature) > 0.0
 
-        # Build logits with just the argmax token set (for generate() compatibility)
-        logits = np.full((1, self.n_vocab), -1e9, dtype=np.float32)
-        logits[0, next_token] = 1.0
-        return logits
+        # Submit with CPU/GPU pipelining (per-layer batches)
+        # In profile mode, provide per-dispatch names so the runner can
+        # attach GPU timestamps to fast-decode operations.
+        p = self.profiler
+        dispatch_names = None
+        if p and p.enabled:
+            if return_token and not use_gpu_topk_sample:
+                dispatch_names = list(getattr(self, '_fd_dispatch_names_sample', []))
+            else:
+                dispatch_names = list(getattr(self, '_fd_dispatch_names_base', []))
+            if want_top_k:
+                top_k_names = top_k
+                topk_name_sets = getattr(self, '_fd_topk_prefix_dispatch_names', None)
+                if topk_name_sets and top_k_names > 0:
+                    dispatch_names.extend(topk_name_sets[top_k_names - 1])
+                else:
+                    dispatch_names.append("argmax_stage1")
+                    dispatch_names.append(f"topk_fused_k{top_k_names}")
+                    dispatch_names.append("topk_sample")
+
+        if return_token and not use_gpu_topk_sample:
+            active_batches = self._fd_all_batches_sample
+        else:
+            active_batches = self._fd_all_batches
+        submit_batches = active_batches
+        if want_top_k:
+            topk_prefix_batches = getattr(self, '_fd_topk_prefix_batches', None)
+            if topk_prefix_batches and top_k > 0:
+                submit_batches = active_batches + topk_prefix_batches[top_k - 1]
+        if use_gpu_topk_sample:
+            rng_state = (int(getattr(self, '_fd_topk_rng_state', 1)) * 1664525 + 1013904223) & 0xFFFFFFFF
+            self._fd_topk_rng_state = rng_state
+            from common.wgsl_kernels import pack_topk_sample_params
+            tks_data = pack_topk_sample_params(top_k, float(sample_temperature), rng_state)
+            runner.write_buffer(self._fd_topk_sample_params_h, tks_data.tobytes())
+            readback = (self._fd_out_token_h, self._fd_out_token_sz, np.uint32)
+        elif want_top_k:
+            readback = None
+        else:
+            readback = (self._fd_out_token_h, self._fd_out_token_sz, np.uint32) if return_token else \
+                       (self._fd_logits_h, self._fd_logits_sz, np.float32)
+
+        if p and p.enabled:
+            begin_ns = time.perf_counter_ns()
+            logits = runner.submit_dispatches_pipelined(
+                submit_batches,
+                readback=readback,
+                profiler=p,
+                dispatch_names=dispatch_names)
+            end_ns = time.perf_counter_ns()
+            p.record_dispatch("fast_decode", begin_ns, end_ns)
+        else:
+            logits = runner.submit_dispatches_pipelined(
+                submit_batches,
+                readback=readback,
+                profiler=None,
+                dispatch_names=None)
+
+        if want_top_k and use_gpu_topk_sample:
+            return int(np.asarray(logits, dtype=np.uint32).reshape(-1)[0])
+        if want_top_k:
+            from common.model_base import GPUBuffer
+            topk_idx_gpu = GPUBuffer(runner, self._fd_topk_idx_h, self._fd_topk_idx_sz,
+                                     np.uint32, owned=False)
+            topk_val_gpu = GPUBuffer(runner, self._fd_topk_val_h, self._fd_topk_val_sz,
+                                     np.float32, owned=False)
+            idx_np = runner.readback(topk_idx_gpu, dtype=np.uint32)[:top_k]
+            val_np = runner.readback(topk_val_gpu, dtype=np.float32)[:top_k]
+            return idx_np, val_np
+
+        if return_token:
+            return int(np.asarray(logits, dtype=np.uint32).reshape(-1)[0])
+        return logits.reshape(1, self.n_vocab)
+
+    def set_decode_input_token_gpu(self, token_id: int):
+        """Seed fast decode token-id GPU buffer for the next decode step."""
+        if (self._decode_mode == 'gpu'
+                and getattr(self, '_use_q4_gpu', False)
+                and getattr(self, '_use_dp4a', False)):
+            if not getattr(self, '_fast_decode_ready', False):
+                self._init_fast_decode_dp4a()
+            if self._fast_decode_ready:
+                runner = self.cache.runner
+                tok = np.array([int(token_id)], dtype=np.uint32)
+                runner.write_buffer(self._fd_out_token_h, tok.tobytes())
+                self._fd_have_token_gpu = True
+
+    def decode_next_token_gpu(self, token_ids, pos_offset,
+                              temperature=0.0, top_k=1):
+        """Decode one token using fast path and GPU greedy sampling.
+
+        Returns next token id (int). Falls back to CPU argmax if fast decode
+        path is unavailable.
+        """
+        # Requires fast decode conditions
+        if (self._decode_mode == 'gpu'
+                and getattr(self, '_use_q4_gpu', False)
+                and getattr(self, '_use_dp4a', False)):
+            if not getattr(self, '_fast_decode_ready', False):
+                self._init_fast_decode_dp4a()
+            if self._fast_decode_ready:
+                if (temperature > 0.0 and top_k > 0
+                        and getattr(self, '_gpu_topk_sampling', False)):
+                    return self._decode_fast(
+                        token_ids, pos_offset, return_token=True,
+                        return_top_k=int(top_k),
+                        sample_temperature=float(temperature))
+                return self._decode_fast(token_ids, pos_offset, return_token=True)
+
+        logits = self.forward(token_ids, use_cache=True, pos_offset=pos_offset)
+        last = logits[-1, :]
+        if top_k > 0 and temperature > 0:
+            k = min(int(top_k), last.shape[0])
+            idx = np.argpartition(last, -k)[-k:]
+            vals = last[idx] / temperature
+            vals -= vals.max()
+            probs = np.exp(vals)
+            probs /= probs.sum()
+            return int(idx[np.random.choice(k, p=probs)])
+        if temperature > 0:
+            vals = last / temperature
+            vals -= vals.max()
+            probs = np.exp(vals)
+            probs /= probs.sum()
+            return int(np.random.choice(len(probs), p=probs))
+        return int(last.argmax())
+
+    def sample_prefill_token_gpu(self, logits: np.ndarray,
+                                 temperature: float = 0.0,
+                                 top_k: int = 1) -> int:
+        """Sample the first generated token on GPU from prefill logits.
+
+        This avoids CPU sampling for decode_0 while keeping the first-token
+        source logits from prefill (no duplicate decode forward pass).
+        """
+        if not (self._decode_mode == 'gpu' and getattr(self, '_use_q4_gpu', False)
+                and getattr(self, '_use_dp4a', False)):
+            # Fallback: CPU sampling
+            last = np.asarray(logits, dtype=np.float32).reshape(-1)
+            if top_k > 0 and temperature > 0:
+                k = min(int(top_k), last.shape[0])
+                idx = np.argpartition(last, -k)[-k:]
+                vals = last[idx] / temperature
+                vals -= vals.max()
+                probs = np.exp(vals)
+                probs /= probs.sum()
+                return int(idx[np.random.choice(k, p=probs)])
+            if temperature > 0:
+                vals = last / temperature
+                vals -= vals.max()
+                probs = np.exp(vals)
+                probs /= probs.sum()
+                return int(np.random.choice(len(probs), p=probs))
+            return int(last.argmax())
+
+        if not getattr(self, '_fast_decode_ready', False):
+            self._warmup_fast_decode()
+        if not getattr(self, '_fast_decode_ready', False):
+            return int(np.asarray(logits, dtype=np.float32).reshape(-1).argmax())
+
+        runner = self.cache.runner
+        logits_np = np.ascontiguousarray(logits, dtype=np.float32).reshape(-1)
+        if logits_np.size != self.n_vocab:
+            raise ValueError(
+                f"Expected logits of size {self.n_vocab}, got {logits_np.size}")
+
+        # Seed fast-decode logits buffer with prefill logits.
+        runner.write_buffer(self._fd_logits_h, logits_np.tobytes())
+
+        if temperature > 0.0 and top_k > 0 and getattr(self, '_gpu_topk_sampling', False):
+            k = min(int(top_k), int(getattr(self, '_fd_topk_max', 64)), self.n_vocab)
+            rng_state = (int(getattr(self, '_fd_topk_rng_state', 1)) * 1664525 + 1013904223) & 0xFFFFFFFF
+            self._fd_topk_rng_state = rng_state
+            from common.wgsl_kernels import pack_topk_sample_params
+            tks_data = pack_topk_sample_params(k, float(temperature), rng_state)
+            runner.write_buffer(self._fd_topk_sample_params_h, tks_data.tobytes())
+            batches = getattr(self, '_fd_topk_prefix_batches', None)
+            if batches and k > 0:
+                tok = runner.submit_dispatches_pipelined(
+                    batches[k - 1],
+                    readback=(self._fd_out_token_h, self._fd_out_token_sz, np.uint32),
+                    profiler=None,
+                    dispatch_names=None)
+                return int(np.asarray(tok, dtype=np.uint32).reshape(-1)[0])
+
+        # Greedy fallback on GPU (argmax stage1 + stage2).
+        sample_batches = getattr(self, '_fd_sample_only_batches', None)
+        if sample_batches:
+            tok = runner.submit_dispatches_pipelined(
+                sample_batches,
+                readback=(self._fd_out_token_h, self._fd_out_token_sz, np.uint32),
+                profiler=None,
+                dispatch_names=None)
+            return int(np.asarray(tok, dtype=np.uint32).reshape(-1)[0])
+
+        return int(logits_np.argmax())
+
+    def decode_topk_gpu(self, token_ids, pos_offset, top_k=40):
+        """Decode one token and return GPU-extracted top-k (idx, logits)."""
+        if (self._decode_mode == 'gpu'
+                and getattr(self, '_use_q4_gpu', False)
+                and getattr(self, '_use_dp4a', False)):
+            if not getattr(self, '_fast_decode_ready', False):
+                self._init_fast_decode_dp4a()
+            if self._fast_decode_ready:
+                return self._decode_fast(
+                    token_ids, pos_offset, return_token=False,
+                    return_top_k=int(top_k))
+
+        logits = self.forward(token_ids, use_cache=True, pos_offset=pos_offset)
+        last = logits[-1, :]
+        k = min(int(top_k), last.shape[0])
+        idx = np.argpartition(last, -k)[-k:]
+        vals = last[idx]
+        return idx.astype(np.uint32), vals.astype(np.float32)
 
     def _decode_gpu(self, x, layer, positions, pfx, p):
         """Fully GPU-resident decode: all operations stay on GPU.
@@ -1692,6 +2089,7 @@ class Phi4WebGPU(WebGPUModel):
         # Ensure layer weights are on GPU
         self._upload_layer_weights(layer)
 
+        _p = p and p.enabled
         HD = self.head_dim
         E = self.n_embd
         n_head = self.n_head
@@ -1712,19 +2110,19 @@ class Phi4WebGPU(WebGPUModel):
             x_gpu = x
 
         # 1. GPU RMSNorm (input layernorm)
-        if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
+        if _p: self.cache._gpu_op_name = f"L{layer}/norm1"
         rn1 = self._rms_norm(
             x_gpu, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
 
         # 2. QKV projection → stays on GPU
-        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
+        if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
         qkv_gpu = self._proj(rn1, pfx + "self_attn.qkv_proj.weight",
                              self._gpu_weights["zero_bias_QKV"],
                              self.qkv_out, gpu_out=True)
 
         # 3. GPU RoPE for Q heads
-        if self._profiling: self._set_gpu_op(f"L{layer}/rope_q")
+        if _p: self.cache._gpu_op_name = f"L{layer}/rope_q"
         q_rot_out = self.cache.run(
             self._rope_result, grid=(n_head,),
             buffers={
@@ -1745,7 +2143,7 @@ class Phi4WebGPU(WebGPUModel):
         K_cache_gpu, V_cache_gpu, cur_len = self._gpu_kv_cache[layer]
         cache_offset = cur_len * n_kv * HD
 
-        if self._profiling: self._set_gpu_op(f"L{layer}/rope_kv")
+        if _p: self.cache._gpu_op_name = f"L{layer}/rope_kv"
         self.cache.run(
             self._rope_kv_result, grid=(n_kv,),
             buffers={
@@ -1768,7 +2166,7 @@ class Phi4WebGPU(WebGPUModel):
         self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T_total)
 
         # 5. GPU GQA decode attention
-        if self._profiling: self._set_gpu_op(f"L{layer}/attn")
+        if _p: self.cache._gpu_op_name = f"L{layer}/attn"
         scale = np.float32(1.0 / np.sqrt(HD))
         kv_stride = n_kv * HD
         attn_out = self.cache.run(
@@ -1793,38 +2191,38 @@ class Phi4WebGPU(WebGPUModel):
         # 6. O projection → stays on GPU
         o_bias = self._gpu_weights.get("zero_bias_QO",
                                        self._gpu_weights["zero_bias_E"])
-        if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
+        if _p: self.cache._gpu_op_name = f"L{layer}/o_proj"
         o_gpu = self._proj(attn_gpu, pfx + "self_attn.o_proj.weight",
                            o_bias, E, gpu_out=True)
 
         # 7. Residual add: x += o_proj (in-place)
-        if self._profiling: self._set_gpu_op(f"L{layer}/res1")
+        if _p: self.cache._gpu_op_name = f"L{layer}/res1"
         self._add_inplace(x_gpu, o_gpu)
 
         # 8. GPU RMSNorm (post-attention layernorm)
-        if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
+        if _p: self.cache._gpu_op_name = f"L{layer}/norm2"
         rn2 = self._rms_norm(
             x_gpu, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
             gpu_out=True)
 
         # 9. Gate_up projection → stays on GPU
-        if self._profiling: self._set_gpu_op(f"L{layer}/gate_up")
+        if _p: self.cache._gpu_op_name = f"L{layer}/gate_up"
         gate_up_gpu = self._proj(rn2, pfx + "mlp.gate_up_proj.weight",
                                  self._gpu_weights["zero_bias_GU"],
                                  self.gate_up_out, gpu_out=True)
 
         # 10. SiLU*mul → stays on GPU
-        if self._profiling: self._set_gpu_op(f"L{layer}/silu_mul")
+        if _p: self.cache._gpu_op_name = f"L{layer}/silu_mul"
         h_gpu = self._silu_mul_fused(gate_up_gpu, IM, gpu_out=True)
 
         # 11. Down projection → stays on GPU
-        if self._profiling: self._set_gpu_op(f"L{layer}/down")
+        if _p: self.cache._gpu_op_name = f"L{layer}/down"
         down_gpu = self._proj(h_gpu, pfx + "mlp.down_proj.weight",
                               self._gpu_weights["zero_bias_E"],
                               E, K=IM, gpu_out=True)
 
         # 12. Residual add: x += down (in-place)
-        if self._profiling: self._set_gpu_op(f"L{layer}/res2")
+        if _p: self.cache._gpu_op_name = f"L{layer}/res2"
         self._add_inplace(x_gpu, down_gpu)
 
         x_gpu.shape = (1, E)
@@ -1856,9 +2254,7 @@ class Phi4WebGPU(WebGPUModel):
                 return self._decode_cpu(x, layer, positions, pfx, p)
         elif use_cache and self._decode_mode == 'gpu':
             # GPU-resident prefill: all ops on GPU, no readbacks
-            if self._profiling: self._begin_cpu("weight_check")
             self._upload_layer_weights(layer)
-            if self._profiling: self._end_cpu("weight_check")
             return self._prefill_gpu(x, layer, positions, pfx, p)
         else:
             # === PREFILL PATH (original) ===
@@ -1954,12 +2350,49 @@ class Phi4WebGPU(WebGPUModel):
                 pos_offset: int = 0) -> np.ndarray:
         """Run Phi-4 mini forward pass."""
         from common.model_base import GPUBuffer
+        p = self.profiler
+        _p = p and p.enabled
 
         T = len(token_ids)
+        cpu_scope = self.profiler._cpu.current_scope if _p else ""
+        deep_profile_prefill_token = (
+            _p and getattr(self, '_profile_deep_decode', False)
+            and cpu_scope.startswith("prefill/token_"))
+
+        # GPU-only mode: avoid CPU embedding table access by ingesting
+        # prompt tokens one-by-one through the GPU decode/cache path.
+        if (T > 1 and self._gpu_only_weights):
+            if not use_cache:
+                raise RuntimeError(
+                    "GPU-only mode requires use_cache=True for multi-token forward")
+            logits_all = []
+            if _p:
+                p._cpu.begin("token_loop")
+            try:
+                for i, tid in enumerate(token_ids):
+                    token_ctx = p.scope(f"token_{i:03d}") if _p else nullcontext()
+                    with token_ctx:
+                        if _p:
+                            p._cpu.begin("token_forward")
+                        try:
+                            li = self.forward(
+                                np.array([int(tid)], dtype=np.int32),
+                                use_cache=True,
+                                pos_offset=pos_offset + i)
+                        finally:
+                            if _p:
+                                p._cpu.end("token_forward")
+                    logits_all.append(li.reshape(1, self.n_vocab))
+            finally:
+                if _p:
+                    p._cpu.end("token_loop")
+            return np.concatenate(logits_all, axis=0)
 
         # Fast decode path: pre-recorded bind groups, 3 ctypes calls/dispatch
         if (T == 1 and use_cache and self._decode_mode == 'gpu'
-                and getattr(self, '_use_q4_gpu', False)):
+            and getattr(self, '_use_q4_gpu', False)
+            and not (deep_profile_prefill_token
+                     and ("embed_tokens.weight" in self.weights))):
             if getattr(self, '_use_dp4a', False):
                 # DP4A fast decode: WGSL Q4 kernel with pre-compiled pipeline
                 if not getattr(self, '_fast_decode_ready', False):
@@ -1975,9 +2408,9 @@ class Phi4WebGPU(WebGPUModel):
 
         wte = self.weights["embed_tokens.weight"]
 
-        if self._profiling: self._begin_cpu("embed")
+        if _p: p._cpu.begin("embed")
         x = wte[token_ids]
-        if self._profiling: self._end_cpu("embed")
+        if _p: p._cpu.end("embed")
 
         positions = np.arange(pos_offset, pos_offset + T, dtype=np.int32)
 
@@ -1990,53 +2423,46 @@ class Phi4WebGPU(WebGPUModel):
         #   batch_layers=4 : every 4 layers (8 submits of ~48 dispatches)
         #   batch_layers=32: single batch (1 submit, no overlap)
         runner = self.cache.runner
-        batch_layers = getattr(self, '_batch_layers', 4)
+        batch_layers = getattr(self, '_batch_layers', 0)
         use_batch = (batch_layers > 0
-                     and use_cache and self._decode_mode == 'gpu')
+                     and use_cache and self._decode_mode == 'gpu' and T == 1)
         if use_batch:
             runner.begin_batch()
 
-        if self._profiling:
-            self._begin_cpu("layers")
-            self.profiler._cpu.push_scope("layers")
-        for layer in range(self.n_layer):
-            x = self._transformer_block(x, layer, use_cache=use_cache,
-                                        positions=positions)
-            # Flush batch every N layers: submit to GPU and start next batch
-            if use_batch and runner.is_batching and (layer + 1) % batch_layers == 0:
-                if self._profiling: self._begin_cpu("submit")
-                runner.end_batch()
-                if self._profiling: self._end_cpu("submit")
-                if layer + 1 < self.n_layer:
-                    runner.begin_batch()
+        profile_layer_loop = _p and (T > 1 or (use_cache and self._decode_mode == 'gpu'))
+        if profile_layer_loop:
+            p._cpu.begin("layer_loop")
+        try:
+            for layer in range(self.n_layer):
+                layer_ctx = p.scope(f"layer_{layer:02d}") if profile_layer_loop else nullcontext()
+                with layer_ctx:
+                    if profile_layer_loop:
+                        p._cpu.begin("transformer_block")
+                    try:
+                        x = self._transformer_block(x, layer, use_cache=use_cache,
+                                                    positions=positions)
+                    finally:
+                        if profile_layer_loop:
+                            p._cpu.end("transformer_block")
+                # Flush batch every N layers: submit to GPU and start next batch
+                if use_batch and runner.is_batching and (layer + 1) % batch_layers == 0:
+                    runner.end_batch()
+                    if layer + 1 < self.n_layer:
+                        runner.begin_batch()
+        finally:
+            if profile_layer_loop:
+                p._cpu.end("layer_loop")
 
         # Flush any remaining dispatches
         if use_batch and runner.is_batching:
             runner.end_batch()
-        if self._profiling:
-            self.profiler._cpu.pop_scope()
-            self._end_cpu("layers")
 
-        # Final RMSNorm + LM head
-        # During prefill (T>1), only the last token's logits are needed
-        # for next-token sampling. Slice to T=1 to use the fast wide kernel
-        # (avoids 4-chunk readback for N=200064).
-        if self._profiling: self._begin_cpu("norm_lm_head")
-        if self._profiling:
-            self._set_gpu_op("final_norm")
+        # Final RMSNorm
+        if _p:
+            self.cache._gpu_op_name = "final_norm"
         # Check if GPU lm_head is available (fp16 embed weights uploaded)
         gpu_lm_head = ("embed_tokens.weight.fp16" in self._gpu_weights
                        and isinstance(x, GPUBuffer))
-        # Slice to last token for prefill (only last logits needed)
-        if T > 1 and isinstance(x, GPUBuffer) and use_cache:
-            runner = self.cache.runner
-            last_offset = (T - 1) * self.n_embd * 4  # fp32
-            last_size = self.n_embd * 4
-            x = runner.gpu_slice(x, last_offset, last_size,
-                                 "__prefill_last_hidden")
-            x.shape = (1, self.n_embd)
-        elif T > 1 and not isinstance(x, GPUBuffer) and use_cache:
-            x = x[-1:, :]  # numpy slice
         if isinstance(x, GPUBuffer):
             # GPU-resident path: keep on GPU if we'll do GPU lm_head
             x = self._rms_norm(x, self._gpu_weights["norm.weight"],
@@ -2045,25 +2471,23 @@ class Phi4WebGPU(WebGPUModel):
             x = self._rms_norm_cpu(x, "norm.weight")
         else:
             x = self._rms_norm(x, self._gpu_weights["norm.weight"])
-        if self._profiling:
-            self._clear_gpu_op()
+        if _p:
+            self.cache._gpu_op_name = None
 
         # LM head (tied with embed_tokens)
         if gpu_lm_head:
-            if self._profiling:
-                self._set_gpu_op("lm_head")
+            if _p:
+                self.cache._gpu_op_name = "lm_head"
             logits = self._linear_fp16w(
                 x, self._gpu_weights["embed_tokens.weight.fp16"],
                 self._gpu_weights["zero_bias_V"], self.n_vocab,
                 K=self.n_embd)
-            if self._profiling:
-                self._clear_gpu_op()
+            if _p:
+                self.cache._gpu_op_name = None
         else:
-            if self._profiling: self._begin_cpu("lm_head")
+            if _p: p._cpu.begin("lm_head")
             logits = np.float32(x @ wte.T)
-            if self._profiling: self._end_cpu("lm_head")
-        if self._profiling: self._end_cpu("norm_lm_head")
-
+            if _p: p._cpu.end("lm_head")
         return logits
 
 
@@ -2077,7 +2501,7 @@ def download_phi4_weights(model_size: str = "mini",
     config = PHI4_CONFIGS[model_size]
     hf_repo = config["hf_repo"]
     if model_dir is None:
-        model_dir = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
+        model_dir = os.path.join(_SCRIPT_DIR, "weights")
 
     def phi4_key_transform(key, arr):
         new_key = key.replace("model.", "")
@@ -2276,22 +2700,30 @@ def main():
                              "(0=off, 1=per-layer, 4=every 4 layers, 32=single batch)")
     parser.add_argument("--use-dp4a", action="store_true",
                         help="Use DP4A (dot4I8Packed) for INT4 matmul")
-    add_device_arg(parser)
+    parser.add_argument("--gpu-topk-sampling", action="store_true",
+                        help="Enable experimental GPU top-k preselection for stochastic decode")
+    parser.add_argument("--auto-switch-sampling", action="store_true",
+                        help="For long greedy generation, auto-switch to sampling mode")
+    parser.add_argument("--auto-switch-after", type=int, default=128,
+                        help="Decode step index to start auto-switch sampling")
+    parser.add_argument("--auto-switch-temp", type=float, default=0.7,
+                        help="Sampling temperature used after auto-switch")
+    parser.add_argument("--auto-switch-top-k", type=int, default=40,
+                        help="Top-k used after auto-switch")
+    parser.add_argument("--profile-deep", action="store_true",
+                        help="Deep profiling: keep CPU weights and disable fused fast-decode in prefill token replay for layer-level drill-down")
     args = parser.parse_args()
-    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()
         sys.exit(0 if success else 1)
 
     config = PHI4_CONFIGS["mini"]
-    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models", os.path.basename(_SCRIPT_DIR), "weights")
+    weights_dir = args.weights_dir or os.path.join(_SCRIPT_DIR, "weights")
 
     # Download if needed
-    _t_download_0 = time.perf_counter_ns()
     npz_path, tokenizer_path = download_phi4_weights("mini", weights_dir)
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
-    _t_download_1 = time.perf_counter_ns()
 
     # Quantize mode: convert fp32 → INT4 + fp16
     if args.quantize:
@@ -2310,7 +2742,6 @@ def main():
 
     # Load weights — prefer quantized if available
     quantized = False
-    _t_weight_load_0 = time.perf_counter_ns()
     if os.path.exists(q4_path):
         print(f"Loading quantized weights from {q4_path}...")
         t0 = time.time()
@@ -2325,11 +2756,9 @@ def main():
         print("  TIP: Run with --quantize first to reduce memory 4x")
         weights = load_weights(npz_path)
         print(f"Loaded {len(weights)} weight tensors")
-    _t_weight_load_1 = time.perf_counter_ns()
 
     tokenizer = load_tokenizer(tokenizer_path)
 
-    _t_model_init_0 = time.perf_counter_ns()
     model = Phi4WebGPU(
         weights,
         n_layer=config["n_layer"],
@@ -2343,11 +2772,15 @@ def main():
         head_dim=config["head_dim"],
         partial_rotary_factor=config["partial_rotary_factor"],
         quantized=quantized,
-        decode_mode=args.decode_mode)
-    _t_model_init_1 = time.perf_counter_ns()
-    print(f"Model init: {(_t_model_init_1-_t_model_init_0)/1e6:.0f}ms")
+        decode_mode=args.decode_mode,
+        gpu_only_weights=not args.profile_deep)
     model._batch_layers = args.batch_layers
     model._use_dp4a = getattr(args, 'use_dp4a', False)
+    model._gpu_topk_sampling = getattr(args, 'gpu_topk_sampling', False)
+    model._profile_deep_decode = bool(args.profile_deep)
+    if args.auto_switch_sampling and not model._gpu_topk_sampling:
+        model._gpu_topk_sampling = True
+        print("Auto-switch sampling enabled GPU top-k sampling path")
 
     # Print adapter/GPU info
     adapter = model.cache.runner.adapter_info
@@ -2367,27 +2800,43 @@ def main():
         print("DP4A: enabled (dot4I8Packed for INT4 matmul)")
 
     if args.profile:
-        profile_model(
-            model, args.prompt, tokenizer,
-            script_dir=_SCRIPT_DIR, model_name="Phi-4 mini",
-            max_tokens=args.max_tokens, temperature=args.temperature,
-            init_timestamps=[
-                ("imports", _t_script_start, _t_imports_done),
-                ("download_check", _t_download_0, _t_download_1),
-                ("weight_loading", _t_weight_load_0, _t_weight_load_1),
-                ("model_init", _t_model_init_0, _t_model_init_1),
-            ])
-        return
+        from common.profiler_html import generate_html_report
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: "
+              f"{model.profiler.gpu_enabled})")
 
-    # Warmup forward: trigger D3D12 first-submit initialization
-    import time as _wt
-    _w0 = _wt.perf_counter()
-    model.warmup()
-    print(f"Warmup forward: {(_wt.perf_counter()-_w0)*1000:.0f}ms")
+        # Use the same generation path as non-profile mode.
+        generate(model, args.prompt, tokenizer,
+                 max_tokens=args.max_tokens,
+                 temperature=args.temperature,
+                 auto_switch_sampling=args.auto_switch_sampling,
+                 auto_switch_after=args.auto_switch_after,
+                 auto_switch_temperature=args.auto_switch_temp,
+                 auto_switch_top_k=args.auto_switch_top_k)
+
+        model.profiler.finish()
+        model.profiler.report()
+
+        # Generate HTML timeline report
+        profile_path = os.path.join(_SCRIPT_DIR, "profile.html")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        generate_html_report(
+            model.profiler,
+            output_path=profile_path,
+            title=f"Phi-4 mini — {adapter.get('description', 'GPU')} ({adapter.get('backend', '')}) — {ts}",
+            adapter_info=adapter,
+            memory_info=model.get_memory_info())
+
+        model.disable_profiling()
+        return
 
     generate(model, args.prompt, tokenizer,
              max_tokens=args.max_tokens,
-             temperature=args.temperature)
+             temperature=args.temperature,
+             auto_switch_sampling=args.auto_switch_sampling,
+             auto_switch_after=args.auto_switch_after,
+             auto_switch_temperature=args.auto_switch_temp,
+             auto_switch_top_k=args.auto_switch_top_k)
 
 
 if __name__ == "__main__":

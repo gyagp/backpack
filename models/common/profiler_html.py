@@ -106,12 +106,8 @@ def generate_html_report(profiler: InferenceProfiler,
     summary = _compute_summary(cpu_events, dispatch_events, gpu_timestamps,
                                 steps_json)
 
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     replacements = {
         "{{TITLE}}": title,
-        "{{TIMESTAMP}}": timestamp,
         "{{CPU_EVENTS}}": json.dumps(cpu_json),
         "{{GPU_EVENTS}}": json.dumps(gpu_json),
         "{{GPU_HW_EVENTS}}": json.dumps(gpu_hw_json),
@@ -135,26 +131,19 @@ def _compute_summary(cpu_events: List[CPUEvent],
                      steps_json: list = None) -> dict:
     cpu_agg = {}
     total_cpu_ms = 0
-    # Structural scope names that aren't real CPU kernels
-    _structural = {"total", "scope_total", "layers", "norm_lm_head",
-                   "fast_decode_init", "attn", "mlp",
-                   "imports", "download_check",
-                   "weight_loading", "model_init", "kernel_compile",
-                   "weight_upload", "warmup", "kv_cache_alloc"}
     for e in cpu_events:
         if e.name in ("total", "scope_total"):
             if e.name == "total" and "/" not in e.scope:
                 total_cpu_ms += e.duration_ms
             continue
-        # Skip structural scopes, batch_submit_*, and per-layer L* entries
-        if (e.name in _structural
-                or e.name.startswith("batch_submit_")
-                or (e.name.startswith("L") and e.name[1:].isdigit())):
-            continue
         if e.name not in cpu_agg:
             cpu_agg[e.name] = {"total_ms": 0, "count": 0}
         cpu_agg[e.name]["total_ms"] += e.duration_ms
         cpu_agg[e.name]["count"] += 1
+
+    # Fallback when model code doesn't emit top-level "total" events.
+    if total_cpu_ms <= 0:
+        total_cpu_ms = sum(d["total_ms"] for d in cpu_agg.values())
 
     cpu_summary = []
     for name, d in sorted(cpu_agg.items(), key=lambda x: -x[1]["total_ms"]):
@@ -210,19 +199,6 @@ def _compute_summary(cpu_events: List[CPUEvent],
         if e.name == "total" and "/" not in e.scope:
             step_times.append({"name": e.scope, "ms": round(e.duration_ms, 2)})
 
-    # Prefill breakdown: list sub-steps under prefill scope
-    prefill_breakdown = []
-    for e in cpu_events:
-        if e.name in ("total", "scope_total"):
-            continue
-        if e.scope == "prefill" and e.duration_ms > 0.01:
-            prefill_breakdown.append({
-                "name": e.name,
-                "ms": round(e.duration_ms, 2),
-            })
-    # Sort by time descending
-    prefill_breakdown.sort(key=lambda x: -x["ms"])
-
     # Op counts per phase (prefill vs decode)
     op_counts = _compute_op_counts(cpu_events, dispatch_events, steps_json)
 
@@ -231,7 +207,6 @@ def _compute_summary(cpu_events: List[CPUEvent],
             "total_gpu_hw_ms": round(total_gpu_hw_ms, 2),
             "cpu": cpu_summary, "gpu": gpu_summary,
             "gpu_hw": gpu_hw_summary, "steps": step_times,
-            "prefill_breakdown": prefill_breakdown,
             "op_counts": op_counts}
 
 
@@ -315,9 +290,12 @@ header .chip { background:var(--bg3); padding:2px 8px; border-radius:4px; font-s
 #controls button { background:var(--bg3); color:var(--fg); border:none; padding:3px 10px;
                    border-radius:3px; cursor:pointer; font-size:11px; }
 #controls button:hover { background:#3b4261; }
+#controls label { color:var(--fg2); display:flex; align-items:center; gap:6px; font-size:11px; }
 #controls .range { color:var(--fg3); margin-left:auto; }
 #timeline-wrap { position:relative; overflow:hidden; cursor:grab; }
 #timeline-wrap.dragging { cursor:grabbing; }
+#flame-wrap { position:relative; overflow:hidden; border-top:1px solid var(--bg3); border-bottom:1px solid var(--bg3); }
+.flame-title { padding:6px 16px; color:var(--fg2); background:var(--bg2); border-top:1px solid var(--bg3); font-size:12px; }
 canvas { display:block; }
 #tooltip { position:fixed; background:var(--bg3); color:var(--fg); padding:6px 10px;
            border-radius:4px; font-size:11px; pointer-events:none; display:none;
@@ -345,7 +323,6 @@ canvas { display:block; }
 <body>
 <header>
   <h1>{{TITLE}}</h1>
-  <span class="chip" id="timestamp-chip" style="background:#555;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">{{TIMESTAMP}}</span>
   <span class="chip" id="gpu-chip"></span>
   <span class="chip" id="backend-chip"></span>
 </header>
@@ -354,12 +331,15 @@ canvas { display:block; }
   <button onclick="resetZoom()">Reset</button>
   <button onclick="zoomIn()">+ Zoom</button>
   <button onclick="zoomOut()">- Zoom</button>
-  <span id="phase-toggles" style="display:inline-flex;gap:4px;margin-left:8px"></span>
+  <label><input id="toggle-flame" type="checkbox" checked onchange="toggleFlame()"> CPU Flamechart</label>
   <span class="range" id="range-label"></span>
 </div>
 <div id="timeline-wrap"><canvas id="c"></canvas></div>
+<div class="flame-title">CPU Flamechart</div>
+<div id="flame-wrap"><canvas id="fc"></canvas></div>
 <div id="tooltip"></div>
 <div id="summary">
+  <div class="panel" id="overview-panel"><h2>Overview</h2><div id="overview-info"></div></div>
   <div class="panel"><h2>CPU Ops</h2><table id="cpu-tbl"><thead><tr>
     <th>Op</th><th>Total</th><th>#</th><th>Avg</th><th>%</th><th></th>
   </tr></thead><tbody></tbody></table></div>
@@ -372,6 +352,7 @@ canvas { display:block; }
 const C=document.getElementById('c'), X=C.getContext('2d'),
       W=document.getElementById('timeline-wrap'),
       TT=document.getElementById('tooltip');
+const FC=document.getElementById('fc'), FX=FC.getContext('2d'), FW=document.getElementById('flame-wrap');
 const cpu=/*CPU*/{{CPU_EVENTS}};
 const gpu=/*GPU*/{{GPU_EVENTS}};
 const gpuHW=/*GPU_HW*/{{GPU_HW_EVENTS}};
@@ -403,6 +384,21 @@ if(S.steps&&S.steps.length){
     if(oc.decode_gpu_ops)h+=`<div class="step-card"><div class="label">Decode total</div><div class="value">${oc.decode_gpu_ops}</div><div class="unit">GPU (${oc.decode_tokens} tok)</div></div>`;
     sc.innerHTML=h;
   }
+}else{
+  // Fallback for profiles that don't emit step markers.
+  const pre=(S.cpu||[]).find(d=>d.name==='prefill');
+  const fd=(S.gpu||[]).find(d=>d.name==='fast_decode');
+  let h='';
+  if(fd&&fd.avg_ms>0){
+    const tps=1000/fd.avg_ms;
+    h+=`<div class="step-card"><div class="label">Decode</div><div class="value">${tps.toFixed(1)}</div><div class="unit">tok/s</div></div>`;
+    h+=`<div class="step-card"><div class="label">Avg/token</div><div class="value">${fd.avg_ms.toFixed(2)}</div><div class="unit">ms</div></div>`;
+    h+=`<div class="step-card"><div class="label">Decode calls</div><div class="value">${fd.count}</div><div class="unit">fast_decode</div></div>`;
+  }
+  if(pre){
+    h+=`<div class="step-card"><div class="label">Prefill</div><div class="value">${pre.total_ms.toFixed(0)}</div><div class="unit">ms</div></div>`;
+  }
+  if(h)sc.innerHTML=h;
 }
 
 // Colors
@@ -414,79 +410,25 @@ const OC={qkv_linear:'#7aa2f7',qkv:'#7aa2f7',gate_up:'#f7768e',down_proj:'#9ece6
   rope_q:'#ff9e64',rope_kv:'#ff9e64',upload_weights:'#414868'};
 function oc(n){if(OC[n])return OC[n];let h=0;for(let i=0;i<n.length;i++)h=(h*31+n.charCodeAt(i))&0xffffff;return`hsl(${h%360},55%,60%)`;}
 
-// Layout: flamechart CPU lanes + 1 GPU lane
-const LW=80, TH=16;
+// Layout: 2 lanes — CPU (with step markers as background), GPU
+const LW=80, TH=20;
 const CPU_Y=6;
+const GPU_Y=CPU_Y+TH+4;
+const CH=GPU_Y+TH+20;
+const FRH=16;
 
-// Compute depth for each CPU event based on scope nesting
-// scope="" → depth 0, scope="prefill" → depth 0 (step), name inside → depth 1+
-cpu.forEach(e=>{
-  const parts = e.scope ? e.scope.split('/') : [];
-  e._depth = parts.length;
+const flameEvents=cpu.map(e=>{
+  const depth=(e.scope?e.scope.split('/').filter(Boolean).length:0);
+  return {...e, depth};
 });
-const maxCpuDepth = cpu.length ? Math.max(...cpu.map(e=>e._depth)) + 1 : 1;
-
-const GPU_Y = CPU_Y + maxCpuDepth * TH + 4;
-const CH = GPU_Y + TH + 20;
+const flameMaxDepth=flameEvents.length?Math.max(...flameEvents.map(e=>e.depth)):0;
+const FCH=(flameMaxDepth+1)*FRH+20;
 // Merge GPU events: prefer HW timestamps, fall back to CPU-timed
 const gpuMerged=gpuHW.length?gpuHW:gpu;
 
 let allS=cpu.map(e=>e.start_us).concat(gpuMerged.map(e=>e.start_us)).concat(steps.map(e=>e.start_us));
 let allE=cpu.map(e=>e.start_us+e.dur_us).concat(gpuMerged.map(e=>e.start_us+e.dur_us)).concat(steps.map(e=>e.start_us+e.dur_us));
 let gMin=allS.length?Math.min(...allS):0, gMax=allE.length?Math.max(...allE):1000;
-
-// --- Phase toggle filtering ---
-// Identify top-level phases: depth-0 CPU events + step groups (prefill, decode)
-const _initPhases = ['imports','download_check','weight_loading','model_init','warmup'];
-const _phases = [];  // {name, start_us, end_us, on}
-for(const e of cpu){
-  if(e._depth===0 && _initPhases.includes(e.name)){
-    _phases.push({name:e.name, start_us:e.start_us, end_us:e.start_us+e.dur_us, on:true});
-  }
-}
-// Add prefill and decode as phase groups
-const pfStep = steps.find(s=>s.name==='prefill');
-if(pfStep) _phases.push({name:'prefill', start_us:pfStep.start_us, end_us:pfStep.start_us+pfStep.dur_us, on:true});
-const decSteps = steps.filter(s=>s.name.startsWith('decode'));
-if(decSteps.length){
-  const ds=Math.min(...decSteps.map(s=>s.start_us));
-  const de=Math.max(...decSteps.map(s=>s.start_us+s.dur_us));
-  _phases.push({name:'decode', start_us:ds, end_us:de, on:true});
-}
-_phases.sort((a,b)=>a.start_us-b.start_us);
-
-// Render toggle buttons
-const _ptDiv=document.getElementById('phase-toggles');
-function renderToggles(){
-  _ptDiv.innerHTML=_phases.map((p,i)=>{
-    const bg=p.on?'#3b4261':'#1a1b26';
-    const fg=p.on?'#c0caf5':'#565f89';
-    const dur=p.end_us-p.start_us;
-    const lb=dur>=1e6?(dur/1e6).toFixed(1)+'s':dur>=1e3?(dur/1e3).toFixed(0)+'ms':dur.toFixed(0)+'us';
-    return`<button onclick="togglePhase(${i})" style="background:${bg};color:${fg};border:1px solid #3b4261;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px">${p.name} <span style="color:#565f89">${lb}</span></button>`;
-  }).join('');
-}
-renderToggles();
-
-function togglePhase(idx){
-  _phases[idx].on=!_phases[idx].on;
-  // Auto-zoom to visible phases
-  const vis=_phases.filter(p=>p.on);
-  if(vis.length){
-    vS=Math.min(...vis.map(p=>p.start_us))-100;
-    vE=Math.max(...vis.map(p=>p.end_us))+100;
-  }
-  renderToggles();draw();
-}
-
-function isEventVisible(start_us, dur_us){
-  if(_phases.every(p=>p.on))return true;
-  const es=start_us, ee=start_us+dur_us;
-  for(const p of _phases){
-    if(!p.on && es>=p.start_us-1 && ee<=p.end_us+1)return false;
-  }
-  return true;
-}
 
 let vS=gMin, vE=gMax, drag=false, dX=0, dVS=0;
 
@@ -495,6 +437,10 @@ function resize(){
   C.width=w*dpr; C.height=CH*dpr;
   C.style.width=w+'px'; C.style.height=CH+'px';
   X.setTransform(dpr,0,0,dpr,0,0); draw();
+
+  FC.width=w*dpr; FC.height=FCH*dpr;
+  FC.style.width=w+'px'; FC.style.height=FCH+'px';
+  FX.setTransform(dpr,0,0,dpr,0,0); drawFlame();
 }
 
 function t2x(t){return LW+(t-vS)/(vE-vS)*(C.clientWidth-LW);}
@@ -508,7 +454,6 @@ function niceStep(r,mx){
 function drawLane(events, y, getName){
   const w=C.clientWidth;
   for(const e of events){
-    if(!isEventVisible(e.start_us, e.dur_us))continue;
     const n=getName?getName(e):e.name;
     const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);
     if(x2<LW||x1>w)continue;
@@ -531,7 +476,7 @@ function draw(){
     const x=t2x(t);
     X.fillStyle='#292e42'; X.fillRect(x,0,1,CH);
     X.fillStyle='#565f89';
-    const lb=t>=1e6?(t/1e6).toFixed(1)+'s':t>=1e3?(t/1e3).toFixed(1)+'ms':t.toFixed(0)+'us';
+    const lb=t>=1e3?(t/1e3).toFixed(1)+'ms':t.toFixed(0)+'us';
     X.fillText(lb,x+2,CH-3);
   }
 
@@ -540,52 +485,34 @@ function draw(){
   X.fillText('CPU',4,CPU_Y+14);
   X.fillText('GPU',4,GPU_Y+14);
 
-  // Lane bg — multiple rows for CPU flamechart
+  // Lane bg
   X.fillStyle='#1f2335';
-  for(let d=0;d<maxCpuDepth;d++){
-    X.fillRect(LW,CPU_Y+d*TH,w-LW,TH);
-  }
+  X.fillRect(LW,CPU_Y,w-LW,TH);
   X.fillRect(LW,GPU_Y,w-LW,TH);
 
-  // Step markers as background bands + flamechart bars at depth 0
+  // Step markers as background bands in BOTH lanes
+  // Prefill = green-tinted, Decode = blue-tinted (obvious differentiation)
   for(const s of steps){
-    if(!isEventVisible(s.start_us, s.dur_us))continue;
     const x1=t2x(s.start_us),x2=t2x(s.start_us+s.dur_us),bw=Math.max(x2-x1,1);
     if(x2<LW||x1>w)continue;
     const isPrefill=s.name==='prefill';
-    const bandColor=isPrefill?'rgba(158,206,106,0.08)':'rgba(122,162,247,0.05)';
+    const bandColor=isPrefill?'rgba(158,206,106,0.12)':'rgba(122,162,247,0.08)';
     const borderColor=isPrefill?'rgba(158,206,106,0.35)':'rgba(122,162,247,0.25)';
-    // Background bands for phase indication
-    for(let d=1;d<maxCpuDepth;d++){
-      X.fillStyle=bandColor;
-      X.fillRect(x1,CPU_Y+d*TH,bw,TH);
-    }
+    const labelColor=isPrefill?'#9ece6a':'#7aa2f7';
+    // CPU lane band
     X.fillStyle=bandColor;
+    X.fillRect(x1,CPU_Y,bw,TH);
+    // GPU lane band (same phase coloring)
     X.fillRect(x1,GPU_Y,bw,TH);
     // Phase border line
     X.strokeStyle=borderColor; X.lineWidth=1;
     X.beginPath();X.moveTo(x1,CPU_Y);X.lineTo(x1,GPU_Y+TH);X.stroke();
-    // Flamechart bar at depth 0
-    const barColor=isPrefill?'#3b5235':'#2d3a5e';
-    X.fillStyle=barColor; X.fillRect(x1,CPU_Y+1,bw,TH-2);
-    if(bw>20){X.fillStyle=isPrefill?'#9ece6a':'#7aa2f7';X.font='bold 8px system-ui';
-      X.save();X.beginPath();X.rect(x1,CPU_Y,bw,TH);X.clip();
-      X.fillText(s.name,x1+2,CPU_Y+11);X.restore();}
+    // Phase label — show at top of CPU lane
+    if(bw>24){X.fillStyle=labelColor;X.font='bold 9px system-ui';X.fillText(s.name,x1+3,CPU_Y+10);}
   }
 
   // CPU lane (ops on top of step bands)
-  // CPU flamechart: each event at its depth level
-  for(const e of cpu){
-    if(!isEventVisible(e.start_us, e.dur_us))continue;
-    const n=e.name;
-    const y=CPU_Y+e._depth*TH;
-    const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);
-    if(x2<LW||x1>w)continue;
-    X.fillStyle=oc(n); X.fillRect(x1,y+1,bw,TH-2);
-    if(bw>20){X.fillStyle='#1a1b26';X.font='8px system-ui';
-      X.save();X.beginPath();X.rect(x1,y,bw,TH);X.clip();
-      X.fillText(n,x1+2,y+11);X.restore();}
-  }
+  drawLane(cpu, CPU_Y, e=>e.name);
 
   // GPU lane (merged: HW timestamps if available, else CPU-timed)
   drawLane(gpuMerged, GPU_Y, e=>e.name.split('/').pop());
@@ -614,7 +541,48 @@ function draw(){
   X.restore();
 
   document.getElementById('range-label').textContent=
-    range>=1e6?(range/1e6).toFixed(2)+'s':(range/1e3).toFixed(1)+'ms';
+    range>=1e3?(range/1e3).toFixed(1)+'ms':range.toFixed(0)+'us';
+
+  drawFlame();
+}
+
+function toggleFlame(){
+  const on=document.getElementById('toggle-flame').checked;
+  const fw=document.getElementById('flame-wrap');
+  const ft=document.querySelector('.flame-title');
+  fw.style.display=on?'block':'none';
+  ft.style.display=on?'block':'none';
+  resize();
+}
+
+function drawFlame(){
+  const w=FC.clientWidth;
+  FX.clearRect(0,0,w,FCH);
+  FX.fillStyle='#1a1b26'; FX.fillRect(0,0,w,FCH);
+
+  const range=vE-vS;
+  const ts=niceStep(range,(w-LW)/80);
+  FX.font='9px system-ui';
+  for(let t=Math.ceil(vS/ts)*ts;t<=vE;t+=ts){
+    const x=t2x(t);
+    FX.fillStyle='#292e42'; FX.fillRect(x,0,1,FCH);
+  }
+
+  for(const e of flameEvents){
+    const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);
+    if(x2<LW||x1>w)continue;
+    const y=4+e.depth*FRH;
+    const n=e.name.includes('/')?e.name.split('/').pop():e.name;
+    FX.fillStyle=oc(n); FX.fillRect(x1,y,bw,FRH-2);
+    if(bw>28){
+      FX.fillStyle='#1a1b26'; FX.font='8px system-ui';
+      FX.save(); FX.beginPath(); FX.rect(x1,y,bw,FRH-2); FX.clip();
+      FX.fillText(n,x1+2,y+11); FX.restore();
+    }
+  }
+
+  FX.fillStyle='#565f89'; FX.font='10px system-ui';
+  FX.fillText('Depth',4,12);
 }
 
 // Zoom/pan
@@ -629,42 +597,42 @@ addEventListener('mousemove',ev=>{
   if(drag){const dx=ev.clientX-dX,r=vE-vS;vS=dVS-dx/(C.clientWidth-LW)*r;vE=vS+r;draw();}
   const rc=C.getBoundingClientRect(),mx=ev.clientX-rc.left,my=ev.clientY-rc.top,t=x2t(mx);
   let hit=null;
-  const cpuBottom = CPU_Y + maxCpuDepth * TH;
-  if(my>=CPU_Y&&my<cpuBottom){
-    // Flamechart hit-test: find event at correct depth
-    const hitDepth = Math.floor((my - CPU_Y) / TH);
-    for(const e of cpu){
-      if(e._depth === hitDepth && t>=e.start_us&&t<=e.start_us+e.dur_us){
-        hit={...e,type:'CPU'};break;
-      }
-    }
-    if(!hit){for(const s of steps)if(t>=s.start_us&&t<=s.start_us+s.dur_us){hit={name:s.name,start_us:s.start_us,dur_us:s.dur_us,type:'Step'};break;}}
+  if(my>=CPU_Y&&my<CPU_Y+TH){
+    for(const e of cpu)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={...e,type:'CPU'};break;}
+    if(!hit){for(const s of steps)if(t>=s.start_us&&t<=s.start_us+s.dur_us){hit={name:s.name,dur_us:s.dur_us,type:'Step'};break;}}
   }else if(my>=GPU_Y&&my<GPU_Y+TH){
-    for(const e of gpuMerged)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,start_us:e.start_us,dur_us:e.dur_us,type:gpuHW.length?'GPU (hw)':'GPU (sub)'};break;}
+    for(const e of gpuMerged)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,dur_us:e.dur_us,type:gpuHW.length?'GPU (hw)':'GPU (sub)'};break;}
   }
   if(hit){
-    function fmt(us){return us>=1e6?(us/1e6).toFixed(3)+' s':us>=1000?(us/1000).toFixed(2)+' ms':us.toFixed(1)+' us';}
-    const d=fmt(hit.dur_us);
-    const s=fmt(hit.start_us);
-    const e=fmt(hit.start_us+hit.dur_us);
+    const d=hit.dur_us>=1000?(hit.dur_us/1000).toFixed(2)+' ms':hit.dur_us.toFixed(1)+' us';
     let h=`<b>${hit.name}</b>`;
     if(hit.scope)h+=`<br><span class="dim">${hit.scope}</span>`;
     h+=`<br>${hit.type}: ${d}`;
-    h+=`<br><span class="dim">${s} → ${e}</span>`;
     TT.innerHTML=h;TT.style.display='block';
     TT.style.left=(ev.clientX+12)+'px';TT.style.top=(ev.clientY-10)+'px';
   }else TT.style.display='none';
+
+  // Flamechart hover
+  const frc=FC.getBoundingClientRect();
+  const fmx=ev.clientX-frc.left, fmy=ev.clientY-frc.top;
+  if(fmx>=LW&&fmx<=FC.clientWidth&&fmy>=0&&fmy<=FCH){
+    const ft=x2t(fmx);
+    let fHit=null;
+    for(const e of flameEvents){
+      const y=4+e.depth*FRH;
+      if(fmy>=y&&fmy<y+FRH-2&&ft>=e.start_us&&ft<=e.start_us+e.dur_us){fHit=e;break;}
+    }
+    if(fHit){
+      const d=fHit.dur_us>=1000?(fHit.dur_us/1000).toFixed(2)+' ms':fHit.dur_us.toFixed(1)+' us';
+      TT.innerHTML=`<b>${fHit.name}</b><br><span class="dim">${fHit.scope||''}</span><br>CPU Flame: ${d}`;
+      TT.style.display='block';
+      TT.style.left=(ev.clientX+12)+'px';TT.style.top=(ev.clientY-10)+'px';
+    }
+  }
 });
 addEventListener('mouseup',()=>{drag=false;W.classList.remove('dragging');});
 
-function resetZoom(){
-  const vis=_phases.filter(p=>p.on);
-  if(vis.length && !_phases.every(p=>p.on)){
-    vS=Math.min(...vis.map(p=>p.start_us))-100;
-    vE=Math.max(...vis.map(p=>p.end_us))+100;
-  }else{vS=gMin;vE=gMax;}
-  draw();
-}
+function resetZoom(){vS=gMin;vE=gMax;draw();}
 function zoomIn(){const m=(vS+vE)/2,r=(vE-vS)/2;vS=m-r/2;vE=m+r/2;draw();}
 function zoomOut(){const m=(vS+vE)/2,r=(vE-vS)*2;vS=m-r/2;vE=m+r/2;draw();}
 
@@ -684,6 +652,22 @@ function fillTbl(id,data,tCol,aCol){
 fillTbl('cpu-tbl',S.cpu,'total_ms','avg_ms');
 // Use HW timestamp summary if available, else CPU-timed dispatch summary
 fillTbl('gpu-tbl',S.gpu_hw&&S.gpu_hw.length?S.gpu_hw:S.gpu,'total_ms','avg_ms');
+
+// Overview panel
+const ov=document.getElementById('overview-info');
+const gpuRows=(S.gpu_hw&&S.gpu_hw.length?S.gpu_hw:S.gpu)||[];
+const cpuTop=(S.cpu||[]).slice(0,1)[0];
+const gpuTop=gpuRows.slice(0,1)[0];
+const ovRows=[
+  ['CPU total', (S.total_cpu_ms||0).toFixed(2)+' ms'],
+  ['GPU total', (S.total_gpu_ms||0).toFixed(2)+' ms'],
+  ['GPU HW total', (S.total_gpu_hw_ms||0).toFixed(2)+' ms'],
+  ['Top CPU op', cpuTop?`${cpuTop.name} (${cpuTop.total_ms.toFixed(2)} ms)`:'N/A'],
+  ['Top GPU op', gpuTop?`${gpuTop.name} (${gpuTop.total_ms.toFixed(2)} ms)`:'N/A'],
+];
+ov.innerHTML='<table style="width:100%;font-size:11px;border-collapse:collapse">'+ovRows.map(([k,v])=>
+  `<tr><td style="padding:3px 6px;color:var(--fg2);border-bottom:1px solid var(--bg)">${k}</td><td class="r" style="padding:3px 6px;border-bottom:1px solid var(--bg);font-variant-numeric:tabular-nums">${v}</td></tr>`
+).join('')+'</table>';
 
 // Memory info panel
 const mp=document.getElementById('mem-info');

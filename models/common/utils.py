@@ -2,7 +2,6 @@
 Shared utilities for WebGPU model inference.
 
 Provides:
-  - add_device_arg() / apply_device_arg(): GPU device selection via --device
   - _parse_safetensors(): parse safetensors files into numpy arrays
   - load_weights(): load weights from npz files
   - download_weights(): generic HuggingFace weight downloader
@@ -14,30 +13,11 @@ import sys
 import time
 import json
 import struct
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# GPU device selection
-# ---------------------------------------------------------------------------
-
-def add_device_arg(parser):
-    """Add --device argument to an argparse parser for GPU selection.
-
-    Options: high (discrete, default), low (integrated)
-    """
-    parser.add_argument("--device", type=str, default=None,
-                        choices=["high", "low"],
-                        help="GPU: high (discrete, default), low (integrated)")
-
-
-def apply_device_arg(args):
-    """Set DAWN_GPU env var from --device arg. Call BEFORE creating model."""
-    if getattr(args, 'device', None) is not None:
-        os.environ["DAWN_GPU"] = args.device
 
 
 # ---------------------------------------------------------------------------
@@ -88,68 +68,20 @@ def _parse_safetensors(path: str) -> Dict[str, np.ndarray]:
 
 
 def load_weights(path: str) -> Dict[str, np.ndarray]:
-    """Load weights from npz file (memory-mapped for fast startup)."""
-    data = np.load(path, mmap_mode='r')
+    """Load weights from npz file."""
+    data = np.load(path)
     return {k: data[k].astype(np.float32) for k in data.files}
-
-
-def load_weights_mmap(path: str) -> Dict[str, np.ndarray]:
-    """Load weights from npz via memory-mapping for fast startup.
-
-    Memory-mapping avoids reading the entire file into RAM upfront.
-    Instead, pages are loaded on-demand as weights are accessed (e.g.,
-    during GPU upload).  This can reduce weight loading time from
-    seconds to near-instant for large models (10–20 GB).
-
-    The returned arrays are read-only memory-mapped views.  They must
-    be copied before modification (e.g., quantization, dtype cast).
-    GPU upload (wgpuQueueWriteBuffer) reads directly from the mapped
-    pages, so the OS page cache provides the I/O.
-
-    Usage:
-        weights = load_weights_mmap("weights_q4.npz")
-        # weights[k] is a read-only mmap view — fast to iterate
-        model = Model(weights)  # GPU upload reads from mmap on demand
-
-    Falls back to regular np.load if mmap is not supported (e.g.,
-    compressed npz).
-    """
-    try:
-        data = np.load(path, mmap_mode='r')
-        return {k: data[k] for k in data.files}
-    except ValueError:
-        # Compressed npz doesn't support mmap — fall back to regular load
-        data = np.load(path)
-        return {k: data[k] for k in data.files}
 
 
 # ---------------------------------------------------------------------------
 # Weight downloading
 # ---------------------------------------------------------------------------
 
-def _download_tokenizer(hf_repo: str, tokenizer_path: str, headers: dict = None):
-    """Download tokenizer.json from HuggingFace."""
-    import requests
-    if headers is None:
-        headers = {}
-    base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
-    tok_url = f"{base_url}/tokenizer.json"
-    print(f"Downloading tokenizer from {hf_repo}...")
-    resp = requests.get(tok_url, headers=headers)
-    resp.raise_for_status()
-    with open(tokenizer_path, 'wb') as f:
-        f.write(resp.content)
-    print(f"  Saved tokenizer to {tokenizer_path}")
-
-
 def download_weights(hf_repo: str, model_dir: str,
                      safetensors_files: list = None,
                      key_transform=None,
                      download_tokenizer: bool = True) -> Tuple[str, Optional[str]]:
     """Download model weights from HuggingFace and convert to npz.
-
-    Skips download entirely if converted weights already exist (weights.npz
-    or weights_q4.npz). Original safetensors are NOT required once converted.
 
     Args:
         hf_repo: HuggingFace repo ID (e.g. "openai-community/gpt2")
@@ -163,34 +95,20 @@ def download_weights(hf_repo: str, model_dir: str,
     Returns:
         (npz_path, tokenizer_path) — tokenizer_path is None if not downloaded
     """
+    import requests
+
     os.makedirs(model_dir, exist_ok=True)
     npz_path = os.path.join(model_dir, "weights.npz")
-    q4_path = os.path.join(model_dir, "weights_q4.npz")
     tokenizer_path = os.path.join(model_dir, "tokenizer.json") \
         if download_tokenizer else None
 
-    # Skip download if ANY converted weights exist in the directory
-    # (handles renamed files like gpt2_weights.npz, whisper_*_fp16.npz, etc.)
-    existing_npz = [f for f in os.listdir(model_dir) if f.endswith('.npz')] \
-        if os.path.isdir(model_dir) else []
-    if os.path.exists(npz_path) or os.path.exists(q4_path) or existing_npz:
-        found = npz_path if os.path.exists(npz_path) else \
-                q4_path if os.path.exists(q4_path) else \
-                os.path.join(model_dir, existing_npz[0])
-        print(f"Weights already cached at {found}")
-        if download_tokenizer and tokenizer_path and not os.path.exists(tokenizer_path):
-            _download_tokenizer(hf_repo, tokenizer_path)
-        elif download_tokenizer and tokenizer_path:
-            print(f"Tokenizer already cached at {tokenizer_path}")
-        return npz_path, tokenizer_path
-
-    import requests
     base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
 
     # Build auth headers if HF token is available
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
         "HUGGING_FACE_HUB_TOKEN")
     if not hf_token:
+        # Check cached token from huggingface-cli login
         token_file = os.path.join(
             os.path.expanduser("~"), ".cache", "huggingface", "token")
         if os.path.exists(token_file):
@@ -203,7 +121,17 @@ def download_weights(hf_repo: str, model_dir: str,
         if os.path.exists(tokenizer_path):
             print(f"Tokenizer already cached at {tokenizer_path}")
         else:
-            _download_tokenizer(hf_repo, tokenizer_path, headers)
+            tok_url = f"{base_url}/tokenizer.json"
+            print(f"Downloading tokenizer from {hf_repo}...")
+            resp = requests.get(tok_url, headers=headers)
+            resp.raise_for_status()
+            with open(tokenizer_path, 'wb') as f:
+                f.write(resp.content)
+            print(f"  Saved tokenizer to {tokenizer_path}")
+
+    if os.path.exists(npz_path):
+        print(f"Weights already cached at {npz_path}")
+        return npz_path, tokenizer_path
 
     if safetensors_files is None:
         safetensors_files = ["model.safetensors"]
@@ -319,7 +247,11 @@ def load_tokenizer(tokenizer_path: str):
 
 def generate(model, prompt: str, tokenizer=None,
              max_tokens: int = 50,
-             temperature: float = 0.8, top_k: int = 40) -> str:
+             temperature: float = 0.8, top_k: int = 40,
+             auto_switch_sampling: bool = False,
+             auto_switch_after: int = 128,
+             auto_switch_temperature: float = 0.7,
+             auto_switch_top_k: int = 40) -> str:
     """Generate text from a prompt using a WebGPU model.
 
     Uses KV-cache for incremental decoding with separate
@@ -377,11 +309,12 @@ def generate(model, prompt: str, tokenizer=None,
     prefill_start = time.perf_counter()
 
     # Prefill: process full prompt, populate KV cache
-    if _p: _cpu.begin("prefill")
-    if _p: _cpu.begin("prefill/forward")
-    logits = model.forward(token_ids, use_cache=True, pos_offset=0)
-    if _p: _cpu.end("prefill/forward")
-    if _p: _cpu.end("prefill")
+    if _p:
+        with model.profiler.step("prefill"):
+            with model.profiler.cpu("forward"):
+                logits = model.forward(token_ids, use_cache=True, pos_offset=0)
+    else:
+        logits = model.forward(token_ids, use_cache=True, pos_offset=0)
     next_logits = logits[-1, :]
 
     # Warm up fast decode pipeline (if available)
@@ -392,54 +325,227 @@ def generate(model, prompt: str, tokenizer=None,
     decode_tokens = 0
     decode_forward_ns = 0  # accumulated forward() time only
     decode_start = None
+    base_temperature = float(temperature)
+    base_top_k = int(top_k)
+    use_gpu_greedy = (base_temperature <= 0
+                      and hasattr(model, 'decode_next_token_gpu'))
+    use_gpu_topk = (base_temperature > 0 and base_top_k > 0
+                    and getattr(model, '_gpu_topk_sampling', False)
+                    and hasattr(model, 'decode_topk_gpu'))
+    use_gpu_sample_decode = (use_gpu_greedy or use_gpu_topk) and hasattr(model, 'decode_next_token_gpu')
+    tokenless_gpu_decode = bool(getattr(model, '_use_dp4a', False))
+    use_gpu_prefill_sampling = use_gpu_sample_decode and hasattr(model, 'sample_prefill_token_gpu')
+    auto_switch_enabled = (
+        bool(auto_switch_sampling)
+        and base_temperature <= 0
+        and max_tokens > int(auto_switch_after)
+        and int(auto_switch_after) >= 1
+    )
+    switch_after = int(auto_switch_after)
+    switch_temperature = max(float(auto_switch_temperature), 1e-5)
+    switch_top_k = max(1, int(auto_switch_top_k))
+    # --- No-repeat n-gram blocking ---
+    # Maintains a set of seen n-grams for O(1) repeat detection.
+    # When active in greedy mode, we use GPU top-k as primary decode
+    # (not greedy) so candidates are available in one dispatch — no
+    # extra round-trip when a token is blocked.
+    no_repeat_ngram_size = 4
+    repeat_fallback_k = 64
+    _seen_ngrams = set()  # set of tuples
+
+    def _record_ngrams(seq, n):
+        """Add all n-grams ending at the last token of seq."""
+        if len(seq) < n:
+            return
+        _seen_ngrams.add(tuple(seq[-n:]))
+
+    def _would_repeat_ngram(seq, tok, n):
+        """O(1) check: would appending tok create a repeated n-gram?"""
+        if n <= 1 or len(seq) < n - 1:
+            return False
+        candidate = tuple(seq[-(n - 1):]) + (int(tok),)
+        return candidate in _seen_ngrams
+
+    # When n-gram blocking is active and decode is greedy, upgrade to
+    # top-k primary path so we always have fallback candidates.
+    _ngram_topk_primary = (
+        no_repeat_ngram_size > 0
+        and base_temperature <= 0
+        and hasattr(model, 'decode_topk_gpu')
+    )
+
+    stream_buf = []
+    stream_flush_every = 16
+    if (use_gpu_sample_decode and tokenless_gpu_decode
+            and hasattr(model, 'set_decode_input_token_gpu') and len(generated) > 0):
+        model.set_decode_input_token_gpu(int(generated[-1]))
+
+    # Seed n-gram set with prompt tokens
+    for i in range(no_repeat_ngram_size, len(generated) + 1):
+        _seen_ngrams.add(tuple(generated[i - no_repeat_ngram_size:i]))
+
+    prefill_end = prefill_start
     for step in range(max_tokens):
-        if _p: _cpu.begin(f"decode_{step}")
-        if step > 0:
-            if _p: _cpu.begin(f"decode_{step}/forward")
-            if _p: _cpu.begin(f"decode_{step}/forward/embed")
-            _token_buf[0] = generated[-1]
-            if _p: _cpu.end(f"decode_{step}/forward/embed")
-            _fwd_t0 = time.perf_counter_ns()
-            logits = model.forward(
-                _token_buf, use_cache=True,
-                pos_offset=len(generated) - 1)
-            _fwd_t1 = time.perf_counter_ns()
-            next_logits = logits[-1, :]
-            if _p: _cpu.end(f"decode_{step}/forward")
+        _fwd_t0 = 0
+        _fwd_t1 = 0
+        next_token = None
+        step_temperature = base_temperature
+        step_top_k = base_top_k
+        if auto_switch_enabled and step >= switch_after:
+            step_temperature = switch_temperature
+            step_top_k = switch_top_k
 
-        # Top-k sampling: only compute softmax on top-k logits
-        if _p: _cpu.begin(f"decode_{step}/sampling")
-        if top_k > 0 and temperature > 0:
-            top_k_idx = np.argpartition(next_logits, -top_k)[-top_k:]
-            top_k_vals = next_logits[top_k_idx] / temperature
-            top_k_vals -= top_k_vals.max()
-            top_k_probs = np.exp(top_k_vals)
-            top_k_probs /= top_k_probs.sum()
-            next_token = top_k_idx[np.random.choice(top_k, p=top_k_probs)]
-        elif temperature > 0:
-            next_logits = next_logits / temperature
-            next_logits -= next_logits.max()
-            probs = np.exp(next_logits)
-            probs /= probs.sum()
-            next_token = np.random.choice(len(probs), p=probs)
-        else:
-            next_token = next_logits.argmax()
-        generated.append(int(next_token))
-        if _p: _cpu.end(f"decode_{step}/sampling")
+        use_gpu_greedy_step = (step_temperature <= 0
+                               and hasattr(model, 'decode_next_token_gpu'))
+        use_gpu_topk_step = (step_temperature > 0 and step_top_k > 0
+                             and getattr(model, '_gpu_topk_sampling', False)
+                             and hasattr(model, 'decode_topk_gpu'))
+        use_gpu_sample_decode_step = (
+            (use_gpu_greedy_step or use_gpu_topk_step)
+            and hasattr(model, 'decode_next_token_gpu')
+        )
+        step_ctx = model.profiler.step(f"decode_{step}") if (_p and step > 0) else nullcontext()
+        with step_ctx:
+            if step > 0:
+                if decode_start is None:
+                    # TPS window starts from decode_1 (not decode_0)
+                    decode_start = time.perf_counter()
+                if not (use_gpu_sample_decode_step and tokenless_gpu_decode):
+                    if _p: _cpu.begin(f"decode_{step}/forward/embed")
+                    _token_buf[0] = generated[-1]
+                    if _p: _cpu.end(f"decode_{step}/forward/embed")
+                _fwd_t0 = time.perf_counter_ns()
+                if _ngram_topk_primary and not (auto_switch_enabled and step >= switch_after):
+                    # N-gram blocking active: use top-k as primary path
+                    # so candidates are available without extra dispatch.
+                    idx, vals = model.decode_topk_gpu(
+                        None if tokenless_gpu_decode else _token_buf,
+                        pos_offset=len(generated) - 1,
+                        top_k=repeat_fallback_k)
+                    _ngram_idx = np.asarray(idx, dtype=np.int64)
+                    _ngram_vals = np.asarray(vals, dtype=np.float32)
+                    # Pick the highest-scoring non-repeating candidate
+                    order = np.argsort(_ngram_vals)[::-1]
+                    next_token = int(_ngram_idx[order[0]])
+                    for i in order:
+                        cand = int(_ngram_idx[i])
+                        if not _would_repeat_ngram(generated, cand,
+                                                    no_repeat_ngram_size):
+                            next_token = cand
+                            break
+                    # Write chosen token back to GPU for next embed gather
+                    if hasattr(model, 'set_decode_input_token_gpu'):
+                        model.set_decode_input_token_gpu(next_token)
+                elif use_gpu_greedy_step:
+                    next_token = model.decode_next_token_gpu(
+                        None if tokenless_gpu_decode else _token_buf,
+                        pos_offset=len(generated) - 1,
+                        temperature=0.0, top_k=1)
+                elif use_gpu_topk_step:
+                    # GPU forward + top-k extraction, then CPU sampling.
+                    # This avoids the GPU RNG quality issues while keeping
+                    # the fast GPU forward pass.
+                    idx, vals = model.decode_topk_gpu(
+                        None if tokenless_gpu_decode else _token_buf,
+                        pos_offset=len(generated) - 1,
+                        top_k=step_top_k)
+                    idx = np.asarray(idx, dtype=np.int64)
+                    vals = np.asarray(vals, dtype=np.float32)
+                    scaled = vals / max(float(step_temperature), 1e-6)
+                    scaled -= scaled.max()
+                    probs = np.exp(scaled)
+                    probs /= probs.sum()
+                    next_token = int(idx[np.random.choice(len(idx), p=probs)])
+                    # Write chosen token back to GPU buffer so next
+                    # step's embed gather uses the correct token.
+                    if hasattr(model, 'set_decode_input_token_gpu'):
+                        model.set_decode_input_token_gpu(next_token)
+                else:
+                    logits = model.forward(
+                        _token_buf, use_cache=True,
+                        pos_offset=len(generated) - 1)
+                _fwd_t1 = time.perf_counter_ns()
+                if not use_gpu_greedy_step and not use_gpu_topk_step:
+                    next_logits = logits[-1, :]
+            elif use_gpu_prefill_sampling:
+                if use_gpu_topk:
+                    next_token = model.sample_prefill_token_gpu(
+                        next_logits, temperature=base_temperature, top_k=base_top_k)
+                else:
+                    next_token = model.sample_prefill_token_gpu(
+                        next_logits, temperature=0.0, top_k=1)
 
-        # Decode and print
-        print(dec_one(int(next_token)), end="", flush=True)
-        if _p: _cpu.end(f"decode_{step}")
+            # CPU sampling scope only when sampling is actually on CPU.
+            cpu_sampling_active = not (
+                (use_gpu_sample_decode_step and step > 0)
+                or (use_gpu_prefill_sampling and step == 0)
+            )
+            if _p and cpu_sampling_active:
+                _cpu.begin(f"decode_{step}/sampling")
+            if use_gpu_topk_step and step > 0:
+                pass
+            elif not (use_gpu_greedy_step and step > 0):
+                if step_top_k > 0 and step_temperature > 0:
+                    top_k_idx = np.argpartition(next_logits, -step_top_k)[-step_top_k:]
+                    top_k_vals = next_logits[top_k_idx] / step_temperature
+                    top_k_vals -= top_k_vals.max()
+                    top_k_probs = np.exp(top_k_vals)
+                    top_k_probs /= top_k_probs.sum()
+                    next_token = top_k_idx[np.random.choice(step_top_k, p=top_k_probs)]
+                elif step_temperature > 0:
+                    next_logits = next_logits / step_temperature
+                    next_logits -= next_logits.max()
+                    probs = np.exp(next_logits)
+                    probs /= probs.sum()
+                    next_token = np.random.choice(len(probs), p=probs)
+                else:
+                    next_token = next_logits.argmax()
 
-        # After the 1st token is output, mark end of prefill / start of decode
-        if step == 0:
-            prefill_end = time.perf_counter()
-            decode_start = time.perf_counter()
-        else:
-            decode_tokens += 1
-            decode_forward_ns += (_fwd_t1 - _fwd_t0)
+            if next_token is None:
+                next_token = int(next_logits.argmax())
+
+            next_token = int(next_token)
+
+            # No-repeat n-gram guard for non-topk-primary paths
+            if (step > 0 and not _ngram_topk_primary
+                    and _would_repeat_ngram(generated, next_token,
+                                            no_repeat_ngram_size)):
+                if 'next_logits' in locals() and isinstance(next_logits, np.ndarray):
+                    k = min(repeat_fallback_k, next_logits.shape[0])
+                    cand_idx = np.argpartition(next_logits, -k)[-k:]
+                    cand_idx = cand_idx[np.argsort(next_logits[cand_idx])[::-1]]
+                    for cand in cand_idx:
+                        cand_i = int(cand)
+                        if not _would_repeat_ngram(generated, cand_i,
+                                                    no_repeat_ngram_size):
+                            next_token = cand_i
+                            break
+
+            # Record n-grams ending at this new token
+            generated.append(int(next_token))
+            _record_ngrams(generated, no_repeat_ngram_size)
+            if _p and cpu_sampling_active:
+                _cpu.end(f"decode_{step}/sampling")
+
+            # Decode and print
+            stream_buf.append(dec_one(int(next_token)))
+            if len(stream_buf) >= stream_flush_every:
+                print("".join(stream_buf), end="", flush=True)
+                stream_buf.clear()
+
+            # After the 1st token is output, mark TTFT end only.
+            # Decode TPS starts from decode_1 via `decode_start` above.
+            if step == 0:
+                prefill_end = time.perf_counter()
+            else:
+                decode_tokens += 1
+                if _fwd_t1 > _fwd_t0:
+                    decode_forward_ns += (_fwd_t1 - _fwd_t0)
 
     decode_end = time.perf_counter()
+
+    if stream_buf:
+        print("".join(stream_buf), end="", flush=True)
 
     prefill_ms = (prefill_end - prefill_start) * 1000
     decode_ms = (decode_end - decode_start) * 1000 if decode_start else 0
@@ -454,7 +560,7 @@ def generate(model, prompt: str, tokenizer=None,
     print(f"\n\n--- Performance ---")
     print(f"  Prefill (TTFT): {prefill_ms:.1f}ms "
           f"({prompt_len} prompt + 1st token)")
-    print(f"  Decode:  {decode_tokens} tokens in {decode_ms:.1f}ms "
+    print(f"  Decode (from decode_1):  {decode_tokens} tokens in {decode_ms:.1f}ms "
           f"({decode_tps:.1f} tok/s)")
     print(f"    forward() only: {decode_fwd_ms:.1f}ms "
           f"({decode_fwd_tps:.1f} tok/s)")
@@ -462,115 +568,3 @@ def generate(model, prompt: str, tokenizer=None,
           f"({overall_tps:.1f} tok/s)")
 
     return dec_fn(generated)
-
-
-# ---------------------------------------------------------------------------
-# Common profiling
-# ---------------------------------------------------------------------------
-
-def profile_model(model, prompt: str, tokenizer,
-                  script_dir: str, model_name: str,
-                  max_tokens: int = 10,
-                  temperature: float = 0.0,
-                  init_timestamps: list = None,
-                  extra_reset=None):
-    """Run a profiled inference session and generate HTML timeline.
-
-    This is the common profiling path for all models. It:
-    1. Enables profiling with GPU timestamps
-    2. Injects pre-recorded init phase events (imports, weight loading, etc.)
-    3. Runs a warmup forward pass (recorded in timeline)
-    4. Profiles prefill + N decode steps with per-step scoping
-    5. Generates HTML flamechart report
-
-    Args:
-        model: WebGPUModel subclass with forward() method
-        prompt: text prompt to generate from
-        tokenizer: tokenizer with encode()/decode() methods
-        script_dir: model's script directory (for saving profile.html)
-        model_name: human-readable name (e.g., "Phi-4 mini", "Qwen3.5-27B")
-        max_tokens: number of tokens to generate (profile uses min(this, 10))
-        temperature: sampling temperature (0.0 = greedy)
-        init_timestamps: list of (name, begin_ns, end_ns[, scope]) tuples
-                         for pre-profiler events (imports, weight_loading, etc.)
-        extra_reset: optional callable to reset model-specific state (e.g., SSM)
-    """
-    model.enable_profiling()
-    print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
-
-    # Inject pre-recorded init timeline events
-    if init_timestamps:
-        model.profiler.inject_init_events(init_timestamps)
-    if hasattr(model, '_init_phases'):
-        model.profiler.inject_init_events(model._init_phases)
-
-    # Tokenize
-    tokens = tokenizer.encode(prompt)
-    token_ids = np.array(tokens, dtype=np.int32)
-
-    # Reset caches
-    model.kv_cache = None
-    if hasattr(model, '_gpu_kv_cache'):
-        for layer in model._gpu_kv_cache:
-            k, v, _ = model._gpu_kv_cache[layer]
-            model._gpu_kv_cache[layer] = (k, v, 0)
-    if extra_reset:
-        extra_reset()
-
-    # Warmup (recorded in timeline)
-    with model.profiler.cpu("warmup"):
-        if hasattr(model, 'warmup'):
-            model.warmup()
-        else:
-            model.forward(np.array([1], dtype=np.int32),
-                          use_cache=True, pos_offset=0)
-            model.kv_cache = None
-            if hasattr(model, '_gpu_kv_cache'):
-                for layer in model._gpu_kv_cache:
-                    k, v, _ = model._gpu_kv_cache[layer]
-                    model._gpu_kv_cache[layer] = (k, v, 0)
-            if extra_reset:
-                extra_reset()
-
-    # Prefill
-    print("\n--- Prefill Breakdown ---")
-    t0 = time.perf_counter()
-    with model.profiler.step("prefill"):
-        logits = model.forward(token_ids, use_cache=True, pos_offset=0)
-    t1 = time.perf_counter()
-    print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
-
-    # Fast decode init (if available)
-    t2 = time.perf_counter()
-    with model.profiler.cpu("fast_decode_init"):
-        if hasattr(model, '_warmup_fast_decode'):
-            model._warmup_fast_decode()
-    t3 = time.perf_counter()
-    print(f"  Fast decode init:   {(t3 - t2)*1000:.1f}ms")
-    print(f"  Total TTFT:         {(t3 - t0)*1000:.1f}ms")
-
-    # Decode
-    n_profile = min(max_tokens, 10)
-    generated = list(tokens)
-    next_logits = logits[-1, :].copy()
-    for step in range(n_profile):
-        if temperature > 0:
-            next_logits = next_logits / temperature
-            next_logits -= next_logits.max()
-            probs = np.exp(next_logits)
-            probs /= probs.sum()
-            next_token = int(np.random.choice(len(probs), p=probs))
-        else:
-            next_token = int(next_logits.argmax())
-        generated.append(next_token)
-
-        with model.profiler.step(f"decode_{step}"):
-            with model.profiler.scope("forward"):
-                logits = model.forward(
-                    np.array([next_token], dtype=np.int32),
-                    use_cache=True,
-                    pos_offset=len(generated) - 1)
-            with model.profiler.cpu("sampling"):
-                next_logits = logits[-1, :].copy()
-
-    model.save_profile(script_dir, model_name)

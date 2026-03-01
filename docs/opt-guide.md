@@ -90,36 +90,7 @@ count and improves memory locality.
 
 Each avoided dispatch saves ~0.7 ms on D3D12 with warm caches.
 
-### 1.5 Last-Token-Only LM Head
-
-During prefill, the model processes T prompt tokens through all layers,
-producing hidden states `(T, E)`.  The LM head projects these to logits
-`(T, V)` where V = vocab_size (e.g., 200K).  But only the **last token's
-logits** are used for next-token sampling — the other T-1 rows are discarded.
-
-**Optimization**: Slice to the last hidden state before the LM head:
-
-```python
-# Before: LM head processes all T tokens → (T, V) → only logits[-1] used
-logits = x @ lm_head_weight.T   # (T, E) × (V, E)^T = (T, V)
-next_token = argmax(logits[-1])
-
-# After: Slice first, then LM head processes only 1 token
-x = x[-1:]                      # (1, E) — last token only
-logits = x @ lm_head_weight.T   # (1, E) × (V, E)^T = (1, V)
-next_token = argmax(logits[0])
-```
-
-**Impact**: For V=200K and E=3072, this changes the matmul from
-(5, 3072) × (200064, 3072)^T to (1, 3072) × (200064, 3072)^T — a 5×
-reduction in compute for a 5-token prompt. For GPU LM head via the
-wide kernel, this also avoids chunked dispatch (single grid instead
-of 4 chunks for N > 65535).
-
-For models with very large vocabularies (e.g., Qwen-3.5 with V=248K),
-this saves ~400ms on CPU LM head per prefill step.
-
-### 1.6 Static KV Cache
+### 1.5 Static KV Cache
 
 The KV cache stores past key/value vectors so that decode only processes
 one new token per step.  A *static* KV cache pre-allocates fixed-size
@@ -190,74 +161,6 @@ on GPU + ~384 MB per-layer weight streamed).
 4. Pass `cur_len` as a scalar uniform to bound the attention loop.
 5. Keep CPU KV cache as fallback for prefill (where GPU causal
    attention is already used per-head).
-
-### 1.7 VRAM Budget Management
-
-GPU memory is the primary constraint for large models.  All ops should
-run on GPU to enable fast decode, but the model weights + activations +
-KV cache must fit in available VRAM.
-
-**VRAM budget example** (RTX 5080, 16 GB):
-
-| Component | Phi-4 (3.8B) | Qwen-3.5 (27B) |
-|-----------|-------------|----------------|
-| Layer weights (INT4) | 1.6 GB | 12.3 GB |
-| Embed/LM head (fp16) | 1.2 GB | 2.4 GB (×2 if untied) |
-| KV cache | 0.5 GB (32L×2K) | 0.06 GB (16L×512) |
-| Intermediates | ~0.1 GB | ~0.1 GB |
-| **Total** | **3.4 GB** | **14.9 GB** |
-| **Headroom** | **12.6 GB** | **1.1 GB** |
-
-**Strategies to reduce VRAM when tight**:
-
-1. **Reduce MAX_SEQ_LEN**: KV cache scales linearly with sequence length.
-   Reducing from 2048 → 512 saves 75% of KV cache VRAM.  For decode-only
-   workloads with short prompts, 512 is sufficient.
-
-2. **Eliminate redundant fp32 embed upload**: If embed_tokens is used for
-   both embedding gather and LM head (tied weights), use the fp16 copy
-   for both.  The `embed_gather_fp16_kernel` reads fp16 and outputs fp32.
-   Saves 1 × `(V × E × 4)` bytes of GPU memory.
-
-3. **Share embed/LM head when tied**: Many models (Phi-4, LLaMA, SmolLM2)
-   tie `embed_tokens.weight == lm_head.weight`.  Upload once as fp16,
-   use for both embedding gather and LM head projection.
-
-4. **Untied LM head: split or stream**: For models with separate LM head
-   (Qwen-3.5 with 248K vocab), the LM head is 2.4 GB fp16.  Options:
-   - **Upload if it fits**: Check VRAM headroom after layer weights.
-   - **Stream per-token**: Upload a chunk, compute, free, repeat.
-     Adds CPU→GPU transfer latency but avoids keeping the full matrix
-     resident.
-   - **Keep on CPU as last resort**: CPU matmul for (1, E) × (V, E)^T
-     costs ~100ms for V=248K.  Still viable at 4 tok/s decode.
-
-5. **Free CPU copies after GPU upload**: Call `_free_cpu_weights()` to
-   reclaim CPU RAM.  This doesn't affect VRAM but prevents OOM on
-   systems with limited system memory.
-
-6. **Quantize LM head**: Apply INT4 quantization to the LM head weight
-   itself. A 248K×5120 fp16 matrix (2.4 GB) becomes ~300 MB in INT4.
-   This requires the Q4 matmul kernel to support the vocab dimension,
-   which may need grid chunking for N > 65535.
-
-**Decision tree**:
-
-```
-Total VRAM needed = layer_weights + embed + lm_head + kv_cache + intermediates
-
-If total < 0.9 × GPU_VRAM:
-    → Upload everything, enable full GPU decode
-
-If total > 0.9 × GPU_VRAM:
-    → Reduce MAX_SEQ_LEN
-    → Eliminate fp32 embed (use fp16 gather)
-    → Try INT4 LM head quantization
-    → If still over: keep LM head on CPU
-
-Always target < 90% VRAM usage to leave headroom for Dawn's internal
-allocations, command buffers, and OS compositor.
-```
 
 ---
 
@@ -435,71 +338,6 @@ WebGPU compute shaders have specific constraints compared to CUDA:
   from multiple threads to the same address can silently lose data.
   Guard scalar stores with `if local_id.x == 0u { ... }`.
 
-### 2.8 Async Pipeline Creation
-
-GPU compute pipeline creation (`createComputePipeline`) is **synchronous
-and expensive** — each call blocks the CPU while the driver compiles the
-shader.  For LLMs with 20–64 layers and 5–10 distinct kernels, this
-means 50–200 blocking compilations at model init, adding 200–800 ms
-of startup latency.
-
-**The problem**: During prefill, every layer's first dispatch triggers
-pipeline creation if not cached.  With synchronous creation, the CPU
-stalls on each new pipeline, serializing compilation with execution.
-
-**Solution (implemented in common)**: The `WebGPUModel._warmup_gpu_pipelines()`
-method in `model_base.py` now uses **parallel async compilation** via
-`DawnRunner.prefetch_pipelines_async()`.  All compiled kernel specs are
-collected and submitted to a thread pool.  Each worker calls
-`_get_or_create_pipeline()` concurrently; all compilations overlap:
-
-```
-Init:
-  Thread 1: compile rms_norm_loop (BLOCK=128)
-  Thread 2: compile linear_loop_fp16w (K=5120)
-  Thread 3: compile linear_q4 (K=5120)
-  Thread 4: compile silu_mul_fused (N=17408)
-  ...
-  barrier: wait for all pipelines
-
-Prefill:
-  All pipelines already cached → zero compilation during forward
-```
-
-This reduces total warm-up time from `sum(compile_times)` (serial) to
-`max(compile_times)` (parallel).  For models with 20+ unique kernel
-configs, this is a 5–10× init speedup.
-
-All models inherit this automatically from `WebGPUModel` — no per-model
-code needed.  The warm-up runs at the end of `_compile_kernels()`, before
-weight upload begins.
-
-**How it works under the hood**:
-
-1. `_warmup_gpu_pipelines()` scans all `self.*_result` attributes
-   (compiled Triton results with `.wgsl`).
-2. Collects `(wgsl, buffer_bindings, param_fields)` specs.
-3. Calls `runner.prefetch_pipelines_async(specs)` which:
-   - Deduplicates by WGSL hash
-   - Submits uncached pipelines to a `ThreadPoolExecutor`
-   - Each worker calls `wgpuDeviceCreateComputePipeline` (releases GIL)
-   - Waits for all to complete
-
-```python
-# model_base.py — _warmup_gpu_pipelines()
-specs = [(r.wgsl, r.buffer_bindings, r.param_fields)
-         for r in all_compiled_results]
-runner.prefetch_pipelines_async(specs)  # parallel compilation
-```
-
-**Why threading works**: Dawn's D3D12 backend delegates to `dxcapi.dll`
-(DirectX Shader Compiler) which is thread-safe.  Python threading works
-because pipeline creation releases the GIL during the native C call.
-
-**Future**: For even lower latency, overlap pipeline warm-up with weight
-upload by running them concurrently in separate threads.  Currently
-warm-up completes before upload begins.
-
 ---
 
 ## 3. Profiling
@@ -562,7 +400,7 @@ generate_html_report(model.profiler, "profile.html")
 
 Most models support `--profile` flag:
 ```bash
-python models/phi-4/model.py --profile --prompt "Hello" --max-tokens 10
+python models/phi4/model.py --profile --prompt "Hello" --max-tokens 10
 ```
 
 ### 3.2 The HTML Timeline — What It Shows
@@ -596,94 +434,34 @@ per-op timing alone cannot:
    near-identical kernel times regardless of compute intensity,
    the kernel is memory-bound. Fix: fp16 weights, quantization.
 
-### 3.3 CPU Profiling Requirements
+### 3.3 Per-Layer Profiling with CPU Scopes
 
-The CPU timeline in the profiler report must show **where CPU cycles
-are actually spent** — not just top-level phase labels like `prefill`
-or `decode_0`.  These phase wrappers tell you nothing about which
-operation is the bottleneck.
-
-**Bad output** (useless for optimization):
-```
---- CPU Timeline ---
-  Operation                         Total  Count      Avg      %
-  prefill                        2163.57ms     1x 2163.565ms   0.0%
-  decode_1                        249.93ms     1x 249.927ms   0.0%
-  decode_2                        204.09ms     1x 204.091ms   0.0%
-  ...
-```
-
-**Good output** (actionable):
-```
---- CPU Timeline ---
-  Operation                         Total  Count      Avg      %
-  attn_qk                         892.3ms   512x   1.743ms  42.1%
-  attn_sv                         340.1ms   512x   0.664ms  16.1%
-  rms_norm                        201.4ms  1024x   0.197ms   9.5%
-  ssm_scan                        188.7ms   384x   0.491ms   8.9%
-  cpu_matmul                      156.2ms   128x   1.221ms   7.4%
-  rope                             89.3ms   512x   0.174ms   4.2%
-  sampling                         38.9ms    20x   1.948ms   1.8%
-  ...
-```
-
-**How to instrument**: Wrap every meaningful CPU operation with
-scoped profiler calls.  Use consistent operation names across layers
-so the report aggregates them:
+For decode-path optimization, the profiler also integrates directly
+into model code via CPU scopes:
 
 ```python
-def _decode_cpu(self, x, layer, positions):
-    _p = self.profiler and self.profiler.enabled
-    _cpu = self.profiler._cpu if _p else None
+# In _decode_cpu() or _transformer_block():
+p = self.profiler
+if p and p.enabled:
+    p._cpu.begin("rms_norm_1")
+    rn1 = self._rms_norm_cpu(x, ...)
+    p._cpu.end("rms_norm_1")
 
-    if _p: _cpu.begin(f"L{layer}/rms_norm")
-    rn1 = self._rms_norm_vec(x, ...)
-    if _p: _cpu.end(f"L{layer}/rms_norm")
-
-    if _p: _cpu.begin(f"L{layer}/attn_qk")
-    scores = Q @ K.T * scale
-    if _p: _cpu.end(f"L{layer}/attn_qk")
-
-    if _p: _cpu.begin(f"L{layer}/ssm_scan")
-    state[:] = A_disc * state + x_dt * B
-    if _p: _cpu.end(f"L{layer}/ssm_scan")
+    p._cpu.begin("qkv_linear")
+    qkv = self._cpu_matmul(rn1, ...)
+    p._cpu.end("qkv_linear")
 ```
 
-The report automatically strips the `L{i}/` prefix and aggregates
-by operation name — so `L0/rms_norm` through `L63/rms_norm` all
-roll up into a single `rms_norm` row with total time and count.
+This produces per-op timing within each layer, making it easy to see
+which operation is the bottleneck (matmul vs. attention vs. norm).
 
-### 3.4 Phase Markers (Prefill vs Decode)
-
-The `generate()` function in `common/utils.py` wraps inference in
-two phases:
-
-| Phase | What happens | Profiler scope |
-|-------|-------------|----------------|
-| **Prefill** | Process full prompt (T tokens), populate KV cache, produce 1st token | `prefill/forward` |
-| **Decode** | Autoregressive generation, one token at a time (T=1) | `decode_{step}/forward` |
-
-The profiler's CPU timeline shows these as nested scopes.  The
-**Hotspot Analysis** section lists them ranked by wall-clock time.
-Use this to quickly see how much time is spent in prefill vs decode,
-but drill into the per-op breakdown (§3.3) for actual optimization.
-
-**Interpreting the phases**:
-- **Prefill-dominated** (TTFT >> decode/token): Optimize GPU kernels
-  for large-T matmuls (norm, QKV, MLP projections).
-- **Decode-dominated** (decode/token is the bottleneck): Optimize the
-  T=1 CPU path — vectorize attention, cache fp32 weight conversions,
-  batch GPU projections.
-- **Sampling overhead**: If `sampling` appears high (> 5ms/token),
-  consider pre-allocating buffers or reducing top-k.
-
-### 3.5 Identifying Bottlenecks
+### 3.4 Identifying Bottlenecks
 
 Use `--profile` to generate both a console report and an interactive
 HTML timeline (`profile.html` in the model folder).
 
 ```bash
-python models/phi-4/model.py --profile --prompt "Hello" --max-tokens 10
+python python/examples/webgpu/phi4/model.py --profile --prompt "Hello" --max-tokens 10
 ```
 
 The profiler tracks:
@@ -691,66 +469,7 @@ The profiler tracks:
 - **GPU timeline**: WebGPU timestamp queries (if `TimestampQuery` feature
   is available)
 
-### 3.6 GPU Kernel Naming (Required)
-
-Every model **must** annotate its GPU dispatches with descriptive names
-via `self.cache._gpu_op_name` so the profiler report shows a per-kernel
-breakdown instead of a flat `gpu_dispatch` aggregate.  Without this,
-profiling output is useless for identifying bottlenecks.
-
-**Pattern** (zero overhead when profiling is disabled):
-
-```python
-_p = self.profiler and self.profiler.enabled if hasattr(self, 'profiler') else False
-
-# Before each GPU dispatch, set the name:
-if _p: self.cache._gpu_op_name = f"L{layer}/qkv"
-qkv = self._proj(x, pfx + "qkv_proj.weight", ...)
-
-# After the last GPU op in a block, clear it:
-if _p: self.cache._gpu_op_name = None
-```
-
-**Naming convention**:
-
-| Name pattern | Operation |
-|-------------|-----------|
-| `L{i}/norm1` | Pre-attention RMSNorm/LayerNorm |
-| `L{i}/norm2` | Post-attention RMSNorm/LayerNorm |
-| `L{i}/qkv` | Fused QKV projection |
-| `L{i}/o_proj` | Attention output projection |
-| `L{i}/rope_q`, `L{i}/rope_kv` | RoPE kernels |
-| `L{i}/attn` | Attention kernel |
-| `L{i}/gate_up` | MLP gate+up projection |
-| `L{i}/silu_mul` | SiLU·mul activation |
-| `L{i}/down` | MLP down projection |
-| `L{i}/res1`, `L{i}/res2` | Residual adds |
-| `L{i}/res1+norm2` | Fused residual add + norm |
-| `L{i}/ssm_qkv` | SSM input projection (Mamba-2) |
-| `L{i}/ssm_z` | SSM gate projection |
-| `L{i}/ssm_out` | SSM output projection |
-| `final_norm` | Final layer norm |
-| `lm_head` | LM head projection |
-
-This produces output like:
-
-```
---- GPU Dispatches (CPU-timed) ---
-  Operation                         Total  Count      Avg      %
-  ------------------------------ -------- ------ -------- ------
-  norm1                          1164.33ms    64x  18.193ms  63.4%
-  ssm_out                         145.18ms   480x   0.302ms   7.9%
-  ssm_qkv                         143.50ms   480x   0.299ms   7.8%
-  gate_up                          95.52ms   640x   0.149ms   5.2%
-  qkv                              92.42ms   176x   0.525ms   5.0%
-  ...
-```
-
-**Requirement**: Any new model must include `_gpu_op_name` annotations
-before submitting for review.  The profiler report must show named
-kernels, not a single `gpu_dispatch` entry.
-
-### 3.7 What to Look For
+### 3.5 What to Look For
 
 1. **Dispatch overhead dominating**: If CPU time per op is mostly
    dispatch overhead (encode → submit → fence → readback), consider
@@ -795,7 +514,7 @@ kernels, not a single `gpu_dispatch` entry.
    level dispatches to a single pipelined submit of pre-recorded
    commands, eliminating virtually all CPU-GPU bubbles.
 
-### 3.8 Key Metrics
+### 3.6 Key Metrics
 
 | Metric | How to compute | Target |
 |--------|---------------|--------|
@@ -804,34 +523,7 @@ kernels, not a single `gpu_dispatch` entry.
 | Dispatch overhead ratio | dispatch_overhead / total_time | < 10% |
 | GPU occupancy | active_threads / max_threads | > 50% |
 
-### 3.9 Profiling Timestamps
-
-Every profiling run **must** include a timestamp so results can be
-compared across optimization iterations.  The profiler report and
-HTML output should record when the profiling was captured.
-
-```
-======================================================================
-  INFERENCE PROFILING REPORT
-  2026-02-28 14:32:05  |  Qwen3.5-27B  |  NVIDIA RTX 4090
-======================================================================
-```
-
-When recording optimization results (e.g., in `opt-history.md`), always
-include:
-
-| Field | Example |
-|-------|---------|
-| **Date** | 2026-02-28 |
-| **Commit / change** | Pre-cache fp32 SSM weights |
-| **TTFT** | 2190ms |
-| **Decode tok/s** | 4.9 |
-| **GPU adapter** | NVIDIA RTX 4090 (D3D12) |
-
-This makes it possible to track regressions and attribute improvements
-to specific changes over time.
-
-### 3.10 TPS Measurement Methodology
+### 3.7 TPS Measurement Methodology
 
 The `generate()` function uses two timers:
 
@@ -890,131 +582,7 @@ norm = self._rms_norm(x, w, gpu_out=True)      # returns GPUBuffer
 qkv = self._linear_fp16w(norm, w, b, N, K, gpu_out=True)  # no upload
 ```
 
-### 4.2 Don't Keep CPU Copies of Weights
-
-After uploading weights to GPU, **free the CPU copy** to reclaim RAM.
-Weights are only needed on GPU at inference time — keeping a redundant
-numpy array wastes memory (often 2–12 GB depending on model size).
-
-```python
-# Upload to GPU
-self._gpu_weights[name] = runner.upload_to_gpu(w_fp16, name)
-
-# Free CPU copy — it's no longer needed
-del self.weights[name]
-```
-
-For large models this is critical: Qwen3.5-27B uploads 12 GB of INT4
-weights to GPU.  Without freeing CPU copies, peak RAM is 24 GB (12 GB
-GPU + 12 GB CPU) instead of 12 GB.
-
-**Exceptions** — keep CPU copies only when:
-- The weight is used in a CPU code path (e.g., `lm_head` for CPU matmul
-  when the vocab is too large for GPU, or small norm weights used in
-  CPU-side RMSNorm during T=1 decode)
-- The weight is needed for on-the-fly transformations (e.g., im2col
-  reshape for conv2d)
-
-Use `_free_large_cpu_weights()` after all uploads are complete to batch
-the cleanup:
-
-```python
-def _free_large_cpu_weights(self):
-    keep = {"lm_head.weight"}  # needed for CPU matmul
-    large = [k for k, v in self.weights.items()
-             if isinstance(v, np.ndarray) and v.ndim >= 2
-             and k not in keep]
-    for k in large:
-        del self.weights[k]
-    import gc; gc.collect()
-```
-
-### 4.3 Memory-Mapped Weight Loading
-
-Loading weights from disk via `np.load()` reads the entire npz file
-into RAM before any tensor is accessed.  For large models (10–20 GB),
-this adds 3–10 seconds of startup latency.
-
-**Solution (implemented)**: Use `np.load(path, mmap_mode='r')` to
-memory-map the file.  The OS maps the file into virtual address space
-without reading it; pages are loaded on-demand as individual weight
-tensors are accessed during GPU upload.
-
-```python
-# Slow: reads entire 18 GB file into RAM
-data = np.load("weights_q4.npz")
-
-# Fast: memory-maps, loads pages on demand
-data = np.load("weights_q4.npz", mmap_mode='r')
-```
-
-**Benefits**:
-- **Near-instant startup**: `np.load()` returns immediately; actual
-  I/O happens lazily during GPU upload
-- **Lower peak RAM**: Only pages currently being uploaded are resident;
-  the OS can evict pages after `wgpuQueueWriteBuffer` consumes them
-- **Sequential I/O**: GPU upload iterates weights in order, producing
-  a sequential disk read pattern that the OS prefetcher optimizes
-
-**Caveats**:
-- **Read-only**: Mmap'd arrays are immutable.  Operations that modify
-  weights (e.g., `w.astype(np.float32)`, `w + 1.0`) create copies —
-  which is fine since we need fp32 copies for GPU upload anyway.
-- **Compressed npz**: `mmap_mode` doesn't work with compressed npz
-  files (`np.savez_compressed`).  Use uncompressed `np.savez` for
-  weight files.  The `load_weights_mmap()` utility in `common/utils.py`
-  handles this with an automatic fallback.
-
-All models now use `mmap_mode='r'` by default for weight loading.
-
-### 4.4 Disk Space: Delete Redundant Weight Files
-
-Weight conversion produces **multiple copies** of the same data:
-the original HuggingFace safetensors, the converted fp32 npz, and
-the quantized INT4 npz.  These are often kept on disk unnecessarily,
-doubling or tripling storage requirements.
-
-**Common redundancy patterns**:
-
-| Pattern | Example | Space wasted |
-|---------|---------|--------------|
-| Original safetensors kept after npz conversion | `model.safetensors` + `weights.npz` | 1× model size |
-| fp32 npz kept after INT4 quantization | `weights.npz` + `weights_q4.npz` | 2–4× Q4 size |
-| Multiple format copies (ONNX + safetensors + fp16) | SD-Turbo hf_cache | 3× model size |
-| Multiple model sizes all kept | SmolLM-2 135M + 360M + 1.7B | unused sizes |
-| Duplicate weight files | GPT-2: `gpt2_weights.npz` + `weights.npz` | 1× copy |
-
-**Rule**: After converting weights to the runtime format (npz or q4.npz),
-the original safetensors and intermediate fp32 npz can be deleted.
-Only keep:
-- The **runtime weight file** (`weights_q4.npz` for quantized models,
-  `*_fp16.npz` for image models)
-- The **tokenizer** (`tokenizer.json`)
-- Any **HF pipeline components** needed at runtime (text encoders, VAE)
-
-**Cleanup command**:
-
-```powershell
-# Delete original safetensors after conversion (per model)
-Remove-Item models/<name>/weights/*.safetensors
-
-# Delete intermediate fp32 npz after quantization
-Remove-Item models/<name>/weights/weights.npz
-
-# Delete ONNX files (not used by our engine)
-Get-ChildItem models -Recurse -Include *.onnx,*.onnx_data | Remove-Item
-```
-
-**Space savings by model** (measured):
-
-| Model | Before cleanup | After | Savings |
-|-------|---------------|-------|---------|
-| Qwen-3.5 | 68.6 GB | 16.8 GB | 51.8 GB (76%) |
-| Phi-4 | 24.2 GB | 2.7 GB | 21.5 GB (89%) |
-| SD-Turbo | 24.2 GB | 4.8 GB + VAE/encoders | 19.4 GB (80%) |
-| Total project | ~257 GB | ~112 GB | ~145 GB (56%) |
-
-### 4.4 Buffer Reuse with Size-Class Pooling
+### 4.2 Buffer Reuse with Size-Class Pooling
 
 GPU buffer allocation (`wgpuDeviceCreateBuffer`) is expensive.  The
 dawn runner caches buffers by `(name, size, usage)`, but exact-size
@@ -1034,7 +602,7 @@ The toggle-pool already alternates between two buffers per `(name, size)`
 to prevent read-write aliasing.  With size-class pooling, more
 allocations map to the same `(name, rounded_size)` key.
 
-### 4.5 Intermediate Buffer Lifetime Analysis
+### 4.3 Intermediate Buffer Lifetime Analysis
 
 Beyond size-class pooling, full **lifetime analysis** of intermediate
 tensors can dramatically reduce memory pressure.  Because neural network
@@ -1053,7 +621,7 @@ smallest available memory slot, minimizing total allocation.
 Full lifetime analysis across the entire layer DAG could further reduce
 allocation count.
 
-### 4.6 Pre-Allocated Working Buffers
+### 4.4 Pre-Allocated Working Buffers
 
 For operations with known maximum sizes (e.g., MoE accumulator, KV
 cache), pre-allocate buffers at init time and reuse via
@@ -1067,48 +635,6 @@ self._moe_acc_gpu = runner.upload_to_gpu(zeros(E), "moe_acc")
 # Per call: overwrite contents, no allocation
 runner.write_buffer(self._moe_x_gpu.handle, data.tobytes())
 ```
-
-### 4.7 Memory Pool with Smart Heuristics
-
-Balancing performance and memory usage requires a managed memory pool
-rather than allocate-on-demand / destroy-on-free.  Key principles:
-
-1. **Over-allocate to aligned sizes**: Allocate buffers rounded up to
-   a **size class** (e.g., powers of 2, or fixed buckets like 4KB,
-   16KB, 64KB, 256KB, 1MB, 4MB, ...).  When a buffer is freed, it
-   returns to the pool's free list under its size class instead of
-   being destroyed.  Future allocations of the same or smaller size
-   reuse the pooled buffer with zero allocation cost.
-
-2. **Free → pool, not destroy**: GPU buffer creation
-   (`wgpuDeviceCreateBuffer`) is expensive (~0.1–0.5 ms).  By
-   returning freed buffers to a per-size-class free list, subsequent
-   allocations become O(1) lookups instead of GPU API calls.
-
-3. **Smart size-class alignment**: Choose size classes that balance
-   fragmentation vs. reuse:
-   - Too many classes → buffers rarely match → low reuse
-   - Too few classes → large waste per buffer → high memory overhead
-   - Good default: powers of 2 above 4KB, with finer granularity
-     (e.g., 1.5× steps) below 4KB for small norm/bias buffers
-
-4. **Peak memory tracking**: Monitor high-water-mark to right-size
-   the pool.  After warmup (first inference pass), the pool stabilizes
-   and no further allocations should occur during steady-state decode.
-
-```
-Example size classes:
-  4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K,
-  1M, 2M, 4M, 8M, 16M, 32M, 64M, 128M, 256M
-
-A 3000-float buffer (12KB) → rounded to 16KB class
-A 3100-float buffer (12.4KB) → same 16KB class → reuses freed buffer
-```
-
-**Current status**: The dawn runner uses exact `(name, size, usage)`
-caching with a toggle pool.  Migrating to size-class pooling would
-reduce allocation count by ~50% for models with varying activation
-sizes (e.g., MoE, varying sequence lengths).
 
 ---
 

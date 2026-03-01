@@ -14,30 +14,32 @@ Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes
 
 All models run fully on Triton WebGPU — no PyTorch at inference time.
 
-| Model | Type | Params | Precision | Conformance | Performance | Status |
-|-------|------|--------|-----------|-------------|-------------|--------|
-| [**Flux-Klein**](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image Gen | 4B | FP16 | | 5.6s/step (512×512), DiT dual-stream |  |
-| [**Gemma-3**](https://huggingface.co/unsloth/gemma-3-2b) | LLM | 4B | FP16 | NA | NA | Gated model |
-| [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | PASS | 60ms TTFT, 97.5 tok/s decode | Done |
-| [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | PASS | 1.2s TTFT, 38.4 tok/s decode | Done |
-| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | PASS | 35ms TTFT, 120 tok/s decode | Done |
-| [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | PASS | 148ms TTFT, 220 tok/s decode | Done |
-| [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | | 2.4s TTFT, 4.9 tok/s decode |  |
-| [**SAM-3**](https://huggingface.co/facebook/sam3) | Segmentation | 31M | FP16 | NA | NA | Gated model |
-| [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | PASS | 8.6s/step (512×512), 1-step or CFG | Done |
-| [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | PASS | 133ms TTFT, 208 tok/s decode | Done |
-| [**Whisper Large V3 Turbo**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech-to-Text | 809M | FP16 | PASS | 8.0s encoder, 6.3 tok/s decode, 11.2s total | Done |
-| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | | 24s/step (512×512), DiT + Qwen3 |  |
+| Model | Type | Params | Real Weights | Status | Performance |
+|-------|------|--------|:------------:|--------|-------------|
+| **GPT-2** | LLM | 124M | ✅ | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
+| **Phi-4** | LLM | 3.8B | ✅ | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode, INT4 |
+| **Qwen 2.5** | LLM | 0.5B–1.5B | ✅ | ✅ Shipping | GQA, RoPE, SwiGLU |
+| **Qwen 3.5** | LLM | 27B | ✅ | ✅ Shipping | 919 tok/s (bench), INT4, Mamba-2 hybrid |
+| **SmolLM2** | LLM | 1.7B | ✅ | ✅ Shipping | 136ms TTFT, 209 tok/s decode, INT4 |
+| **GPT-OSS** | LLM (MoE) | — | ✅ | ✅ Shipping | MXFP4 quantized, MoE routing |
+| **Whisper** | Speech-to-Text | 39M | ✅ | ✅ Shipping | 160ms encoder, 30 tok/s decode, 0.9s total |
+| **SAM3** | Segmentation | 31M | ✅ | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
+| **Flux-Klein** | Image Gen | — | — | ✅ Verified | DiT architecture |
+| **SD-Turbo** | Image Gen | — | — | ✅ Verified | UNet, 1-step distilled |
+| **SDXL** | Image Gen | — | — | ✅ Verified | UNet, cross-attention |
+
+**Legend:** ✅ Real Weights = runs with real HuggingFace weights end-to-end. ✅ Verified = passes correctness test with random weights.
 
 ## Project Structure
+
 ```
 backpack/
 ├── models/           # Model implementations
 │   ├── common/       # Shared kernels, base classes, utilities
-│   ├── gpt-2/        # GPT-2 inference
-│   ├── gemma-3/      # Google Gemma 3
-│   ├── phi-4/        # Microsoft Phi-4
-│   ├── qwen-2.5/     # Alibaba Qwen 2.5
+│   ├── gpt2/         # GPT-2 inference
+│   ├── gemma/        # Google Gemma
+│   ├── phi4/         # Microsoft Phi-4
+│   ├── qwen2.5/      # Alibaba Qwen 2.5
 │   └── ...           # More models
 ├── docs/             # Documentation
 ├── third_party/
@@ -68,8 +70,8 @@ backpack/
 ```powershell
 git clone https://github.com/gyagp/backpack.git
 cd backpack
-python build.py          # Full setup: deps, clone, build Dawn, build triton
-python build.py verify   # Verify the pipeline works
+.\build.ps1          # Full setup: deps, clone, build Dawn, build triton
+.\build.ps1 verify   # Verify the pipeline works
 ```
 
 The build script automates everything — MSVC detection, repo cloning, Dawn build, triton build, and deployment. It skips steps that are already done, so it's safe to re-run.
@@ -77,14 +79,14 @@ The build script automates everything — MSVC detection, repo cloning, Dawn bui
 Individual targets are available for partial builds:
 
 ```powershell
-python build.py help           # Show all targets
-python build.py dawn           # Rebuild Dawn only
-python build.py triton         # Rebuild triton only
-python build.py clean          # Remove all build artifacts
-python build.py info           # Show build status
+.\build.ps1 help           # Show all targets
+.\build.ps1 dawn           # Rebuild Dawn only
+.\build.ps1 triton         # Rebuild triton only
+.\build.ps1 clean          # Remove all build artifacts
+.\build.ps1 info           # Show build status
 ```
 
-### Manual Steps (if not using build.py)
+### Manual Steps (if not using build.ps1)
 
 <details>
 <summary>Click to expand manual setup steps</summary>
@@ -158,10 +160,7 @@ cmake -S . -B build -G Ninja `
     -DDAWN_BUILD_PROTOBUF=OFF `
     -DDAWN_WERROR=OFF `
     -DTINT_BUILD_CMD_TOOLS=OFF `
-    -DTINT_BUILD_TESTS=OFF `
-    -DDAWN_ENABLE_SPIRV_VALIDATION=OFF `
-    -DDAWN_DXC_ENABLE_ASSERTS_IN_NDEBUG=OFF `
-    -DTINT_ENABLE_IR_VALIDATION=OFF
+    -DTINT_BUILD_TESTS=OFF
 
 # Build (10-30 minutes)
 cmake --build build --target webgpu_dawn --target dxcompiler
@@ -200,10 +199,10 @@ cd ../..
 
 ```powershell
 # Quick pipeline verification with random weights (no download needed)
-python models/gpt-2/model.py --verify
+python models/gpt2/model.py --verify
 
 # Full GPT-2 text generation (downloads ~500 MB weights on first run)
-python models/gpt-2/model.py --prompt "The future of AI is"
+python models/gpt2/model.py --prompt "The future of AI is"
 ```
 
 </details>
