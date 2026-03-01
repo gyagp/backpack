@@ -349,6 +349,15 @@ class Qwen35WebGPU(WebGPUModel):
         self._compile_rms_norm()
         self._compile_silu_mul()
         self._compile_sigmoid()
+        self._compile_gdn_kernel()
+
+    def _compile_gdn_kernel(self):
+        """Compile the GatedDeltaNet recurrence WGSL kernel."""
+        from common.gdn_kernel import WGSL_GDN_KERNEL, GDN_BINDINGS, GDN_WORKGROUP_SIZE
+        runner = self.cache.runner
+        self._gdn_pipeline, self._gdn_bgl = runner.get_pipeline_info(
+            WGSL_GDN_KERNEL, GDN_BINDINGS, [])
+        self._gdn_bindings = GDN_BINDINGS
 
     def _proj(self, x, weight_name, bias_key, out_features,
               K=None, gpu_out=False):
@@ -444,8 +453,18 @@ class Qwen35WebGPU(WebGPUModel):
         """Initialize Mamba-2 SSM recurrent state for each linear_attn layer."""
         self._ssm_states = {}
         self._ssm_conv_states = {}
+        self._ssm_gpu_states = {}  # GPU SSM state buffers
+        self._ssm_gpu_conv_states = {}  # GPU conv state buffers
         # Pre-cache fp32 conversion of SSM/attention weights used per decode
         self._fp32_cache = {}
+
+        runner = self.cache.runner
+        n_v = self.gdn_n_v_heads  # 48
+        hk = self.gdn_head_k_dim  # 128
+        hv = self.gdn_head_v_dim  # 128
+        conv_dim = self.ssm_qkv_dim  # 10240
+        conv_hist = self.ssm_conv_kernel - 1  # 3
+
         for i in range(self.n_layer):
             pfx = f"layers.{i}."
             if LAYER_TYPES[i] == "full_attention":
@@ -455,26 +474,42 @@ class Qwen35WebGPU(WebGPUModel):
                         self._fp32_cache[pfx + wn] = w.astype(np.float32)
             else:
                 la = pfx + "linear_attn."
+
+                # Allocate GPU SSM state: (n_v, hk, hv) fp32
+                state_size = n_v * hk * hv
+                self._ssm_gpu_states[i] = runner.upload_to_gpu(
+                    np.zeros(state_size, dtype=np.float32), f"ssm_state_{i}")
+
+                # Allocate GPU conv state: (conv_hist, conv_dim) fp32
+                conv_size = conv_hist * conv_dim
+                self._ssm_gpu_conv_states[i] = runner.upload_to_gpu(
+                    np.zeros(conv_size, dtype=np.float32), f"ssm_conv_state_{i}")
+
+                # Upload SSM weights to GPU
                 for wn in ("A_log", "dt_bias", "norm.weight"):
                     w = self.weights.get(la + wn)
-                    if w is not None and w.dtype == np.float16:
-                        self._fp32_cache[la + wn] = w.astype(np.float32)
-                # Pre-compute A = -exp(A_log) (used every SSM step)
-                A_log = self._fp32_cache.get(la + "A_log",
-                                             self.weights.get(la + "A_log"))
-                if A_log is not None:
-                    self._fp32_cache[la + "A"] = -np.exp(
-                        A_log.astype(np.float32) if A_log.dtype != np.float32 else A_log)
+                    if w is not None:
+                        w_fp32 = w.astype(np.float32) if w.dtype != np.float32 else w
+                        self._fp32_cache[la + wn] = w_fp32
+                        self._gpu_weights[la + wn] = runner.upload_to_gpu(
+                            w_fp32.ravel(), la + wn)
+
+                # Conv1d weight: reshape to (conv_dim, conv_kernel) and upload
                 conv_w = self.weights.get(la + "conv1d.weight")
                 if conv_w is not None:
                     cw = conv_w.astype(np.float32) if conv_w.dtype == np.float16 else conv_w
+                    cw_reshaped = cw.reshape(conv_dim, self.ssm_conv_kernel)
                     self._fp32_cache[la + "conv1d.weight"] = cw
-                    self._fp32_cache[la + "conv1d.weight.reshaped"] = cw.reshape(
-                        self.ssm_qkv_dim, self.ssm_conv_kernel)
+                    self._fp32_cache[la + "conv1d.weight.reshaped"] = cw_reshaped
+                    self._gpu_weights[la + "conv1d.weight"] = runner.upload_to_gpu(
+                        cw_reshaped.ravel(), la + "conv1d.weight")
+
+                # a, b projection weights (small: 48×5120)
                 for wn in ("in_proj_a.weight", "in_proj_b.weight"):
                     w = self.weights.get(la + wn)
-                    if w is not None and w.dtype == np.float16:
-                        self._fp32_cache[la + wn] = w.astype(np.float32)
+                    if w is not None:
+                        w_fp32 = w.astype(np.float32) if w.dtype == np.float16 else w
+                        self._fp32_cache[la + wn] = w_fp32
 
     def _init_gpu_kv_cache(self):
         """Pre-allocate GPU KV cache for full-attention layers."""
@@ -1136,16 +1171,114 @@ class Qwen35WebGPU(WebGPUModel):
                                    E, self.ssm_dim)
         return out
 
+    def _ssm_gpu_decode(self, x, layer):
+        """GPU-resident GatedDeltaNet decode (T=1, no CPU readbacks).
+
+        All operations run on GPU:
+        1. QKV + Z + a + b projections (GPU Q4 matmul)
+        2. GDN recurrence kernel (conv1d + recurrence + gated norm)
+        3. Output projection (GPU Q4 matmul)
+        """
+        from common.model_base import GPUBuffer
+        from common.gdn_kernel import GDN_BINDINGS, pack_gdn_params
+        import struct
+
+        E = self.n_embd
+        pfx = f"layers.{layer}.linear_attn."
+        runner = self.cache.runner
+
+        # 1. GPU projections: QKV, Z, a, b (batched)
+        runner.begin_batch()
+        if self._profiling: self._set_gpu_op(f"L{layer}/ssm_qkv")
+        qkv_gpu = self._proj(
+            x, pfx + "in_proj_qkv.weight",
+            "zero_bias_SSM_QKV", self.ssm_qkv_dim,
+            K=E, gpu_out=True)
+        if self._profiling: self._set_gpu_op(f"L{layer}/ssm_z")
+        z_gpu = self._proj(
+            x, pfx + "in_proj_z.weight",
+            "zero_bias_SSM", self.ssm_dim,
+            K=E, gpu_out=True)
+        if self._profiling: self._clear_gpu_op()
+        runner.end_batch()
+
+        # a, b projections: small (5120→48) — use GPU Q4 if available,
+        # else readback x for CPU matmul
+        a_key = pfx + "in_proj_a.weight"
+        b_key = pfx + "in_proj_b.weight"
+        if (a_key + ".q4.gpu") in self._gpu_weights:
+            a_gpu = self._proj(x, a_key, "zero_bias_SSM_A",
+                               self.gdn_n_v_heads, K=E, gpu_out=True)
+            b_gpu = self._proj(x, b_key, "zero_bias_SSM_B",
+                               self.gdn_n_v_heads, K=E, gpu_out=True)
+        else:
+            # CPU path for a,b (tiny weights, not quantized)
+            if isinstance(x, GPUBuffer):
+                x_np = runner.readback(x).reshape(1, E)
+            else:
+                x_np = x.reshape(1, E)
+            a_w = self._fp32_cache.get(a_key, self.weights[a_key])
+            b_w = self._fp32_cache.get(b_key, self.weights[b_key])
+            a_np = (x_np.astype(np.float32) @ a_w.astype(np.float32).T).ravel()
+            b_np = (x_np.astype(np.float32) @ b_w.astype(np.float32).T).ravel()
+            a_gpu = runner.upload_to_gpu(a_np.astype(np.float32), "__ssm_a_proj")
+            b_gpu = runner.upload_to_gpu(b_np.astype(np.float32), "__ssm_b_proj")
+
+        # 2. GDN recurrence kernel (GPU)
+        if self._profiling: self._set_gpu_op(f"L{layer}/ssm_gdn")
+
+        # Zero biases for a,b if not already created
+        if "zero_bias_SSM_A" not in self._gpu_weights:
+            self._upload_zero_bias("zero_bias_SSM_A", self.gdn_n_v_heads)
+            self._upload_zero_bias("zero_bias_SSM_B", self.gdn_n_v_heads)
+
+        # Pack epsilon as f32 bits
+        eps_bits = struct.unpack('<I', struct.pack('<f', self.rms_norm_eps))[0]
+        params = pack_gdn_params(eps_bits)
+        params_gpu = runner.upload_to_gpu(params, "__gdn_params")
+
+        ssm_out_gpu = runner.upload_to_gpu(
+            np.zeros(self.ssm_dim, dtype=np.float32), "__gdn_output")
+
+        # Dispatch GDN kernel using pre-compiled pipeline
+        from common.gdn_kernel import WGSL_GDN_KERNEL
+        runner.run_kernel(
+            wgsl_code=WGSL_GDN_KERNEL,
+            buffer_bindings=GDN_BINDINGS,
+            param_fields=[],
+            workgroup_size=128,
+            grid=(self.gdn_n_v_heads,),  # 48 workgroups
+            buffers={
+                'QKV': qkv_gpu,
+                'Z': z_gpu,
+                'A_proj': a_gpu,
+                'B_proj': b_gpu,
+                'ConvState': self._ssm_gpu_conv_states[layer],
+                'ConvWeight': self._gpu_weights[pfx + "conv1d.weight"],
+                'SSMState': self._ssm_gpu_states[layer],
+                'A_log': self._gpu_weights[pfx + "A_log"],
+                'DT_bias': self._gpu_weights[pfx + "dt_bias"],
+                'NormWeight': self._gpu_weights[pfx + "norm.weight"],
+                'Output': ssm_out_gpu,
+                '_params_': params_gpu,
+            },
+            gpu_outputs={'Output', 'SSMState', 'ConvState'})
+        ssm_out_gpu.shape = (1, self.ssm_dim)
+
+        # 3. Output projection (GPU)
+        if self._profiling: self._set_gpu_op(f"L{layer}/ssm_out")
+        out = self._proj(
+            ssm_out_gpu, pfx + "out_proj.weight",
+            "zero_bias_E", E, K=self.ssm_dim)
+        if self._profiling: self._clear_gpu_op()
+        return out
+
     def _linear_attention_block(self, x, layer: int,
                                 use_cache: bool = False, **kwargs):
-        """GatedDeltaNet linear attention block (prefill path).
+        """GatedDeltaNet linear attention block.
 
-        1. Project input → Q, K, V via in_proj_qkv
-        2. Conv1d with SiLU activation
-        3. L2-normalize Q and K, compute a/b projections
-        4. GatedDeltaNet recurrence (sequential scan)
-        5. Gated RMSNorm with Z gate
-        6. Output projection
+        For T=1 decode: dispatches GPU GDN recurrence kernel (no readbacks).
+        For T>1 prefill: uses CPU sequential scan.
         """
         from common.model_base import GPUBuffer
 
@@ -1156,13 +1289,19 @@ class Qwen35WebGPU(WebGPUModel):
 
         E = self.n_embd
         pfx = f"layers.{layer}.linear_attn."
-        n_v = self.gdn_n_v_heads      # 48
-        n_k = self.gdn_n_k_heads      # 16
-        hk = self.gdn_head_k_dim      # 128
-        hv = self.gdn_head_v_dim      # 128
-        key_dim = self.gdn_key_dim    # 2048
-        val_dim = self.gdn_value_dim  # 6144
-        v_per_k = self.gdn_v_per_k    # 3
+        n_v = self.gdn_n_v_heads
+        n_k = self.gdn_n_k_heads
+        hk = self.gdn_head_k_dim
+        hv = self.gdn_head_v_dim
+        key_dim = self.gdn_key_dim
+        val_dim = self.gdn_value_dim
+        v_per_k = self.gdn_v_per_k
+
+        # --- T=1 GPU decode path: all on GPU, no readbacks ---
+        if T == 1 and use_cache and layer in self._ssm_gpu_states:
+            return self._ssm_gpu_decode(x, layer)
+
+        # --- T>1 prefill path: CPU sequential scan ---
 
         # 1. QKV projection (weights stored in contiguous Q|K|V order)
         if self._profiling: self._set_gpu_op(f"L{layer}/ssm_qkv")
