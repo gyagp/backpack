@@ -294,7 +294,7 @@ fn main(
     workgroupBarrier();
     let rms_inv = shared_scalar;
 
-    let norm_w = NormWeight[v_head * HV + tid];
+    let norm_w = NormWeight[tid];  // shared (HV,) weight across all heads
     let normed = out_val * rms_inv * norm_w;
 
     // Gated: multiply by SiLU(z)

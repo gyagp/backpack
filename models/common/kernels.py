@@ -623,6 +623,27 @@ def mul_kernel(X, Y, Out, N,
     tl.store(Out + offs, x * y, mask=mask)
 
 
+@triton.jit
+def sigmoid_gate_interleaved_kernel(X, Out, N, HD,
+                                    BLOCK: tl.constexpr):
+    """Output gating: Out[i] = sigmoid(X[2*h*HD + d]) * X[(2*h+1)*HD + d].
+
+    Input X has 2*N elements with interleaved gate/value pairs of HD elements.
+    Output Out has N elements.
+    Grid: (ceil(N / BLOCK),).
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    h = offs // HD  # output head index (integer division)
+    d = offs % HD
+    gate_idx = h * HD * 2 + d
+    val_idx = gate_idx + HD
+    gate = tl.load(X + gate_idx, mask=mask, other=0.0).to(tl.float32)
+    val = tl.load(X + val_idx, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Out + offs, (1.0 / (1.0 + tl.exp(-gate))) * val, mask=mask)
+
+
 # ---------------------------------------------------------------------------
 # Element-wise kernels
 # ---------------------------------------------------------------------------
@@ -937,6 +958,9 @@ def partial_rope_decode_kernel(X, Y, CosTable, SinTable,
     remaining pass through unchanged).
     Cos/Sin are looked up from pre-computed tables at position `pos`.
 
+    Uses interleaved-pair convention: pairs (0,1), (2,3), ... share
+    the same frequency.  Even dims get -sin, odd dims get +sin.
+
     Grid: (n_heads,) — one workgroup per head.
     """
     head = tl.program_id(0)
@@ -953,10 +977,7 @@ def partial_rope_decode_kernel(X, Y, CosTable, SinTable,
     sin_v = tl.load(SinTable + pos * half_rot + cs_idx,
                     mask=is_rotary, other=0.0).to(tl.float32)
 
-    # Partner element for rotation:
-    #   [0:half_rot)     → partner at [half_rot:2*half_rot)
-    #   [half_rot:2*hr)  → partner at [0:half_rot)
-    #   [2*hr:HD)        → unused (clamped, masked out)
+    # Partner element: first half pairs with second half
     partner_idx = tl.where(hd < half_rot, hd + half_rot, hd - half_rot)
     partner_idx = tl.where(is_rotary, partner_idx, hd)
     partner = tl.load(X + src + partner_idx).to(tl.float32)
@@ -986,7 +1007,7 @@ def rope_kv_scatter_kernel(QKV, K_cache, V_cache,
     kv_head = tl.program_id(0)
     hd = tl.arange(0, BLOCK_HD)
 
-    # K: apply RoPE
+    # K: apply RoPE (half-rotation convention)
     k_src = q_size + kv_head * BLOCK_HD
     k = tl.load(QKV + k_src + hd).to(tl.float32)
 
@@ -1031,7 +1052,7 @@ def fused_rope_qkv_kernel(QKV, Q_out, K_cache, V_cache,
     pid = tl.program_id(0)
     hd = tl.arange(0, BLOCK_HD)
 
-    # cos/sin (shared by Q and K RoPE)
+    # cos/sin (shared by Q and K RoPE, half-rotation convention)
     cs_idx = hd % half_rot
     is_rotary = hd < half_rot * 2
     cos_v = tl.load(CosTable + pos * half_rot + cs_idx,

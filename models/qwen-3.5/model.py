@@ -264,12 +264,19 @@ class Qwen35WebGPU(WebGPUModel):
             k_dimensions=k_dims,
         )
         self._precompute_rope_tables()
+        # Upload RoPE cos/sin tables to GPU for GPU-side RoPE
+        runner = self.cache.runner
+        self._rope_cos_gpu = runner.upload_to_gpu(
+            self._rope_cos.ravel(), "rope_cos_table")
+        self._rope_sin_gpu = runner.upload_to_gpu(
+            self._rope_sin.ravel(), "rope_sin_table")
         self._upload_weights_to_gpu()
         self._init_ssm_state()
         self._init_gpu_kv_cache()
+        self._fd_last_token = np.array([1], dtype=np.int32)
+        self._gpu_topk_sampling = True
 
-    @staticmethod
-    def _fuse_qkv_weights(weights, n_layer, n_head, n_kv_heads,
+    def _fuse_qkv_weights(self, weights, n_layer, n_head, n_kv_heads,
                           head_dim, n_embd):
         """Fuse Q, K, V projection weights into single QKV matrix.
 
@@ -277,7 +284,8 @@ class Qwen35WebGPU(WebGPUModel):
         Handles both fp32 and INT4-quantized weight formats.
         """
         E = n_embd
-        qo_dim = n_head * head_dim
+        # Q projection is doubled (query + gate) when output gate is enabled
+        qo_dim = self.n_q_heads * head_dim
         kv_dim = n_kv_heads * head_dim
         for i in range(n_layer):
             if LAYER_TYPES[i] != "full_attention":
@@ -348,6 +356,8 @@ class Qwen35WebGPU(WebGPUModel):
         self._compile_rms_norm()
         self._compile_silu_mul()
         self._compile_sigmoid()
+        self._compile_mul()
+        self._compile_sigmoid_gate()
         self._compile_gdn_kernel()
 
     def _compile_gdn_kernel(self):
@@ -433,11 +443,15 @@ class Qwen35WebGPU(WebGPUModel):
         self._rope_sin = np.sin(angles).astype(np.float32)
 
     def _apply_partial_rope_fast(self, x, positions, rotary_dim=None):
-        """Apply partial RoPE using pre-computed tables."""
+        """Apply partial RoPE using half-rotation convention.
+
+        Half-rotation: pairs (dim i, dim i+half_rot) share the same
+        frequency.  first_half gets -sin, second_half gets +sin.
+        """
         if rotary_dim is None:
             rotary_dim = self.rotary_dim
         half_rot = rotary_dim // 2
-        cos_v = self._rope_cos[positions][:, None, :]
+        cos_v = self._rope_cos[positions][:, None, :]  # (T, 1, half_rot)
         sin_v = self._rope_sin[positions][:, None, :]
 
         x1 = x[..., :half_rot]
@@ -503,7 +517,7 @@ class Qwen35WebGPU(WebGPUModel):
                     self._gpu_weights[la + "conv1d.weight"] = runner.upload_to_gpu(
                         cw_reshaped.ravel(), la + "conv1d.weight")
 
-                # a, b projection weights (small: 48×5120)
+                # a, b projection weights (small: 48×5120) — keep on CPU
                 for wn in ("in_proj_a.weight", "in_proj_b.weight"):
                     w = self.weights.get(la + wn)
                     if w is not None:
@@ -661,6 +675,30 @@ class Qwen35WebGPU(WebGPUModel):
         rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + self.rms_norm_eps)
         return (x / rms * weight).astype(np.float32)
 
+    def _rms_norm_per_head(self, x_gpu, w_gpu, n_heads, head_dim,
+                           gpu_out=True):
+        """GPU RMSNorm per head: x is (n_heads * head_dim,) flat.
+
+        Reuses the standard RMSNorm kernel with stride=head_dim, N=head_dim,
+        grid=(n_heads,). Weight w is (head_dim,) broadcast across heads.
+        """
+        out = self.cache.run(
+            self._rn_result, grid=(n_heads,),
+            buffers={
+                'X': x_gpu,
+                'Y': np.zeros(n_heads * head_dim, dtype=np.float32),
+                'W': w_gpu,
+                'Rstd': np.zeros(n_heads, dtype=np.float32),
+            },
+            scalars={'stride': head_dim, 'N': head_dim,
+                     'eps': self.rms_norm_eps},
+            gpu_outputs={'Y', 'Rstd'} if gpu_out else None)
+        if gpu_out:
+            gpu_buf = out['Y']
+            gpu_buf.shape = (n_heads, head_dim)
+            return gpu_buf
+        return out['Y'].reshape(n_heads, head_dim)
+
     def _attention_cpu_from_qkv(self, qkv, layer, T, use_cache, positions):
         """CPU attention from pre-projected QKV (GPU matmul already done).
 
@@ -746,8 +784,8 @@ class Qwen35WebGPU(WebGPUModel):
                          **kwargs):
         """Full GQA with QK-norm, partial RoPE, and output gate.
 
-        For T=1 decode: uses GPU KV cache + GPU attention kernel.
-        For T>1 prefill: uses CPU attention with numpy KV cache.
+        For T=1 decode: ALL ops on GPU (no CPU readbacks).
+        For T>1 prefill: CPU attention with numpy KV cache.
         """
         from common.model_base import GPUBuffer
 
@@ -756,91 +794,129 @@ class Qwen35WebGPU(WebGPUModel):
         else:
             T = x.shape[0]
         HD = self.head_dim
-        n_q_heads = self.n_q_heads  # 48 (Q heads)
-        n_head = self.n_head        # 24 (output heads)
-        n_kv = self.n_kv_heads
-        n_rep = n_q_heads // n_kv   # 48/4 = 12 (GQA expansion)
+        n_q_heads = self.n_q_heads  # 48 (Q proj dim, but actual heads = 24)
+        n_head = self.n_head        # 24
+        n_kv = self.n_kv_heads      # 4
+        n_rep = n_head // n_kv      # 6 (24/4, not 48/4)
         pfx = f"layers.{layer}.self_attn."
 
-        # Fused QKV projection (GPU)
-        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
-        qkv = self._proj(
-            x, pfx + "qkv_proj.weight",
-            "zero_bias_QKV", self.full_attn_qkv_dim,
-            K=self.n_embd)
-
-        # Split into Q, K, V
-        q_dim = self.full_attn_q_dim
-        q = qkv[:, :q_dim]
-        k = qkv[:, q_dim:q_dim + self.kv_dim]
-        v = qkv[:, q_dim + self.kv_dim:]
-
-        Q = q.reshape(T, n_q_heads, HD)
-        K_new = k.reshape(T, n_kv, HD)
-        V_new = v.reshape(T, n_kv, HD)
-
-        # QK-norm (CPU — per-head RMSNorm, lightweight)
-        q_norm_w = self.weights[pfx + "q_norm.weight"]
-        k_norm_w = self.weights[pfx + "k_norm.weight"]
-        q_rms = np.sqrt(np.mean(Q * Q, axis=-1, keepdims=True) + self.rms_norm_eps)
-        Q = Q / q_rms * q_norm_w
-        k_rms = np.sqrt(np.mean(K_new * K_new, axis=-1, keepdims=True) + self.rms_norm_eps)
-        K_new = K_new / k_rms * k_norm_w
-
-        # Partial RoPE (CPU — 25% of head_dim)
-        if positions is None:
-            positions = np.arange(T, dtype=np.int32)
-        Q = self._apply_partial_rope_fast(Q, positions)
-        K_new = self._apply_partial_rope_fast(K_new, positions)
-
-        # --- GPU attention path for T=1 decode ---
+        # === T=1 GPU decode ===
         if T == 1 and use_cache and layer in self._gpu_kv_cache:
             runner = self.cache.runner
-            K_gpu, V_gpu, cur_len = self._gpu_kv_cache[layer]
 
-            # Upload K_new, V_new to GPU KV cache at cur_len
-            kv_offset = cur_len * n_kv * HD * 4  # byte offset
-            k_bytes = K_new.ravel().astype(np.float32).tobytes()
-            v_bytes = V_new.ravel().astype(np.float32).tobytes()
-            import ctypes
-            lib = runner._lib
-            lib.wgpuQueueWriteBuffer(
-                runner._queue, K_gpu.handle, kv_offset,
-                ctypes.c_char_p(k_bytes), len(k_bytes))
-            lib.wgpuQueueWriteBuffer(
-                runner._queue, V_gpu.handle, kv_offset,
-                ctypes.c_char_p(v_bytes), len(v_bytes))
+            # Batch: QKV projection + QK-norm + RoPE + KV cache copy
+            runner.begin_batch()
+
+            # 1. QKV projection (GPU, stays on GPU)
+            if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
+            qkv_gpu = self._proj(
+                x, pfx + "qkv_proj.weight",
+                "zero_bias_QKV", self.full_attn_qkv_dim,
+                K=self.n_embd, gpu_out=True)
+
+            # 2. Split Q+gate, K, V (readback Q for split, K/V stay on GPU)
+            #    Q proj gives (12288,) = 24 heads × 512 (query 256 + gate 256)
+            q_dim = self.full_attn_q_dim  # 12288
+            kv_dim = self.kv_dim           # 1024
+            k_gpu = runner.gpu_slice(qkv_gpu, q_dim * 4, kv_dim * 4, "__attn_k")
+            k_gpu.shape = (n_kv * HD,)
+            v_gpu = runner.gpu_slice(qkv_gpu, (q_dim + kv_dim) * 4, kv_dim * 4, "__attn_v")
+            v_gpu.shape = (n_kv * HD,)
+
+            # Split Q into query (for norm/RoPE/attn) and gate (for post-attn)
+            q_full_gpu = runner.gpu_slice(qkv_gpu, 0, q_dim * 4, "__attn_q_full")
+            runner.end_batch()
+
+            # Readback Q to split query/gate
+            has_gate = self.attn_output_gate and self.n_q_heads > n_head
+            if has_gate:
+                # Layout: 24 heads × 512 = [q0_query(256), q0_gate(256), ...]
+                q_full = runner.readback(q_full_gpu).reshape(n_head, 2 * HD)
+                query_np = q_full[:, :HD]       # (24, 256) query part
+                gate_np = q_full[:, HD:]         # (24, 256) gate part
+            else:
+                query_np = runner.readback(q_full_gpu).reshape(n_head, HD)
+                gate_np = None
+
+            # 3. QK-norm on query only (24 heads, not 48)
+            runner.begin_batch()
+            if self._profiling: self._set_gpu_op(f"L{layer}/qk_norm")
+            norm_pfx = f"layers.{layer}."
+            query_gpu = runner.upload_to_gpu(query_np.ravel().astype(np.float32), "__attn_query")
+            query_gpu.shape = (n_head * HD,)
+            q_normed = self._rms_norm_per_head(
+                query_gpu, self._gpu_weights[norm_pfx + "self_attn.q_norm.weight"],
+                n_head, HD, gpu_out=True)
+            k_normed = self._rms_norm_per_head(
+                k_gpu, self._gpu_weights[norm_pfx + "self_attn.k_norm.weight"],
+                n_kv, HD, gpu_out=True)
+
+            # 4. Partial RoPE on query (24 heads) and K (4 heads)
+            if self._profiling: self._set_gpu_op(f"L{layer}/rope")
+            pos = int(positions[0]) if positions is not None else 0
+            half_rot = self.rotary_dim // 2  # 32
+
+            q_roped = self.cache.run(
+                self._rope_result, grid=(n_head,),
+                buffers={
+                    'X': q_normed, 'Y': np.zeros(n_head * self._attn_bhd, dtype=np.float32),
+                    'CosTable': self._rope_cos_gpu, 'SinTable': self._rope_sin_gpu,
+                },
+                scalars={'src_offset': 0, 'pos': pos, 'half_rot': half_rot},
+                gpu_outputs={'Y'})
+            q_roped_gpu = q_roped['Y']
+            q_roped_gpu.shape = (n_head, self._attn_bhd)
+
+            k_roped = self.cache.run(
+                self._rope_result, grid=(n_kv,),
+                buffers={
+                    'X': k_normed, 'Y': np.zeros(n_kv * self._attn_bhd, dtype=np.float32),
+                    'CosTable': self._rope_cos_gpu, 'SinTable': self._rope_sin_gpu,
+                },
+                scalars={'src_offset': 0, 'pos': pos, 'half_rot': half_rot},
+                gpu_outputs={'Y'})
+            k_roped_gpu = k_roped['Y']
+            k_roped_gpu.shape = (n_kv, self._attn_bhd)
+
+            # 5. KV cache update (GPU→GPU copy)
+            K_gpu_cache, V_gpu_cache, cur_len = self._gpu_kv_cache[layer]
+            BHD = self._attn_bhd
+            kv_offset = cur_len * n_kv * BHD * 4
+            kv_copy_size = n_kv * BHD * 4
+            if runner.is_batching:
+                runner.copy_buffer_in_batch(
+                    k_roped_gpu.handle, 0,
+                    K_gpu_cache.handle, kv_offset, kv_copy_size)
+                runner.copy_buffer_in_batch(
+                    v_gpu.handle, 0,
+                    V_gpu_cache.handle, kv_offset, kv_copy_size)
+            else:
+                import ctypes
+                k_np = runner.readback(k_roped_gpu)
+                v_np = runner.readback(v_gpu)
+                runner._lib.wgpuQueueWriteBuffer(
+                    runner._queue, K_gpu_cache.handle, kv_offset,
+                    ctypes.c_char_p(k_np.tobytes()), kv_copy_size)
+                runner._lib.wgpuQueueWriteBuffer(
+                    runner._queue, V_gpu_cache.handle, kv_offset,
+                    ctypes.c_char_p(v_np.tobytes()), kv_copy_size)
             T_total = cur_len + 1
-            self._gpu_kv_cache[layer] = (K_gpu, V_gpu, T_total)
+            self._gpu_kv_cache[layer] = (K_gpu_cache, V_gpu_cache, T_total)
 
-            # Also update CPU KV cache (for prefill fallback)
-            if self.kv_cache is None:
-                self.kv_cache = {}
-            if layer not in self.kv_cache:
-                K_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
-                V_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
-                self.kv_cache[layer] = (K_buf, V_buf, 0)
-            K_buf, V_buf, _ = self.kv_cache[layer]
-            K_buf[cur_len] = K_new[0]
-            V_buf[cur_len] = V_new[0]
-            self.kv_cache[layer] = (K_buf, V_buf, T_total)
+            runner.end_batch()
 
-            # Upload Q to GPU
-            BHD = self._attn_bhd  # block size for attention kernel
-            Q_flat = Q.reshape(n_q_heads, HD)
-            Q_padded = np.zeros((n_q_heads, BHD), dtype=np.float32)
-            Q_padded[:, :HD] = Q_flat
-            Q_gpu = runner.upload_to_gpu(Q_padded.ravel(), "__attn_q_tmp")
+            # Batch: attention + gate + O projection
+            runner.begin_batch()
 
-            # GPU GQA decode attention
+            # 6. GPU GQA decode attention (24 Q heads, 4 KV heads, n_rep=6)
             if self._profiling: self._set_gpu_op(f"L{layer}/attn_gpu")
             scale = float(1.0 / np.sqrt(HD))
             attn_result = self.cache.run(
-                self._gqa_attn_result, grid=(n_q_heads,),
+                self._gqa_attn_result, grid=(n_head,),
                 buffers={
-                    'Q': Q_gpu,
-                    'K_cache': K_gpu, 'V_cache': V_gpu,
-                    'Out': np.zeros(n_q_heads * BHD, dtype=np.float32),
+                    'Q': q_roped_gpu,
+                    'K_cache': K_gpu_cache, 'V_cache': V_gpu_cache,
+                    'Out': np.zeros(n_head * BHD, dtype=np.float32),
                 },
                 scalars={
                     'kv_stride': n_kv * BHD,
@@ -848,51 +924,123 @@ class Qwen35WebGPU(WebGPUModel):
                     'T_total': T_total,
                     'scale': scale,
                     'neg_inf': float(-1e9),
-                })
-            attn_out = attn_result['Out'].reshape(n_q_heads, BHD)[:, :HD]
-            attn_out = attn_out[None, :, :]  # (1, n_q_heads, HD)
-        else:
-            # --- CPU attention path for prefill ---
-            if use_cache:
-                if self.kv_cache is None:
-                    self.kv_cache = {}
-                if layer not in self.kv_cache:
-                    K_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
-                    V_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
-                    K_buf[:T] = K_new; V_buf[:T] = V_new
-                    self.kv_cache[layer] = (K_buf, V_buf, T)
-                    # Also upload to GPU KV cache
-                    if layer in self._gpu_kv_cache:
-                        K_gpu, V_gpu, _ = self._gpu_kv_cache[layer]
-                        runner = self.cache.runner
-                        k_bytes = K_new.ravel().astype(np.float32).tobytes()
-                        v_bytes = V_new.ravel().astype(np.float32).tobytes()
-                        import ctypes
-                        lib = runner._lib
-                        lib.wgpuQueueWriteBuffer(
-                            runner._queue, K_gpu.handle, 0,
-                            ctypes.c_char_p(k_bytes), len(k_bytes))
-                        lib.wgpuQueueWriteBuffer(
-                            runner._queue, V_gpu.handle, 0,
-                            ctypes.c_char_p(v_bytes), len(v_bytes))
-                        self._gpu_kv_cache[layer] = (K_gpu, V_gpu, T)
-                else:
-                    K_buf, V_buf, cur_len = self.kv_cache[layer]
-                    K_buf[cur_len:cur_len + T] = K_new
-                    V_buf[cur_len:cur_len + T] = V_new
-                    self.kv_cache[layer] = (K_buf, V_buf, cur_len + T)
-                _, _, T_total = self.kv_cache[layer]
-                K_full = K_buf[:T_total]; V_full = V_buf[:T_total]
+                },
+                gpu_outputs={'Out'})
+            attn_out_gpu = attn_result['Out']
+            attn_out_gpu.shape = (n_head * BHD,)
+
+            # 7. Output gate: sigmoid(gate) * attn_output (element-wise)
+            if self.attn_output_gate and gate_np is not None:
+                if self._profiling: self._set_gpu_op(f"L{layer}/out_gate")
+                # Readback attn output, apply gate on CPU, upload result
+                attn_np = runner.readback(attn_out_gpu).reshape(n_head, BHD)[:, :HD]
+                runner.end_batch()
+                gate_sig = 1.0 / (1.0 + np.exp(-gate_np))
+                gated = (gate_sig * attn_np).reshape(1, self.full_attn_qo_dim)
+                # Start new batch for O projection
+                runner.begin_batch()
+                o_input = gated
             else:
-                T_total = T; K_full = K_new; V_full = V_new
+                attn_np = runner.readback(attn_out_gpu).reshape(n_head, BHD)[:, :HD]
+                runner.end_batch()
+                o_input = attn_np.reshape(1, self.full_attn_qo_dim)
+                runner.begin_batch()
 
-            attn_out = self._causal_attention_multihead(Q, K_full, V_full, n_rep)
+            # 8. O projection
+            if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
+            o = self._proj(
+                o_input, pfx + "o_proj.weight",
+                "zero_bias_E", self.n_embd,
+                K=self.full_attn_qo_dim, gpu_out=True)
+            if self._profiling: self._clear_gpu_op()
 
-        # Output gate: 48 Q heads → 24 output heads
-        if self.attn_output_gate and n_q_heads > n_head:
-            attn_out = attn_out.reshape(T, n_head, 2 * HD)
-            gate = 1.0 / (1.0 + np.exp(-attn_out[:, :, :HD]))
-            attn_out = gate * attn_out[:, :, HD:]
+            runner.end_batch()
+            return o
+
+        # === T>1 prefill: CPU path ===
+        # Fused QKV projection (GPU, readback for CPU attention)
+        if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
+        qkv = self._proj(
+            x, pfx + "qkv_proj.weight",
+            "zero_bias_QKV", self.full_attn_qkv_dim,
+            K=self.n_embd)
+
+        # Split into Q(+gate), K, V
+        q_dim = self.full_attn_q_dim
+        k = qkv[:, q_dim:q_dim + self.kv_dim]
+        v = qkv[:, q_dim + self.kv_dim:]
+
+        if self.attn_output_gate and self.n_q_heads > n_head:
+            # Q projection doubled: (n_head, 2*HD) = [query(HD), gate(HD)]
+            q_all = qkv[:, :q_dim].reshape(T, n_head, 2 * HD)
+            Q = q_all[:, :, :HD]           # (T, 24, 256) query part
+            attn_gate = q_all[:, :, HD:]   # (T, 24, 256) gate part
+        else:
+            # Standard Q projection: (n_head, HD)
+            Q = qkv[:, :q_dim].reshape(T, n_head, HD)
+            attn_gate = None
+        K_new = k.reshape(T, n_kv, HD)
+        V_new = v.reshape(T, n_kv, HD)
+
+        # QK-norm (CPU — per-head RMSNorm, on query & key only)
+        q_norm_w = self.weights[pfx + "q_norm.weight"]
+        k_norm_w = self.weights[pfx + "k_norm.weight"]
+        q_rms = np.sqrt(np.mean(Q * Q, axis=-1, keepdims=True) + self.rms_norm_eps)
+        Q = Q / q_rms * q_norm_w
+        k_rms = np.sqrt(np.mean(K_new * K_new, axis=-1, keepdims=True) + self.rms_norm_eps)
+        K_new = K_new / k_rms * k_norm_w
+
+        # Partial RoPE (CPU — 25% of head_dim, on query & key)
+        if positions is None:
+            positions = np.arange(T, dtype=np.int32)
+        Q = self._apply_partial_rope_fast(Q, positions)
+        K_new = self._apply_partial_rope_fast(K_new, positions)
+
+        # GQA: 24 Q heads, 4 KV heads → n_rep=6
+        n_rep_actual = n_head // n_kv
+
+        # --- CPU attention path for prefill ---
+        if use_cache:
+            if self.kv_cache is None:
+                self.kv_cache = {}
+            if layer not in self.kv_cache:
+                K_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
+                V_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
+                K_buf[:T] = K_new; V_buf[:T] = V_new
+                self.kv_cache[layer] = (K_buf, V_buf, T)
+                # Also upload to GPU KV cache
+                if layer in self._gpu_kv_cache:
+                    K_gpu, V_gpu, _ = self._gpu_kv_cache[layer]
+                    runner = self.cache.runner
+                    k_bytes = K_new.ravel().astype(np.float32).tobytes()
+                    v_bytes = V_new.ravel().astype(np.float32).tobytes()
+                    import ctypes
+                    lib = runner._lib
+                    lib.wgpuQueueWriteBuffer(
+                        runner._queue, K_gpu.handle, 0,
+                        ctypes.c_char_p(k_bytes), len(k_bytes))
+                    lib.wgpuQueueWriteBuffer(
+                        runner._queue, V_gpu.handle, 0,
+                        ctypes.c_char_p(v_bytes), len(v_bytes))
+                    self._gpu_kv_cache[layer] = (K_gpu, V_gpu, T)
+            else:
+                K_buf, V_buf, cur_len = self.kv_cache[layer]
+                K_buf[cur_len:cur_len + T] = K_new
+                V_buf[cur_len:cur_len + T] = V_new
+                self.kv_cache[layer] = (K_buf, V_buf, cur_len + T)
+            _, _, T_total = self.kv_cache[layer]
+            K_full = K_buf[:T_total]; V_full = V_buf[:T_total]
+        else:
+            T_total = T; K_full = K_new; V_full = V_new
+
+        attn_out = self._causal_attention_multihead(Q, K_full, V_full, n_rep_actual)
+
+        # Output gate: sigmoid(gate) * attn_out (element-wise, 24 heads)
+        if self.attn_output_gate and attn_gate is not None:
+            gate_sig = 1.0 / (1.0 + np.exp(-attn_gate[:, :, :HD]))
+            # attn_out is (T, 24, BHD) → take first HD dims
+            attn_out_trimmed = attn_out[:, :, :HD] if attn_out.shape[-1] > HD else attn_out
+            attn_out = gate_sig * attn_out_trimmed
 
         attn_flat = attn_out.reshape(T, self.full_attn_qo_dim)
 
@@ -1186,7 +1334,14 @@ class Qwen35WebGPU(WebGPUModel):
         pfx = f"layers.{layer}.linear_attn."
         runner = self.cache.runner
 
-        # 1. GPU projections: QKV, Z, a, b (batched)
+        # Readback x for CPU a/b projections (tiny: 5120 floats = 20KB)
+        from common.model_base import GPUBuffer
+        if isinstance(x, GPUBuffer):
+            x_np = runner.readback(x).reshape(1, E)
+        else:
+            x_np = x.reshape(1, E) if x.ndim != 2 else x
+
+        # 1. GPU projections: QKV, Z (batched)
         runner.begin_batch()
         if self._profiling: self._set_gpu_op(f"L{layer}/ssm_qkv")
         qkv_gpu = self._proj(
@@ -1199,37 +1354,20 @@ class Qwen35WebGPU(WebGPUModel):
             "zero_bias_SSM", self.ssm_dim,
             K=E, gpu_out=True)
         if self._profiling: self._clear_gpu_op()
-        runner.end_batch()
 
-        # a, b projections: small (5120→48) — use GPU Q4 if available,
-        # else readback x for CPU matmul
+        # a, b projections: small (5120→48) — CPU matmul (no GPU upload)
         a_key = pfx + "in_proj_a.weight"
         b_key = pfx + "in_proj_b.weight"
-        if (a_key + ".q4.gpu") in self._gpu_weights:
-            a_gpu = self._proj(x, a_key, "zero_bias_SSM_A",
-                               self.gdn_n_v_heads, K=E, gpu_out=True)
-            b_gpu = self._proj(x, b_key, "zero_bias_SSM_B",
-                               self.gdn_n_v_heads, K=E, gpu_out=True)
-        else:
-            # CPU path for a,b (tiny weights, not quantized)
-            if isinstance(x, GPUBuffer):
-                x_np = runner.readback(x).reshape(1, E)
-            else:
-                x_np = x.reshape(1, E)
-            a_w = self._fp32_cache.get(a_key, self.weights[a_key])
-            b_w = self._fp32_cache.get(b_key, self.weights[b_key])
-            a_np = (x_np.astype(np.float32) @ a_w.astype(np.float32).T).ravel()
-            b_np = (x_np.astype(np.float32) @ b_w.astype(np.float32).T).ravel()
-            a_gpu = runner.upload_to_gpu(a_np.astype(np.float32), "__ssm_a_proj")
-            b_gpu = runner.upload_to_gpu(b_np.astype(np.float32), "__ssm_b_proj")
+        a_w = self._fp32_cache.get(a_key, self.weights[a_key])
+        b_w = self._fp32_cache.get(b_key, self.weights[b_key])
+        a_np = (x_np.astype(np.float32) @ a_w.astype(np.float32).T).ravel()
+        b_np = (x_np.astype(np.float32) @ b_w.astype(np.float32).T).ravel()
+        a_gpu = runner.upload_to_gpu(a_np.astype(np.float32), "__ssm_a_proj")
+        b_gpu = runner.upload_to_gpu(b_np.astype(np.float32), "__ssm_b_proj")
+        runner.end_batch()
 
         # 2. GDN recurrence kernel (GPU)
         if self._profiling: self._set_gpu_op(f"L{layer}/ssm_gdn")
-
-        # Zero biases for a,b if not already created
-        if "zero_bias_SSM_A" not in self._gpu_weights:
-            self._upload_zero_bias("zero_bias_SSM_A", self.gdn_n_v_heads)
-            self._upload_zero_bias("zero_bias_SSM_B", self.gdn_n_v_heads)
 
         # Pack epsilon as f32 bits
         eps_bits = struct.unpack('<I', struct.pack('<f', self.rms_norm_eps))[0]
@@ -1268,7 +1406,7 @@ class Qwen35WebGPU(WebGPUModel):
         if self._profiling: self._set_gpu_op(f"L{layer}/ssm_out")
         out = self._proj(
             ssm_out_gpu, pfx + "out_proj.weight",
-            "zero_bias_E", E, K=self.ssm_dim)
+            "zero_bias_E", E, K=self.ssm_dim, gpu_out=True)
         if self._profiling: self._clear_gpu_op()
         return out
 
@@ -1406,6 +1544,18 @@ class Qwen35WebGPU(WebGPUModel):
 
         if use_cache:
             self._ssm_states[layer] = state
+            # Sync CPU state to GPU buffer for subsequent GPU decode steps
+            if layer in self._ssm_gpu_states:
+                runner = self.cache.runner
+                runner.write_buffer(
+                    self._ssm_gpu_states[layer].handle,
+                    state.ravel().astype(np.float32).tobytes())
+            # Sync conv state to GPU buffer
+            if layer in self._ssm_conv_states and layer in self._ssm_gpu_conv_states:
+                runner = self.cache.runner
+                runner.write_buffer(
+                    self._ssm_gpu_conv_states[layer].handle,
+                    self._ssm_conv_states[layer].ravel().astype(np.float32).tobytes())
 
         # 7. Gated RMSNorm with Z
         norm_w = self.weights[pfx + "norm.weight"]
@@ -1665,26 +1815,22 @@ class Qwen35WebGPU(WebGPUModel):
         T = (x.shape[0] if x.shape else 1) if isinstance(x, GPUBuffer) else x.shape[0]
         runner = self.cache.runner
         use_batch = (T == 1 and use_cache and getattr(self, '_use_q4_gpu', False))
+        is_attn = LAYER_TYPES[layer] == "full_attention"
 
-        # Phase 1: Norm1 (batch with attention QKV if possible)
-        if use_batch:
-            runner.begin_batch()
         if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
-        if use_batch:
-            runner.end_batch()
 
-        # Phase 2: Attention or SSM (handles own batching/readbacks internally)
-        if LAYER_TYPES[layer] == "full_attention":
+        # Phase 2: Attention or SSM
+        if is_attn:
             attn = self._attention_block(rn1, layer, use_cache=use_cache,
                                          positions=positions)
         else:
             attn = self._linear_attention_block(rn1, layer,
                                                 use_cache=use_cache)
 
-        # Phase 3: Residual + norm2 + MLP (all GPU, batch together)
+        # Phase 3: Residual + norm2 + MLP (batch together for decode)
         if use_batch:
             runner.begin_batch()
 
@@ -1855,6 +2001,84 @@ class Qwen35WebGPU(WebGPUModel):
             K=self.n_embd)
         if self._profiling: self._clear_gpu_op()
         return logits
+
+    # ------------------------------------------------------------------
+    # Fast decode helpers (GPU-side sampling, no CPU round-trip)
+    # ------------------------------------------------------------------
+
+    def decode_next_token_gpu(self, token_ids, pos_offset,
+                              temperature=0.0, top_k=1):
+        """Decode one token: forward + CPU argmax/sampling.
+
+        Returns next token id (int).
+        """
+        if token_ids is not None:
+            logits = self.forward(
+                np.asarray(token_ids, dtype=np.int32).reshape(-1),
+                use_cache=True, pos_offset=pos_offset)
+        else:
+            logits = self.forward(
+                self._fd_last_token, use_cache=True, pos_offset=pos_offset)
+        last = logits[-1, :]
+        if top_k > 0 and temperature > 0:
+            k = min(int(top_k), last.shape[0])
+            idx = np.argpartition(last, -k)[-k:]
+            vals = last[idx] / temperature
+            vals -= vals.max()
+            probs = np.exp(vals)
+            probs /= probs.sum()
+            tok = int(idx[np.random.choice(k, p=probs)])
+        elif temperature > 0:
+            vals = last / temperature
+            vals -= vals.max()
+            probs = np.exp(vals)
+            probs /= probs.sum()
+            tok = int(np.random.choice(len(probs), p=probs))
+        else:
+            tok = int(last.argmax())
+        self._fd_last_token = np.array([tok], dtype=np.int32)
+        return tok
+
+    def decode_topk_gpu(self, token_ids, pos_offset, top_k=40):
+        """Decode one token: forward + top-k extraction.
+
+        Returns (indices, values) arrays of top-k logits.
+        """
+        if token_ids is not None:
+            logits = self.forward(
+                np.asarray(token_ids, dtype=np.int32).reshape(-1),
+                use_cache=True, pos_offset=pos_offset)
+        else:
+            logits = self.forward(
+                self._fd_last_token, use_cache=True, pos_offset=pos_offset)
+        last = logits[-1, :]
+        k = min(int(top_k), last.shape[0])
+        idx = np.argpartition(last, -k)[-k:]
+        vals = last[idx]
+        return idx, vals
+
+    def sample_prefill_token_gpu(self, logits, temperature=0.0, top_k=1):
+        """Sample the first token from prefill logits."""
+        last = np.asarray(logits, dtype=np.float32).reshape(-1)
+        if top_k > 0 and temperature > 0:
+            k = min(int(top_k), last.shape[0])
+            idx = np.argpartition(last, -k)[-k:]
+            vals = last[idx] / temperature
+            vals -= vals.max()
+            probs = np.exp(vals)
+            probs /= probs.sum()
+            return int(idx[np.random.choice(k, p=probs)])
+        if temperature > 0:
+            vals = last / temperature
+            vals -= vals.max()
+            probs = np.exp(vals)
+            probs /= probs.sum()
+            return int(np.random.choice(len(probs), p=probs))
+        return int(last.argmax())
+
+    def set_decode_input_token_gpu(self, token_id):
+        """Set the token for the next decode step (used by generate loop)."""
+        self._fd_last_token = np.array([int(token_id)], dtype=np.int32)
 
 
 # ---------------------------------------------------------------------------

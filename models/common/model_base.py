@@ -41,6 +41,7 @@ from common.kernels import (
     silu_mul_fused_rows_kernel,
     gelu_mul_kernel,
     silu_kernel, sigmoid_kernel, mul_kernel,
+    sigmoid_gate_interleaved_kernel,
     causal_attn_kernel, causal_attn_multihead_kernel,
     full_attn_kernel, full_attn_multihead_kernel, gqa_decode_attn_kernel,
     partial_rope_decode_kernel, rope_kv_scatter_kernel,
@@ -985,6 +986,19 @@ class WebGPUModel:
             {'BLOCK': MUL_BLOCK}, num_warps=self._nw(MUL_BLOCK))
         self._mul_block = MUL_BLOCK
 
+    def _compile_sigmoid_gate(self):
+        """Compile interleaved sigmoid gate kernel: Out[i] = sigmoid(X[gate]) * X[val]."""
+        SG_BLOCK = self.LOOP_BLOCK
+        self._siggate_sig = {
+            'X': '*fp32', 'Out': '*fp32',
+            'N': 'i32', 'HD': 'i32',
+            'BLOCK': 'constexpr',
+        }
+        self._siggate_result = self.cache.get_or_compile(
+            sigmoid_gate_interleaved_kernel, self._siggate_sig,
+            {'BLOCK': SG_BLOCK}, num_warps=self._nw(SG_BLOCK))
+        self._siggate_block = SG_BLOCK
+
     def _compile_full_attn(self):
         """Compile non-causal (full) attention kernel."""
         HD = self.head_dim
@@ -1260,9 +1274,14 @@ class WebGPUModel:
         return buf
 
     def _upload_norm_weight(self, name: str) -> GPUBuffer:
-        """Upload a normalization weight to GPU."""
+        """Upload a normalization weight to GPU as fp32.
+
+        Norm weights must be fp32 because the RMSNorm kernel reads
+        them as array<f32>.  Stored weights may be fp16.
+        """
         runner = self.cache.runner
-        buf = runner.upload_to_gpu(self.weights[name], name)
+        w = np.asarray(self.weights[name], dtype=np.float32)
+        buf = runner.upload_to_gpu(w, name)
         self._gpu_weights[name] = buf
         return buf
 
