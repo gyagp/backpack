@@ -39,7 +39,6 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg, profile_model,
 )
 
 _t_imports_done = time.perf_counter_ns()
@@ -2461,9 +2460,7 @@ def main():
     parser.add_argument("--weights-dir", type=str, default=None)
     parser.add_argument("--profile", action="store_true",
                         help="Enable profiling")
-    add_device_arg(parser)
     args = parser.parse_args()
-    apply_device_arg(args)
 
     if args.verify:
         success = verify_with_random_weights()
@@ -2525,19 +2522,19 @@ def main():
     print(f"Model created in {(_t_model_init_1-_t_model_init_0)/1e6:.0f}ms")
 
     if args.profile:
-        profile_model(
-            model, args.prompt, tokenizer,
-            script_dir=_SCRIPT_DIR, model_name="Qwen3.5-27B",
-            max_tokens=args.max_tokens, temperature=args.temperature,
-            init_timestamps=[
-                ("imports", _t_script_start, _t_imports_done),
-                ("weight_loading", _t_weight_load_0, _t_weight_load_1),
-                ("model_init", _t_model_init_0, _t_model_init_1),
-            ],
-            extra_reset=model._init_ssm_state)
-        return
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+        # Inject pre-recorded init events
+        init_phases = [
+            ("imports", _t_script_start, _t_imports_done),
+            ("weight_loading", _t_weight_load_0, _t_weight_load_1),
+            ("model_init", _t_model_init_0, _t_model_init_1),
+        ]
+        if hasattr(model, '_init_phases'):
+            init_phases.extend(model._init_phases)
+        model.profiler.inject_init_events(init_phases)
 
-    # Warmup: trigger D3D12 first-submit pipeline init
+    # Warmup
     import time as _wt
     _w0 = _wt.perf_counter()
     model.forward(np.array([1], dtype=np.int32), use_cache=True, pos_offset=0)
@@ -2552,6 +2549,9 @@ def main():
     generate(model, args.prompt, tokenizer,
              max_tokens=args.max_tokens,
              temperature=args.temperature)
+
+    if args.profile:
+        model.save_profile(_SCRIPT_DIR, "Qwen3.5-27B")
 
 
 if __name__ == "__main__":
