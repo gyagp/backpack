@@ -1536,6 +1536,9 @@ def download_and_quantize_streaming(weights_dir: str = None):
                 pfx + "linear_attn.out_proj.weight",
             ])
 
+    # Also quantize lm_head to save 2.4 GB VRAM
+    linear_keys.add("lm_head.weight")
+
     all_quantized = {}
     total_orig = 0
     total_quant = 0
