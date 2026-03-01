@@ -1513,13 +1513,9 @@ class Qwen35WebGPU(WebGPUModel):
 
         T = (x.shape[0] if x.shape else 1) if isinstance(x, GPUBuffer) else x.shape[0]
 
-        # For T>1 prefill: use original attention/SSM blocks
-        if T > 1:
-            return self._transformer_block_prefill(x, layer, use_cache, positions)
-
-        # For T=1 decode: batch GPU ops per layer to minimize submits
-        runner = self.cache.runner
-        use_batch = getattr(self, '_use_q4_gpu', False)
+        # All ops on GPU — use the same path for prefill and decode.
+        # Matmuls run on GPU, attention/SSM readback to CPU only where needed.
+        return self._transformer_block_prefill(x, layer, use_cache, positions)
 
         # ---------- Phase 1: Norm + QKV projection (GPU, batched) ----------
         if use_batch:
