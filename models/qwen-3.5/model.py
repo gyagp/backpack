@@ -184,7 +184,7 @@ class Qwen35WebGPU(WebGPUModel):
                  ssm_n_groups: int = 16,
                  ssm_d_state: int = 128,
                  ssm_conv_kernel: int = 4,
-                 max_seq_len: int = 2048,
+                 max_seq_len: int = 512,
                  quantized: bool = False,
                  n_q_heads: int = None):
         self.partial_rotary_factor = partial_rotary_factor
@@ -435,9 +435,18 @@ class Qwen35WebGPU(WebGPUModel):
                         self._fp32_cache[la + wn] = w.astype(np.float32)
 
     def _init_gpu_kv_cache(self):
-        """Pre-allocate KV cache for full-attention layers only (16 layers)."""
-        # Only full attention layers need KV cache
-        pass  # Use numpy-based cache in kv_cache dict
+        """Pre-allocate GPU KV cache for full-attention layers."""
+        runner = self.cache.runner
+        n_kv = self.n_kv_heads
+        HD = self.head_dim
+        buf_size = self.MAX_SEQ_LEN * n_kv * HD
+        self._gpu_kv_cache = {}
+        for layer in FULL_ATTN_LAYERS:
+            k_buf = runner.upload_to_gpu(
+                np.zeros(buf_size, dtype=np.float32), f"kv_cache_K_{layer}")
+            v_buf = runner.upload_to_gpu(
+                np.zeros(buf_size, dtype=np.float32), f"kv_cache_V_{layer}")
+            self._gpu_kv_cache[layer] = (k_buf, v_buf, 0)
 
     def _upload_weights_to_gpu(self):
         """Upload all weights to GPU (INT4/fp16/fp32 depending on capabilities)."""
@@ -516,6 +525,12 @@ class Qwen35WebGPU(WebGPUModel):
         # lm_head runs as CPU matmul (avoids 4.8 GB GPU upload for
         # 248K vocab × 5120 × 2 = 2.4 GB each).
         # Ensure lm_head weights are fp32 for CPU matmul.
+        lm_w = self.weights.get("lm_head.weight")
+        if lm_w is not None and lm_w.dtype == np.float16:
+            self.weights["lm_head.weight"] = lm_w.astype(np.float32)
+
+        # LM head stays on CPU (2.4 GB fp16 won't fit alongside 12.3 GB layer weights)
+        # Keep in fp32 for fast CPU matmul (avoids fp16→fp32 cast overhead)
         lm_w = self.weights.get("lm_head.weight")
         if lm_w is not None and lm_w.dtype == np.float16:
             self.weights["lm_head.weight"] = lm_w.astype(np.float32)
@@ -1243,7 +1258,8 @@ class Qwen35WebGPU(WebGPUModel):
 
         T = (x.shape[0] if x.shape else 1) if isinstance(x, GPUBuffer) else x.shape[0]
 
-        # T=1 decode: CPU path avoids GPU dispatch overhead
+        # T=1 decode: use CPU path with cached dequantized weights
+        # (GPU readback overhead dominates for small T=1 matmuls)
         if T == 1 and use_cache:
             return self._decode_cpu(x, layer, positions)
 
@@ -1305,10 +1321,10 @@ class Qwen35WebGPU(WebGPUModel):
         x = self._rms_norm(x, self._gpu_weights["norm.weight"])
         if self._profiling: self._clear_gpu_op()
 
-        # LM head on CPU (avoids uploading 2.4 GB to GPU)
-        lm_w = self.weights["lm_head.weight"]
-        if lm_w.dtype != np.float32:
-            lm_w = lm_w.astype(np.float32)
+        # LM head on CPU (2.4 GB won't fit in 16GB VRAM alongside 12.3 GB weights)
+        lm_w = self.weights["lm_head.weight"]  # fp32, pre-cast at init
+        if T > 1 and use_cache:
+            x = x[-1:]  # only last token logits needed for prefill
         logits = np.float32(x @ lm_w.T)
         return logits
 
@@ -1985,6 +2001,19 @@ def main():
         quantized=quantized,
         n_q_heads=config.get("n_q_heads"))
     print("Model created, kernels compiled")
+
+    # Warmup: trigger D3D12 first-submit pipeline init
+    import time as _wt
+    _w0 = _wt.perf_counter()
+    model.forward(np.array([1], dtype=np.int32), use_cache=True, pos_offset=0)
+    # Reset KV cache and SSM state after warmup
+    model.kv_cache = None
+    if hasattr(model, '_gpu_kv_cache'):
+        for layer in model._gpu_kv_cache:
+            k, v, _ = model._gpu_kv_cache[layer]
+            model._gpu_kv_cache[layer] = (k, v, 0)
+    model._init_ssm_state()
+    print(f"Warmup: {(_wt.perf_counter()-_w0)*1000:.0f}ms")
 
     if args.profile:
         model.enable_profiling()
