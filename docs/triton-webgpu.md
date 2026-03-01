@@ -184,6 +184,223 @@ The C++ runtime is straightforward (~700 lines for a full LLM):
 
 The GPU kernels are identical (same WGSL), so decode throughput is the same. The C++ streaming overhead (~12%) comes from per-token `wgpuBufferMapAsync` readback; Python avoids this by keeping the argmax → embedding feedback loop entirely on GPU.
 
+## How to Support a New Model
+
+This section describes the process of adding a new LLM to the WebGPU inference stack, using Phi-4 mini (3.8B, Phi3 architecture) as a concrete example.
+
+### Overview
+
+Supporting a model requires three things:
+1. **Kernels** — Triton kernels for each GPU operation (most are reusable across models)
+2. **Weight pipeline** — Download, quantize, and upload model weights
+3. **Forward pass** — Wire kernels together in the correct order
+
+Most transformer-based LLMs share the same set of ~10 kernels. The effort to add a new model is primarily in the forward pass logic (which layers, in what order, with what dimensions).
+
+### Step 1: Identify the Architecture
+
+Read the model config (usually `config.json` from HuggingFace) to determine:
+
+```python
+# Phi-4 mini example
+config = {
+    "n_layer": 32,        # transformer layers
+    "n_head": 24,         # query attention heads
+    "n_kv_heads": 8,      # key/value heads (GQA)
+    "n_embd": 3072,       # hidden dimension
+    "intermediate_size": 8192,  # MLP intermediate dim
+    "n_vocab": 200064,    # vocabulary size
+    "head_dim": 128,      # per-head dimension
+    "partial_rotary_factor": 0.75,  # RoPE coverage
+}
+```
+
+Key architectural decisions:
+- **Normalization**: LayerNorm (GPT-2) vs RMSNorm (LLaMA/Phi/Qwen)
+- **Attention**: MHA vs GQA (grouped-query) vs MQA (multi-query)
+- **Activation**: GELU (GPT-2) vs SiLU/SwiGLU (LLaMA/Phi)
+- **Positional encoding**: Absolute (GPT-2) vs RoPE (most modern LLMs)
+- **Weight tying**: Whether embed_tokens == lm_head weights
+
+### Step 2: Identify Required Kernels
+
+Map architecture ops to kernels. Most are already implemented in `models/common/`:
+
+| Operation | Kernel | Shared across models? |
+|-----------|--------|----------------------|
+| Normalization | `rms_norm_kernel` or `layer_norm_kernel` | ✓ |
+| Linear projection | `linear_q4_kernel` (INT4), `linear_fp16w_kernel` (fp16) | ✓ |
+| Attention | `gqa_decode_attn_kernel` (T=1) or `causal_attn_multihead_kernel` (T>1) | ✓ |
+| RoPE | `fused_rope_qkv_kernel` (decode) or `partial_rope_prefill_kernel` (prefill) | ✓ |
+| Activation | `silu_mul_kernel` (SwiGLU) or `gelu_kernel` | ✓ |
+| Residual add | `add_inplace_kernel` | ✓ |
+| Embedding | `embed_gather_fp16_kernel` | ✓ |
+| Sampling | `argmax_kernel` | ✓ |
+
+If the model needs a new op (e.g., a novel attention pattern or activation), write a new Triton kernel:
+
+```python
+@triton.jit
+def my_new_activation(X, Y, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X + offs, mask=mask)
+    # ... custom activation logic
+    tl.store(Y + offs, result, mask=mask)
+```
+
+### Step 3: Weight Pipeline
+
+**Download** from HuggingFace (safetensors format):
+
+```python
+from common.utils import download_weights
+
+npz_path, tokenizer_path = download_weights(
+    hf_repo="microsoft/Phi-4-mini-instruct",
+    model_dir="weights/",
+    safetensors_files=["model-00001-of-00002.safetensors", ...],
+    key_transform=lambda key, arr: (key.replace("model.", ""), arr),
+    download_tokenizer=True,
+)
+```
+
+**Quantize** to INT4 (4× memory reduction):
+
+```python
+# Per-group INT4 quantization (group_size=128)
+for each weight matrix W (N×K):
+    for each group of 128 values:
+        scale = (max - min) / 15
+        zero = round(-min / scale)
+        q4[i] = round((W[i] - min) / scale)  # 4-bit, packed 2 per byte
+    save: w.q4 (uint8), w.scales (fp16), w.zeros (fp16)
+```
+
+**Upload** to GPU — two strategies:
+- **Eager** (used for decode-mode models): Upload all layer weights at init. Costs more VRAM but eliminates per-token upload overhead.
+- **Streaming** (used for VRAM-constrained models): Upload weights per-layer during forward pass. Lower peak VRAM but adds CPU→GPU transfer cost.
+
+### Step 4: Implement the Forward Pass
+
+Create a model class inheriting from `WebGPUModel`:
+
+```python
+class Phi4WebGPU(WebGPUModel):
+    def __init__(self, weights, **config):
+        super().__init__(weights, ...)  # compiles shared kernels
+        self._compile_model_kernels()   # model-specific kernels
+        self._upload_weights_to_gpu()
+        self._init_gpu_kv_cache()
+
+    def forward(self, token_ids, use_cache, pos_offset):
+        # Embedding lookup
+        x = self.weights["embed_tokens.weight"][token_ids]
+
+        # 32 transformer layers
+        for layer in range(self.n_layer):
+            # Pre-norm → attention → residual
+            norm = self._rms_norm(x, norm_weight[layer])
+            qkv = self._proj(norm, qkv_weight[layer])  # INT4 matmul
+            q, k, v = split_and_rope(qkv)               # RoPE
+            attn = self._gqa_attention(q, k, v, kv_cache[layer])
+            x = x + self._proj(attn, o_weight[layer])
+
+            # Pre-norm → MLP → residual
+            norm = self._rms_norm(x, norm2_weight[layer])
+            gate_up = self._proj(norm, gate_up_weight[layer])
+            mlp = silu(gate) * up
+            x = x + self._proj(mlp, down_weight[layer])
+
+        # Output
+        x = self._rms_norm(x, final_norm_weight)
+        logits = x @ embed_weight.T  # tied weights
+        return logits
+```
+
+### Step 5: Fast Decode Optimization
+
+For production throughput, implement GPU-resident decode:
+
+1. **Pre-record bind groups** — Create all buffer bindings at init (once), not per dispatch
+2. **Batch into single command buffer** — Encode all ~350 dispatches per token into one `wgpuQueueSubmit`
+3. **GPU feedback loop** — Keep argmax → embed_gather on GPU (no CPU readback per token)
+4. **Fuse operations** — Combine rope_q + rope_kv → fused_rope; combine residual_add + rms_norm → add_rms_norm
+
+```python
+# Python fast decode (from Phi-4 implementation)
+def _decode_fast(self, token_ids, pos):
+    # 3 wgpuQueueWriteBuffer calls (token_id, rope_pos, attn_len)
+    # Then submit_dispatches_pipelined:
+    #   embed_gather → [norm, qkv, rope, attn, o_proj, add, norm, gate_up, silu, down, add] × 32
+    #   → final_norm → lm_head → argmax
+    # All in 1 command buffer, 0 readbacks
+```
+
+### Step 6: Verify Correctness
+
+Always verify against a reference implementation:
+
+```python
+# Random weight verification (no download needed)
+python model.py --verify
+
+# Real weight verification (greedy decode, deterministic)
+python model.py --prompt "The capital of France is" --temperature 0
+# Expected: "Paris. Paris is the capital of France..."
+```
+
+Key correctness checks:
+- Embedding lookup matches NumPy indexing
+- RMSNorm output matches `x / sqrt(mean(x²) + eps) * w`
+- INT4 dequantize matches reference: `(q4 - zero) * scale`
+- Attention matches scaled dot-product with causal mask
+- End-to-end greedy decode produces coherent text
+
+### Step 7: Export for C++ (Optional)
+
+If deploying as a standalone binary:
+
+```bash
+# 1. Export WGSL shaders + tokenizer
+python export_shaders.py
+# Output: shaders/*.wgsl, vocab.bin, merges.bin
+
+# 2. Build C++ binary
+cmake -B build -DDAWN_DIR=path/to/dawn
+cmake --build build --config Release
+
+# 3. Run
+./inference --weights weights_q4.npz --prompt "Hello, world"
+```
+
+The C++ code (~700 lines) implements:
+- NPZ file reader (ZIP64 + NumPy header parser)
+- BPE tokenizer (byte-level encode/decode)
+- Dawn device setup with feature negotiation
+- Pre-recorded bind groups for all layers
+- Single command buffer dispatch loop
+
+### Summary: What's Model-Specific vs Shared
+
+| Component | Model-specific | Shared (`common/`) |
+|-----------|---------------|---------------------|
+| Triton kernels | Rarely (only novel ops) | ✓ (10 standard kernels) |
+| Weight download/quantize | Key transform function | ✓ (download + INT4 quantize) |
+| Model config | Architecture params | — |
+| Forward pass logic | Layer order, dimensions | — |
+| Fast decode | Bind group setup | ✓ (dispatch infrastructure) |
+| C++ runtime | Dispatch loop, params | ✓ (GPU wrapper, NPZ reader, tokenizer) |
+
+For a standard transformer (RMSNorm + GQA + SwiGLU + RoPE), adding a new model is primarily:
+1. Write `config` dict (~10 lines)
+2. Write `_upload_weights_to_gpu` with key mapping (~50 lines)
+3. Write `forward()` wiring layers together (~100 lines)
+4. Write `_init_fast_decode` with bind groups (~200 lines)
+
+The kernel compilation, GPU runtime, weight quantization, tokenizer, and profiling infrastructure are all reusable.
+
 ## File Structure
 
 | Path | Description |
