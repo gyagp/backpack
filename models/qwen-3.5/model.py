@@ -706,7 +706,11 @@ class Qwen35WebGPU(WebGPUModel):
                          use_cache: bool = False,
                          positions: np.ndarray = None,
                          **kwargs):
-        """Full GQA with QK-norm, partial RoPE, and output gate."""
+        """Full GQA with QK-norm, partial RoPE, and output gate.
+
+        For T=1 decode: uses GPU KV cache + GPU attention kernel.
+        For T>1 prefill: uses CPU attention with numpy KV cache.
+        """
         from common.model_base import GPUBuffer
 
         if isinstance(x, GPUBuffer):
@@ -720,7 +724,7 @@ class Qwen35WebGPU(WebGPUModel):
         n_rep = n_q_heads // n_kv   # 48/4 = 12 (GQA expansion)
         pfx = f"layers.{layer}.self_attn."
 
-        # Fused QKV projection (single dispatch)
+        # Fused QKV projection (GPU)
         if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
         qkv = self._proj(
             x, pfx + "qkv_proj.weight",
@@ -728,17 +732,16 @@ class Qwen35WebGPU(WebGPUModel):
             K=self.n_embd)
 
         # Split into Q, K, V
-        q_dim = self.full_attn_q_dim  # 48 * 256 = 12288
+        q_dim = self.full_attn_q_dim
         q = qkv[:, :q_dim]
         k = qkv[:, q_dim:q_dim + self.kv_dim]
         v = qkv[:, q_dim + self.kv_dim:]
 
-        # Reshape to heads
         Q = q.reshape(T, n_q_heads, HD)
         K_new = k.reshape(T, n_kv, HD)
         V_new = v.reshape(T, n_kv, HD)
 
-        # QK-norm (RMSNorm per head) — vectorized
+        # QK-norm (CPU — per-head RMSNorm, lightweight)
         q_norm_w = self.weights[pfx + "q_norm.weight"]
         k_norm_w = self.weights[pfx + "k_norm.weight"]
         q_rms = np.sqrt(np.mean(Q * Q, axis=-1, keepdims=True) + self.rms_norm_eps)
@@ -746,68 +749,116 @@ class Qwen35WebGPU(WebGPUModel):
         k_rms = np.sqrt(np.mean(K_new * K_new, axis=-1, keepdims=True) + self.rms_norm_eps)
         K_new = K_new / k_rms * k_norm_w
 
-        # Partial RoPE (25% of head_dim)
+        # Partial RoPE (CPU — 25% of head_dim)
         if positions is None:
             positions = np.arange(T, dtype=np.int32)
         Q = self._apply_partial_rope_fast(Q, positions)
         K_new = self._apply_partial_rope_fast(K_new, positions)
 
-        # KV cache
-        if use_cache:
+        # --- GPU attention path for T=1 decode ---
+        if T == 1 and use_cache and layer in self._gpu_kv_cache:
+            runner = self.cache.runner
+            K_gpu, V_gpu, cur_len = self._gpu_kv_cache[layer]
+
+            # Upload K_new, V_new to GPU KV cache at cur_len
+            kv_offset = cur_len * n_kv * HD * 4  # byte offset
+            k_bytes = K_new.ravel().astype(np.float32).tobytes()
+            v_bytes = V_new.ravel().astype(np.float32).tobytes()
+            import ctypes
+            lib = runner._lib
+            lib.wgpuQueueWriteBuffer(
+                runner._queue, K_gpu.handle, kv_offset,
+                ctypes.c_char_p(k_bytes), len(k_bytes))
+            lib.wgpuQueueWriteBuffer(
+                runner._queue, V_gpu.handle, kv_offset,
+                ctypes.c_char_p(v_bytes), len(v_bytes))
+            T_total = cur_len + 1
+            self._gpu_kv_cache[layer] = (K_gpu, V_gpu, T_total)
+
+            # Also update CPU KV cache (for prefill fallback)
             if self.kv_cache is None:
                 self.kv_cache = {}
             if layer not in self.kv_cache:
                 K_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
                 V_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
-                K_buf[:T] = K_new
-                V_buf[:T] = V_new
-                self.kv_cache[layer] = (K_buf, V_buf, T)
+                self.kv_cache[layer] = (K_buf, V_buf, 0)
+            K_buf, V_buf, _ = self.kv_cache[layer]
+            K_buf[cur_len] = K_new[0]
+            V_buf[cur_len] = V_new[0]
+            self.kv_cache[layer] = (K_buf, V_buf, T_total)
+
+            # Upload Q to GPU
+            BHD = self._attn_bhd  # block size for attention kernel
+            Q_flat = Q.reshape(n_q_heads, HD)
+            Q_padded = np.zeros((n_q_heads, BHD), dtype=np.float32)
+            Q_padded[:, :HD] = Q_flat
+            Q_gpu = runner.upload_to_gpu(Q_padded.ravel(), "__attn_q_tmp")
+
+            # GPU GQA decode attention
+            if self._profiling: self._set_gpu_op(f"L{layer}/attn_gpu")
+            scale = float(1.0 / np.sqrt(HD))
+            attn_result = self.cache.run(
+                self._gqa_attn_result, grid=(n_q_heads,),
+                buffers={
+                    'Q': Q_gpu,
+                    'K_cache': K_gpu, 'V_cache': V_gpu,
+                    'Out': np.zeros(n_q_heads * BHD, dtype=np.float32),
+                },
+                scalars={
+                    'kv_stride': n_kv * BHD,
+                    'n_rep': n_rep,
+                    'T_total': T_total,
+                    'scale': scale,
+                    'neg_inf': float(-1e9),
+                })
+            attn_out = attn_result['Out'].reshape(n_q_heads, BHD)[:, :HD]
+            attn_out = attn_out[None, :, :]  # (1, n_q_heads, HD)
+        else:
+            # --- CPU attention path for prefill ---
+            if use_cache:
+                if self.kv_cache is None:
+                    self.kv_cache = {}
+                if layer not in self.kv_cache:
+                    K_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
+                    V_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
+                    K_buf[:T] = K_new; V_buf[:T] = V_new
+                    self.kv_cache[layer] = (K_buf, V_buf, T)
+                    # Also upload to GPU KV cache
+                    if layer in self._gpu_kv_cache:
+                        K_gpu, V_gpu, _ = self._gpu_kv_cache[layer]
+                        runner = self.cache.runner
+                        k_bytes = K_new.ravel().astype(np.float32).tobytes()
+                        v_bytes = V_new.ravel().astype(np.float32).tobytes()
+                        import ctypes
+                        lib = runner._lib
+                        lib.wgpuQueueWriteBuffer(
+                            runner._queue, K_gpu.handle, 0,
+                            ctypes.c_char_p(k_bytes), len(k_bytes))
+                        lib.wgpuQueueWriteBuffer(
+                            runner._queue, V_gpu.handle, 0,
+                            ctypes.c_char_p(v_bytes), len(v_bytes))
+                        self._gpu_kv_cache[layer] = (K_gpu, V_gpu, T)
+                else:
+                    K_buf, V_buf, cur_len = self.kv_cache[layer]
+                    K_buf[cur_len:cur_len + T] = K_new
+                    V_buf[cur_len:cur_len + T] = V_new
+                    self.kv_cache[layer] = (K_buf, V_buf, cur_len + T)
+                _, _, T_total = self.kv_cache[layer]
+                K_full = K_buf[:T_total]; V_full = V_buf[:T_total]
             else:
-                K_buf, V_buf, cur_len = self.kv_cache[layer]
-                K_buf[cur_len:cur_len + T] = K_new
-                V_buf[cur_len:cur_len + T] = V_new
-                self.kv_cache[layer] = (K_buf, V_buf, cur_len + T)
-            _, _, T_total = self.kv_cache[layer]
-            K_full = K_buf[:T_total]
-            V_full = V_buf[:T_total]
-        else:
-            T_total = T
-            K_full = K_new
-            V_full = V_new
+                T_total = T; K_full = K_new; V_full = V_new
 
-        scale = 1.0 / np.sqrt(HD)
+            attn_out = self._causal_attention_multihead(Q, K_full, V_full, n_rep)
 
-        if T == 1 and use_cache and T_total > 1:
-            # Decode: vectorized multi-head attention
-            K_exp = np.repeat(K_full, n_rep, axis=1)
-            V_exp = np.repeat(V_full, n_rep, axis=1)
-            Q_t = Q.transpose(1, 0, 2)          # (n_head, 1, HD)
-            K_t = K_exp.transpose(1, 2, 0)      # (n_head, HD, T_total)
-            scores = np.float32((Q_t @ K_t).squeeze(1) * scale)
-            scores -= scores.max(axis=1, keepdims=True)
-            exp_s = np.exp(scores)
-            s = exp_s.sum(axis=1, keepdims=True)
-            s = np.where(s == 0, 1.0, s)
-            attn = exp_s / s
-            V_t = V_exp.transpose(1, 0, 2)
-            attn_out = (attn[:, None, :] @ V_t).squeeze(1)
-            attn_out = attn_out[None, :, :].astype(np.float32)
-        else:
-            attn_out = self._causal_attention_multihead(
-                Q, K_full, V_full, n_rep)
-
-        # Attention output: 48 Q heads → gate to 24 output heads
-        # Reshape (T, 48, 256) → (T, 24, 512) then split: gate + value
+        # Output gate: 48 Q heads → 24 output heads
         if self.attn_output_gate and n_q_heads > n_head:
             attn_out = attn_out.reshape(T, n_head, 2 * HD)
-            gate_part = attn_out[:, :, :HD]
-            value_part = attn_out[:, :, HD:]
-            gate = 1.0 / (1.0 + np.exp(-gate_part))
-            attn_out = gate * value_part  # (T, n_head, HD)
+            gate = 1.0 / (1.0 + np.exp(-attn_out[:, :, :HD]))
+            attn_out = gate * attn_out[:, :, HD:]
 
         attn_flat = attn_out.reshape(T, self.full_attn_qo_dim)
 
-        # O projection
+        # O projection (GPU)
         if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
         o = self._proj(
             attn_flat, pfx + "o_proj.weight",
