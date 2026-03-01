@@ -623,6 +623,85 @@ class Qwen35WebGPU(WebGPUModel):
         rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + self.rms_norm_eps)
         return (x / rms * weight).astype(np.float32)
 
+    def _attention_cpu_from_qkv(self, qkv, layer, T, use_cache, positions):
+        """CPU attention from pre-projected QKV (GPU matmul already done).
+
+        Returns numpy attention output (T, full_attn_qo_dim).
+        """
+        HD = self.head_dim
+        n_q_heads = self.n_q_heads
+        n_head = self.n_head
+        n_kv = self.n_kv_heads
+        n_rep = n_q_heads // n_kv
+        pfx = f"layers.{layer}.self_attn."
+
+        # Split QKV
+        q_dim = self.full_attn_q_dim
+        q = qkv[:, :q_dim]
+        k = qkv[:, q_dim:q_dim + self.kv_dim]
+        v = qkv[:, q_dim + self.kv_dim:]
+
+        Q = q.reshape(T, n_q_heads, HD)
+        K_new = k.reshape(T, n_kv, HD)
+        V_new = v.reshape(T, n_kv, HD)
+
+        # QK-norm
+        q_norm_w = self.weights[pfx + "q_norm.weight"]
+        k_norm_w = self.weights[pfx + "k_norm.weight"]
+        q_rms = np.sqrt(np.mean(Q * Q, axis=-1, keepdims=True) + self.rms_norm_eps)
+        Q = Q / q_rms * q_norm_w
+        k_rms = np.sqrt(np.mean(K_new * K_new, axis=-1, keepdims=True) + self.rms_norm_eps)
+        K_new = K_new / k_rms * k_norm_w
+
+        # Partial RoPE
+        if positions is None:
+            positions = np.arange(T, dtype=np.int32)
+        Q = self._apply_partial_rope_fast(Q, positions)
+        K_new = self._apply_partial_rope_fast(K_new, positions)
+
+        # KV cache
+        if use_cache:
+            if self.kv_cache is None:
+                self.kv_cache = {}
+            if layer not in self.kv_cache:
+                K_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
+                V_buf = np.zeros((self.MAX_SEQ_LEN, n_kv, HD), dtype=np.float32)
+                K_buf[:T] = K_new; V_buf[:T] = V_new
+                self.kv_cache[layer] = (K_buf, V_buf, T)
+            else:
+                K_buf, V_buf, cur_len = self.kv_cache[layer]
+                K_buf[cur_len:cur_len + T] = K_new
+                V_buf[cur_len:cur_len + T] = V_new
+                self.kv_cache[layer] = (K_buf, V_buf, cur_len + T)
+            _, _, T_total = self.kv_cache[layer]
+            K_full = K_buf[:T_total]; V_full = V_buf[:T_total]
+        else:
+            T_total = T; K_full = K_new; V_full = V_new
+
+        scale = 1.0 / np.sqrt(HD)
+        if T == 1 and use_cache and T_total > 1:
+            K_exp = np.repeat(K_full, n_rep, axis=1)
+            V_exp = np.repeat(V_full, n_rep, axis=1)
+            scores = np.float32(
+                (Q.transpose(1, 0, 2) @ K_exp.transpose(1, 2, 0)).squeeze(1) * scale)
+            scores -= scores.max(axis=1, keepdims=True)
+            exp_s = np.exp(scores)
+            s = exp_s.sum(axis=1, keepdims=True)
+            s = np.where(s == 0, 1.0, s)
+            attn = exp_s / s
+            attn_out = (attn[:, None, :] @ V_exp.transpose(1, 0, 2)).squeeze(1)
+            attn_out = attn_out[None, :, :].astype(np.float32)
+        else:
+            attn_out = self._causal_attention_multihead(Q, K_full, V_full, n_rep)
+
+        # Output gate: 48 Q heads → 24 output heads
+        if self.attn_output_gate and n_q_heads > n_head:
+            attn_out = attn_out.reshape(T, n_head, 2 * HD)
+            gate = 1.0 / (1.0 + np.exp(-attn_out[:, :, :HD]))
+            attn_out = gate * attn_out[:, :, HD:]
+
+        return attn_out.reshape(T, self.full_attn_qo_dim)
+
     def _attention_block(self, x, layer: int,
                          use_cache: bool = False,
                          positions: np.ndarray = None,
@@ -741,7 +820,116 @@ class Qwen35WebGPU(WebGPUModel):
     # Linear attention (Mamba-2 SSM) block
     # ------------------------------------------------------------------
 
-    def _ssm_decode_cpu(self, x_np, layer):
+    def _ssm_from_projections(self, qkv_np, z_np, layer, T, use_cache):
+        """CPU SSM recurrence from pre-projected QKV and Z (GPU matmul done).
+
+        Returns numpy output (T, ssm_dim) ready for output projection.
+        """
+        pfx = f"layers.{layer}.linear_attn."
+        n_v = self.gdn_n_v_heads
+        n_k = self.gdn_n_k_heads
+        hk = self.gdn_head_k_dim
+        hv = self.gdn_head_v_dim
+        key_dim = self.gdn_key_dim
+        v_per_k = self.gdn_v_per_k
+        kernel_size = self.ssm_conv_kernel
+
+        # a, b projections (small CPU matmul: 5120 × 48)
+        x_reconstruct = None  # not available, use conv output
+        # We need the original x for a,b projections — but we only
+        # have the projected QKV. The a,b weights are tiny (48×5120),
+        # so we'll compute from the input x that was passed to the
+        # transformer block. For now, use the _ssm_decode_cpu approach
+        # which gets x from the caller.
+        # Actually the _ssm_decode_cpu gets x_np as input and computes
+        # a = x @ a_w.T. But here we don't have x_np.
+        # We must pass x through. Let the caller pass it.
+
+        # FALLBACK: delegate to _ssm_decode_cpu for correctness
+        # The optimization here is that QKV + Z projections are
+        # already done on GPU (batched). But _ssm_decode_cpu also
+        # does them, so we save nothing. Instead, let's just use
+        # the pre-projected values.
+
+        # For T=1 decode, use the pre-projected Q/K/V directly
+        qkv_flat = qkv_np[0]  # (ssm_qkv_dim,)
+        z = z_np
+
+        # a, b projections need original x — extract from conv state
+        # Actually, the a,b projection input is x_np (the norm output),
+        # not the qkv output. This is a fundamental issue — we need
+        # access to the norm output for a,b. For now, store it.
+        x_for_ab = getattr(self, '_ssm_x_for_ab', None)
+        if x_for_ab is None:
+            # Can't compute a,b without access to original x
+            # Return zeros as placeholder
+            return np.zeros((T, self.ssm_dim), dtype=np.float32)
+
+        a_w = self._fp32_cache.get(pfx + "in_proj_a.weight",
+                                   self.weights.get(pfx + "in_proj_a.weight"))
+        b_w = self._fp32_cache.get(pfx + "in_proj_b.weight",
+                                   self.weights.get(pfx + "in_proj_b.weight"))
+        x_flat = x_for_ab.ravel().astype(np.float32)
+        a_proj = x_flat @ a_w.T
+        b_proj = x_flat @ b_w.T
+
+        # Conv1d
+        conv_dim = self.ssm_qkv_dim
+        if layer not in self._ssm_conv_states:
+            self._ssm_conv_states[layer] = np.zeros(
+                (kernel_size - 1, conv_dim), dtype=np.float32)
+        conv_state = self._ssm_conv_states[layer]
+        conv_w = self._fp32_cache.get(pfx + "conv1d.weight.reshaped")
+        if conv_w is None:
+            conv_w_raw = self.weights[pfx + "conv1d.weight"]
+            if conv_w_raw.dtype == np.float16:
+                conv_w_raw = conv_w_raw.astype(np.float32)
+            conv_w = conv_w_raw.reshape(conv_dim, kernel_size)
+        x_conv = (conv_state * conv_w[:, :kernel_size - 1].T).sum(axis=0) + \
+                 qkv_flat * conv_w[:, kernel_size - 1]
+        conv_state[:-1] = conv_state[1:]
+        conv_state[-1] = qkv_flat
+        x_conv = x_conv * (1.0 / (1.0 + np.exp(-x_conv)))  # SiLU
+
+        # Split Q, K, V
+        q = x_conv[:key_dim].reshape(n_k, hk)
+        k = x_conv[key_dim:key_dim*2].reshape(n_k, hk)
+        v = x_conv[key_dim*2:].reshape(n_v, hv)
+
+        # L2 normalize Q and K
+        q = q / (np.sqrt(np.sum(q ** 2, axis=-1, keepdims=True)) + 1e-6)
+        k = k / (np.sqrt(np.sum(k ** 2, axis=-1, keepdims=True)) + 1e-6)
+        q = q * (1.0 / np.sqrt(float(hk)))
+        q = np.repeat(q, v_per_k, axis=0)
+        k = np.repeat(k, v_per_k, axis=0)
+
+        # Decay and gate
+        dt_bias = self._fp32_cache.get(pfx + "dt_bias", self.weights[pfx + "dt_bias"])
+        A_log = self._fp32_cache.get(pfx + "A_log", self.weights[pfx + "A_log"])
+        if A_log.dtype != np.float32:
+            A_log = A_log.astype(np.float32)
+        g = -np.exp(A_log) * np.log1p(np.exp(a_proj.astype(np.float32) + dt_bias))
+        g_exp = np.exp(g)
+        beta = 1.0 / (1.0 + np.exp(-b_proj.astype(np.float32)))
+
+        # Recurrence
+        if layer not in self._ssm_states:
+            self._ssm_states[layer] = np.zeros((n_v, hk, hv), dtype=np.float32)
+        state = self._ssm_states[layer]
+        state *= g_exp[:, None, None]
+        kv_mem = np.einsum('nhv,nh->nv', state, k)
+        delta = (v - kv_mem) * beta[:, None]
+        state += k[:, :, None] * delta[:, None, :]
+        output = np.einsum('nhv,nh->nv', state, q)
+
+        # Gated RMSNorm
+        norm_w = self._fp32_cache.get(pfx + "norm.weight",
+                                       self.weights[pfx + "norm.weight"])
+        rms = np.sqrt(np.mean(output ** 2, axis=-1, keepdims=True) + self.rms_norm_eps)
+        y_normed = output / rms * norm_w
+        z_flat = z.ravel().reshape(n_v, hv)
+        z_silu = z_flat * (1.0 / (1.0 + np.exp(-z_flat)))
+        return (y_normed * z_silu).reshape(1, self.ssm_dim).astype(np.float32)
         """GatedDeltaNet T=1 decode with batched GPU projections.
 
         GatedDeltaNet recurrence (per head):
@@ -1277,27 +1465,16 @@ class Qwen35WebGPU(WebGPUModel):
 
         return x_np + mlp_out
 
-    def _transformer_block(self, x, layer: int,
-                           use_cache: bool = False,
-                           positions: np.ndarray = None, **kwargs):
-        """Pre-norm transformer block. Dispatches to full or linear attn."""
+    def _transformer_block_prefill(self, x, layer, use_cache, positions):
+        """Prefill path (T>1): uses original attention/SSM blocks."""
         from common.model_base import GPUBuffer
         pfx = f"layers.{layer}."
 
-        T = (x.shape[0] if x.shape else 1) if isinstance(x, GPUBuffer) else x.shape[0]
-
-        # T=1 decode: use CPU path with cached dequantized weights
-        # (GPU readback overhead dominates for small T=1 matmuls)
-        if T == 1 and use_cache:
-            return self._decode_cpu(x, layer, positions)
-
-        # Pre-norm
         if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
         rn1 = self._rms_norm(
             x, self._gpu_weights[pfx + "input_layernorm.weight"],
             gpu_out=True)
 
-        # Attention (full GQA or Mamba-2 SSM)
         if LAYER_TYPES[layer] == "full_attention":
             attn = self._attention_block(rn1, layer, use_cache=use_cache,
                                          positions=positions)
@@ -1305,7 +1482,6 @@ class Qwen35WebGPU(WebGPUModel):
             attn = self._linear_attention_block(rn1, layer,
                                                 use_cache=use_cache)
 
-        # Fused residual add + RMSNorm (saves 1 dispatch) when available
         use_fused = (hasattr(self, '_add_rn_result') and
                      isinstance(x, GPUBuffer) and isinstance(attn, GPUBuffer))
         if use_fused:
@@ -1326,6 +1502,121 @@ class Qwen35WebGPU(WebGPUModel):
         if self._profiling: self._set_gpu_op(f"L{layer}/res2")
         x = self._add(x, mlp, gpu_out=True)
         if self._profiling: self._clear_gpu_op()
+        return x
+
+    def _transformer_block(self, x, layer: int,
+                           use_cache: bool = False,
+                           positions: np.ndarray = None, **kwargs):
+        """Pre-norm transformer block. Dispatches to full or linear attn."""
+        from common.model_base import GPUBuffer
+        pfx = f"layers.{layer}."
+
+        T = (x.shape[0] if x.shape else 1) if isinstance(x, GPUBuffer) else x.shape[0]
+
+        # For T>1 prefill: use original attention/SSM blocks
+        if T > 1:
+            return self._transformer_block_prefill(x, layer, use_cache, positions)
+
+        # For T=1 decode: batch GPU ops per layer to minimize submits
+        runner = self.cache.runner
+        use_batch = getattr(self, '_use_q4_gpu', False)
+
+        # ---------- Phase 1: Norm + QKV projection (GPU, batched) ----------
+        if use_batch:
+            runner.begin_batch()
+
+        if self._profiling: self._set_gpu_op(f"L{layer}/norm1")
+        rn1 = self._rms_norm(
+            x, self._gpu_weights[pfx + "input_layernorm.weight"],
+            gpu_out=True)
+
+        # QKV/SSM projection stays on GPU
+        if LAYER_TYPES[layer] == "full_attention":
+            if self._profiling: self._set_gpu_op(f"L{layer}/qkv")
+            qkv_gpu = self._proj(
+                rn1, pfx + "self_attn.qkv_proj.weight",
+                "zero_bias_QKV", self.full_attn_qkv_dim,
+                K=self.n_embd, gpu_out=True)
+            if use_batch:
+                # Readback QKV for CPU attention
+                rb = runner.end_batch(readback_buffers=[qkv_gpu])
+                qkv = rb[id(qkv_gpu)].reshape(T, self.full_attn_qkv_dim)
+            else:
+                qkv = qkv_gpu if isinstance(qkv_gpu, np.ndarray) else \
+                    self.cache.runner.readback(qkv_gpu).reshape(T, self.full_attn_qkv_dim)
+            # CPU attention (QK-norm, RoPE, dot product, output gate)
+            if self._profiling: self._set_gpu_op(f"L{layer}/attn")
+            attn = self._attention_cpu_from_qkv(qkv, layer, T, use_cache, positions)
+        else:
+            if self._profiling: self._set_gpu_op(f"L{layer}/ssm_qkv")
+            qkv_gpu = self._proj(
+                rn1, pfx + "linear_attn.in_proj_qkv.weight",
+                "zero_bias_SSM_QKV", self.ssm_qkv_dim,
+                K=self.n_embd, gpu_out=True)
+            if self._profiling: self._set_gpu_op(f"L{layer}/ssm_z")
+            z_gpu = self._proj(
+                rn1, pfx + "linear_attn.in_proj_z.weight",
+                "zero_bias_SSM", self.ssm_dim,
+                K=self.n_embd, gpu_out=True)
+            if use_batch:
+                rb = runner.end_batch(readback_buffers=[qkv_gpu, z_gpu])
+                qkv_np = rb[id(qkv_gpu)].reshape(T, self.ssm_qkv_dim)
+                z_np = rb[id(z_gpu)].reshape(T, self.ssm_dim)
+            else:
+                qkv_np = qkv_gpu if isinstance(qkv_gpu, np.ndarray) else \
+                    self.cache.runner.readback(qkv_gpu).reshape(T, self.ssm_qkv_dim)
+                z_np = z_gpu if isinstance(z_gpu, np.ndarray) else \
+                    self.cache.runner.readback(z_gpu).reshape(T, self.ssm_dim)
+            # Save norm output for SSM a,b projections (small CPU matmul)
+            if isinstance(rn1, GPUBuffer):
+                self._ssm_x_for_ab = self.cache.runner.readback(rn1).reshape(T, self.n_embd)
+            else:
+                self._ssm_x_for_ab = rn1
+            # CPU SSM recurrence
+            if self._profiling: self._set_gpu_op(f"L{layer}/ssm")
+            attn = self._ssm_from_projections(qkv_np, z_np, layer, T, use_cache)
+
+        # ---------- Phase 2: O proj + residual + norm2 + MLP (GPU, batched) ----------
+        if use_batch:
+            runner.begin_batch()
+
+        # O projection (full attention) or out projection (SSM)
+        if LAYER_TYPES[layer] == "full_attention":
+            if self._profiling: self._set_gpu_op(f"L{layer}/o_proj")
+            o = self._proj(
+                attn, pfx + "self_attn.o_proj.weight",
+                "zero_bias_E", self.n_embd,
+                K=self.full_attn_qo_dim, gpu_out=True)
+        else:
+            if self._profiling: self._set_gpu_op(f"L{layer}/ssm_out")
+            o = self._proj(
+                attn, pfx + "linear_attn.out_proj.weight",
+                "zero_bias_E", self.n_embd,
+                K=self.ssm_dim, gpu_out=True)
+
+        # Residual + Norm2 + MLP (all on GPU)
+        if hasattr(self, '_add_rn_result') and isinstance(x, GPUBuffer):
+            if self._profiling: self._set_gpu_op(f"L{layer}/res1+norm2")
+            rn2 = self._add_rms_norm(
+                x, o,
+                self._gpu_weights[pfx + "post_attention_layernorm.weight"],
+                gpu_out=True)
+        else:
+            if self._profiling: self._set_gpu_op(f"L{layer}/res1")
+            x = self._add(x, o, gpu_out=True)
+            if self._profiling: self._set_gpu_op(f"L{layer}/norm2")
+            rn2 = self._rms_norm(
+                x, self._gpu_weights[pfx + "post_attention_layernorm.weight"],
+                gpu_out=True)
+
+        mlp = self._mlp_block(rn2, layer, gpu_out=True)
+        if self._profiling: self._set_gpu_op(f"L{layer}/res2")
+        x = self._add(x, mlp, gpu_out=True)
+        if self._profiling: self._clear_gpu_op()
+
+        if use_batch and runner.is_batching:
+            runner.end_batch()
+
         return x
 
     # ------------------------------------------------------------------
