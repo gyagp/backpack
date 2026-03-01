@@ -29,6 +29,8 @@ import sys
 import time
 from typing import Dict, Tuple, List
 
+_t_script_start = time.perf_counter_ns()
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 
@@ -37,8 +39,10 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg,
+    add_device_arg, apply_device_arg, profile_model,
 )
+
+_t_imports_done = time.perf_counter_ns()
 
 
 # ---------------------------------------------------------------------------
@@ -2340,6 +2344,7 @@ def main():
         return
 
     # Load weights (prefer quantized if available)
+    _t_weight_load_0 = time.perf_counter_ns()
     if os.path.exists(q4_path):
         print(f"Loading quantized weights from {q4_path}...")
         weights = {k: v for k, v in np.load(q4_path, mmap_mode='r').items()}
@@ -2348,6 +2353,7 @@ def main():
         npz_path, _ = download_qwen35_weights(weights_dir)
         weights = load_weights(npz_path)
         quantized = False
+    _t_weight_load_1 = time.perf_counter_ns()
 
     print(f"Loaded {len(weights)} weight tensors "
           f"({'INT4' if quantized else 'fp32'})")
@@ -2355,6 +2361,7 @@ def main():
     tokenizer_path = os.path.join(weights_dir, "tokenizer.json")
     tokenizer = load_tokenizer(tokenizer_path)
 
+    _t_model_init_0 = time.perf_counter_ns()
     model = Qwen35WebGPU(
         weights,
         n_layer=config["n_layer"],
@@ -2375,13 +2382,26 @@ def main():
         ssm_conv_kernel=config["ssm_conv_kernel"],
         quantized=quantized,
         n_q_heads=config.get("n_q_heads"))
-    print("Model created, kernels compiled")
+    _t_model_init_1 = time.perf_counter_ns()
+    print(f"Model created in {(_t_model_init_1-_t_model_init_0)/1e6:.0f}ms")
+
+    if args.profile:
+        profile_model(
+            model, args.prompt, tokenizer,
+            script_dir=_SCRIPT_DIR, model_name="Qwen3.5-27B",
+            max_tokens=args.max_tokens, temperature=args.temperature,
+            init_timestamps=[
+                ("imports", _t_script_start, _t_imports_done),
+                ("weight_loading", _t_weight_load_0, _t_weight_load_1),
+                ("model_init", _t_model_init_0, _t_model_init_1),
+            ],
+            extra_reset=model._init_ssm_state)
+        return
 
     # Warmup: trigger D3D12 first-submit pipeline init
     import time as _wt
     _w0 = _wt.perf_counter()
     model.forward(np.array([1], dtype=np.int32), use_cache=True, pos_offset=0)
-    # Reset KV cache and SSM state after warmup
     model.kv_cache = None
     if hasattr(model, '_gpu_kv_cache'):
         for layer in model._gpu_kv_cache:
@@ -2390,15 +2410,9 @@ def main():
     model._init_ssm_state()
     print(f"Warmup: {(_wt.perf_counter()-_w0)*1000:.0f}ms")
 
-    if args.profile:
-        model.enable_profiling()
-
     generate(model, args.prompt, tokenizer,
              max_tokens=args.max_tokens,
              temperature=args.temperature)
-
-    if args.profile:
-        model.save_profile(_SCRIPT_DIR, "Qwen3.5-27B")
 
 
 if __name__ == "__main__":

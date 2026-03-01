@@ -462,3 +462,115 @@ def generate(model, prompt: str, tokenizer=None,
           f"({overall_tps:.1f} tok/s)")
 
     return dec_fn(generated)
+
+
+# ---------------------------------------------------------------------------
+# Common profiling
+# ---------------------------------------------------------------------------
+
+def profile_model(model, prompt: str, tokenizer,
+                  script_dir: str, model_name: str,
+                  max_tokens: int = 10,
+                  temperature: float = 0.0,
+                  init_timestamps: list = None,
+                  extra_reset=None):
+    """Run a profiled inference session and generate HTML timeline.
+
+    This is the common profiling path for all models. It:
+    1. Enables profiling with GPU timestamps
+    2. Injects pre-recorded init phase events (imports, weight loading, etc.)
+    3. Runs a warmup forward pass (recorded in timeline)
+    4. Profiles prefill + N decode steps with per-step scoping
+    5. Generates HTML flamechart report
+
+    Args:
+        model: WebGPUModel subclass with forward() method
+        prompt: text prompt to generate from
+        tokenizer: tokenizer with encode()/decode() methods
+        script_dir: model's script directory (for saving profile.html)
+        model_name: human-readable name (e.g., "Phi-4 mini", "Qwen3.5-27B")
+        max_tokens: number of tokens to generate (profile uses min(this, 10))
+        temperature: sampling temperature (0.0 = greedy)
+        init_timestamps: list of (name, begin_ns, end_ns[, scope]) tuples
+                         for pre-profiler events (imports, weight_loading, etc.)
+        extra_reset: optional callable to reset model-specific state (e.g., SSM)
+    """
+    model.enable_profiling()
+    print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+
+    # Inject pre-recorded init timeline events
+    if init_timestamps:
+        model.profiler.inject_init_events(init_timestamps)
+    if hasattr(model, '_init_phases'):
+        model.profiler.inject_init_events(model._init_phases)
+
+    # Tokenize
+    tokens = tokenizer.encode(prompt)
+    token_ids = np.array(tokens, dtype=np.int32)
+
+    # Reset caches
+    model.kv_cache = None
+    if hasattr(model, '_gpu_kv_cache'):
+        for layer in model._gpu_kv_cache:
+            k, v, _ = model._gpu_kv_cache[layer]
+            model._gpu_kv_cache[layer] = (k, v, 0)
+    if extra_reset:
+        extra_reset()
+
+    # Warmup (recorded in timeline)
+    with model.profiler.cpu("warmup"):
+        if hasattr(model, 'warmup'):
+            model.warmup()
+        else:
+            model.forward(np.array([1], dtype=np.int32),
+                          use_cache=True, pos_offset=0)
+            model.kv_cache = None
+            if hasattr(model, '_gpu_kv_cache'):
+                for layer in model._gpu_kv_cache:
+                    k, v, _ = model._gpu_kv_cache[layer]
+                    model._gpu_kv_cache[layer] = (k, v, 0)
+            if extra_reset:
+                extra_reset()
+
+    # Prefill
+    print("\n--- Prefill Breakdown ---")
+    t0 = time.perf_counter()
+    with model.profiler.step("prefill"):
+        logits = model.forward(token_ids, use_cache=True, pos_offset=0)
+    t1 = time.perf_counter()
+    print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
+
+    # Fast decode init (if available)
+    t2 = time.perf_counter()
+    with model.profiler.cpu("fast_decode_init"):
+        if hasattr(model, '_warmup_fast_decode'):
+            model._warmup_fast_decode()
+    t3 = time.perf_counter()
+    print(f"  Fast decode init:   {(t3 - t2)*1000:.1f}ms")
+    print(f"  Total TTFT:         {(t3 - t0)*1000:.1f}ms")
+
+    # Decode
+    n_profile = min(max_tokens, 10)
+    generated = list(tokens)
+    next_logits = logits[-1, :].copy()
+    for step in range(n_profile):
+        if temperature > 0:
+            next_logits = next_logits / temperature
+            next_logits -= next_logits.max()
+            probs = np.exp(next_logits)
+            probs /= probs.sum()
+            next_token = int(np.random.choice(len(probs), p=probs))
+        else:
+            next_token = int(next_logits.argmax())
+        generated.append(next_token)
+
+        with model.profiler.step(f"decode_{step}"):
+            with model.profiler.scope("forward"):
+                logits = model.forward(
+                    np.array([next_token], dtype=np.int32),
+                    use_cache=True,
+                    pos_offset=len(generated) - 1)
+            with model.profiler.cpu("sampling"):
+                next_logits = logits[-1, :].copy()
+
+    model.save_profile(script_dir, model_name)

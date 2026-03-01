@@ -45,7 +45,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg,
+    add_device_arg, apply_device_arg, profile_model,
 )
 
 _t_imports_done = time.perf_counter_ns()
@@ -2367,81 +2367,16 @@ def main():
         print("DP4A: enabled (dot4I8Packed for INT4 matmul)")
 
     if args.profile:
-        model.enable_profiling()
-        print(f"Profiling enabled (GPU timestamps: "
-              f"{model.profiler.gpu_enabled})")
-
-        # Inject pre-recorded init timeline events
-        init_phases = [
-            ("imports", _t_script_start, _t_imports_done),
-            ("download_check", _t_download_0, _t_download_1),
-            ("weight_loading", _t_weight_load_0, _t_weight_load_1),
-            ("model_init", _t_model_init_0, _t_model_init_1),
-        ]
-        init_phases.extend(model._init_phases)
-        model.profiler.inject_init_events(init_phases)
-
-        # Profile a short generation
-        from common.profiler import InferenceProfiler
-        tokenizer_loaded = load_tokenizer(tokenizer_path)
-        tokens = tokenizer_loaded.encode(args.prompt)
-        token_ids = np.array(tokens, dtype=np.int32)
-        model.kv_cache = None
-        if hasattr(model, '_gpu_kv_cache'):
-            for layer in model._gpu_kv_cache:
-                k, v, _ = model._gpu_kv_cache[layer]
-                model._gpu_kv_cache[layer] = (k, v, 0)
-
-        # Warmup forward: trigger D3D12 first-submit init (recorded in timeline)
-        with model.profiler.cpu("warmup"):
-            model.warmup()
-
-        # Prefill with detailed timing
-        import time as _time
-        print("\n--- Prefill Breakdown ---")
-
-        t0 = _time.perf_counter()
-        with model.profiler.step("prefill"):
-            logits = model.forward(token_ids, use_cache=True, pos_offset=0)
-        t1 = _time.perf_counter()
-
-        # Print per-phase timing from the forward pass
-        print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
-
-        # Warmup fast decode (uploads all layer weights + creates bind groups)
-        t2 = _time.perf_counter()
-        with model.profiler.cpu("fast_decode_init"):
-            if hasattr(model, '_warmup_fast_decode'):
-                model._warmup_fast_decode()
-        t3 = _time.perf_counter()
-        print(f"  Fast decode init:   {(t3 - t2)*1000:.1f}ms")
-        print(f"  Total TTFT:         {(t3 - t0)*1000:.1f}ms")
-
-        # Decode N tokens with profiling
-        n_profile = min(args.max_tokens, 10)
-        generated = list(tokens)
-        next_logits = logits[-1, :].copy()
-        for step in range(n_profile):
-            if args.temperature > 0:
-                next_logits = next_logits / args.temperature
-                next_logits -= next_logits.max()
-                probs = np.exp(next_logits)
-                probs /= probs.sum()
-                next_token = int(np.random.choice(len(probs), p=probs))
-            else:
-                next_token = int(next_logits.argmax())
-            generated.append(next_token)
-
-            with model.profiler.step(f"decode_{step}"):
-                with model.profiler.scope(f"forward"):
-                    logits = model.forward(
-                        np.array([next_token], dtype=np.int32),
-                        use_cache=True,
-                        pos_offset=len(generated) - 1)
-                with model.profiler.cpu("sampling"):
-                    next_logits = logits[-1, :].copy()
-
-        model.save_profile(_SCRIPT_DIR, "Phi-4 mini")
+        profile_model(
+            model, args.prompt, tokenizer,
+            script_dir=_SCRIPT_DIR, model_name="Phi-4 mini",
+            max_tokens=args.max_tokens, temperature=args.temperature,
+            init_timestamps=[
+                ("imports", _t_script_start, _t_imports_done),
+                ("download_check", _t_download_0, _t_download_1),
+                ("weight_loading", _t_weight_load_0, _t_weight_load_1),
+                ("model_init", _t_model_init_0, _t_model_init_1),
+            ])
         return
 
     # Warmup forward: trigger D3D12 first-submit initialization
