@@ -448,9 +448,12 @@ The translator (`llvm_to_wgsl.py`) converts LLVM IR from Triton's compilation pi
 
 Triton generates butterfly reductions using `__spirv_SubgroupShuffleXor` with intra-warp stages (masks 16, 8, 4, 2, 1) and cross-warp stages via shared memory (`addrspace(3)` with `__spirv_ControlBarrier`).
 
-Since the Dawn D3D12 adapter does not support the `Subgroups` WebGPU feature, the backend emulates subgroup shuffles entirely through workgroup shared memory:
+The backend supports two paths for subgroup shuffles, selected at compile time via `use_native_subgroups`:
 
-- **Shuffle emulation**: `__spirv_SubgroupShuffleXor(scope, val, mask)` → `_shfl[_lid.x] = val; workgroupBarrier(); result = _shfl[_lid.x ^ mask]; workgroupBarrier();`
+- **Native subgroups** (default when adapter supports `Subgroups` feature): `__spirv_SubgroupShuffleXor(scope, val, mask)` → WGSL `subgroupShuffleXor(val, mask)` with `enable subgroups;`. This is the fast path used on modern GPUs (D3D12/Vulkan with Wave Intrinsics / subgroup support).
+- **Shared memory fallback** (for adapters without subgroups): Emulates shuffles via workgroup shared memory: `_shfl[_lid.x] = val; workgroupBarrier(); result = _shfl[_lid.x ^ mask]; workgroupBarrier();`
+
+Additional reduction features:
 - **Shared memory**: `@global_smem` (`addrspace(3)`) GEP/load/store → `var<workgroup> _smem: array<i32, N>` with byte-offset-to-index conversion and `bitcast<f32>`/`bitcast<i32>` for float data
 - **Barriers**: `__spirv_ControlBarrier` → `workgroupBarrier()`
 - **Uniform store detection**: Scalar stores to output buffers (e.g., reduction results, means, rstd) are guarded with `if _lid.x == 0u { ... }`. The translator tracks which values are "uniform" — derived from `tl.sum`, `tl.max`, `tl.min`, or scalar loads from uniform sources. This prevents a D3D12 bug where concurrent UAV writes from multiple threads within the same workgroup after a barrier can silently lose data.
