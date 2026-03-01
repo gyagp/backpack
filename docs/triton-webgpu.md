@@ -153,6 +153,40 @@ wgpuQueueSubmit(queue, 1, &cmdBuf);  // single GPU submit
 
 The key insight: **Triton is an offline compiler**. It generates WGSL text files that can be consumed by any WebGPU runtime — Dawn (C++), wgpu (Rust), or browser WebGPU (JavaScript) — without Triton at runtime.
 
+### Why Static Kernels Work for LLM Decode
+
+A surprising property of autoregressive LLM decode is that the **kernel set is completely static** — the same ~10 WGSL shaders, with the same buffer bindings, are reused for every token. This enables aggressive pre-recording and near-zero CPU overhead per token.
+
+**Why this is possible:**
+
+1. **Fixed tensor shapes at decode time (T=1)**. During decode, every operation processes exactly one token. The hidden dimension (E), head count, KV head count, and intermediate size are all constants defined by the model architecture. So every matmul is always `(1, E) × (N, E)`, every norm is always `(1, E)`, every attention is always 1 query × T_cached keys. The grid dimensions change only for attention (as T_cached grows), and that's handled via a params buffer, not a different kernel.
+
+2. **Weights never change**. All weight buffers (Q4 packed data, scales, zeros, norm weights) are uploaded once at init and never modified. This means bind groups referencing weight buffers can be created once and reused indefinitely.
+
+3. **Intermediate buffers are fixed-size**. The hidden state `x` is always `(1, E)`, QKV output is always `(1, qkv_dim)`, attention output is always `(1, n_head×head_dim)`, etc. These buffers are allocated once and reused.
+
+4. **Only 2-3 values change per token**: the position index (for RoPE cos/sin lookup and KV cache offset) and the sequence length (for attention masking). These are written to small params buffers via `wgpuQueueWriteBuffer` — no bind group recreation needed.
+
+**This leads to the fast decode pattern:**
+
+```
+INIT (once):
+  Create 9 pipelines (from .wgsl files)
+  Upload all weights → GPU buffers
+  Create 261 bind groups (all static)
+
+PER TOKEN (repeat):
+  WriteBuffer(ropeParams, 24 bytes)    // update position
+  WriteBuffer(attnParams, 20 bytes)    // update seq length
+  Encode 356 dispatches into 1 command buffer
+  QueueSubmit(1 command buffer)
+  // GPU executes all 356 dispatches back-to-back
+```
+
+The per-token CPU work is minimal: 2 tiny buffer writes + 1 command encoder loop + 1 submit. No bind group creation, no pipeline lookup, no shader compilation, no buffer allocation. This is why C++ matches Python performance — the GPU is the bottleneck, not the host language.
+
+**Contrast with training frameworks** like PyTorch/JAX where shapes, kernels, and graph structure can vary per step — requiring JIT compilation, dynamic dispatch, and graph tracing. For LLM decode, none of that is needed.
+
 ### Deploying as a Standalone C++ Binary
 
 The offline/runtime separation enables deployment as a single executable with no Python dependencies:
