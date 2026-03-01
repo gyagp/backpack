@@ -1336,7 +1336,7 @@ class Phi4WebGPU(WebGPUModel):
         rn_p = mk_params('rn_p', self._rn_result.param_fields,
                           {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
 
-        # Fused add+norm params 
+        # Fused add+norm params
         arn_p = mk_params('arn_p', self._add_rn_result.param_fields,
                           {'stride': E, 'N': E, 'eps': self.rms_norm_eps})
 

@@ -401,6 +401,98 @@ For a standard transformer (RMSNorm + GQA + SwiGLU + RoPE), adding a new model i
 
 The kernel compilation, GPU runtime, weight quantization, tokenizer, and profiling infrastructure are all reusable.
 
+## Profiling Infrastructure
+
+The stack includes a comprehensive CPU+GPU profiling system that produces interactive HTML timeline reports.
+
+### Architecture
+
+```
+InferenceProfiler
+    ├── CPUProfiler         — time.perf_counter_ns() scoped events
+    ├── GPUTimestampProfiler — WebGPU timestamp queries (HW-level)
+    └── ClockCalibration    — D3D12 GPU↔CPU clock correlation
+             │
+             ▼
+    profiler_html.py → profile.html (interactive flamechart)
+```
+
+### What Gets Profiled
+
+The timeline covers the **full lifecycle** from script start to the last decode token:
+
+| Phase | Source | Typical Time |
+|-------|--------|-------------|
+| `imports` | Python module loading (Triton, Dawn) | ~180ms |
+| `download_check` | Weight file cache check | ~0ms (cached) |
+| `weight_loading` | Read NPZ from disk (mmap) | ~1.2s |
+| `model_init` | Kernel compile + weight upload + KV cache alloc | ~3.4s |
+| `warmup` | D3D12 first-submit pipeline init | ~800ms |
+| `prefill` | Process prompt tokens (GPU forward pass) | ~38ms |
+| `decode_0..N` | Per-token GPU decode | ~10ms each |
+
+Sub-phases nest under their parent (e.g., `model_init/kernel_compile`, `model_init/weight_upload`, `model_init/kv_cache_alloc`).
+
+### Three Timing Sources
+
+1. **CPU scoped events** — `time.perf_counter_ns()` around each Python operation. Zero overhead when not profiling. Provides the flamechart hierarchy.
+
+2. **GPU dispatch events** — CPU-timed brackets around each `run_kernel()` call. Measures end-to-end dispatch cost (buffer setup + submit + readback).
+
+3. **GPU hardware timestamps** — WebGPU `TimestampQuery` inserted into compute passes. Measures actual GPU shader execution time, independent of CPU overhead. Requires `WGPUFeatureName_TimestampQuery` adapter support.
+
+### D3D12 Clock Calibration
+
+To align GPU and CPU timestamps on a single timeline, the profiler queries D3D12's `ID3D12CommandQueue::GetClockCalibration()` to obtain a correlated `(gpu_tick, cpu_qpc_tick)` pair. This maps GPU hardware timestamps into the `perf_counter_ns` domain with sub-microsecond accuracy.
+
+### Interactive HTML Report
+
+`profiler_html.py` generates a self-contained HTML file with:
+
+- **Flamechart timeline** — CPU events as nested bars, GPU events in a separate lane. Zoom/pan with mouse wheel + drag.
+- **Phase toggle buttons** — Click to show/hide phases (e.g., hide `weight_loading` + `model_init` to zoom into just inference). Auto-zooms to visible range.
+- **Step markers** — Prefill and each decode step shown as labeled bands with phase-colored backgrounds.
+- **Tooltip** — Hover shows event name, scope, duration, and start→end timestamps.
+- **Summary tables** — CPU ops, GPU dispatches, and GPU HW timestamps aggregated by operation type with counts, averages, and percentages.
+- **Memory panel** — GPU/CPU memory usage, weight tensor counts, compiled pipeline counts.
+
+### Usage
+
+```bash
+# Generate profile (runs short inference + saves HTML)
+python models/phi-4/model.py --profile --max-tokens 5
+
+# Output: gitignore/models/phi-4/profile.html
+```
+
+### Recording Pre-Profiler Events
+
+Init phases (imports, weight loading, model construction) happen before the profiler is created. The system records `perf_counter_ns()` timestamps at each boundary, then injects them after `enable_profiling()` via `profiler.inject_init_events()`:
+
+```python
+_t_script_start = time.perf_counter_ns()  # top of file, before imports
+# ... imports ...
+_t_imports_done = time.perf_counter_ns()
+# ... weight loading, model init ...
+
+model.enable_profiling()
+model.profiler.inject_init_events([
+    ("imports", _t_script_start, _t_imports_done),
+    ("weight_loading", _t_load_0, _t_load_1),
+    ("model_init", _t_init_0, _t_init_1),
+])
+# Sub-phases recorded inside the constructor:
+model.profiler.inject_init_events(model._init_phases)
+```
+
+### Key Files
+
+| File | Description |
+|------|-------------|
+| `models/common/profiler.py` | `InferenceProfiler`, `CPUProfiler`, `GPUTimestampProfiler`, `ClockCalibration` |
+| `models/common/profiler_html.py` | HTML report generator (~650 lines of embedded JS/CSS) |
+| `models/common/model_base.py` | `enable_profiling()`, `save_profile()`, profiler hooks in `KernelCache.run()` |
+
 ## File Structure
 
 | Path | Description |

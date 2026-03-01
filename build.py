@@ -25,7 +25,7 @@ def write_ok(msg):
 
 def write_skip(msg):
     print(f"  \033[33m[SKIP]\033[0m {msg}")
-    
+
 def write_error(msg):
     print(f"  \033[31m[ERROR]\033[0m {msg}")
 
@@ -52,14 +52,14 @@ def invoke_deps():
 
 def invoke_clone():
     write_step("Cloning third-party repos")
-    
+
     if (DAWN_DIR / ".git").exists():
         write_skip(f"Dawn already cloned at {DAWN_DIR}")
     else:
         print("  Cloning Dawn...")
         run_cmd(f"git clone {DAWN_REPO} {DAWN_DIR}")
         write_ok("Dawn cloned")
-        
+
     if (TRITON_DIR / ".git").exists():
         write_skip(f"triton-windows already cloned at {TRITON_DIR}")
     else:
@@ -72,21 +72,21 @@ def invoke_msvc():
     if shutil.which("cl"):
         write_skip("MSVC already loaded (cl.exe found)")
         return os.environ.copy()
-        
+
     vs_locations = [
         os.environ.get("ProgramFiles", "C:\\Program Files") + r"\Microsoft Visual Studio\2022\Community",
         os.environ.get("ProgramFiles", "C:\\Program Files") + r"\Microsoft Visual Studio\2022\Professional",
         os.environ.get("ProgramFiles", "C:\\Program Files") + r"\Microsoft Visual Studio\2022\Enterprise",
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)") + r"\Microsoft Visual Studio\2022\BuildTools"
     ]
-    
+
     vcvars = None
     for vs in vs_locations:
         candidate = Path(vs) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
         if candidate.exists():
             vcvars = candidate
             break
-            
+
     if not vcvars:
         vswhere = Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
         if vswhere.exists():
@@ -102,7 +102,7 @@ def invoke_msvc():
     if not vcvars:
         write_error("Could not find vcvars64.bat. Install Visual Studio 2022 Build Tools.")
         sys.exit(1)
-        
+
     print(f"  Loading from: {vcvars}")
     try:
         output = subprocess.check_output(f'"{vcvars}" >nul 2>&1 && set', shell=True, text=True)
@@ -111,16 +111,16 @@ def invoke_msvc():
             if '=' in line:
                 k, v = line.split('=', 1)
                 new_env[k] = v
-        
+
         # apply to current os.environ
         for k, v in new_env.items():
             os.environ[k] = v
-            
+
         try:
             cl_ver = subprocess.check_output("cl 2>&1", env=os.environ, shell=True, stderr=subprocess.STDOUT, text=True).splitlines()[0]
         except subprocess.CalledProcessError as e:
             cl_ver = e.output.splitlines()[0] if e.output else "unknown"
-            
+
         write_ok(f"MSVC loaded: {cl_ver}")
         return new_env
     except Exception as e:
@@ -129,22 +129,22 @@ def invoke_msvc():
 
 def invoke_dawn():
     invoke_msvc()
-    
+
     if (DAWN_DLL_DIR / "webgpu_dawn.dll").exists() and \
        (DAWN_DLL_DIR / "dxcompiler.dll").exists() and \
        (DAWN_DLL_DIR / "dxil.dll").exists():
         write_skip(f"Dawn DLLs already deployed at {DAWN_DLL_DIR}")
         print("  To rebuild, run: python build.py dawn-clean && python build.py dawn")
         return
-        
+
     assert_command("cmake", "Install via: pip install cmake")
     assert_command("ninja", "Install via: pip install ninja")
     assert_command("git", "Install Git from https://git-scm.com")
-    
+
     if not (DAWN_DIR / ".git").exists():
         write_error("Dawn not cloned. Run: python build.py clone")
         sys.exit(1)
-        
+
     write_step("Configuring Dawn")
     cmake_args = [
         "cmake",
@@ -188,7 +188,7 @@ def invoke_dawn():
         write_error("Dawn CMake configure failed")
         sys.exit(1)
     write_ok("Dawn configured")
-    
+
     write_step("Building Dawn (this may take 10-30 minutes)")
     if not run_cmd(f"cmake --build {DAWN_BUILD} --target webgpu_dawn --target dxcompiler", check=False):
         write_error("Dawn build failed")
@@ -197,13 +197,13 @@ def invoke_dawn():
         write_error("dxil.dll copy failed")
         sys.exit(1)
     write_ok("Dawn built")
-    
+
     invoke_dawn_deploy()
 
 def invoke_dawn_deploy():
     write_step("Deploying Dawn DLLs")
     DAWN_DLL_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     for dll in ["webgpu_dawn.dll", "dxcompiler.dll", "dxil.dll"]:
         src = DAWN_BUILD / dll
         if not src.exists():
@@ -220,14 +220,14 @@ def invoke_install():
     except Exception as e:
         write_error(f"Failed to get site packages directory: {e}")
         sys.exit(1)
-        
+
     site_dir.mkdir(parents=True, exist_ok=True)
-    
+
     pth_content = f"import os; os.environ.setdefault('TRITON_BACKENDS_IN_TREE', '1')\n{str(TRITON_DIR.as_posix())}/python\n"
     pth_path = site_dir / "triton-backpack.pth"
     pth_path.write_text(pth_content, encoding="utf-8")
     write_ok(f"Wrote {pth_path}")
-    
+
     os.environ["TRITON_BACKENDS_IN_TREE"] = "1"
     if not run_cmd(f'{sys.executable} -c "import triton; print(\'triton loaded from:\', triton.__file__)"', check=False):
         print("  \033[33m[WARN]\033[0m triton import check failed")
@@ -239,25 +239,25 @@ def invoke_triton():
     invoke_msvc()
     assert_command("cmake", "Install via: pip install cmake")
     assert_command("ninja", "Install via: pip install ninja")
-    
+
     if not (TRITON_DIR / ".git").exists():
         write_error("triton-windows not cloned. Run: python build.py clone")
         sys.exit(1)
-        
+
     write_step("Building triton-windows (this may take 15-45 minutes on first build)")
-    
+
     env = os.environ.copy()
     env["TRITON_BUILD_PROTON"] = "0"
     env["TRITON_BUILD_UT"] = "0"
     env["TRITON_BUILD_BINARY"] = "0"
-    
+
     pip_install_ok = run_cmd(f"{sys.executable} -m pip install --no-build-isolation --verbose -e .", cwd=TRITON_DIR, env=env, check=False)
-    
+
     if not pip_install_ok:
         print("  \033[33m[WARN]\033[0m pip editable install failed, falling back to .pth install")
         invoke_install()
         return
-        
+
     env["TRITON_BACKENDS_IN_TREE"] = "1"
     if not run_cmd(f'{sys.executable} -c "import triton; print(\'triton loaded from:\', triton.__file__)"', env=env, check=False):
         print("  \033[33m[WARN]\033[0m triton import failed after install")
@@ -268,7 +268,7 @@ def invoke_verify():
     write_step("Running GPT-2 verification")
     env = os.environ.copy()
     env["TRITON_BACKENDS_IN_TREE"] = "1"
-    
+
     gpt2_verify = MODELS_DIR / "gpt-2" / "model.py"
     if run_cmd(f"{sys.executable} {gpt2_verify} --verify", env=env, check=False):
         write_ok("Verification passed")
@@ -280,12 +280,12 @@ def invoke_setup():
     write_step("Backpack full setup")
     print(f"  Python: {sys.version.split()[0]}")
     print(f"  Root:   {ROOT_DIR}\n")
-    
+
     invoke_deps()
     invoke_clone()
     invoke_dawn()
     invoke_triton()
-    
+
     print("\n\033[32m============================================\033[0m")
     print("\033[32m  Backpack setup complete!\033[0m")
     print("\033[32m============================================\033[0m\n")
@@ -321,27 +321,27 @@ def invoke_info():
     print(f"  DAWN_DIR:     {DAWN_DIR}")
     print(f"  TRITON_DIR:   {TRITON_DIR}")
     print(f"  DAWN_DLL_DIR: {DAWN_DLL_DIR}\n")
-    
+
     dawn_dll = DAWN_DLL_DIR / "webgpu_dawn.dll"
     libtriton = TRITON_DIR / "python" / "triton" / "_C" / "libtriton.pyd"
-    
+
     print(f"  Dawn DLL:     {'BUILT' if dawn_dll.exists() else 'NOT BUILT'}")
     print(f"  libtriton:    {'BUILT' if libtriton.exists() else 'NOT BUILT'}")
     print(f"  MSVC (cl):    {'Available' if shutil.which('cl') else 'Not loaded'}\n")
-    
+
     run_cmd(f"{sys.executable} --version", check=False)
     run_cmd("cmake --version", check=False)
 
 def main():
     parser = argparse.ArgumentParser(description="Backpack build script")
-    parser.add_argument("target", nargs="?", default="setup", 
-                        choices=["setup", "deps", "clone", "msvc", "dawn", "dawn-deploy", 
-                                 "triton", "install", "verify", "clean", "dawn-clean", 
+    parser.add_argument("target", nargs="?", default="setup",
+                        choices=["setup", "deps", "clone", "msvc", "dawn", "dawn-deploy",
+                                 "triton", "install", "verify", "clean", "dawn-clean",
                                  "triton-clean", "info", "help"],
                         help="Build target to run")
-    
+
     args = parser.parse_args()
-    
+
     if args.target == "help":
         parser.print_help()
         print("\nTargets:")
@@ -379,7 +379,7 @@ def main():
         "triton-clean": invoke_triton_clean,
         "info": invoke_info
     }
-    
+
     funcs[args.target]()
 
 if __name__ == "__main__":
