@@ -90,7 +90,36 @@ count and improves memory locality.
 
 Each avoided dispatch saves ~0.7 ms on D3D12 with warm caches.
 
-### 1.5 Static KV Cache
+### 1.5 Last-Token-Only LM Head
+
+During prefill, the model processes T prompt tokens through all layers,
+producing hidden states `(T, E)`.  The LM head projects these to logits
+`(T, V)` where V = vocab_size (e.g., 200K).  But only the **last token's
+logits** are used for next-token sampling — the other T-1 rows are discarded.
+
+**Optimization**: Slice to the last hidden state before the LM head:
+
+```python
+# Before: LM head processes all T tokens → (T, V) → only logits[-1] used
+logits = x @ lm_head_weight.T   # (T, E) × (V, E)^T = (T, V)
+next_token = argmax(logits[-1])
+
+# After: Slice first, then LM head processes only 1 token
+x = x[-1:]                      # (1, E) — last token only
+logits = x @ lm_head_weight.T   # (1, E) × (V, E)^T = (1, V)
+next_token = argmax(logits[0])
+```
+
+**Impact**: For V=200K and E=3072, this changes the matmul from
+(5, 3072) × (200064, 3072)^T to (1, 3072) × (200064, 3072)^T — a 5×
+reduction in compute for a 5-token prompt. For GPU LM head via the
+wide kernel, this also avoids chunked dispatch (single grid instead
+of 4 chunks for N > 65535).
+
+For models with very large vocabularies (e.g., Qwen-3.5 with V=248K),
+this saves ~400ms on CPU LM head per prefill step.
+
+### 1.6 Static KV Cache
 
 The KV cache stores past key/value vectors so that decode only processes
 one new token per step.  A *static* KV cache pre-allocates fixed-size
@@ -161,6 +190,74 @@ on GPU + ~384 MB per-layer weight streamed).
 4. Pass `cur_len` as a scalar uniform to bound the attention loop.
 5. Keep CPU KV cache as fallback for prefill (where GPU causal
    attention is already used per-head).
+
+### 1.7 VRAM Budget Management
+
+GPU memory is the primary constraint for large models.  All ops should
+run on GPU to enable fast decode, but the model weights + activations +
+KV cache must fit in available VRAM.
+
+**VRAM budget example** (RTX 5080, 16 GB):
+
+| Component | Phi-4 (3.8B) | Qwen-3.5 (27B) |
+|-----------|-------------|----------------|
+| Layer weights (INT4) | 1.6 GB | 12.3 GB |
+| Embed/LM head (fp16) | 1.2 GB | 2.4 GB (×2 if untied) |
+| KV cache | 0.5 GB (32L×2K) | 0.06 GB (16L×512) |
+| Intermediates | ~0.1 GB | ~0.1 GB |
+| **Total** | **3.4 GB** | **14.9 GB** |
+| **Headroom** | **12.6 GB** | **1.1 GB** |
+
+**Strategies to reduce VRAM when tight**:
+
+1. **Reduce MAX_SEQ_LEN**: KV cache scales linearly with sequence length.
+   Reducing from 2048 → 512 saves 75% of KV cache VRAM.  For decode-only
+   workloads with short prompts, 512 is sufficient.
+
+2. **Eliminate redundant fp32 embed upload**: If embed_tokens is used for
+   both embedding gather and LM head (tied weights), use the fp16 copy
+   for both.  The `embed_gather_fp16_kernel` reads fp16 and outputs fp32.
+   Saves 1 × `(V × E × 4)` bytes of GPU memory.
+
+3. **Share embed/LM head when tied**: Many models (Phi-4, LLaMA, SmolLM2)
+   tie `embed_tokens.weight == lm_head.weight`.  Upload once as fp16,
+   use for both embedding gather and LM head projection.
+
+4. **Untied LM head: split or stream**: For models with separate LM head
+   (Qwen-3.5 with 248K vocab), the LM head is 2.4 GB fp16.  Options:
+   - **Upload if it fits**: Check VRAM headroom after layer weights.
+   - **Stream per-token**: Upload a chunk, compute, free, repeat.
+     Adds CPU→GPU transfer latency but avoids keeping the full matrix
+     resident.
+   - **Keep on CPU as last resort**: CPU matmul for (1, E) × (V, E)^T
+     costs ~100ms for V=248K.  Still viable at 4 tok/s decode.
+
+5. **Free CPU copies after GPU upload**: Call `_free_cpu_weights()` to
+   reclaim CPU RAM.  This doesn't affect VRAM but prevents OOM on
+   systems with limited system memory.
+
+6. **Quantize LM head**: Apply INT4 quantization to the LM head weight
+   itself. A 248K×5120 fp16 matrix (2.4 GB) becomes ~300 MB in INT4.
+   This requires the Q4 matmul kernel to support the vocab dimension,
+   which may need grid chunking for N > 65535.
+
+**Decision tree**:
+
+```
+Total VRAM needed = layer_weights + embed + lm_head + kv_cache + intermediates
+
+If total < 0.9 × GPU_VRAM:
+    → Upload everything, enable full GPU decode
+
+If total > 0.9 × GPU_VRAM:
+    → Reduce MAX_SEQ_LEN
+    → Eliminate fp32 embed (use fp16 gather)
+    → Try INT4 LM head quantization
+    → If still over: keep LM head on CPU
+
+Always target < 90% VRAM usage to leave headroom for Dawn's internal
+allocations, command buffers, and OS compositor.
+```
 
 ---
 
