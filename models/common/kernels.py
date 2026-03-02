@@ -91,6 +91,67 @@ def linear_loop_fp16w_kernel(X, W, Bias, Y, K, stride_x, stride_w, N,
 
 
 @triton.jit
+def linear_loop_fp16w_tiled_kernel(X, W, Bias, Y, K, stride_x, stride_w,
+                                   N, T, BLOCK_K: tl.constexpr,
+                                   BLOCK_M: tl.constexpr):
+    """Tiled linear with fp16 weights: each workgroup computes BLOCK_M rows.
+
+    Tiles along the M (row) dimension so that the weight vector W[col, :]
+    is loaded once from global memory and reused for BLOCK_M input rows.
+    This reduces weight memory traffic by BLOCK_M× compared to the
+    per-element kernel.
+
+    Grid: (ceil(T/BLOCK_M), N) — one workgroup per (row_tile, col).
+    BLOCK_M=8: 8 rows share one weight read per K-chunk.
+    """
+    tile_m = tl.program_id(0)
+    col = tl.program_id(1)
+    num_chunks = (K + BLOCK_K - 1) // BLOCK_K
+
+    acc0 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc4 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc5 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc6 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc7 = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+    row0 = tile_m * BLOCK_M
+    for chunk_i in range(num_chunks):
+        off = chunk_i * BLOCK_K
+        ks = off + tl.arange(0, BLOCK_K)
+        mask = ks < K
+        w = tl.load(W + col * stride_w + ks, mask=mask, other=0.0).to(tl.float32)
+        x0 = tl.load(X + (row0 + 0) * stride_x + ks, mask=mask & (row0 + 0 < T), other=0.0).to(tl.float32)
+        acc0 += x0 * w
+        x1 = tl.load(X + (row0 + 1) * stride_x + ks, mask=mask & (row0 + 1 < T), other=0.0).to(tl.float32)
+        acc1 += x1 * w
+        x2 = tl.load(X + (row0 + 2) * stride_x + ks, mask=mask & (row0 + 2 < T), other=0.0).to(tl.float32)
+        acc2 += x2 * w
+        x3 = tl.load(X + (row0 + 3) * stride_x + ks, mask=mask & (row0 + 3 < T), other=0.0).to(tl.float32)
+        acc3 += x3 * w
+        x4 = tl.load(X + (row0 + 4) * stride_x + ks, mask=mask & (row0 + 4 < T), other=0.0).to(tl.float32)
+        acc4 += x4 * w
+        x5 = tl.load(X + (row0 + 5) * stride_x + ks, mask=mask & (row0 + 5 < T), other=0.0).to(tl.float32)
+        acc5 += x5 * w
+        x6 = tl.load(X + (row0 + 6) * stride_x + ks, mask=mask & (row0 + 6 < T), other=0.0).to(tl.float32)
+        acc6 += x6 * w
+        x7 = tl.load(X + (row0 + 7) * stride_x + ks, mask=mask & (row0 + 7 < T), other=0.0).to(tl.float32)
+        acc7 += x7 * w
+
+    b = tl.load(Bias + col).to(tl.float32)
+    tl.store(Y + (row0 + 0) * N + col, tl.sum(acc0, axis=0) + b, mask=(row0 + 0 < T))
+    tl.store(Y + (row0 + 1) * N + col, tl.sum(acc1, axis=0) + b, mask=(row0 + 1 < T))
+    tl.store(Y + (row0 + 2) * N + col, tl.sum(acc2, axis=0) + b, mask=(row0 + 2 < T))
+    tl.store(Y + (row0 + 3) * N + col, tl.sum(acc3, axis=0) + b, mask=(row0 + 3 < T))
+    tl.store(Y + (row0 + 4) * N + col, tl.sum(acc4, axis=0) + b, mask=(row0 + 4 < T))
+    tl.store(Y + (row0 + 5) * N + col, tl.sum(acc5, axis=0) + b, mask=(row0 + 5 < T))
+    tl.store(Y + (row0 + 6) * N + col, tl.sum(acc6, axis=0) + b, mask=(row0 + 6 < T))
+    tl.store(Y + (row0 + 7) * N + col, tl.sum(acc7, axis=0) + b, mask=(row0 + 7 < T))
+
+
+@triton.jit
 def linear_q4_kernel(X, W_Q4, Scales, Zeros, Bias, Y,
                      K, stride_x, stride_w_q4, n_groups, N,
                      BLOCK_K: tl.constexpr):

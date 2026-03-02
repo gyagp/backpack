@@ -374,6 +374,7 @@ class FluxKleinWebGPU(WebGPUModel):
             "time_guidance_embed.timestep_embedder.linear_1.weight",
             "time_guidance_embed.timestep_embedder.linear_2.weight",
             "norm_out.linear.weight",
+            "proj_out.weight",
             "double_stream_modulation_img.linear.weight",
             "double_stream_modulation_txt.linear.weight",
             "single_stream_modulation.linear.weight",
@@ -487,8 +488,7 @@ class FluxKleinWebGPU(WebGPUModel):
                       mod_img, mod_txt,
                       concat_cos: np.ndarray, concat_sin: np.ndarray,
                       block_idx: int,
-                      gpu_state: bool = False,
-                      _profile: bool = False):
+                      gpu_state: bool = False):
         """One double-stream transformer block.
 
         hidden_states: (T_img, D) numpy or GPUBuffer
@@ -497,10 +497,7 @@ class FluxKleinWebGPU(WebGPUModel):
         """
         pfx = f"transformer_blocks.{block_idx}"
         runner = self.cache.runner
-        if _profile:
-            _t = [time.perf_counter()]
-            def _m():
-                _t.append(time.perf_counter())
+        _p = self._profiling
 
         is_gpu = isinstance(hidden_states, GPUBuffer)
 
@@ -517,6 +514,7 @@ class FluxKleinWebGPU(WebGPUModel):
             HD = HEAD_DIM
 
             # Norm + modulation on GPU for both streams
+            if _p: self._set_gpu_op(f"DB{block_idx}/norm+mod")
             norm_x_gpu = self._layer_norm_no_affine(hidden_states,
                                                      gpu_out=True)
             norm_x_gpu = self._mod_scale_shift(
@@ -530,23 +528,22 @@ class FluxKleinWebGPU(WebGPUModel):
                 norm_ctx_gpu, c_scale_msa_gpu, c_shift_msa_gpu,
                 HIDDEN_DIM, gpu_out=True)
             norm_ctx_gpu.shape = (T_txt, HIDDEN_DIM)
-            if _profile: _m()  # 0: norm+mod (GPU)
-            if _profile: _m()  # 1: (skip upload)
 
             # QKV projections on GPU
+            if _p: self._set_gpu_op(f"DB{block_idx}/img_qkv")
             img_qkv_gpu = self._linear(norm_x_gpu,
                                         f"{pfx}.img_qkv.weight",
                                         3 * HIDDEN_DIM, gpu_out=True)
             img_qkv_gpu.shape = (T_img, 3 * HIDDEN_DIM)
-            if _profile: _m()  # 2: img_QKV
 
+            if _p: self._set_gpu_op(f"DB{block_idx}/txt_qkv")
             txt_qkv_gpu = self._linear(norm_ctx_gpu,
                                         f"{pfx}.txt_qkv.weight",
                                         3 * HIDDEN_DIM, gpu_out=True)
             txt_qkv_gpu.shape = (T_txt, 3 * HIDDEN_DIM)
-            if _profile: _m()  # 3: txt_QKV
 
             # QK-RMSNorm + RoPE on GPU
+            if _p: self._set_gpu_op(f"DB{block_idx}/qk_norm_rope")
             img_cos = concat_cos[T_txt:]
             img_sin = concat_sin[T_txt:]
             q_img, k_img, v_img = self._qk_norm_rope(
@@ -562,23 +559,23 @@ class FluxKleinWebGPU(WebGPUModel):
                 self.weights[f"{pfx}.attn.norm_added_q.weight"].astype(np.float32),
                 self.weights[f"{pfx}.attn.norm_added_k.weight"].astype(np.float32),
                 txt_cos, txt_sin, NUM_HEADS, T_txt, eps=EPS, gpu_out=True)
-            if _profile: _m()  # 4: norm+RoPE (GPU)
 
             # Concat Q/K/V on GPU: [txt; img] for each
+            if _p: self._set_gpu_op(f"DB{block_idx}/concat")
             q_cat = self._concat_gpu(add_q, q_img)
             q_cat.shape = (T_total, NUM_HEADS, HD)
             k_cat = self._concat_gpu(add_k, k_img)
             k_cat.shape = (T_total, NUM_HEADS, HD)
             v_cat = self._concat_gpu(add_v, v_img)
             v_cat.shape = (T_total, NUM_HEADS, HD)
-            if _profile: _m()  # 5: concat (GPU)
 
             # Full attention on GPU
+            if _p: self._set_gpu_op(f"DB{block_idx}/attn")
             attn_gpu = self._full_attention_multihead(
                 q_cat, k_cat, v_cat, NUM_HEADS, gpu_out=True)
-            if _profile: _m()  # 6: attention (GPU)
 
             # Split attn into txt/img on GPU, then reshape to (T, D)
+            if _p: self._set_gpu_op(f"DB{block_idx}/o_proj+res")
             N_txt_elems = T_txt * NUM_HEADS * HD
             N_img_elems = T_img * NUM_HEADS * HD
             ctx_attn_gpu = self._split_gpu(attn_gpu, 0, N_txt_elems)
@@ -598,9 +595,9 @@ class FluxKleinWebGPU(WebGPUModel):
                                          HIDDEN_DIM, gpu_out=True)
             self._gate_residual_add(encoder_hidden_states, c_gate_msa_gpu,
                                      ctx_proj_gpu, HIDDEN_DIM)
-            if _profile: _m()  # 7: out_proj+res (GPU)
 
             # --- Image FF on GPU ---
+            if _p: self._set_gpu_op(f"DB{block_idx}/img_ff")
             ff_norm_x = self._layer_norm_no_affine(hidden_states,
                                                     gpu_out=True)
             ff_norm_x = self._mod_scale_shift(
@@ -619,9 +616,9 @@ class FluxKleinWebGPU(WebGPUModel):
                                        HIDDEN_DIM, gpu_out=True)
             self._gate_residual_add(hidden_states, gate_mlp_gpu,
                                      ff_out_gpu, HIDDEN_DIM)
-            if _profile: _m()  # 8: img_FF (GPU)
 
             # --- Text FF on GPU ---
+            if _p: self._set_gpu_op(f"DB{block_idx}/txt_ff")
             ff_norm_ctx = self._layer_norm_no_affine(
                 encoder_hidden_states, gpu_out=True)
             ff_norm_ctx = self._mod_scale_shift(
@@ -643,18 +640,8 @@ class FluxKleinWebGPU(WebGPUModel):
             self._gate_residual_add(encoder_hidden_states,
                                      c_gate_mlp_gpu,
                                      ff_ctx_out_gpu, HIDDEN_DIM)
-            if _profile: _m()  # 9: txt_FF (GPU)
 
-            if _profile:
-                labels = ["norm+mod", "(skip)", "img_QKV", "txt_QKV",
-                           "norm+RoPE", "concat", "attention",
-                           "out_proj+res", "img_FF", "txt_FF"]
-                parts = [(_t[j+1] - _t[j]) * 1000
-                         for j in range(len(_t) - 1)]
-                print(f"  [double {block_idx}] " + " | ".join(
-                    f"{l}:{v:.1f}" for l, v in zip(labels, parts))
-                    + f"  TOTAL:{sum(parts):.1f}ms")
-
+            if _p: self._clear_gpu_op()
             return encoder_hidden_states, hidden_states
 
         # ---- CPU fallback path (original) ----
@@ -676,7 +663,6 @@ class FluxKleinWebGPU(WebGPUModel):
         # --- Text stream attention ---
         norm_ctx = self._layer_norm_no_affine(encoder_hidden_states)
         norm_ctx = (1.0 + c_scale_msa) * norm_ctx + c_shift_msa
-        if _profile: _m()  # 0: norm+mod
 
         # Pre-upload norm inputs for QKV reuse (avoids re-uploads)
         upload_dt = np.float16 if self.fp16_act else np.float32
@@ -686,19 +672,16 @@ class FluxKleinWebGPU(WebGPUModel):
         norm_ctx_gpu = runner.upload_to_gpu(
             norm_ctx.astype(upload_dt), f"tmp_norm_txt_{block_idx}")
         norm_ctx_gpu.shape = norm_ctx.shape
-        if _profile: _m()  # 1: upload
 
         # Fused QKV for image → stays on GPU
         img_qkv_gpu = self._linear(norm_x_gpu, f"{pfx}.img_qkv.weight",
                                     3 * HIDDEN_DIM, gpu_out=True)
         img_qkv_gpu.shape = (hidden_states.shape[0], 3 * HIDDEN_DIM)
-        if _profile: _m()  # 2: img_QKV
 
         # Fused QKV for text → stays on GPU
         txt_qkv_gpu = self._linear(norm_ctx_gpu, f"{pfx}.txt_qkv.weight",
                                     3 * HIDDEN_DIM, gpu_out=True)
         txt_qkv_gpu.shape = (T_txt, 3 * HIDDEN_DIM)
-        if _profile: _m()  # 3: txt_QKV
 
         # Fused QK-RMSNorm + RoPE on GPU for image stream
         T_img = hidden_states.shape[0]
@@ -718,18 +701,15 @@ class FluxKleinWebGPU(WebGPUModel):
             self.weights[f"{pfx}.attn.norm_added_q.weight"].astype(np.float32),
             self.weights[f"{pfx}.attn.norm_added_k.weight"].astype(np.float32),
             txt_cos, txt_sin, NUM_HEADS, T_txt, eps=EPS, gpu_out=False)
-        if _profile: _m()  # 4: norm+RoPE (GPU)
 
         # Concatenate text + image
         q = np.concatenate([add_q, q_img], axis=0)
         k = np.concatenate([add_k, k_img], axis=0)
         v = np.concatenate([add_v, v_img], axis=0)
-        if _profile: _m()  # 5: concat
 
         # Full attention
         attn_out = self._full_attention_multihead(q, k, v, NUM_HEADS)  # (T_total, H, D)
         attn_out = attn_out.reshape(-1, HIDDEN_DIM)  # (T_total, D)
-        if _profile: _m()  # 6: attention
 
         # Split back
         ctx_attn = attn_out[:T_txt]
@@ -744,7 +724,6 @@ class FluxKleinWebGPU(WebGPUModel):
         ctx_attn = self._linear(ctx_attn, f"{pfx}.attn.to_add_out.weight", HIDDEN_DIM)
         ctx_attn = c_gate_msa * ctx_attn
         encoder_hidden_states = encoder_hidden_states + ctx_attn
-        if _profile: _m()  # 7: out_proj+residual
 
         # --- Image FF (full GPU chain: gate/up stay on GPU) ---
         norm_x = self._layer_norm_no_affine(hidden_states)
@@ -757,7 +736,6 @@ class FluxKleinWebGPU(WebGPUModel):
         ff_act = self._silu_mul(gate_gpu, up_gpu, gpu_out=True)
         ff_out = self._linear(ff_act, f"{pfx}.ff.linear_out.weight", HIDDEN_DIM)
         hidden_states = hidden_states + gate_mlp * ff_out
-        if _profile: _m()  # 8: img_FF
 
         # --- Text FF (full GPU chain: gate/up stay on GPU) ---
         norm_ctx = self._layer_norm_no_affine(encoder_hidden_states)
@@ -770,18 +748,9 @@ class FluxKleinWebGPU(WebGPUModel):
         ff_ctx_act = self._silu_mul(gate_ctx_gpu, up_ctx_gpu, gpu_out=True)
         ff_ctx_out = self._linear(ff_ctx_act, f"{pfx}.ff_context.linear_out.weight", HIDDEN_DIM)
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp * ff_ctx_out
-        if _profile: _m()  # 9: txt_FF
 
         # Clip for fp16 safety
         encoder_hidden_states = np.clip(encoder_hidden_states, -65504, 65504)
-
-        if _profile:
-            labels = ["norm+mod", "upload", "img_QKV", "txt_QKV", "norm+RoPE",
-                       "concat", "attention", "out_proj+res", "img_FF", "txt_FF"]
-            parts = [(_t[j+1] - _t[j]) * 1000 for j in range(len(_t) - 1)]
-            print(f"  [double {block_idx}] " + " | ".join(
-                f"{l}:{v:.1f}" for l, v in zip(labels, parts))
-                + f"  TOTAL:{sum(parts):.1f}ms")
 
         return encoder_hidden_states, hidden_states
 
@@ -793,8 +762,7 @@ class FluxKleinWebGPU(WebGPUModel):
                       mod_params,
                       concat_cos: np.ndarray, concat_sin: np.ndarray,
                       block_idx: int,
-                      gpu_state: bool = False,
-                      _profile: bool = False):
+                      gpu_state: bool = False):
         """One single-stream transformer block (fully GPU-resident).
 
         hidden_states: (T_total, D) — numpy or GPUBuffer.
@@ -813,15 +781,13 @@ class FluxKleinWebGPU(WebGPUModel):
         pfx = f"single_transformer_blocks.{block_idx}"
         shift, scale, gate = mod_params
         runner = self.cache.runner
-        if _profile:
-            _t = [time.perf_counter()]
-            def _m():
-                _t.append(time.perf_counter())
+        _p = self._profiling
 
         is_gpu = isinstance(hidden_states, GPUBuffer)
 
         if is_gpu and gpu_state:
             # Fully GPU-resident path: norm + modulation on GPU
+            if _p: self._set_gpu_op(f"SB{block_idx}/norm+mod")
             norm_x_gpu = self._layer_norm_no_affine(hidden_states,
                                                      gpu_out=True)
             T = hidden_states.shape[0]
@@ -838,8 +804,6 @@ class FluxKleinWebGPU(WebGPUModel):
             norm_x_gpu = self._mod_scale_shift(
                 norm_x_gpu, scale_gpu, shift_gpu, HIDDEN_DIM, gpu_out=True)
             norm_x_gpu.shape = (T, HIDDEN_DIM)
-            if _profile: _m()  # 0: norm+mod (GPU)
-            if _profile: _m()  # 1: upload (skip)
         else:
             # CPU path (original)
             if is_gpu:
@@ -849,54 +813,52 @@ class FluxKleinWebGPU(WebGPUModel):
                 hidden_np = hidden_states
             norm_x = self._layer_norm_no_affine(hidden_np)
             norm_x = (1.0 + scale) * norm_x + shift
-            if _profile: _m()  # 0: norm+mod
 
             upload_dt = np.float16 if self.fp16_act else np.float32
             norm_x_gpu = runner.upload_to_gpu(
                 norm_x.astype(upload_dt), f"tmp_sb_norm_{block_idx}")
             norm_x_gpu.shape = norm_x.shape
             T = norm_x.shape[0]
-            if _profile: _m()  # 1: upload
 
         # Fused QKV projection → stays on GPU
+        if _p: self._set_gpu_op(f"SB{block_idx}/qkv")
         qkv_gpu = self._linear(norm_x_gpu, f"{pfx}.qkv_proj.weight",
                                 3 * HIDDEN_DIM, gpu_out=True)
         qkv_gpu.shape = (T, 3 * HIDDEN_DIM)
-        if _profile: _m()  # 2: QKV proj (no readback)
 
         # MLP projections → stay on GPU
+        if _p: self._set_gpu_op(f"SB{block_idx}/gate_up")
         gate_proj_gpu = self._linear(norm_x_gpu, f"{pfx}.gate_proj.weight",
                                 FF_DIM, gpu_out=True)
         up_gpu = self._linear(norm_x_gpu, f"{pfx}.up_proj.weight",
                               FF_DIM, gpu_out=True)
-        if _profile: _m()  # 3: MLP proj
 
         # Fused QK-RMSNorm + RoPE on GPU → Q, K, V stay on GPU
+        if _p: self._set_gpu_op(f"SB{block_idx}/qk_norm_rope")
         q_gpu, k_gpu, v_gpu = self._qk_norm_rope(
             qkv_gpu,
             self.weights[f"{pfx}.attn.norm_q.weight"].astype(np.float32),
             self.weights[f"{pfx}.attn.norm_k.weight"].astype(np.float32),
             concat_cos, concat_sin, NUM_HEADS, T, eps=EPS, gpu_out=True)
-        if _profile: _m()  # 4: QK_norm+RoPE (GPU)
 
         # Attention on GPU (GPUBuffer input)
+        if _p: self._set_gpu_op(f"SB{block_idx}/attn")
         attn_out_gpu = self._full_attention_multihead(
             q_gpu, k_gpu, v_gpu, NUM_HEADS, gpu_out=True)
         attn_out_gpu.shape = (T, HIDDEN_DIM)
-        if _profile: _m()  # 5: attn
 
         # SiLU·mul stays on GPU
+        if _p: self._set_gpu_op(f"SB{block_idx}/silu_mul")
         mlp_out_gpu = self._silu_mul(gate_proj_gpu, up_gpu, gpu_out=True)
-        if _profile: _m()  # 6: silu_mul
 
         # Output projections on GPU
+        if _p: self._set_gpu_op(f"SB{block_idx}/out_proj+res")
         attn_proj_gpu = self._linear(
             attn_out_gpu, f"{pfx}.to_out_attn.weight",
             HIDDEN_DIM, gpu_out=True)
         mlp_proj_gpu = self._linear(
             mlp_out_gpu, f"{pfx}.to_out_mlp.weight",
             HIDDEN_DIM, gpu_out=True)
-        if _profile: _m()  # 7: out proj
 
         # Add attn + mlp on GPU
         out_gpu = self._add(attn_proj_gpu, mlp_proj_gpu, gpu_out=True)
@@ -912,19 +874,11 @@ class FluxKleinWebGPU(WebGPUModel):
                     f"tmp_sb_gate_{block_idx}")
             self._gate_residual_add(hidden_states, gate_gpu, out_gpu,
                                      HIDDEN_DIM)
-            if _profile: _m()  # 8: gate_residual (GPU, no readback)
-            if _profile:
-                _m()  # 9: (no clip needed - GPU values stay bounded)
-                labels = ["norm+mod", "(skip)", "QKV_proj", "MLP_proj",
-                           "norm+RoPE", "attn", "silu_mul",
-                           "out_proj", "gate_res", "done"]
-                parts = "  |  ".join(f"{l}={(_t[i+1]-_t[i])*1000:.0f}" for i, l in enumerate(labels))
-                print(f"    SB{block_idx}: {parts}")
+            if _p: self._clear_gpu_op()
             return hidden_states
         else:
             # CPU path: readback and residual on CPU
             out = runner.readback(out_gpu).reshape(T, HIDDEN_DIM)
-            if _profile: _m()  # 8: add+readback
             if is_gpu:
                 hidden_np = runner.readback(hidden_states).reshape(
                     hidden_states.shape)
@@ -932,13 +886,7 @@ class FluxKleinWebGPU(WebGPUModel):
                 hidden_np = hidden_states
             hidden_np = hidden_np + gate * out
             hidden_np = np.clip(hidden_np, -65504, 65504)
-            if _profile:
-                _m()  # 9: residual+clip
-                labels = ["norm+mod", "upload", "QKV_proj", "MLP_proj",
-                           "norm+RoPE", "attn", "silu_mul",
-                           "out_proj", "add+read", "residual"]
-                parts = "  |  ".join(f"{l}={(_t[i+1]-_t[i])*1000:.0f}" for i, l in enumerate(labels))
-                print(f"    SB{block_idx}: {parts}")
+            if _p: self._clear_gpu_op()
             return hidden_np
 
     # ------------------------------------------------------------------
@@ -949,8 +897,8 @@ class FluxKleinWebGPU(WebGPUModel):
                       temb: np.ndarray) -> np.ndarray:
         """AdaLayerNormContinuous → Linear projection.
 
-        hidden_states: (T_img, D)
-        Returns: (T_img, IN_CHANNELS)
+        hidden_states: (T_img, D) numpy
+        Returns: (T_img, IN_CHANNELS) numpy
         """
         # AdaLayerNormContinuous: LayerNorm → SiLU(temb) → Linear → scale + shift
         norm_x = layer_norm_cpu(hidden_states, EPS)
@@ -964,8 +912,12 @@ class FluxKleinWebGPU(WebGPUModel):
         scale, shift = np.split(emb, 2, axis=-1)
         norm_x = norm_x * (1.0 + scale) + shift
 
-        # Final projection — use gpu_out=False since this is the last op
-        output = self._linear(norm_x, "proj_out.weight", IN_CHANNELS)
+        # Final projection (CPU — small output dim=128, avoids GPU buffer pool issues)
+        proj_w = self.weights.get("proj_out.weight")
+        if proj_w is not None:
+            output = norm_x @ proj_w.astype(np.float32).T
+        else:
+            output = self._linear(norm_x, "proj_out.weight", IN_CHANNELS)
         return output
 
     # ------------------------------------------------------------------
@@ -976,8 +928,7 @@ class FluxKleinWebGPU(WebGPUModel):
                 encoder_hidden_states: np.ndarray,
                 timestep: float,
                 img_ids: np.ndarray,
-                txt_ids: np.ndarray,
-                _profile: bool = False) -> np.ndarray:
+                txt_ids: np.ndarray) -> np.ndarray:
         """Run one denoising step.
 
         latents: (T_img, IN_CHANNELS) packed image latents
@@ -987,20 +938,20 @@ class FluxKleinWebGPU(WebGPUModel):
         txt_ids: (T_txt, 4) position IDs
         Returns: (T_img, IN_CHANNELS) noise prediction
         """
-        if _profile:
-            _t = [time.perf_counter()]
-            def _mark(label):
-                _t.append(time.perf_counter())
-                return label
-            _labels = []
-        else:
-            _mark = None
-
         T_txt = encoder_hidden_states.shape[0]
+
+        # Clear transient buffer cache at the start of each forward pass
+        # to avoid reusing buffers with wrong usage flags (STORAGE vs MAP_READ)
+        runner = self.cache.runner
+        stale = [k for k in runner._buffer_cache
+                 if isinstance(k, tuple) and isinstance(k[0], str)
+                 and k[0].startswith("__")]
+        for k in stale:
+            del runner._buffer_cache[k]
+        runner._pool_free.clear()
 
         # 1. Timestep embedding (no guidance for Klein)
         temb = self._compute_temb(timestep)  # (1, D)
-        if _profile: _labels.append(_mark("temb"))
 
         # 2. Compute modulation parameters
         mod_img = self._compute_modulation(
@@ -1009,25 +960,22 @@ class FluxKleinWebGPU(WebGPUModel):
             temb, "double_stream_modulation_txt.linear.weight", num_param_sets=2)
         mod_single = self._compute_modulation(
             temb, "single_stream_modulation.linear.weight", num_param_sets=1)
-        if _profile: _labels.append(_mark("modulation"))
 
         # 3. Input projections
         hidden_states = self._linear(latents, "x_embedder.weight", HIDDEN_DIM)
         ctx = self._linear(encoder_hidden_states, "context_embedder.weight", HIDDEN_DIM)
-        if _profile: _labels.append(_mark("input_proj"))
 
         # 4. Compute RoPE frequencies
         image_rope = compute_rope_freqs(img_ids, AXES_DIMS_ROPE, ROPE_THETA)
         text_rope = compute_rope_freqs(txt_ids, AXES_DIMS_ROPE, ROPE_THETA)
         concat_cos = np.concatenate([text_rope[0], image_rope[0]], axis=0)
         concat_sin = np.concatenate([text_rope[1], image_rope[1]], axis=0)
-        if _profile: _labels.append(_mark("rope_freqs"))
 
         # 5. Double stream blocks (GPU-resident: upload once, readback after all)
         runner = self.cache.runner
         upload_dt = np.float16 if self.fp16_act else np.float32
 
-        # Reset concat/split buffer counters to reuse GPU buffers across forward passes
+        # Reset concat/split buffer counters
         type(self)._concat_counter = 0
         type(self)._split_counter = 0
 
@@ -1062,20 +1010,17 @@ class FluxKleinWebGPU(WebGPUModel):
             ctx_gpu, hs_gpu = self._double_block(
                 hs_gpu, ctx_gpu, mod_img_gpu, mod_txt_gpu,
                 concat_cos, concat_sin, i,
-                gpu_state=True, _profile=(_profile and i < 2))
+                gpu_state=True)
             runner.end_batch()
-            if _profile: _labels.append(_mark(f"double_{i}"))
 
         # Concatenate ctx + hs on GPU for single stream
         T_img = hs_gpu.shape[0]
         hs_gpu = self._concat_gpu(ctx_gpu, hs_gpu)
         T_total = T_txt + T_img
         hs_gpu.shape = (T_total, HIDDEN_DIM)
-        if _profile: _labels.append(_mark("concat"))
 
-        # 7. Single stream blocks (separate batch)
-        runner.begin_batch()
-        # Pre-upload modulation params (same for all 20 blocks)
+        # 7. Single stream blocks (per-block batching to avoid GPU OOM
+        #    from accumulating hundreds of temp buffers in one mega-batch)
         shift, scale, gate = mod_single[0]
         sb_scale_gpu = runner.upload_to_gpu(
             scale.ravel().astype(np.float32), "sb_mod_scale")
@@ -1085,39 +1030,27 @@ class FluxKleinWebGPU(WebGPUModel):
             gate.ravel().astype(np.float32), "sb_mod_gate")
 
         for i in range(NUM_SINGLE_BLOCKS):
+            runner.begin_batch()
             hs_gpu = self._single_block(
                 hs_gpu, (sb_shift_gpu, sb_scale_gpu, sb_gate_gpu),
                 concat_cos, concat_sin, i,
-                gpu_state=True,
-                _profile=(_profile and i < 3))
-        # Submit batch and readback in one shot
-        if _profile: _labels.append(_mark("single_record"))
-        rb_results = runner.end_batch(readback_buffers=[hs_gpu])
-        hidden_states = rb_results[id(hs_gpu)].reshape(hs_gpu.shape)
-        if _profile: _labels.append(_mark("single_exec"))
+                gpu_state=True)
+            runner.end_batch()
+
+        # Readback via add-with-zero into a fresh mappable buffer
+        n_total = (T_txt + T_img) * HIDDEN_DIM
+        zero = np.zeros(n_total, dtype=np.float32)
+        out = self.cache.run(
+            self._add_result, grid=((n_total + self._add_block - 1) // self._add_block,),
+            buffers={'X': hs_gpu, 'Y': zero, 'Out': np.zeros(n_total, dtype=np.float32)},
+            scalars={'N': n_total})
+        hidden_states = out['Out'].reshape(T_txt + T_img, HIDDEN_DIM)
 
         # 8. Remove text tokens
         hidden_states = hidden_states[T_txt:]
 
         # 9. Output layer
         output = self._output_layer(hidden_states, temb)
-
-        if _profile:
-            _labels.append(_mark("output"))
-            print("\n  --- Forward pass breakdown ---")
-            total = _t[-1] - _t[0]
-            for j, label in enumerate(_labels):
-                dt = (_t[j+1] - _t[j]) * 1000
-                pct = dt / (total * 1000) * 100
-                print(f"  {label:20s}  {dt:8.1f} ms  ({pct:5.1f}%)")
-            # Aggregate summaries
-            dbl_ms = sum((_t[j+1] - _t[j]) * 1000 for j, l in enumerate(_labels) if l.startswith("double_"))
-            sgl_ms = sum((_t[j+1] - _t[j]) * 1000 for j, l in enumerate(_labels) if l.startswith("single_"))
-            print(f"  {'--- double total':20s}  {dbl_ms:8.1f} ms  ({dbl_ms/(total*1000)*100:5.1f}%)")
-            print(f"  {'--- single total':20s}  {sgl_ms:8.1f} ms  ({sgl_ms/(total*1000)*100:5.1f}%)")
-            print(f"  {'--- TOTAL':20s}  {total*1000:8.1f} ms")
-            print(f"  avg double block: {dbl_ms/NUM_DOUBLE_BLOCKS:.1f} ms")
-            print(f"  avg single block: {sgl_ms/NUM_SINGLE_BLOCKS:.1f} ms")
 
         return output
 
@@ -1232,8 +1165,7 @@ def generate_image(model: FluxKleinWebGPU,
                    prompt_embeds: np.ndarray,
                    height: int, width: int,
                    num_steps: int = 20,
-                   seed: int = 42,
-                   profile: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+                   seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
     """Run the full denoising loop.
 
     Returns: (latents, latent_ids) as numpy arrays.
@@ -1288,7 +1220,6 @@ def generate_image(model: FluxKleinWebGPU,
             timestep=timestep_frac,
             img_ids=img_ids,
             txt_ids=txt_ids,
-            _profile=(profile and i == 0),
         )
 
         # Euler step: latents = latents + (sigma_next - sigma) * vel
@@ -1411,7 +1342,9 @@ def main():
     parser.add_argument("--steps", type=int, default=20)
 
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, default="output.png")
+    default_output = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore", "models",
+                                   os.path.basename(_SCRIPT_DIR), "output.png")
+    parser.add_argument("--output", type=str, default=default_output)
     parser.add_argument("--profile", action="store_true")
     add_device_arg(parser)
     args = parser.parse_args()
@@ -1491,7 +1424,6 @@ def main():
         args.height, args.width,
         num_steps=args.steps,
         seed=args.seed,
-        profile=args.profile,
     )
 
     # Step 5: VAE decode
@@ -1507,7 +1439,7 @@ def main():
     print(f"\n  Saved to {args.output}")
 
     if args.profile:
-        pass  # profiling output printed during forward pass
+        model.save_profile(_SCRIPT_DIR, "FLUX.2 Klein 4B")
 
 
 if __name__ == "__main__":

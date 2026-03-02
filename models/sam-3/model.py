@@ -1112,7 +1112,8 @@ def _encode_image_hiera(W, img_chw):
 
 
 def run_webgpu_inference(image_path: str, point: Tuple[int, int] = None,
-                         output: str = "mask_output.png"):
+                         output: str = "mask_output.png",
+                         profile: bool = False):
     """Run SAM 2.1 fully on Triton WebGPU — no PyTorch at inference.
 
     All operations (Hiera encoder + mask decoder) run as WebGPU compute
@@ -1790,6 +1791,8 @@ def main():
     parser.add_argument("--point-y", type=int, default=None,
                         help="Prompt point Y coordinate")
     parser.add_argument("--output", type=str, default="mask_output.png")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling with GPU timestamps")
     add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)

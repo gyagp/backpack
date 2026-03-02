@@ -31,7 +31,7 @@ from common.kernels import (
     rms_norm_kernel, rms_norm_loop_kernel,
     add_rms_norm_loop_kernel,
     linear_kernel, linear_loop_kernel, linear_loop_fp16w_kernel,
-    linear_loop_fp16w_wide_kernel,
+    linear_loop_fp16w_wide_kernel, linear_loop_fp16w_tiled_kernel,
     linear_Wt_fp16_kernel,
     linear_q4_kernel, linear_q4_add_kernel, linear_q4_wide_kernel,
     add_kernel, add_inplace_kernel,
@@ -293,6 +293,29 @@ class WebGPUModel:
             self._k_dimensions = {n_embd}
 
         self._compile_kernels()
+        self._configure_for_device()
+
+    def _configure_for_device(self):
+        """Adjust runtime parameters based on GPU adapter capabilities.
+
+        Uses Dawn's adapterInfo API to detect the GPU vendor and
+        architecture, then selects optimal kernel configurations:
+
+        NVIDIA (discrete):
+          - BLOCK_M=8 for tiled matmul (good register pressure)
+          - Large workgroups benefit from L2 cache
+
+        AMD (integrated/discrete):
+          - BLOCK_M=8 for tiled matmul (same, benefits from weight reuse)
+          - Shared system memory makes bandwidth critical
+
+        Intel (integrated):
+          - BLOCK_M=4 for tiled matmul (smaller register file)
+        """
+        runner = self.cache.runner
+        info = runner.adapter_info
+        vendor = info.get('vendor', '').lower()
+        self._gpu_vendor = vendor
 
     @staticmethod
     def _nw(block_size):
@@ -390,13 +413,17 @@ class WebGPUModel:
         gitignore_dir = os.path.join(script_dir, "..", "..", "gitignore",
                                      "models", model_folder)
         os.makedirs(gitignore_dir, exist_ok=True)
-        profile_path = os.path.join(gitignore_dir, "profile.html")
         runner = self.cache.runner
         adapter = runner.adapter_info
+        # Include GPU name in profile filename for multi-GPU comparison
+        gpu_name = adapter.get('device') or adapter.get('description', 'GPU')
+        gpu_slug = gpu_name.replace(' ', '-').replace('(', '').replace(')', '')
+        profile_path = os.path.join(gitignore_dir,
+                                    f"profile-{gpu_slug}.html")
         generate_html_report(
             self.profiler,
             output_path=profile_path,
-            title=f"{model_name} — {adapter.get('description', 'GPU')}",
+            title=f"{model_name} — {adapter.get('device', adapter.get('description', 'GPU'))}",
             adapter_info=adapter,
             memory_info=self.get_memory_info())
         print(f"HTML profile: {profile_path}")
@@ -469,6 +496,21 @@ class WebGPUModel:
                 self._linear_fp16w_result = self.cache.get_or_compile(
                     linear_loop_fp16w_kernel, self._linear_fp16w_sig,
                     {'BLOCK_K': LB}, num_warps=_nw(LB))
+
+                # Tiled fp16w kernel: BLOCK_M=8 rows per workgroup
+                TILED_BM = 8
+                self._linear_fp16w_tiled_sig = {
+                    'X': '*fp32', 'W': '*fp16', 'Bias': '*fp32', 'Y': '*fp32',
+                    'K': 'i32', 'stride_x': 'i32', 'stride_w': 'i32',
+                    'N': 'i32', 'T': 'i32',
+                    'BLOCK_K': 'constexpr', 'BLOCK_M': 'constexpr',
+                }
+                self._linear_fp16w_tiled_result = self.cache.get_or_compile(
+                    linear_loop_fp16w_tiled_kernel,
+                    self._linear_fp16w_tiled_sig,
+                    {'BLOCK_K': LB, 'BLOCK_M': TILED_BM},
+                    num_warps=_nw(LB))
+                self._tiled_block_m = TILED_BM
 
                 # Wide kernel for N > MAX_DISPATCH_DIM (e.g. lm_head)
                 self._linear_fp16w_wide_sig = {
@@ -1631,6 +1673,29 @@ class WebGPUModel:
         if N > self.MAX_DISPATCH_DIM:
             return self._linear_fp16w_chunked(x, w_fp16, bias, N,
                                               K=K, gpu_out=gpu_out)
+
+        # Tiled kernel for T>1: reuses weight across BLOCK_M rows
+        if (T > 1 and not self.fp16_act
+                and hasattr(self, '_linear_fp16w_tiled_result')
+                and N <= self.MAX_DISPATCH_DIM):
+            BM = self._tiled_block_m
+            grid_m = (T + BM - 1) // BM
+            out = self.cache.run(
+                self._linear_fp16w_tiled_result, grid=(grid_m, N),
+                buffers={
+                    'X': x if x_is_gpu else x.ravel(),
+                    'W': w_fp16 if w_is_gpu else w_fp16.ravel(),
+                    'Bias': bias,
+                    'Y': np.zeros(T * N, dtype=np.float32),
+                },
+                scalars={'K': K, 'stride_x': K, 'stride_w': K,
+                         'N': N, 'T': T},
+                gpu_outputs={'Y'} if gpu_out else None)
+            if gpu_out:
+                gpu_buf = out['Y']
+                gpu_buf.shape = (T, N)
+                return gpu_buf
+            return out['Y'].reshape(T, N)
 
         if self.fp16_act:
             kern = self._linear_fp16io_result

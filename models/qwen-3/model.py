@@ -1,17 +1,17 @@
 """
-Qwen2.5 inference on WebGPU via Triton.
+Qwen3-0.6B inference on WebGPU via Triton.
 
-Qwen2.5 is a LLaMA-family model featuring:
+Qwen3 is a LLaMA-family model featuring:
   - RoPE (rotary position embeddings)
   - RMSNorm (root mean square normalization)
   - GQA (grouped query attention)
   - SwiGLU MLP (SiLU-gated linear unit)
-  - Attention biases on Q, K, V projections (unlike SmolLM2/LLaMA)
-  - Separate (untied) lm_head
+  - No attention biases (unlike Qwen2.5)
+  - Tied word embeddings (embed_tokens == lm_head)
 
 Optimizations:
   - INT4 per-group weight quantization (4× memory reduction)
-  - Fused QKV projection (3→1 dispatch) with bias concatenation
+  - Fused QKV projection (3→1 dispatch)
   - Fused gate+up MLP projection (2→1 dispatch)
   - fp16 weight storage (2× bandwidth reduction)
   - Pre-computed RoPE tables
@@ -19,10 +19,10 @@ Optimizations:
   - Fast decode pipeline (pre-recorded dispatches)
 
 Usage:
-    python models/qwen-2.5/model.py --verify
-    python models/qwen-2.5/model.py --prompt "Hello"
-    python models/qwen-2.5/model.py --quantize
-    python models/qwen-2.5/model.py --prompt "Hello" --decode-mode gpu
+    python models/qwen-3/model.py --verify
+    python models/qwen-3/model.py --prompt "Hello"
+    python models/qwen-3/model.py --quantize
+    python models/qwen-3/model.py --prompt "Hello" --decode-mode gpu
 
 Requirements:
     pip install requests tokenizers
@@ -97,34 +97,25 @@ def dequantize_int4(q_packed, scales, zeros, K_orig,
     return w.astype(dtype)
 
 
-# Qwen2.5 model configs
+# Qwen3 model configs
 QWEN_CONFIGS = {
-    "0.5B": {
-        "n_layer": 24, "n_head": 14, "n_kv_heads": 2,
-        "n_embd": 896, "intermediate_size": 4864,
-        "n_vocab": 151936, "rope_theta": 1000000.0,
-        "rms_norm_eps": 1e-6, "head_dim": 64,
-        "hf_repo": "Qwen/Qwen2.5-0.5B",
-        "attention_bias": True,
-        "tie_word_embeddings": True,
-    },
-    "1.5B": {
-        "n_layer": 28, "n_head": 12, "n_kv_heads": 2,
-        "n_embd": 1536, "intermediate_size": 8960,
+    "0.6B": {
+        "n_layer": 28, "n_head": 16, "n_kv_heads": 8,
+        "n_embd": 1024, "intermediate_size": 3072,
         "n_vocab": 151936, "rope_theta": 1000000.0,
         "rms_norm_eps": 1e-6, "head_dim": 128,
-        "hf_repo": "Qwen/Qwen2.5-1.5B",
-        "attention_bias": True,
+        "hf_repo": "Qwen/Qwen3-0.6B",
+        "attention_bias": False,
         "tie_word_embeddings": True,
     },
 }
 
 
-class QwenWebGPU(WebGPUModel):
-    """Qwen2.5 inference on WebGPU via Triton kernels.
+class Qwen3WebGPU(WebGPUModel):
+    """Qwen3 inference on WebGPU via Triton kernels.
 
-    Supports Qwen2.5-0.5B and Qwen2.5-1.5B with:
-      - Fused QKV projection (3→1 dispatch) with concatenated biases
+    Supports Qwen3-0.6B with:
+      - Fused QKV projection (3→1 dispatch, no biases)
       - Fused gate+up MLP projection (2→1 dispatch)
       - INT4 per-group quantization with fp16 scales
       - GPU-resident KV cache with fused RoPE+scatter
@@ -147,7 +138,9 @@ class QwenWebGPU(WebGPUModel):
                  decode_mode: str = 'cpu'):
         self.attention_bias = attention_bias
         self.tie_word_embeddings = tie_word_embeddings
-        self.qkv_out = n_head * head_dim + 2 * n_kv_heads * head_dim
+        self.q_dim = n_head * head_dim
+        self.kv_dim = n_kv_heads * head_dim
+        self.qkv_out = self.q_dim + 2 * self.kv_dim
         self.gate_up_out = 2 * intermediate_size
         self._quantized = quantized
         self._decode_mode = decode_mode
@@ -159,7 +152,7 @@ class QwenWebGPU(WebGPUModel):
             head_dim=head_dim,
             rope_theta=rope_theta,
             rms_norm_eps=rms_norm_eps,
-            k_dimensions={n_embd, intermediate_size},
+            k_dimensions={n_embd, intermediate_size, self.q_dim},
         )
         self._fuse_weights()
         if self._quantized and not getattr(self, '_has_fp16_linear', False):
@@ -309,10 +302,18 @@ class QwenWebGPU(WebGPUModel):
                     self.weights[nkey] = self.weights[nkey].astype(np.float32)
                 self._upload_norm_weight(nkey)
 
+            # QK-norm weights (Qwen3 uses per-head RMSNorm on Q and K)
+            for qk_nkey in [pfx + "self_attn.q_norm.weight",
+                            pfx + "self_attn.k_norm.weight"]:
+                if qk_nkey in self.weights:
+                    if self.weights[qk_nkey].dtype == np.float16:
+                        self.weights[qk_nkey] = self.weights[qk_nkey].astype(np.float32)
+                    self._upload_norm_weight(qk_nkey)
+
             # Linear projections
             layer_projs = [
                 (pfx + "self_attn.qkv_proj.weight", self.qkv_out, E),
-                (pfx + "self_attn.o_proj.weight", E, E),
+                (pfx + "self_attn.o_proj.weight", E, self.q_dim),
                 (pfx + "mlp.gate_up_proj.weight", self.gate_up_out, E),
                 (pfx + "mlp.down_proj.weight", E, IM),
             ]
@@ -359,6 +360,7 @@ class QwenWebGPU(WebGPUModel):
         # Zero biases
         self._upload_zero_bias("zero_bias_E", E)
         self._upload_zero_bias("zero_bias_QKV", self.qkv_out)
+        self._upload_zero_bias("zero_bias_QO", self.q_dim)
         self._upload_zero_bias("zero_bias_GU", self.gate_up_out)
         self._upload_zero_bias("zero_bias_V", self.n_vocab)
 
@@ -410,6 +412,15 @@ class QwenWebGPU(WebGPUModel):
         K_new = k.reshape(T, n_kv, HD)
         V_new = v.reshape(T, n_kv, HD)
 
+        # QK-norm (per-head RMSNorm on Q and K)
+        q_norm_w = self.weights.get(pfx + "q_norm.weight")
+        k_norm_w = self.weights.get(pfx + "k_norm.weight")
+        if q_norm_w is not None:
+            q_rms = np.sqrt(np.mean(Q * Q, axis=-1, keepdims=True) + self.rms_norm_eps)
+            Q = Q / q_rms * q_norm_w.astype(np.float32)
+            k_rms = np.sqrt(np.mean(K_new * K_new, axis=-1, keepdims=True) + self.rms_norm_eps)
+            K_new = K_new / k_rms * k_norm_w.astype(np.float32)
+
         # RoPE (pre-computed tables)
         if positions is None:
             positions = np.arange(T, dtype=np.int32)
@@ -450,9 +461,9 @@ class QwenWebGPU(WebGPUModel):
             attn_out = self._causal_attention_multihead(
                 Q, K_full, V_full, n_rep)
 
-        attn_flat = attn_out.reshape(T, n_head * HD)
+        attn_flat = attn_out.reshape(T, q_dim)
         return self._proj(attn_flat, pfx + "o_proj.weight",
-                          "zero_bias_E", E, K=n_head * HD)
+                          "zero_bias_E", E, K=q_dim)
 
     # -- MLP --
 
@@ -776,6 +787,8 @@ class QwenWebGPU(WebGPUModel):
         logits_buf = mkbuf('logits', self.n_vocab * 4)
         ekey = ("embed_tokens.weight" if self.tie_word_embeddings
                 else "lm_head.weight")
+
+        # Always use fp16 for LM head (INT4 degrades quality for small models)
         lm_w_fp16 = self._gpu_weights[ekey + ".fp16"]
 
         pl_lmh, bgl_lmh = get_pl(self._linear_fp16w_wide_result)
@@ -909,7 +922,7 @@ class QwenWebGPU(WebGPUModel):
     def forward(self, token_ids: np.ndarray,
                 use_cache: bool = False,
                 pos_offset: int = 0) -> np.ndarray:
-        """Run Qwen2.5 forward pass."""
+        """Run Qwen3 forward pass."""
         T = len(token_ids)
 
         # Fast decode path
@@ -931,9 +944,18 @@ class QwenWebGPU(WebGPUModel):
 
         lm_key = ("embed_tokens.weight" if self.tie_word_embeddings
                    else "lm_head.weight")
-        logits = self._linear(
-            x, self._gpu_weights[lm_key],
-            self._gpu_weights["zero_bias_V"], self.n_vocab)
+        # Always use fp16 weight for LM head (INT4 quantization degrades
+        # quality for small models; fp16 is lossless from BF16 originals)
+        fp16_key = lm_key + ".fp16"
+        if fp16_key in self._gpu_weights:
+            logits = self._linear_fp16w(
+                x, self._gpu_weights[fp16_key],
+                self._gpu_weights["zero_bias_V"], self.n_vocab,
+                K=self.n_embd)
+        else:
+            logits = self._linear(
+                x, self._gpu_weights[lm_key],
+                self._gpu_weights["zero_bias_V"], self.n_vocab)
         return logits
 
 
@@ -943,7 +965,7 @@ class QwenWebGPU(WebGPUModel):
 
 def quantize_qwen_weights(weights: Dict[str, np.ndarray],
                           n_layer: int) -> Dict[str, np.ndarray]:
-    """Quantize Qwen2.5 fused weights to INT4 with per-group fp16 scales."""
+    """Quantize Qwen3 fused weights to INT4 with per-group fp16 scales."""
     linear_keys = set()
     for i in range(n_layer):
         pfx = f"layers.{i}."
@@ -985,9 +1007,9 @@ def quantize_qwen_weights(weights: Dict[str, np.ndarray],
 # Weight downloading
 # ---------------------------------------------------------------------------
 
-def download_qwen_weights(model_size: str = "0.5B",
+def download_qwen_weights(model_size: str = "0.6B",
                           model_dir: str = None) -> Tuple[str, str]:
-    """Download Qwen2.5 weights and tokenizer from HuggingFace."""
+    """Download Qwen3 weights and tokenizer from HuggingFace."""
     config = QWEN_CONFIGS[model_size]
     hf_repo = config["hf_repo"]
     if model_dir is None:
@@ -1013,9 +1035,9 @@ def download_qwen_weights(model_size: str = "0.5B",
 # ---------------------------------------------------------------------------
 
 def verify_with_random_weights():
-    """Verify Qwen2.5 pipeline with small random weights."""
+    """Verify Qwen3 pipeline with small random weights."""
     print("=" * 60)
-    print("Qwen2.5 WebGPU Pipeline Verification (random weights)")
+    print("Qwen3 WebGPU Pipeline Verification (random weights)")
     print("=" * 60)
 
     n_layer, n_head, n_kv_heads = 2, 4, 2
@@ -1046,13 +1068,6 @@ def verify_with_random_weights():
             kv_dim, n_embd).astype(np.float32) * 0.02
         weights[pfx + "self_attn.o_proj.weight"] = np.random.randn(
             n_embd, n_embd).astype(np.float32) * 0.02
-        # Attention biases
-        weights[pfx + "self_attn.q_proj.bias"] = np.random.randn(
-            n_embd).astype(np.float32) * 0.01
-        weights[pfx + "self_attn.k_proj.bias"] = np.random.randn(
-            kv_dim).astype(np.float32) * 0.01
-        weights[pfx + "self_attn.v_proj.bias"] = np.random.randn(
-            kv_dim).astype(np.float32) * 0.01
         # MLP
         weights[pfx + "mlp.gate_proj.weight"] = np.random.randn(
             intermediate_size, n_embd).astype(np.float32) * 0.02
@@ -1089,12 +1104,9 @@ def verify_with_random_weights():
         rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)
         ln1 = x / rms * weights[pfx + "input_layernorm.weight"]
 
-        q = ln1 @ weights[pfx + "self_attn.q_proj.weight"].T + \
-            weights[pfx + "self_attn.q_proj.bias"]
-        k = ln1 @ weights[pfx + "self_attn.k_proj.weight"].T + \
-            weights[pfx + "self_attn.k_proj.bias"]
-        v = ln1 @ weights[pfx + "self_attn.v_proj.weight"].T + \
-            weights[pfx + "self_attn.v_proj.bias"]
+        q = ln1 @ weights[pfx + "self_attn.q_proj.weight"].T
+        k = ln1 @ weights[pfx + "self_attn.k_proj.weight"].T
+        v = ln1 @ weights[pfx + "self_attn.v_proj.weight"].T
 
         Q = q.reshape(T, n_head, head_dim)
         K_ = k.reshape(T, n_kv_heads, head_dim)
@@ -1133,11 +1145,11 @@ def verify_with_random_weights():
     logits_ref = x @ weights["embed_tokens.weight"].T
 
     # --- GPU forward pass (fuses weights internally) ---
-    model = QwenWebGPU(
+    model = Qwen3WebGPU(
         weights, n_layer=n_layer, n_head=n_head, n_kv_heads=n_kv_heads,
         n_embd=n_embd, intermediate_size=intermediate_size,
         n_vocab=n_vocab, rope_theta=rope_theta, rms_norm_eps=eps,
-        head_dim=head_dim, attention_bias=True, tie_word_embeddings=True)
+        head_dim=head_dim, attention_bias=False, tie_word_embeddings=True)
 
     t0 = time.time()
     logits = model.forward(token_ids)
@@ -1165,11 +1177,11 @@ def verify_with_random_weights():
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Qwen2.5 on WebGPU via Triton")
+        description="Qwen3 on WebGPU via Triton")
     parser.add_argument("--verify", action="store_true",
                         help="Verify pipeline with random weights")
-    parser.add_argument("--model", type=str, default="1.5B",
-                        choices=["0.5B", "1.5B"],
+    parser.add_argument("--model", type=str, default="0.6B",
+                        choices=["0.6B"],
                         help="Model size")
     parser.add_argument("--prompt", type=str,
                         default="The future of AI is",
@@ -1199,7 +1211,7 @@ def main():
     q4_path = os.path.join(weights_dir, "weights_q4.npz")
 
     if args.quantize:
-        print(f"Quantizing Qwen2.5-{args.model} weights...")
+        print(f"Quantizing Qwen3-{args.model} weights...")
         weights = load_weights(npz_path)
         # Fuse before quantizing
         n_layer = config["n_layer"]
@@ -1245,7 +1257,7 @@ def main():
 
     tokenizer = load_tokenizer(tokenizer_path)
 
-    model = QwenWebGPU(
+    model = Qwen3WebGPU(
         weights,
         n_layer=config["n_layer"],
         n_head=config["n_head"],
@@ -1256,7 +1268,7 @@ def main():
         rope_theta=config["rope_theta"],
         rms_norm_eps=config["rms_norm_eps"],
         head_dim=config["head_dim"],
-        attention_bias=config.get("attention_bias", True),
+        attention_bias=config.get("attention_bias", False),
         tie_word_embeddings=config.get("tie_word_embeddings", True),
         quantized=quantized,
         decode_mode=args.decode_mode)
@@ -1274,7 +1286,7 @@ def main():
              temperature=args.temperature)
 
     if args.profile:
-        model.save_profile(_SCRIPT_DIR, f"Qwen2.5-{args.model}")
+        model.save_profile(_SCRIPT_DIR, f"Qwen3-{args.model}")
 
 
 if __name__ == "__main__":

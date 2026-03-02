@@ -158,6 +158,7 @@ class ZImageTurboWebGPU(WebGPUModel):
             DIM,           # 3840: main dimension
             CAP_FEAT_DIM,  # 2560: caption input
             FF_DIM,        # 15360: SwiGLU hidden
+            FF_DIM * 2,    # 30720: fused gate+up
             DIM * 6,       # 23040: adaLN modulation output (6*D for main, 3*D for refiner)
             DIM * 3,       # 11520: adaLN modulation for refiners
             DIM * 2,       # 7680: final layer adaLN
@@ -176,13 +177,74 @@ class ZImageTurboWebGPU(WebGPUModel):
         )
 
         self._upload_weights_to_gpu()
+        self._fuse_qkv_weights()
+        self._fuse_gate_up_weights()
         self._precompute_caches()
+
+    def _fuse_qkv_weights(self):
+        """Fuse separate Q/K/V projection weights into single QKV matrices."""
+        runner = self.cache.runner
+        to_fp16 = lambda w: w.astype(np.float16) if w.dtype != np.float16 else w
+        count = 0
+
+        # Helper to fuse Q/K/V for a given block prefix
+        def _fuse_block(pfx):
+            nonlocal count
+            q_key = f"{pfx}.attention.to_q.weight"
+            k_key = f"{pfx}.attention.to_k.weight"
+            v_key = f"{pfx}.attention.to_v.weight"
+            fused_key = f"{pfx}.attention.qkv.weight"
+            if q_key not in self.weights:
+                return
+            q_w = self.weights[q_key]
+            k_w = self.weights[k_key]
+            v_w = self.weights[v_key]
+            fused = np.concatenate([q_w, k_w, v_w], axis=0)
+            self._gpu_weights[fused_key] = runner.upload_to_gpu(
+                to_fp16(fused), fused_key)
+            count += 1
+
+        for i in range(N_LAYERS):
+            _fuse_block(f"layers.{i}")
+        for i in range(N_REFINER_LAYERS):
+            _fuse_block(f"context_refiner.{i}")
+            _fuse_block(f"noise_refiner.{i}")
+        print(f"  Fused & uploaded {count} QKV weight tensors")
+
+    def _fuse_gate_up_weights(self):
+        """Fuse gate (w1) + up (w3) weights into single gate_up matrices."""
+        runner = self.cache.runner
+        to_fp16 = lambda w: w.astype(np.float16) if w.dtype != np.float16 else w
+        count = 0
+
+        def _fuse_block(pfx):
+            nonlocal count
+            g_key = f"{pfx}.feed_forward.w1.weight"
+            u_key = f"{pfx}.feed_forward.w3.weight"
+            fused_key = f"{pfx}.feed_forward.gate_up.weight"
+            if g_key not in self.weights:
+                return
+            g_w = self.weights[g_key]
+            u_w = self.weights[u_key]
+            fused = np.concatenate([g_w, u_w], axis=0)
+            self._gpu_weights[fused_key] = runner.upload_to_gpu(
+                to_fp16(fused), fused_key)
+            count += 1
+
+        for i in range(N_LAYERS):
+            _fuse_block(f"layers.{i}")
+        for i in range(N_REFINER_LAYERS):
+            _fuse_block(f"context_refiner.{i}")
+            _fuse_block(f"noise_refiner.{i}")
+        print(f"  Fused & uploaded {count} gate+up weight tensors")
 
     def _compile_model_kernels(self):
         """Compile Z-Image-specific kernels."""
         self._compile_layer_norm()
+        self._compile_rms_norm()
         self._compile_silu_mul()
         self._compile_full_attn()
+        self._compile_qk_norm_rope()
 
     def _precompute_caches(self):
         """Pre-cache fp32 norm weights and zero biases."""
@@ -194,11 +256,18 @@ class ZImageTurboWebGPU(WebGPUModel):
             self._zero_biases[sz] = runner.upload_to_gpu(
                 np.zeros(sz, dtype=np.float32), f"zero_bias_{sz}")
 
-        # Pre-cache fp32 conversions of norm weights
+        # Pre-cache fp32 conversions of norm weights and upload to GPU
         self._fp32_cache = {}
+        self._gpu_norm_weights = {}
         for name, w in self.weights.items():
-            if "norm" in name and w.ndim == 1 and w.dtype == np.float16:
-                self._fp32_cache[name] = w.astype(np.float32)
+            if "norm" in name and w.ndim == 1:
+                w32 = w.astype(np.float32) if w.dtype != np.float32 else w
+                self._fp32_cache[name] = w32
+                if name not in self._gpu_weights:
+                    self._gpu_norm_weights[name] = runner.upload_to_gpu(
+                        w32, f"norm_{name}")
+                else:
+                    self._gpu_norm_weights[name] = self._gpu_weights[name]
 
     def _upload_weights_to_gpu(self):
         """Upload all weights to GPU."""
@@ -301,22 +370,26 @@ class ZImageTurboWebGPU(WebGPUModel):
     # Transformer block
     # ------------------------------------------------------------------
 
-    def _transformer_block(self, x: np.ndarray, c: np.ndarray,
+    def _transformer_block(self, x, c,
                            temb: np.ndarray, cos: np.ndarray,
-                           sin: np.ndarray, layer: int) -> np.ndarray:
-        """One main transformer block with adaLN modulation.
+                           sin: np.ndarray, layer: int):
+        """One main transformer block with adaLN modulation (GPU-resident).
 
-        x: (T, DIM) — combined image + text hidden states
-        c: (T, DIM) — caption features (for concatenation in attention)
-        temb: (1, DIM) — timestep embedding
-        Returns: (T, DIM)
+        x: (T, DIM) GPUBuffer — combined image + text hidden states
+        c: not used (kept for API compat)
+        temb: (1, DIM) — timestep embedding (CPU)
+        Returns: (T, DIM) GPUBuffer
         """
         pfx = f"layers.{layer}"
         D = DIM
         n_head = NUM_HEADS
         HD = HEAD_DIM
+        runner = self.cache.runner
+        _p = self._profiling
 
-        # adaLN modulation: SiLU(temb) → Linear → chunk into 6
+        # adaLN modulation: SiLU(temb) → Linear → chunk into 6 (CPU, tiny)
+        if _p: self._begin_cpu(f"L{layer}/adaLN_cpu")
+        if _p: self._set_gpu_op(f"L{layer}/adaLN")
         mod = temb * (1.0 / (1.0 + np.exp(-temb)))  # SiLU
         mod = self._linear_with_bias(
             mod, f"{pfx}.adaLN_modulation.0.weight",
@@ -325,157 +398,169 @@ class ZImageTurboWebGPU(WebGPUModel):
         shift_attn, scale_attn, gate_attn = chunks[0], chunks[1], chunks[2]
         shift_ff, scale_ff, gate_ff = chunks[3], chunks[4], chunks[5]
 
+        # Upload modulation params to GPU
+        scale_attn_gpu = runner.upload_to_gpu(scale_attn.astype(np.float32), f"_tb{layer}_sa_sc")
+        shift_attn_gpu = runner.upload_to_gpu(shift_attn.astype(np.float32), f"_tb{layer}_sa_sh")
+        gate_attn_gpu = runner.upload_to_gpu(gate_attn.astype(np.float32), f"_tb{layer}_sa_gt")
+        scale_ff_gpu = runner.upload_to_gpu(scale_ff.astype(np.float32), f"_tb{layer}_ff_sc")
+        shift_ff_gpu = runner.upload_to_gpu(shift_ff.astype(np.float32), f"_tb{layer}_ff_sh")
+        gate_ff_gpu = runner.upload_to_gpu(gate_ff.astype(np.float32), f"_tb{layer}_ff_gt")
+        if _p: self._end_cpu(f"L{layer}/adaLN_cpu")
+
+        T = x.shape[0]
+
         # --- Attention ---
-        # Pre-norm (attention_norm1 = RMSNorm pre-attn)
-        norm_x = rms_norm_cpu(
-            x, self._get_fp32(f"{pfx}.attention_norm1.weight"),
-            NORM_EPS)
-        # Apply adaLN: (1 + scale) * norm + shift
-        norm_x = (1.0 + scale_attn) * norm_x + shift_attn
+        if _p: self._set_gpu_op(f"L{layer}/norm1+mod")
+        norm_w = self._gpu_norm_weights[f"{pfx}.attention_norm1.weight"]
+        norm_x = self._rms_norm(x, norm_w, eps=NORM_EPS, gpu_out=True)
+        norm_x = self._mod_scale_shift(norm_x, scale_attn_gpu, shift_attn_gpu,
+                                       D, gpu_out=True)
+        norm_x.shape = (T, D)
 
-        T = norm_x.shape[0]
-        q = self._linear_proj(norm_x, f"{pfx}.attention.to_q.weight", D)
-        k = self._linear_proj(norm_x, f"{pfx}.attention.to_k.weight", D)
-        v = self._linear_proj(norm_x, f"{pfx}.attention.to_v.weight", D)
+        if _p: self._set_gpu_op(f"L{layer}/qkv")
+        qkv_gpu = self._linear_proj(norm_x, f"{pfx}.attention.qkv.weight",
+                                    3 * D, gpu_out=True)
+        qkv_gpu.shape = (T, 3 * D)
 
-        # Reshape to multi-head
-        q = q.reshape(T, n_head, HD)
-        k = k.reshape(T, n_head, HD)
-        v = v.reshape(T, n_head, HD)
+        if _p: self._set_gpu_op(f"L{layer}/qk_norm_rope")
+        q_gpu, k_gpu, v_gpu = self._qk_norm_rope(
+            qkv_gpu,
+            self._get_fp32(f"{pfx}.attention.norm_q.weight"),
+            self._get_fp32(f"{pfx}.attention.norm_k.weight"),
+            cos, sin, n_head, T, eps=NORM_EPS, gpu_out=True)
 
-        # QK-norm
-        q = rms_norm_cpu(q,
-                         self._get_fp32(f"{pfx}.attention.norm_q.weight"),
-                         NORM_EPS)
-        k = rms_norm_cpu(k,
-                         self._get_fp32(f"{pfx}.attention.norm_k.weight"),
-                         NORM_EPS)
+        if _p: self._set_gpu_op(f"L{layer}/attn")
+        attn_out = self._full_attention_multihead(q_gpu, k_gpu, v_gpu,
+                                                  n_head, gpu_out=True)
+        attn_out.shape = (T, D)
 
-        # Apply RoPE
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if _p: self._set_gpu_op(f"L{layer}/o_proj")
+        attn_out = self._linear_proj(attn_out,
+                                     f"{pfx}.attention.to_out.0.weight",
+                                     D, gpu_out=True)
 
-        # Full attention
-        attn_out = self._full_attention_multihead(q, k, v, n_head)
-        attn_out = attn_out[:, :, :HD].reshape(T, D)
-
-        # Output projection
-        attn_out = self._linear_proj(attn_out, f"{pfx}.attention.to_out.0.weight", D)
-
-        # Post-norm (attention_norm2 = RMSNorm post-attn)
-        attn_out = rms_norm_cpu(
-            attn_out,
-            self._get_fp32(f"{pfx}.attention_norm2.weight"),
-            NORM_EPS)
-
-        # Residual with gating
-        x = x + gate_attn * attn_out
+        if _p: self._set_gpu_op(f"L{layer}/norm2+res")
+        norm2_w = self._gpu_norm_weights[f"{pfx}.attention_norm2.weight"]
+        attn_out = self._rms_norm(attn_out, norm2_w, eps=NORM_EPS, gpu_out=True)
+        self._gate_residual_add(x, gate_attn_gpu, attn_out, D)
 
         # --- Feed-forward (SwiGLU) ---
-        # Pre-norm (ffn_norm1)
-        norm_x = rms_norm_cpu(
-            x, self._get_fp32(f"{pfx}.ffn_norm1.weight"),
-            NORM_EPS)
-        norm_x = (1.0 + scale_ff) * norm_x + shift_ff
+        if _p: self._set_gpu_op(f"L{layer}/ff_norm+mod")
+        ffn_norm_w = self._gpu_norm_weights[f"{pfx}.ffn_norm1.weight"]
+        norm_x = self._rms_norm(x, ffn_norm_w, eps=NORM_EPS, gpu_out=True)
+        norm_x = self._mod_scale_shift(norm_x, scale_ff_gpu, shift_ff_gpu,
+                                       D, gpu_out=True)
+        norm_x.shape = (T, D)
 
-        # SwiGLU: w1 (gate), w3 (up), w2 (down) — gpu_out to stay on GPU
-        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
-                                     gpu_out=True)
-        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM,
-                                   gpu_out=True)
-        ff_out = self._silu_mul(gate_val, up_val)
-        ff_out = self._linear_proj(ff_out, f"{pfx}.feed_forward.w2.weight", D)
+        if _p: self._set_gpu_op(f"L{layer}/gate_up")
+        gate_up = self._linear_proj(norm_x,
+                                    f"{pfx}.feed_forward.gate_up.weight",
+                                    FF_DIM * 2, gpu_out=True)
 
-        # Post-norm (ffn_norm2)
-        ff_out = rms_norm_cpu(
-            ff_out,
-            self._get_fp32(f"{pfx}.ffn_norm2.weight"),
-            NORM_EPS)
+        if _p: self._set_gpu_op(f"L{layer}/silu_mul")
+        ff_out = self._silu_mul_fused(gate_up, FF_DIM, gpu_out=True)
 
-        x = x + gate_ff * ff_out
+        if _p: self._set_gpu_op(f"L{layer}/down")
+        ff_out = self._linear_proj(ff_out,
+                                   f"{pfx}.feed_forward.w2.weight",
+                                   D, gpu_out=True)
+
+        if _p: self._set_gpu_op(f"L{layer}/ff_norm2+res")
+        ffn_norm2_w = self._gpu_norm_weights[f"{pfx}.ffn_norm2.weight"]
+        ff_out = self._rms_norm(ff_out, ffn_norm2_w, eps=NORM_EPS, gpu_out=True)
+        self._gate_residual_add(x, gate_ff_gpu, ff_out, D)
+
+        if _p: self._clear_gpu_op()
         return x
 
     # ------------------------------------------------------------------
     # Context refiner block
     # ------------------------------------------------------------------
 
-    def _context_refiner_block(self, x: np.ndarray,
+    def _context_refiner_block(self, x,
                                cos: np.ndarray, sin: np.ndarray,
-                               layer: int) -> np.ndarray:
-        """Context refiner block (no modulation — uses standard pre/post norm)."""
+                               layer: int):
+        """Context refiner block (no modulation, GPU-resident)."""
         pfx = f"context_refiner.{layer}"
         D = DIM
         n_head = NUM_HEADS
         HD = HEAD_DIM
+        _p = self._profiling
 
-        # Pre-norm → attention
-        norm_x = rms_norm_cpu(
-            x, self._get_fp32(f"{pfx}.attention_norm1.weight"),
-            NORM_EPS)
+        T = x.shape[0]
 
-        T = norm_x.shape[0]
-        q = self._linear_proj(norm_x, f"{pfx}.attention.to_q.weight", D)
-        k = self._linear_proj(norm_x, f"{pfx}.attention.to_k.weight", D)
-        v = self._linear_proj(norm_x, f"{pfx}.attention.to_v.weight", D)
+        if _p: self._set_gpu_op(f"CR{layer}/norm1")
+        norm_w = self._gpu_norm_weights[f"{pfx}.attention_norm1.weight"]
+        norm_x = self._rms_norm(x, norm_w, eps=NORM_EPS, gpu_out=True)
+        norm_x.shape = (T, D)
 
-        q = q.reshape(T, n_head, HD)
-        k = k.reshape(T, n_head, HD)
-        v = v.reshape(T, n_head, HD)
+        if _p: self._set_gpu_op(f"CR{layer}/qkv")
+        qkv_gpu = self._linear_proj(norm_x, f"{pfx}.attention.qkv.weight",
+                                    3 * D, gpu_out=True)
+        qkv_gpu.shape = (T, 3 * D)
 
-        q = rms_norm_cpu(q,
-                         self._get_fp32(f"{pfx}.attention.norm_q.weight"),
-                         NORM_EPS)
-        k = rms_norm_cpu(k,
-                         self._get_fp32(f"{pfx}.attention.norm_k.weight"),
-                         NORM_EPS)
+        if _p: self._set_gpu_op(f"CR{layer}/qk_norm_rope")
+        q_gpu, k_gpu, v_gpu = self._qk_norm_rope(
+            qkv_gpu,
+            self._get_fp32(f"{pfx}.attention.norm_q.weight"),
+            self._get_fp32(f"{pfx}.attention.norm_k.weight"),
+            cos, sin, n_head, T, eps=NORM_EPS, gpu_out=True)
 
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if _p: self._set_gpu_op(f"CR{layer}/attn")
+        attn_out = self._full_attention_multihead(q_gpu, k_gpu, v_gpu,
+                                                  n_head, gpu_out=True)
+        attn_out.shape = (T, D)
 
-        attn_out = self._full_attention_multihead(q, k, v, n_head)
-        attn_out = attn_out[:, :, :HD].reshape(T, D)
-        attn_out = self._linear_proj(attn_out, f"{pfx}.attention.to_out.0.weight", D)
+        if _p: self._set_gpu_op(f"CR{layer}/o_proj+norm2+res")
+        attn_out = self._linear_proj(attn_out,
+                                     f"{pfx}.attention.to_out.0.weight",
+                                     D, gpu_out=True)
+        norm2_w = self._gpu_norm_weights[f"{pfx}.attention_norm2.weight"]
+        attn_out = self._rms_norm(attn_out, norm2_w, eps=NORM_EPS, gpu_out=True)
+        self._add_inplace(x, attn_out)
 
-        # Post-norm
-        attn_out = rms_norm_cpu(
-            attn_out,
-            self._get_fp32(f"{pfx}.attention_norm2.weight"),
-            NORM_EPS)
-        x = x + attn_out
+        if _p: self._set_gpu_op(f"CR{layer}/ff_norm")
+        ffn_norm_w = self._gpu_norm_weights[f"{pfx}.ffn_norm1.weight"]
+        norm_x = self._rms_norm(x, ffn_norm_w, eps=NORM_EPS, gpu_out=True)
+        norm_x.shape = (T, D)
 
-        # FFN
-        norm_x = rms_norm_cpu(
-            x, self._get_fp32(f"{pfx}.ffn_norm1.weight"),
-            NORM_EPS)
+        if _p: self._set_gpu_op(f"CR{layer}/gate_up")
+        gate_up = self._linear_proj(norm_x,
+                                    f"{pfx}.feed_forward.gate_up.weight",
+                                    FF_DIM * 2, gpu_out=True)
 
-        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
-                                     gpu_out=True)
-        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM,
-                                   gpu_out=True)
-        ff_out = self._silu_mul(gate_val, up_val)
-        ff_out = self._linear_proj(ff_out, f"{pfx}.feed_forward.w2.weight", D)
+        if _p: self._set_gpu_op(f"CR{layer}/silu_mul+down")
+        ff_out = self._silu_mul_fused(gate_up, FF_DIM, gpu_out=True)
+        ff_out = self._linear_proj(ff_out,
+                                   f"{pfx}.feed_forward.w2.weight",
+                                   D, gpu_out=True)
 
-        ff_out = rms_norm_cpu(
-            ff_out,
-            self._get_fp32(f"{pfx}.ffn_norm2.weight"),
-            NORM_EPS)
-        x = x + ff_out
+        if _p: self._set_gpu_op(f"CR{layer}/ff_norm2+res")
+        ffn_norm2_w = self._gpu_norm_weights[f"{pfx}.ffn_norm2.weight"]
+        ff_out = self._rms_norm(ff_out, ffn_norm2_w, eps=NORM_EPS, gpu_out=True)
+        self._add_inplace(x, ff_out)
+
+        if _p: self._clear_gpu_op()
         return x
 
     # ------------------------------------------------------------------
     # Noise refiner block
     # ------------------------------------------------------------------
 
-    def _noise_refiner_block(self, x: np.ndarray, temb: np.ndarray,
+    def _noise_refiner_block(self, x, temb: np.ndarray,
                              cos: np.ndarray, sin: np.ndarray,
-                             layer: int) -> np.ndarray:
-        """Noise refiner block (same as main block with adaLN modulation)."""
+                             layer: int):
+        """Noise refiner block (with adaLN modulation, GPU-resident)."""
         pfx = f"noise_refiner.{layer}"
         D = DIM
         n_head = NUM_HEADS
         HD = HEAD_DIM
+        runner = self.cache.runner
+        _p = self._profiling
 
-        # adaLN modulation
+        # adaLN modulation (CPU, tiny)
+        if _p: self._begin_cpu(f"NR{layer}/adaLN_cpu")
+        if _p: self._set_gpu_op(f"NR{layer}/adaLN")
         mod = temb * (1.0 / (1.0 + np.exp(-temb)))
         mod = self._linear_with_bias(
             mod, f"{pfx}.adaLN_modulation.0.weight",
@@ -484,59 +569,73 @@ class ZImageTurboWebGPU(WebGPUModel):
         shift_attn, scale_attn, gate_attn = chunks[0], chunks[1], chunks[2]
         shift_ff, scale_ff, gate_ff = chunks[3], chunks[4], chunks[5]
 
-        # Attention
-        norm_x = rms_norm_cpu(
-            x, self._get_fp32(f"{pfx}.attention_norm1.weight"),
-            NORM_EPS)
-        norm_x = (1.0 + scale_attn) * norm_x + shift_attn
+        # Upload modulation params to GPU
+        scale_attn_gpu = runner.upload_to_gpu(scale_attn.astype(np.float32), f"_nr{layer}_sa_sc")
+        shift_attn_gpu = runner.upload_to_gpu(shift_attn.astype(np.float32), f"_nr{layer}_sa_sh")
+        gate_attn_gpu = runner.upload_to_gpu(gate_attn.astype(np.float32), f"_nr{layer}_sa_gt")
+        scale_ff_gpu = runner.upload_to_gpu(scale_ff.astype(np.float32), f"_nr{layer}_ff_sc")
+        shift_ff_gpu = runner.upload_to_gpu(shift_ff.astype(np.float32), f"_nr{layer}_ff_sh")
+        gate_ff_gpu = runner.upload_to_gpu(gate_ff.astype(np.float32), f"_nr{layer}_ff_gt")
+        if _p: self._end_cpu(f"NR{layer}/adaLN_cpu")
 
-        T = norm_x.shape[0]
-        q = self._linear_proj(norm_x, f"{pfx}.attention.to_q.weight", D)
-        k = self._linear_proj(norm_x, f"{pfx}.attention.to_k.weight", D)
-        v = self._linear_proj(norm_x, f"{pfx}.attention.to_v.weight", D)
+        T = x.shape[0]
 
-        q = q.reshape(T, n_head, HD)
-        k = k.reshape(T, n_head, HD)
-        v = v.reshape(T, n_head, HD)
+        if _p: self._set_gpu_op(f"NR{layer}/norm1+mod")
+        norm_w = self._gpu_norm_weights[f"{pfx}.attention_norm1.weight"]
+        norm_x = self._rms_norm(x, norm_w, eps=NORM_EPS, gpu_out=True)
+        norm_x = self._mod_scale_shift(norm_x, scale_attn_gpu, shift_attn_gpu,
+                                       D, gpu_out=True)
+        norm_x.shape = (T, D)
 
-        q = rms_norm_cpu(q,
-                         self._get_fp32(f"{pfx}.attention.norm_q.weight"),
-                         NORM_EPS)
-        k = rms_norm_cpu(k,
-                         self._get_fp32(f"{pfx}.attention.norm_k.weight"),
-                         NORM_EPS)
+        if _p: self._set_gpu_op(f"NR{layer}/qkv")
+        qkv_gpu = self._linear_proj(norm_x, f"{pfx}.attention.qkv.weight",
+                                    3 * D, gpu_out=True)
+        qkv_gpu.shape = (T, 3 * D)
 
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if _p: self._set_gpu_op(f"NR{layer}/qk_norm_rope")
+        q_gpu, k_gpu, v_gpu = self._qk_norm_rope(
+            qkv_gpu,
+            self._get_fp32(f"{pfx}.attention.norm_q.weight"),
+            self._get_fp32(f"{pfx}.attention.norm_k.weight"),
+            cos, sin, n_head, T, eps=NORM_EPS, gpu_out=True)
 
-        attn_out = self._full_attention_multihead(q, k, v, n_head)
-        attn_out = attn_out[:, :, :HD].reshape(T, D)
-        attn_out = self._linear_proj(attn_out, f"{pfx}.attention.to_out.0.weight", D)
+        if _p: self._set_gpu_op(f"NR{layer}/attn")
+        attn_out = self._full_attention_multihead(q_gpu, k_gpu, v_gpu,
+                                                  n_head, gpu_out=True)
+        attn_out.shape = (T, D)
 
-        attn_out = rms_norm_cpu(
-            attn_out,
-            self._get_fp32(f"{pfx}.attention_norm2.weight"),
-            NORM_EPS)
-        x = x + gate_attn * attn_out
+        if _p: self._set_gpu_op(f"NR{layer}/o_proj+norm2+res")
+        attn_out = self._linear_proj(attn_out,
+                                     f"{pfx}.attention.to_out.0.weight",
+                                     D, gpu_out=True)
+        norm2_w = self._gpu_norm_weights[f"{pfx}.attention_norm2.weight"]
+        attn_out = self._rms_norm(attn_out, norm2_w, eps=NORM_EPS, gpu_out=True)
+        self._gate_residual_add(x, gate_attn_gpu, attn_out, D)
 
-        # FFN
-        norm_x = rms_norm_cpu(
-            x, self._get_fp32(f"{pfx}.ffn_norm1.weight"),
-            NORM_EPS)
-        norm_x = (1.0 + scale_ff) * norm_x + shift_ff
+        if _p: self._set_gpu_op(f"NR{layer}/ff_norm+mod")
+        ffn_norm_w = self._gpu_norm_weights[f"{pfx}.ffn_norm1.weight"]
+        norm_x = self._rms_norm(x, ffn_norm_w, eps=NORM_EPS, gpu_out=True)
+        norm_x = self._mod_scale_shift(norm_x, scale_ff_gpu, shift_ff_gpu,
+                                       D, gpu_out=True)
+        norm_x.shape = (T, D)
 
-        gate_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w1.weight", FF_DIM,
-                                     gpu_out=True)
-        up_val = self._linear_proj(norm_x, f"{pfx}.feed_forward.w3.weight", FF_DIM,
-                                   gpu_out=True)
-        ff_out = self._silu_mul(gate_val, up_val)
-        ff_out = self._linear_proj(ff_out, f"{pfx}.feed_forward.w2.weight", D)
+        if _p: self._set_gpu_op(f"NR{layer}/gate_up")
+        gate_up = self._linear_proj(norm_x,
+                                    f"{pfx}.feed_forward.gate_up.weight",
+                                    FF_DIM * 2, gpu_out=True)
 
-        ff_out = rms_norm_cpu(
-            ff_out,
-            self._get_fp32(f"{pfx}.ffn_norm2.weight"),
-            NORM_EPS)
-        x = x + gate_ff * ff_out
+        if _p: self._set_gpu_op(f"NR{layer}/silu_mul+down")
+        ff_out = self._silu_mul_fused(gate_up, FF_DIM, gpu_out=True)
+        ff_out = self._linear_proj(ff_out,
+                                   f"{pfx}.feed_forward.w2.weight",
+                                   D, gpu_out=True)
+
+        if _p: self._set_gpu_op(f"NR{layer}/ff_norm2+res")
+        ffn_norm2_w = self._gpu_norm_weights[f"{pfx}.ffn_norm2.weight"]
+        ff_out = self._rms_norm(ff_out, ffn_norm2_w, eps=NORM_EPS, gpu_out=True)
+        self._gate_residual_add(x, gate_ff_gpu, ff_out, D)
+
+        if _p: self._clear_gpu_op()
         return x
 
     # ------------------------------------------------------------------
@@ -592,44 +691,82 @@ class ZImageTurboWebGPU(WebGPUModel):
         """
         T_img = latents.shape[0]
         T_txt = encoder_hidden_states.shape[0]
+        runner = self.cache.runner
+        _p = self._profiling
 
         # 1. Timestep embedding
+        if _p: self._begin_cpu("temb")
         temb = self._compute_temb(timestep)  # (1, DIM)
+        if _p: self._end_cpu("temb")
 
         # 2. Caption embedding
+        if _p: self._begin_cpu("cap_embed")
         cap = self._embed_caption(encoder_hidden_states)  # (T_txt, DIM)
+        if _p: self._end_cpu("cap_embed")
 
         # 3. Context refinement (2 blocks on text only)
+        if _p: self._begin_cpu("ctx_refiner")
         text_cos, text_sin = compute_rope_freqs(txt_ids, AXES_DIMS, ROPE_THETA)
+        cap_gpu = runner.upload_to_gpu(
+            cap.astype(np.float32).ravel(), "ctx_refiner_input")
+        cap_gpu.shape = (T_txt, DIM)
         for i in range(N_REFINER_LAYERS):
-            cap = self._context_refiner_block(cap, text_cos, text_sin, i)
+            cap_gpu = self._context_refiner_block(cap_gpu, text_cos, text_sin, i)
+        if _p: self._end_cpu("ctx_refiner")
 
         # 4. Input projection: patchified latents → DIM
+        if _p: self._begin_cpu("input_proj")
         x = self._linear_with_bias(
             latents, "all_x_embedder.2-1.weight",
             "all_x_embedder.2-1.bias", DIM)
+        if _p: self._end_cpu("input_proj")
 
         # 5. Concatenate: [text | image] for joint attention
-        x = np.concatenate([cap, x], axis=0)  # (T_txt + T_img, DIM)
+        if _p: self._begin_cpu("concat+rope")
+        x_gpu = runner.upload_to_gpu(
+            x.astype(np.float32).ravel(), "main_input_img")
+        x_gpu.shape = (T_img, DIM)
+        x_gpu = self._concat_gpu(cap_gpu, x_gpu)
+        T_total = T_txt + T_img
+        x_gpu.shape = (T_total, DIM)
 
         # 6. Compute RoPE for concatenated sequence
         all_ids = np.concatenate([txt_ids, img_ids], axis=0)
         all_cos, all_sin = compute_rope_freqs(all_ids, AXES_DIMS, ROPE_THETA)
+        if _p: self._end_cpu("concat+rope")
 
-        # 7. Main transformer blocks (30 layers)
+        # 7. Main transformer blocks (30 layers, all GPU-resident)
+        if _p: self._begin_cpu("main_blocks")
         for i in range(N_LAYERS):
-            x = self._transformer_block(x, cap, temb, all_cos, all_sin, i)
+            if _p: self._begin_cpu(f"L{i}")
+            x_gpu = self._transformer_block(x_gpu, None, temb,
+                                            all_cos, all_sin, i)
+            if _p: self._end_cpu(f"L{i}")
+        if _p: self._end_cpu("main_blocks")
 
-        # 8. Extract image tokens
-        x = x[T_txt:]  # (T_img, DIM)
+        # 8. Extract image tokens (GPU split)
+        if _p: self._begin_cpu("split")
+        N_txt_elems = T_txt * DIM
+        N_img_elems = T_img * DIM
+        x_gpu = self._split_gpu(x_gpu, N_txt_elems, N_img_elems)
+        x_gpu.shape = (T_img, DIM)
+        if _p: self._end_cpu("split")
 
-        # 9. Noise refiner blocks (2 layers, image-only)
+        # 9. Noise refiner blocks (2 layers, image-only, GPU-resident)
+        if _p: self._begin_cpu("noise_refiner")
         img_cos, img_sin = compute_rope_freqs(img_ids, AXES_DIMS, ROPE_THETA)
         for i in range(N_REFINER_LAYERS):
-            x = self._noise_refiner_block(x, temb, img_cos, img_sin, i)
+            if _p: self._begin_cpu(f"NR{i}")
+            x_gpu = self._noise_refiner_block(x_gpu, temb,
+                                              img_cos, img_sin, i)
+            if _p: self._end_cpu(f"NR{i}")
+        if _p: self._end_cpu("noise_refiner")
 
-        # 10. Output layer
+        # 10. Output layer (readback to CPU for final projection)
+        if _p: self._begin_cpu("output_layer")
+        x = runner.readback(x_gpu).reshape(T_img, DIM)
         output = self._output_layer(x, temb)
+        if _p: self._end_cpu("output_layer")
         return output
 
 
@@ -691,7 +828,7 @@ def generate_image(model: ZImageTurboWebGPU,
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
         FlowMatchEulerDiscreteScheduler,
     )
-    scheduler = FlowMatchEulerDiscreteScheduler()
+    scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
     scheduler.set_timesteps(num_steps)
     timesteps = scheduler.timesteps.numpy()
     sigmas = scheduler.sigmas.numpy()
@@ -894,7 +1031,9 @@ def main():
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, default="output.png")
+    default_output = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore",
+                                   "output.png")
+    parser.add_argument("--output", type=str, default=default_output)
     parser.add_argument("--profile", action="store_true",
                         help="Profile the denoising loop")
     add_device_arg(parser)

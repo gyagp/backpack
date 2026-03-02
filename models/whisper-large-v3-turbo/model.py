@@ -842,7 +842,7 @@ def verify_with_random_weights():
 # Full inference with real weights
 # ---------------------------------------------------------------------------
 
-def run_full_inference(audio_path: str):
+def run_full_inference(audio_path: str, profile: bool = False):
     """Run Whisper Large V3 Turbo transcription fully on Triton WebGPU — no PyTorch.
 
     All operations (mel spectrogram, encoder, decoder) run on WebGPU/numpy.
@@ -882,6 +882,10 @@ def run_full_inference(audio_path: str):
     # --- Create model ---
     model = WhisperWebGPU(weights, **config)
     print("  Model created")
+
+    if profile:
+        model.enable_profiling()
+        print(f"  Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
 
     # --- Encode ---
     print("  Encoding audio...")
@@ -928,6 +932,9 @@ def run_full_inference(audio_path: str):
     print(f"  Encoder:         {t_enc*1000:.0f}ms")
     print(f"  Decoder:         {t_dec*1000:.0f}ms ({n_out} tokens)")
     print(f"  Total:           {(t_mel + t_enc + t_dec)*1000:.0f}ms")
+
+    if profile:
+        model.save_profile(_SCRIPT_DIR, "Whisper Large V3 Turbo")
 
 
 def _load_audio(path: str, sr: int = 16000) -> np.ndarray:
@@ -1085,6 +1092,8 @@ def main():
                         help="Verify pipeline with random weights")
     parser.add_argument("--audio", type=str, default=None,
                         help="Input audio path for transcription")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling with GPU timestamps")
     add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
@@ -1094,7 +1103,7 @@ def main():
         sys.exit(0 if success else 1)
 
     if args.audio:
-        run_full_inference(args.audio)
+        run_full_inference(args.audio, profile=args.profile)
     else:
         print("Whisper Large V3 Turbo speech-to-text on WebGPU")
         print("Usage:")

@@ -14,20 +14,35 @@ Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes
 
 All models run fully on Triton WebGPU — no PyTorch at inference time.
 
-| Model | Type | Params | Precision | Conformance | Performance | Status |
-|-------|------|--------|-----------|-------------|-------------|--------|
-| [**Flux-Klein**](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image Gen | 4B | FP16 | | 5.6s/step (512×512), DiT dual-stream |  |
-| [**Gemma-3**](https://huggingface.co/unsloth/gemma-3-2b) | LLM | 4B | FP16 | NA | NA | Gated model |
-| [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | PASS | 60ms TTFT, 97.5 tok/s decode | Done |
-| [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | PASS | 1.2s TTFT, 38.4 tok/s decode | Done |
-| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | PASS | 35ms TTFT, 120 tok/s decode | Done |
-| [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | PASS | 148ms TTFT, 220 tok/s decode | Done |
-| [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | | 2.4s TTFT, 4.9 tok/s decode |  |
-| [**SAM-3**](https://huggingface.co/facebook/sam3) | Segmentation | 31M | FP16 | NA | NA | Gated model |
-| [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | PASS | 8.6s/step (512×512), 1-step or CFG | Done |
-| [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | PASS | 133ms TTFT, 208 tok/s decode | Done |
-| [**Whisper Large V3 Turbo**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech-to-Text | 809M | FP16 | PASS | 8.0s encoder, 6.3 tok/s decode, 11.2s total | Done |
-| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | | 24s/step (512×512), DiT + Qwen3 |  |
+| Model | Type | Params | Precision | RTX 5080 | Radeon iGPU | Status |
+|-------|------|--------|-----------|----------|-------------|--------|
+| [**Flux-Klein**](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image Gen | 4B | FP16 | 5.6s/step (512²) | — | |
+| [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | 60ms TTFT, 97.5 tok/s | — | Done |
+| [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 38.4 tok/s | — | Done |
+| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | 35ms TTFT, 120 tok/s | — | Done |
+| [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s | — | Done |
+| [**Qwen-3**](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | 0.6B | FP16 | 580ms TTFT, 44.6 tok/s | 640ms TTFT, 7.1 tok/s | |
+| [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | 2.4s TTFT, 4.9 tok/s | — | |
+| [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | 8.6s/step (512²) | — | Done |
+| [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s | — | Done |
+| [**Whisper**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech | 809M | FP16 | 8.0s enc, 6.3 tok/s dec | — | Done |
+| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | 12s/step (512²) | — | |
+
+**GPUs**: NVIDIA GeForce RTX 5080 (discrete, D3D12) · AMD Radeon Graphics (RDNA 2 integrated, D3D12). All models support `--device low` for integrated GPUs.
+
+## Multi-GPU Support
+
+Backpack supports GPU selection via the `--device` flag:
+
+```powershell
+# Discrete GPU (default) — NVIDIA, AMD discrete
+python models/qwen-3/model.py --prompt "Hello" --device high
+
+# Integrated GPU — AMD Radeon, Intel UHD
+python models/qwen-3/model.py --prompt "Hello" --device low
+```
+
+Device-specific optimizations are applied automatically based on the GPU vendor detected via Dawn's `wgpuAdapterGetInfo` API.
 
 ## Project Structure
 ```
@@ -38,6 +53,7 @@ backpack/
 │   ├── gemma-3/      # Google Gemma 3
 │   ├── phi-4/        # Microsoft Phi-4
 │   ├── qwen-2.5/     # Alibaba Qwen 2.5
+│   ├── qwen-3/       # Alibaba Qwen 3
 │   └── ...           # More models
 ├── docs/             # Documentation
 ├── third_party/

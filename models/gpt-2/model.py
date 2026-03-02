@@ -395,6 +395,8 @@ def main():
                         help="Sampling temperature")
     parser.add_argument("--weights-dir", type=str, default=None,
                         help="Directory for cached weights")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling with GPU timestamps")
     add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
@@ -412,10 +414,17 @@ def main():
     model = GPT2WebGPU(weights)
     print("Model created, kernels compiled")
 
+    if args.profile:
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+
     # Generate (GPT-2 uses tiktoken, no tokenizer.json)
     generate(model, args.prompt, tokenizer=None,
              max_tokens=args.max_tokens,
              temperature=args.temperature)
+
+    if args.profile:
+        model.save_profile(_SCRIPT_DIR, "GPT-2")
 
 
 if __name__ == "__main__":
