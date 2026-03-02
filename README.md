@@ -26,7 +26,7 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | 8.6s/step (512²) | — | Done |
 | [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | 133ms / 208 | — | Done |
 | [**Whisper**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech | 809M | FP16 | 8.0s enc, 6.3 dec | — | Done |
-| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | 12s/step (512²) | — | |
+| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | 7.0s/step (512²) | — | |
 
 **GPUs**: NVIDIA GeForce RTX 5080 (discrete, D3D12) · AMD Radeon Graphics (RDNA 2 integrated, D3D12). All models support `--device low` for integrated GPUs.
 

@@ -52,9 +52,13 @@ ROPE_THETA = 256.0
 N_LAYERS = 30
 N_REFINER_LAYERS = 2
 NORM_EPS = 1e-5
+FINAL_NORM_EPS = 1e-6
 T_SCALE = 1000.0
-FF_DIM = DIM * 4              # 15360 (SwiGLU hidden)
+FF_DIM = int(DIM / 3 * 8)     # 10240 (SwiGLU hidden, matches upstream)
 TIMESTEP_DIM = 256            # sinusoidal embedding dim
+ADALN_EMBED_DIM = 256         # adaLN conditioning dim (min(dim, 256))
+SEQ_MULTI_OF = 32
+USE_SEQ_PADDING = True
 
 # Text encoder
 QWEN3_HIDDEN_SIZE = 2560
@@ -117,10 +121,15 @@ def rms_norm_cpu(x: np.ndarray, w: np.ndarray,
     return (x_f / rms * w.astype(np.float32)).astype(np.float32)
 
 
-def prepare_latent_ids(height: int, width: int) -> np.ndarray:
-    """3D position IDs for image latents: (t=0, h, w)."""
+def prepare_latent_ids(height: int, width: int,
+                       text_seq_len: int = 0) -> np.ndarray:
+    """3D position IDs for image latents.
+
+    Matches Z-Image convention where image tokens use t = text_len + 1.
+    """
     num_tokens = height * width
     ids = np.zeros((num_tokens, 3), dtype=np.float32)
+    ids[:, 0] = float(text_seq_len + 1)
     hh, ww = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
     ids[:, 1] = hh.ravel()
     ids[:, 2] = ww.ravel()
@@ -128,8 +137,10 @@ def prepare_latent_ids(height: int, width: int) -> np.ndarray:
 
 
 def prepare_text_ids(seq_len: int) -> np.ndarray:
-    """3D position IDs for text tokens: all zeros (text has no spatial pos)."""
-    return np.zeros((seq_len, 3), dtype=np.float32)
+    """3D position IDs for text tokens: (t=l, h=0, w=0), l starts at 1."""
+    ids = np.zeros((seq_len, 3), dtype=np.float32)
+    ids[:, 0] = np.arange(1, seq_len + 1, dtype=np.float32)
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +166,12 @@ class ZImageTurboWebGPU(WebGPUModel):
         k_dims = {
             IN_CHANNELS * PATCH_SIZE * PATCH_SIZE,  # 64: patchify input
             TIMESTEP_DIM,  # 256: sinusoidal embed
+            1024,          # t_embedder hidden
             DIM,           # 3840: main dimension
             CAP_FEAT_DIM,  # 2560: caption input
             FF_DIM,        # 15360: SwiGLU hidden
             FF_DIM * 2,    # 30720: fused gate+up
-            DIM * 6,       # 23040: adaLN modulation output (6*D for main, 3*D for refiner)
-            DIM * 3,       # 11520: adaLN modulation for refiners
-            DIM * 2,       # 7680: final layer adaLN
+            DIM * 4,       # 15360: adaLN modulation output (scale+gate for attn/ff)
         }
 
         super().__init__(
@@ -251,7 +261,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         # Pre-upload zero biases for common sizes
         runner = self.cache.runner
         self._zero_biases = {}
-        for sz in (DIM, FF_DIM, DIM * 6, DIM * 3, DIM * 2,
+        for sz in (DIM, FF_DIM, DIM * 4,
                    IN_CHANNELS * PATCH_SIZE * PATCH_SIZE, CAP_FEAT_DIM):
             self._zero_biases[sz] = runner.upload_to_gpu(
                 np.zeros(sz, dtype=np.float32), f"zero_bias_{sz}")
@@ -341,7 +351,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         w2 = self._get_fp32("t_embedder.mlp.2.weight")
         b2 = self._get_fp32("t_embedder.mlp.2.bias")
         t_emb = t_emb @ w2.T + b2
-        return t_emb  # (1, DIM)
+        return t_emb  # (1, ADALN_EMBED_DIM)
 
     # ------------------------------------------------------------------
     # Caption embedding
@@ -387,24 +397,25 @@ class ZImageTurboWebGPU(WebGPUModel):
         runner = self.cache.runner
         _p = self._profiling
 
-        # adaLN modulation: SiLU(temb) → Linear → chunk into 6 (CPU, tiny)
+        # adaLN modulation: Linear(temb) → chunk into 4 (CPU, tiny)
         if _p: self._begin_cpu(f"L{layer}/adaLN_cpu")
         if _p: self._set_gpu_op(f"L{layer}/adaLN")
-        mod = temb * (1.0 / (1.0 + np.exp(-temb)))  # SiLU
+        mod = temb
         mod = self._linear_with_bias(
             mod, f"{pfx}.adaLN_modulation.0.weight",
-            f"{pfx}.adaLN_modulation.0.bias", D * 6)
-        chunks = np.split(mod.ravel(), 6)
-        shift_attn, scale_attn, gate_attn = chunks[0], chunks[1], chunks[2]
-        shift_ff, scale_ff, gate_ff = chunks[3], chunks[4], chunks[5]
+            f"{pfx}.adaLN_modulation.0.bias", D * 4)
+        chunks = np.split(mod.ravel(), 4)
+        scale_attn, gate_attn, scale_ff, gate_ff = chunks
+
+        gate_attn = np.tanh(gate_attn)
+        gate_ff = np.tanh(gate_ff)
 
         # Upload modulation params to GPU
         scale_attn_gpu = runner.upload_to_gpu(scale_attn.astype(np.float32), f"_tb{layer}_sa_sc")
-        shift_attn_gpu = runner.upload_to_gpu(shift_attn.astype(np.float32), f"_tb{layer}_sa_sh")
         gate_attn_gpu = runner.upload_to_gpu(gate_attn.astype(np.float32), f"_tb{layer}_sa_gt")
         scale_ff_gpu = runner.upload_to_gpu(scale_ff.astype(np.float32), f"_tb{layer}_ff_sc")
-        shift_ff_gpu = runner.upload_to_gpu(shift_ff.astype(np.float32), f"_tb{layer}_ff_sh")
         gate_ff_gpu = runner.upload_to_gpu(gate_ff.astype(np.float32), f"_tb{layer}_ff_gt")
+        zero_shift_gpu = self._zero_biases[D]
         if _p: self._end_cpu(f"L{layer}/adaLN_cpu")
 
         T = x.shape[0]
@@ -413,7 +424,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         if _p: self._set_gpu_op(f"L{layer}/norm1+mod")
         norm_w = self._gpu_norm_weights[f"{pfx}.attention_norm1.weight"]
         norm_x = self._rms_norm(x, norm_w, eps=NORM_EPS, gpu_out=True)
-        norm_x = self._mod_scale_shift(norm_x, scale_attn_gpu, shift_attn_gpu,
+        norm_x = self._mod_scale_shift(norm_x, scale_attn_gpu, zero_shift_gpu,
                                        D, gpu_out=True)
         norm_x.shape = (T, D)
 
@@ -448,7 +459,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         if _p: self._set_gpu_op(f"L{layer}/ff_norm+mod")
         ffn_norm_w = self._gpu_norm_weights[f"{pfx}.ffn_norm1.weight"]
         norm_x = self._rms_norm(x, ffn_norm_w, eps=NORM_EPS, gpu_out=True)
-        norm_x = self._mod_scale_shift(norm_x, scale_ff_gpu, shift_ff_gpu,
+        norm_x = self._mod_scale_shift(norm_x, scale_ff_gpu, zero_shift_gpu,
                                        D, gpu_out=True)
         norm_x.shape = (T, D)
 
@@ -558,24 +569,25 @@ class ZImageTurboWebGPU(WebGPUModel):
         runner = self.cache.runner
         _p = self._profiling
 
-        # adaLN modulation (CPU, tiny)
+        # adaLN modulation (CPU, tiny): scale+gate for attn/ff (4*D params)
         if _p: self._begin_cpu(f"NR{layer}/adaLN_cpu")
         if _p: self._set_gpu_op(f"NR{layer}/adaLN")
-        mod = temb * (1.0 / (1.0 + np.exp(-temb)))
+        mod = temb
         mod = self._linear_with_bias(
             mod, f"{pfx}.adaLN_modulation.0.weight",
-            f"{pfx}.adaLN_modulation.0.bias", D * 6)
-        chunks = np.split(mod.ravel(), 6)
-        shift_attn, scale_attn, gate_attn = chunks[0], chunks[1], chunks[2]
-        shift_ff, scale_ff, gate_ff = chunks[3], chunks[4], chunks[5]
+            f"{pfx}.adaLN_modulation.0.bias", D * 4)
+        chunks = np.split(mod.ravel(), 4)
+        scale_attn, gate_attn, scale_ff, gate_ff = chunks
+
+        gate_attn = np.tanh(gate_attn)
+        gate_ff = np.tanh(gate_ff)
 
         # Upload modulation params to GPU
         scale_attn_gpu = runner.upload_to_gpu(scale_attn.astype(np.float32), f"_nr{layer}_sa_sc")
-        shift_attn_gpu = runner.upload_to_gpu(shift_attn.astype(np.float32), f"_nr{layer}_sa_sh")
         gate_attn_gpu = runner.upload_to_gpu(gate_attn.astype(np.float32), f"_nr{layer}_sa_gt")
         scale_ff_gpu = runner.upload_to_gpu(scale_ff.astype(np.float32), f"_nr{layer}_ff_sc")
-        shift_ff_gpu = runner.upload_to_gpu(shift_ff.astype(np.float32), f"_nr{layer}_ff_sh")
         gate_ff_gpu = runner.upload_to_gpu(gate_ff.astype(np.float32), f"_nr{layer}_ff_gt")
+        zero_shift_gpu = self._zero_biases[D]
         if _p: self._end_cpu(f"NR{layer}/adaLN_cpu")
 
         T = x.shape[0]
@@ -583,7 +595,7 @@ class ZImageTurboWebGPU(WebGPUModel):
         if _p: self._set_gpu_op(f"NR{layer}/norm1+mod")
         norm_w = self._gpu_norm_weights[f"{pfx}.attention_norm1.weight"]
         norm_x = self._rms_norm(x, norm_w, eps=NORM_EPS, gpu_out=True)
-        norm_x = self._mod_scale_shift(norm_x, scale_attn_gpu, shift_attn_gpu,
+        norm_x = self._mod_scale_shift(norm_x, scale_attn_gpu, zero_shift_gpu,
                                        D, gpu_out=True)
         norm_x.shape = (T, D)
 
@@ -615,8 +627,8 @@ class ZImageTurboWebGPU(WebGPUModel):
         if _p: self._set_gpu_op(f"NR{layer}/ff_norm+mod")
         ffn_norm_w = self._gpu_norm_weights[f"{pfx}.ffn_norm1.weight"]
         norm_x = self._rms_norm(x, ffn_norm_w, eps=NORM_EPS, gpu_out=True)
-        norm_x = self._mod_scale_shift(norm_x, scale_ff_gpu, shift_ff_gpu,
-                                       D, gpu_out=True)
+        norm_x = self._mod_scale_shift(norm_x, scale_ff_gpu, zero_shift_gpu,
+                           D, gpu_out=True)
         norm_x.shape = (T, D)
 
         if _p: self._set_gpu_op(f"NR{layer}/gate_up")
@@ -644,26 +656,26 @@ class ZImageTurboWebGPU(WebGPUModel):
 
     def _output_layer(self, x: np.ndarray,
                       temb: np.ndarray) -> np.ndarray:
-        """Final layer: adaLN modulation + projection.
+        """Final layer: adaLN scale modulation + projection.
 
         all_final_layer.2-1: adaLN_modulation (scale+shift) + linear
         """
         D = DIM
         out_dim = IN_CHANNELS * PATCH_SIZE * PATCH_SIZE  # 64
 
-        # adaLN modulation
-        mod = temb * (1.0 / (1.0 + np.exp(-temb)))
-        mod = self._linear_with_bias(
-            mod, "all_final_layer.2-1.adaLN_modulation.1.weight",
-            "all_final_layer.2-1.adaLN_modulation.1.bias", D * 2)
-        scale, shift = np.split(mod, 2, axis=-1)
+        # adaLN modulation: scale = 1 + Linear(SiLU(temb))
+        temb_silu = temb * (1.0 / (1.0 + np.exp(-temb)))
+        scale = self._linear_with_bias(
+            temb_silu, "all_final_layer.2-1.adaLN_modulation.1.weight",
+            "all_final_layer.2-1.adaLN_modulation.1.bias", D)
+        scale = 1.0 + scale
 
         # LayerNorm (no affine) + adaLN
         x_f = x.astype(np.float32)
         mean = np.mean(x_f, axis=-1, keepdims=True)
         var = np.var(x_f, axis=-1, keepdims=True)
-        norm_x = (x_f - mean) / np.sqrt(var + NORM_EPS)
-        norm_x = norm_x * (1.0 + scale) + shift
+        norm_x = (x_f - mean) / np.sqrt(var + FINAL_NORM_EPS)
+        norm_x = norm_x * scale
 
         # Linear projection to patch space
         out = self._linear_with_bias(
@@ -694,6 +706,12 @@ class ZImageTurboWebGPU(WebGPUModel):
         runner = self.cache.runner
         _p = self._profiling
 
+        # Match upstream: pad each stream to multiple of 32 before refinement.
+        txt_pad = ((-T_txt) % SEQ_MULTI_OF) if USE_SEQ_PADDING else 0
+        img_pad = ((-T_img) % SEQ_MULTI_OF) if USE_SEQ_PADDING else 0
+        T_txt_pad = T_txt + txt_pad
+        T_img_pad = T_img + img_pad
+
         # 1. Timestep embedding
         if _p: self._begin_cpu("temb")
         temb = self._compute_temb(timestep)  # (1, DIM)
@@ -702,40 +720,83 @@ class ZImageTurboWebGPU(WebGPUModel):
         # 2. Caption embedding
         if _p: self._begin_cpu("cap_embed")
         cap = self._embed_caption(encoder_hidden_states)  # (T_txt, DIM)
+        if txt_pad > 0:
+            cap = np.concatenate([cap, np.repeat(cap[-1:], txt_pad, axis=0)], axis=0)
+            cap_pad = self._get_fp32("cap_pad_token").reshape(1, DIM)
+            cap[T_txt:] = cap_pad
         if _p: self._end_cpu("cap_embed")
 
-        # 3. Context refinement (2 blocks on text only)
-        if _p: self._begin_cpu("ctx_refiner")
-        text_cos, text_sin = compute_rope_freqs(txt_ids, AXES_DIMS, ROPE_THETA)
-        cap_gpu = runner.upload_to_gpu(
-            cap.astype(np.float32).ravel(), "ctx_refiner_input")
-        cap_gpu.shape = (T_txt, DIM)
-        for i in range(N_REFINER_LAYERS):
-            cap_gpu = self._context_refiner_block(cap_gpu, text_cos, text_sin, i)
-        if _p: self._end_cpu("ctx_refiner")
-
-        # 4. Input projection: patchified latents → DIM
+        # 3. Input projection: patchified latents → DIM
         if _p: self._begin_cpu("input_proj")
         x = self._linear_with_bias(
             latents, "all_x_embedder.2-1.weight",
             "all_x_embedder.2-1.bias", DIM)
+        if img_pad > 0:
+            x = np.concatenate([x, np.repeat(x[-1:], img_pad, axis=0)], axis=0)
+            x_pad = self._get_fp32("x_pad_token").reshape(1, DIM)
+            x[T_img:] = x_pad
         if _p: self._end_cpu("input_proj")
 
-        # 5. Concatenate: [text | image] for joint attention
-        if _p: self._begin_cpu("concat+rope")
+        # 4. Noise refiner (2 blocks on image tokens)
+        if _p: self._begin_cpu("noise_refiner")
+        img_ids_branch = img_ids.copy()
+        txt_pos_len = ((T_txt + SEQ_MULTI_OF - 1) // SEQ_MULTI_OF) * SEQ_MULTI_OF
+        img_ids_branch[:T_img, 0] = float(txt_pos_len + 1)
+        if img_pad > 0:
+            img_ids_ref = np.concatenate(
+                [img_ids_branch, np.zeros((img_pad, 3), dtype=np.float32)], axis=0)
+        else:
+            img_ids_ref = img_ids_branch
+        img_cos, img_sin = compute_rope_freqs(img_ids_ref, AXES_DIMS, ROPE_THETA)
         x_gpu = runner.upload_to_gpu(
-            x.astype(np.float32).ravel(), "main_input_img")
-        x_gpu.shape = (T_img, DIM)
-        x_gpu = self._concat_gpu(cap_gpu, x_gpu)
-        T_total = T_txt + T_img
+            x.astype(np.float32).ravel(), "noise_refiner_input")
+        x_gpu.shape = (T_img_pad, DIM)
+        for i in range(N_REFINER_LAYERS):
+            if _p: self._begin_cpu(f"NR{i}")
+            x_gpu = self._noise_refiner_block(x_gpu, temb,
+                                              img_cos, img_sin, i)
+            if _p: self._end_cpu(f"NR{i}")
+        if _p: self._end_cpu("noise_refiner")
+
+        # 5. Context refinement (2 blocks on text only)
+        if _p: self._begin_cpu("ctx_refiner")
+        if txt_pad > 0:
+            txt_ids_ref = np.concatenate(
+                [txt_ids,
+                 np.stack([
+                     np.arange(T_txt + 1, T_txt_pad + 1, dtype=np.float32),
+                     np.zeros(txt_pad, dtype=np.float32),
+                     np.zeros(txt_pad, dtype=np.float32),
+                 ], axis=1)], axis=0)
+        else:
+            txt_ids_ref = txt_ids
+        text_cos, text_sin = compute_rope_freqs(txt_ids_ref, AXES_DIMS, ROPE_THETA)
+        cap_gpu = runner.upload_to_gpu(
+            cap.astype(np.float32).ravel(), "ctx_refiner_input")
+        cap_gpu.shape = (T_txt_pad, DIM)
+        for i in range(N_REFINER_LAYERS):
+            cap_gpu = self._context_refiner_block(cap_gpu, text_cos, text_sin, i)
+        if _p: self._end_cpu("ctx_refiner")
+
+        # 6. Concatenate: [image | text] for joint attention
+        if _p: self._begin_cpu("concat+rope")
+        x_gpu = self._concat_gpu(x_gpu, cap_gpu)
+        T_total = T_txt_pad + T_img_pad
         x_gpu.shape = (T_total, DIM)
 
-        # 6. Compute RoPE for concatenated sequence
-        all_ids = np.concatenate([txt_ids, img_ids], axis=0)
+        # 7. Compute RoPE for concatenated sequence
+        if img_pad > 0:
+            img_ids_main = np.concatenate(
+                [img_ids_branch,
+                 np.zeros((img_pad, 3), dtype=np.float32)], axis=0)
+        else:
+            img_ids_main = img_ids_branch
+
+        all_ids = np.concatenate([img_ids_main, txt_ids_ref], axis=0)
         all_cos, all_sin = compute_rope_freqs(all_ids, AXES_DIMS, ROPE_THETA)
         if _p: self._end_cpu("concat+rope")
 
-        # 7. Main transformer blocks (30 layers, all GPU-resident)
+        # 8. Main transformer blocks (30 layers, all GPU-resident)
         if _p: self._begin_cpu("main_blocks")
         for i in range(N_LAYERS):
             if _p: self._begin_cpu(f"L{i}")
@@ -744,27 +805,17 @@ class ZImageTurboWebGPU(WebGPUModel):
             if _p: self._end_cpu(f"L{i}")
         if _p: self._end_cpu("main_blocks")
 
-        # 8. Extract image tokens (GPU split)
+        # 9. Extract image tokens (first segment)
         if _p: self._begin_cpu("split")
-        N_txt_elems = T_txt * DIM
-        N_img_elems = T_img * DIM
-        x_gpu = self._split_gpu(x_gpu, N_txt_elems, N_img_elems)
-        x_gpu.shape = (T_img, DIM)
+        N_img_elems = T_img_pad * DIM
+        x_gpu = self._split_gpu(x_gpu, 0, N_img_elems)
+        x_gpu.shape = (T_img_pad, DIM)
         if _p: self._end_cpu("split")
-
-        # 9. Noise refiner blocks (2 layers, image-only, GPU-resident)
-        if _p: self._begin_cpu("noise_refiner")
-        img_cos, img_sin = compute_rope_freqs(img_ids, AXES_DIMS, ROPE_THETA)
-        for i in range(N_REFINER_LAYERS):
-            if _p: self._begin_cpu(f"NR{i}")
-            x_gpu = self._noise_refiner_block(x_gpu, temb,
-                                              img_cos, img_sin, i)
-            if _p: self._end_cpu(f"NR{i}")
-        if _p: self._end_cpu("noise_refiner")
 
         # 10. Output layer (readback to CPU for final projection)
         if _p: self._begin_cpu("output_layer")
-        x = runner.readback(x_gpu).reshape(T_img, DIM)
+        x = runner.readback(x_gpu).reshape(T_img_pad, DIM)
+        x = x[:T_img]
         output = self._output_layer(x, temb)
         if _p: self._end_cpu("output_layer")
         return output
@@ -775,27 +826,48 @@ class ZImageTurboWebGPU(WebGPUModel):
 # ---------------------------------------------------------------------------
 
 def encode_prompt(prompt: str, tokenizer, text_encoder,
-                  device="cpu", max_seq_len: int = 256) -> np.ndarray:
+                  device="cpu", max_seq_len: int = 512) -> np.ndarray:
     """Encode prompt using Qwen3 text encoder.
 
     Returns: (seq_len, CAP_FEAT_DIM) prompt embeddings.
     """
     import torch
 
+    if hasattr(tokenizer, "apply_chat_template"):
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        except TypeError:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
     inputs = tokenizer(
-        prompt, return_tensors="pt", padding="max_length",
-        truncation=True, max_length=max_seq_len)
+        prompt,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=max_seq_len,
+    )
     input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
+    attention_mask = inputs["attention_mask"].to(device).bool()
 
     with torch.no_grad():
         output = text_encoder(
             input_ids=input_ids, attention_mask=attention_mask,
             output_hidden_states=True, use_cache=False)
 
-    # Use last hidden state
-    hidden = output.hidden_states[-1]  # (1, seq, 2560)
-    return hidden.float().squeeze(0).cpu().numpy()  # (seq, 2560)
+    # Z-Image uses penultimate hidden state and strips padded tokens.
+    hidden = output.hidden_states[-2][0]  # (seq, 2560)
+    mask = attention_mask[0]
+    return hidden[mask].float().cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -804,60 +876,97 @@ def encode_prompt(prompt: str, tokenizer, text_encoder,
 
 def generate_image(model: ZImageTurboWebGPU,
                    prompt_embeds: np.ndarray,
+                   negative_prompt_embeds: Optional[np.ndarray],
                    height: int, width: int,
                    num_steps: int = 4,
-                   seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+                   seed: int = 42,
+                   guidance_scale: float = 5.0) -> Tuple[np.ndarray, np.ndarray]:
     """Run the full denoising loop.
 
     Returns: (latents, latent_ids) as numpy arrays.
     """
-    # Compute latent dimensions (VAE divides by 8, patch divides by 2)
-    lat_h = height // 8 // PATCH_SIZE
-    lat_w = width // 8 // PATCH_SIZE
+    # Spatial latent grid for scheduler updates (matches upstream pipeline).
+    lat_h_sp = height // 8
+    lat_w_sp = width // 8
+
+    # Token grid used by transformer patch embedding.
+    lat_h = lat_h_sp // PATCH_SIZE
+    lat_w = lat_w_sp // PATCH_SIZE
     patch_dim = IN_CHANNELS * PATCH_SIZE * PATCH_SIZE  # 64
 
     # Generate noise
     rng = np.random.RandomState(seed)
-    noise = rng.randn(lat_h * lat_w, patch_dim).astype(np.float32)
-
-    latents = noise
-    img_ids = prepare_latent_ids(lat_h, lat_w)
+    latents = rng.randn(1, IN_CHANNELS, lat_h_sp, lat_w_sp).astype(np.float32)
+    img_ids = prepare_latent_ids(lat_h, lat_w, text_seq_len=prompt_embeds.shape[0])
     txt_ids = prepare_text_ids(prompt_embeds.shape[0])
 
     # Scheduler
+    import torch
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
         FlowMatchEulerDiscreteScheduler,
     )
     scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+    scheduler.sigma_min = 0.0
     scheduler.set_timesteps(num_steps)
-    timesteps = scheduler.timesteps.numpy()
+    timesteps = scheduler.timesteps
     sigmas = scheduler.sigmas.numpy()
 
-    print(f"  Latent: {lat_h}x{lat_w} = {lat_h * lat_w} tokens, patch_dim={patch_dim}")
+    print(f"  Latent spatial: {lat_h_sp}x{lat_w_sp}, token grid: {lat_h}x{lat_w} = {lat_h * lat_w} tokens")
     print(f"  Text: {prompt_embeds.shape}")
     print(f"  Steps: {num_steps}")
+
+    latents_t = torch.from_numpy(latents.astype(np.float32))
 
     for i, t in enumerate(timesteps):
         t0 = time.time()
         sigma = sigmas[i]
-        timestep_frac = t.item() / 1000.0
+        timestep_frac = (1000.0 - t.item()) / 1000.0
 
-        noise_pred = model.forward(
-            latents, prompt_embeds,
+        # Patchify (1,C,H,W) -> (T, P*P*C) with (ph,pw,c) inner order.
+        lat_np = latents_t.cpu().numpy()[0]
+        lat_tokens = lat_np.reshape(
+            IN_CHANNELS, lat_h, PATCH_SIZE, lat_w, PATCH_SIZE
+        ).transpose(1, 3, 2, 4, 0).reshape(lat_h * lat_w, patch_dim)
+
+        noise_pred_pos = model.forward(
+            lat_tokens, prompt_embeds,
             timestep=timestep_frac,
             img_ids=img_ids, txt_ids=txt_ids)
 
+        if negative_prompt_embeds is not None and guidance_scale > 0.0:
+            txt_ids_neg = prepare_text_ids(negative_prompt_embeds.shape[0])
+            noise_pred_neg = model.forward(
+                lat_tokens, negative_prompt_embeds,
+                timestep=timestep_frac,
+                img_ids=img_ids, txt_ids=txt_ids_neg)
+            noise_pred = noise_pred_pos + guidance_scale * (noise_pred_pos - noise_pred_neg)
+        else:
+            noise_pred = noise_pred_pos
+
+        noise_pred = -noise_pred
+
+        # Unpatchify noise prediction back to spatial latent layout.
+        noise_pred_sp = noise_pred.reshape(
+            lat_h, lat_w, PATCH_SIZE, PATCH_SIZE, IN_CHANNELS
+        ).transpose(4, 0, 2, 1, 3).reshape(1, IN_CHANNELS, lat_h_sp, lat_w_sp)
+
+        latents_t = scheduler.step(
+            torch.from_numpy(noise_pred_sp.astype(np.float32)),
+            t,
+            latents_t,
+            return_dict=False,
+        )[0]
+
         sigma_next = sigmas[i + 1] if i + 1 < len(sigmas) else 0.0
         dt = sigma_next - sigma
-        latents = latents + dt * noise_pred
 
         elapsed = time.time() - t0
         print(f"  Step {i+1}/{num_steps}: t={t.item():.1f}, "
               f"sigma={sigma:.4f}, dt={dt:.4f}, "
-              f"pred std={noise_pred.std():.4f}, "
+              f"pred std={noise_pred_sp.std():.4f}, "
               f"time={elapsed:.2f}s")
 
-    return latents, img_ids
+    return latents_t.cpu().numpy(), img_ids
 
 
 # ---------------------------------------------------------------------------
@@ -889,14 +998,15 @@ def verify_with_random_weights():
     ps = PATCH_SIZE
     patch_dim = in_ch * ps * ps  # 64
     td = TIMESTEP_DIM  # 256
+    ad = min(D, ADALN_EMBED_DIM)  # 256
 
     W = {}
 
     # Timestep embedder
-    W["t_embedder.mlp.0.weight"] = rng.randn(D, td).astype(np.float32) * s
-    W["t_embedder.mlp.0.bias"] = np.zeros(D, dtype=np.float32)
-    W["t_embedder.mlp.2.weight"] = rng.randn(D, D).astype(np.float32) * s
-    W["t_embedder.mlp.2.bias"] = np.zeros(D, dtype=np.float32)
+    W["t_embedder.mlp.0.weight"] = rng.randn(1024, td).astype(np.float32) * s
+    W["t_embedder.mlp.0.bias"] = np.zeros(1024, dtype=np.float32)
+    W["t_embedder.mlp.2.weight"] = rng.randn(ad, 1024).astype(np.float32) * s
+    W["t_embedder.mlp.2.bias"] = np.zeros(ad, dtype=np.float32)
 
     # Caption embedder: RMSNorm(cap_dim) → Linear(cap_dim → D, bias)
     W["cap_embedder.0.weight"] = np.ones(cap_dim, dtype=np.float32)
@@ -910,8 +1020,8 @@ def verify_with_random_weights():
     # Main transformer blocks
     for i in range(n_layers):
         pfx = f"layers.{i}"
-        W[f"{pfx}.adaLN_modulation.0.weight"] = rng.randn(D * 6, D).astype(np.float32) * s
-        W[f"{pfx}.adaLN_modulation.0.bias"] = np.zeros(D * 6, dtype=np.float32)
+        W[f"{pfx}.adaLN_modulation.0.weight"] = rng.randn(D * 4, ad).astype(np.float32) * s
+        W[f"{pfx}.adaLN_modulation.0.bias"] = np.zeros(D * 4, dtype=np.float32)
         W[f"{pfx}.attention_norm1.weight"] = np.ones(D, dtype=np.float32)
         W[f"{pfx}.attention_norm2.weight"] = np.ones(D, dtype=np.float32)
         W[f"{pfx}.attention.to_q.weight"] = rng.randn(D, D).astype(np.float32) * s
@@ -946,8 +1056,8 @@ def verify_with_random_weights():
     # Noise refiner
     for i in range(n_refiner):
         pfx = f"noise_refiner.{i}"
-        W[f"{pfx}.adaLN_modulation.0.weight"] = rng.randn(D * 6, D).astype(np.float32) * s
-        W[f"{pfx}.adaLN_modulation.0.bias"] = np.zeros(D * 6, dtype=np.float32)
+        W[f"{pfx}.adaLN_modulation.0.weight"] = rng.randn(D * 4, ad).astype(np.float32) * s
+        W[f"{pfx}.adaLN_modulation.0.bias"] = np.zeros(D * 4, dtype=np.float32)
         W[f"{pfx}.attention_norm1.weight"] = np.ones(D, dtype=np.float32)
         W[f"{pfx}.attention_norm2.weight"] = np.ones(D, dtype=np.float32)
         W[f"{pfx}.attention.to_q.weight"] = rng.randn(D, D).astype(np.float32) * s
@@ -963,8 +1073,8 @@ def verify_with_random_weights():
         W[f"{pfx}.feed_forward.w3.weight"] = rng.randn(ff, D).astype(np.float32) * s
 
     # Final layer
-    W["all_final_layer.2-1.adaLN_modulation.1.weight"] = rng.randn(D * 2, D).astype(np.float32) * s
-    W["all_final_layer.2-1.adaLN_modulation.1.bias"] = np.zeros(D * 2, dtype=np.float32)
+    W["all_final_layer.2-1.adaLN_modulation.1.weight"] = rng.randn(D, ad).astype(np.float32) * s
+    W["all_final_layer.2-1.adaLN_modulation.1.bias"] = np.zeros(D, dtype=np.float32)
     W["all_final_layer.2-1.linear.weight"] = rng.randn(patch_dim, D).astype(np.float32) * s
     W["all_final_layer.2-1.linear.bias"] = np.zeros(patch_dim, dtype=np.float32)
 
@@ -986,7 +1096,7 @@ def verify_with_random_weights():
     T_txt = 4
     latents = rng.randn(T_img, patch_dim).astype(np.float32) * 0.1
     ctx = rng.randn(T_txt, cap_dim).astype(np.float32) * 0.1
-    img_ids = prepare_latent_ids(4, 4)
+    img_ids = prepare_latent_ids(4, 4, text_seq_len=T_txt)
     txt_ids = prepare_text_ids(T_txt)
 
     t0 = time.time()
@@ -1031,8 +1141,12 @@ def main():
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    default_output = os.path.join(_SCRIPT_DIR, "..", "..", "gitignore",
-                                   "output.png")
+    parser.add_argument("--guidance", type=float, default=5.0,
+                        help="Classifier-free guidance scale (0 to disable)")
+    default_output = os.path.join(
+        _SCRIPT_DIR, "..", "..", "gitignore", "models",
+        os.path.basename(_SCRIPT_DIR), "output.png"
+    )
     parser.add_argument("--output", type=str, default=default_output)
     parser.add_argument("--profile", action="store_true",
                         help="Profile the denoising loop")
@@ -1051,11 +1165,11 @@ def main():
 
     # Step 1: Load text encoder
     print("=== Loading text encoder (Qwen3) ===")
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModel
 
     tokenizer = AutoTokenizer.from_pretrained(
         os.path.join(hf_cache, "tokenizer"), local_files_only=True)
-    text_encoder = AutoModelForCausalLM.from_pretrained(
+    text_encoder = AutoModel.from_pretrained(
         os.path.join(hf_cache, "text_encoder"),
         torch_dtype=torch.bfloat16, local_files_only=True)
 
@@ -1065,6 +1179,11 @@ def main():
     print(f"\n=== Encoding prompt: '{args.prompt}' ===")
     prompt_embeds = encode_prompt(args.prompt, tokenizer, text_encoder)
     print(f"  Prompt embeddings: {prompt_embeds.shape}")
+
+    negative_prompt_embeds = None
+    if args.guidance > 0.0:
+        negative_prompt_embeds = encode_prompt("", tokenizer, text_encoder)
+        print(f"  Negative prompt embeddings: {negative_prompt_embeds.shape}")
 
     del text_encoder, tokenizer
     import gc; gc.collect()
@@ -1098,22 +1217,17 @@ def main():
     print(f"\n=== Generating {args.height}x{args.width} image "
           f"({args.steps} steps) ===")
     latents, img_ids = generate_image(
-        model, prompt_embeds,
+        model, prompt_embeds, negative_prompt_embeds,
         args.height, args.width,
-        num_steps=args.steps, seed=args.seed)
+        num_steps=args.steps, seed=args.seed,
+        guidance_scale=args.guidance)
 
     # Step 5: VAE decode
     print("\n=== VAE decoding ===")
-    lat_h = args.height // 8 // PATCH_SIZE
-    lat_w = args.width // 8 // PATCH_SIZE
-
-    # Unpatchify: (T, C*P*P) → (1, C, H*P, W*P)
-    C = IN_CHANNELS
-    P = PATCH_SIZE
-    lat = latents.reshape(lat_h, lat_w, C, P, P)
-    lat = lat.transpose(2, 0, 3, 1, 4).reshape(1, C, lat_h * P, lat_w * P)
-
-    lat_tensor = torch.from_numpy(lat).to(vae.dtype)
+    lat_tensor = torch.from_numpy(latents).to(vae.dtype)
+    lat_tensor = lat_tensor / vae.config.scaling_factor
+    if hasattr(vae.config, "shift_factor") and vae.config.shift_factor is not None:
+        lat_tensor = lat_tensor + vae.config.shift_factor
     with torch.no_grad():
         img = vae.decode(lat_tensor, return_dict=False)[0]
 
