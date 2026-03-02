@@ -152,6 +152,65 @@ def linear_loop_fp16w_tiled_kernel(X, W, Bias, Y, K, stride_x, stride_w,
 
 
 @triton.jit
+def linear_fp16w_matvec_kernel(X, W, Bias, Y, K, stride_w, N,
+                               BLOCK_K: tl.constexpr,
+                               BLOCK_N: tl.constexpr):
+    """N-tiled matvec with fp16 weights for T=1 large-N projections.
+
+    Each workgroup computes BLOCK_N output elements, reusing the input
+    vector x across all N output rows. This reduces workgroup count by
+    BLOCK_N× and dramatically improves GPU utilization for large-vocab
+    LM head projections on integrated GPUs.
+
+    Grid: (ceil(N / BLOCK_N),) — one workgroup per N-tile.
+    """
+    tile_n = tl.program_id(0)
+    num_chunks = (K + BLOCK_K - 1) // BLOCK_K
+    col0 = tile_n * BLOCK_N
+
+    # Accumulate BLOCK_N dot products, x shared across all
+    acc0 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc4 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc5 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc6 = tl.zeros([BLOCK_K], dtype=tl.float32)
+    acc7 = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+    for chunk_i in range(num_chunks):
+        off = chunk_i * BLOCK_K
+        ks = off + tl.arange(0, BLOCK_K)
+        mask = ks < K
+        x = tl.load(X + ks, mask=mask, other=0.0).to(tl.float32)
+        w0 = tl.load(W + (col0 + 0) * stride_w + ks, mask=mask & (col0 + 0 < N), other=0.0).to(tl.float32)
+        acc0 += x * w0
+        w1 = tl.load(W + (col0 + 1) * stride_w + ks, mask=mask & (col0 + 1 < N), other=0.0).to(tl.float32)
+        acc1 += x * w1
+        w2 = tl.load(W + (col0 + 2) * stride_w + ks, mask=mask & (col0 + 2 < N), other=0.0).to(tl.float32)
+        acc2 += x * w2
+        w3 = tl.load(W + (col0 + 3) * stride_w + ks, mask=mask & (col0 + 3 < N), other=0.0).to(tl.float32)
+        acc3 += x * w3
+        w4 = tl.load(W + (col0 + 4) * stride_w + ks, mask=mask & (col0 + 4 < N), other=0.0).to(tl.float32)
+        acc4 += x * w4
+        w5 = tl.load(W + (col0 + 5) * stride_w + ks, mask=mask & (col0 + 5 < N), other=0.0).to(tl.float32)
+        acc5 += x * w5
+        w6 = tl.load(W + (col0 + 6) * stride_w + ks, mask=mask & (col0 + 6 < N), other=0.0).to(tl.float32)
+        acc6 += x * w6
+        w7 = tl.load(W + (col0 + 7) * stride_w + ks, mask=mask & (col0 + 7 < N), other=0.0).to(tl.float32)
+        acc7 += x * w7
+
+    tl.store(Y + col0 + 0, tl.sum(acc0, axis=0) + tl.load(Bias + col0 + 0, mask=(col0 + 0 < N), other=0.0), mask=(col0 + 0 < N))
+    tl.store(Y + col0 + 1, tl.sum(acc1, axis=0) + tl.load(Bias + col0 + 1, mask=(col0 + 1 < N), other=0.0), mask=(col0 + 1 < N))
+    tl.store(Y + col0 + 2, tl.sum(acc2, axis=0) + tl.load(Bias + col0 + 2, mask=(col0 + 2 < N), other=0.0), mask=(col0 + 2 < N))
+    tl.store(Y + col0 + 3, tl.sum(acc3, axis=0) + tl.load(Bias + col0 + 3, mask=(col0 + 3 < N), other=0.0), mask=(col0 + 3 < N))
+    tl.store(Y + col0 + 4, tl.sum(acc4, axis=0) + tl.load(Bias + col0 + 4, mask=(col0 + 4 < N), other=0.0), mask=(col0 + 4 < N))
+    tl.store(Y + col0 + 5, tl.sum(acc5, axis=0) + tl.load(Bias + col0 + 5, mask=(col0 + 5 < N), other=0.0), mask=(col0 + 5 < N))
+    tl.store(Y + col0 + 6, tl.sum(acc6, axis=0) + tl.load(Bias + col0 + 6, mask=(col0 + 6 < N), other=0.0), mask=(col0 + 6 < N))
+    tl.store(Y + col0 + 7, tl.sum(acc7, axis=0) + tl.load(Bias + col0 + 7, mask=(col0 + 7 < N), other=0.0), mask=(col0 + 7 < N))
+
+
+@triton.jit
 def linear_q4_kernel(X, W_Q4, Scales, Zeros, Bias, Y,
                      K, stride_x, stride_w_q4, n_groups, N,
                      BLOCK_K: tl.constexpr):
@@ -1143,6 +1202,74 @@ def fused_rope_qkv_kernel(QKV, Q_out, K_cache, V_cache,
              mask=kv_mask)
 
     # V: straight copy to cache (only for KV workgroups)
+    v_src = q_size + kv_size + kv_head * BLOCK_HD
+    v = tl.load(QKV + v_src + hd, mask=kv_mask, other=0.0).to(tl.float32)
+    tl.store(V_cache + cache_offset + kv_head * BLOCK_HD + hd, v,
+             mask=kv_mask)
+
+
+@triton.jit
+def fused_qknorm_rope_qkv_kernel(QKV, Q_out, K_cache, V_cache,
+                                  CosTable, SinTable, NormQ, NormK,
+                                  n_head, q_size, kv_size, pos, half_rot,
+                                  cache_offset, eps,
+                                  BLOCK_HD: tl.constexpr):
+    """Fused QK-norm + RoPE for Q heads + RoPE K + scatter KV.
+
+    Same as fused_rope_qkv_kernel but adds per-head RMSNorm on Q and K
+    before applying RoPE. Used by models with QK-norm (Qwen3).
+
+    NormQ: (HD,) norm weights for Q heads
+    NormK: (HD,) norm weights for K heads
+
+    Grid: (n_head + n_kv_heads,)
+    """
+    pid = tl.program_id(0)
+    hd = tl.arange(0, BLOCK_HD)
+
+    is_q = pid < n_head
+    kv_head = pid - n_head
+    src = tl.where(is_q, pid * BLOCK_HD, q_size + kv_head * BLOCK_HD)
+    x = tl.load(QKV + src + hd).to(tl.float32)
+
+    # Per-head RMSNorm: rms = sqrt(mean(x^2) + eps), x = x / rms * w
+    x_sq = x * x
+    mean_sq = tl.sum(x_sq, axis=0) / BLOCK_HD
+    rms_inv = 1.0 / tl.sqrt(mean_sq + eps)
+    norm_w_q = tl.load(NormQ + hd).to(tl.float32)
+    norm_w_k = tl.load(NormK + hd).to(tl.float32)
+    norm_w = tl.where(is_q, norm_w_q, norm_w_k)
+    x = x * rms_inv * norm_w
+
+    # RoPE (half-rotation convention)
+    cs_idx = hd % half_rot
+    is_rotary = hd < half_rot * 2
+    cos_v = tl.load(CosTable + pos * half_rot + cs_idx,
+                    mask=is_rotary, other=1.0).to(tl.float32)
+    sin_v = tl.load(SinTable + pos * half_rot + cs_idx,
+                    mask=is_rotary, other=0.0).to(tl.float32)
+    sign = tl.where(hd < half_rot, -1.0, 1.0)
+    partner_hd = tl.where(hd < half_rot, hd + half_rot, hd - half_rot)
+    partner_hd = tl.where(is_rotary, partner_hd, hd)
+
+    # Need normed partner for rotation (same head, same rms_inv)
+    partner_raw = tl.load(QKV + src + partner_hd).to(tl.float32)
+    norm_w_partner_q = tl.load(NormQ + partner_hd).to(tl.float32)
+    norm_w_partner_k = tl.load(NormK + partner_hd).to(tl.float32)
+    norm_w_partner = tl.where(is_q, norm_w_partner_q, norm_w_partner_k)
+    partner = partner_raw * rms_inv * norm_w_partner
+
+    rotated = x * cos_v + sign * partner * sin_v
+    y = tl.where(is_rotary, rotated, x)
+
+    # Q heads: write to Q_out
+    tl.store(Q_out + pid * BLOCK_HD + hd, y, mask=is_q)
+    # K heads: scatter to KV cache
+    kv_mask = is_q == 0
+    tl.store(K_cache + cache_offset + kv_head * BLOCK_HD + hd, y,
+             mask=kv_mask)
+
+    # V: straight copy to cache (KV workgroups only)
     v_src = q_size + kv_size + kv_head * BLOCK_HD
     v = tl.load(QKV + v_src + hd, mask=kv_mask, other=0.0).to(tl.float32)
     tl.store(V_cache + cache_offset + kv_head * BLOCK_HD + hd, v,

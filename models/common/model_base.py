@@ -32,6 +32,7 @@ from common.kernels import (
     add_rms_norm_loop_kernel,
     linear_kernel, linear_loop_kernel, linear_loop_fp16w_kernel,
     linear_loop_fp16w_wide_kernel, linear_loop_fp16w_tiled_kernel,
+    linear_fp16w_matvec_kernel,
     linear_Wt_fp16_kernel,
     linear_q4_kernel, linear_q4_add_kernel, linear_q4_wide_kernel,
     add_kernel, add_inplace_kernel,
@@ -45,7 +46,7 @@ from common.kernels import (
     causal_attn_kernel, causal_attn_multihead_kernel,
     full_attn_kernel, full_attn_multihead_kernel, gqa_decode_attn_kernel,
     partial_rope_decode_kernel, rope_kv_scatter_kernel,
-    fused_rope_qkv_kernel,
+    fused_rope_qkv_kernel, fused_qknorm_rope_qkv_kernel,
     partial_rope_prefill_kernel, rope_kv_scatter_prefill_kernel,
     group_norm_kernel,
     linear_mxfp4_kernel, gptoss_gate_kernel,
@@ -523,6 +524,20 @@ class WebGPUModel:
                     self._linear_fp16w_wide_sig,
                     {'BLOCK_K': LB}, num_warps=_nw(LB))
 
+                # N-tiled matvec for T=1 large-N (LM head on iGPUs)
+                MATVEC_BN = 8
+                self._linear_fp16w_matvec_sig = {
+                    'X': '*fp32', 'W': '*fp16', 'Bias': '*fp32', 'Y': '*fp32',
+                    'K': 'i32', 'stride_w': 'i32', 'N': 'i32',
+                    'BLOCK_K': 'constexpr', 'BLOCK_N': 'constexpr',
+                }
+                self._linear_fp16w_matvec_result = self.cache.get_or_compile(
+                    linear_fp16w_matvec_kernel,
+                    self._linear_fp16w_matvec_sig,
+                    {'BLOCK_K': LB, 'BLOCK_N': MATVEC_BN},
+                    num_warps=_nw(LB))
+                self._matvec_block_n = MATVEC_BN
+
                 # Barrier-free transposed-weight kernel
                 self._linear_Wt_fp16_sig = {
                     'X': '*fp32', 'W_T': '*fp16', 'Bias': '*fp32',
@@ -719,6 +734,21 @@ class WebGPUModel:
         }
         self._fused_rope_result = self.cache.get_or_compile(
             fused_rope_qkv_kernel, self._fused_rope_sig,
+            {'BLOCK_HD': BS_hd}, num_warps=_nw(BS_hd))
+
+        # --- Fused QK-norm + RoPE Q + K scatter + V copy (decode, T=1) ---
+        self._fused_qknorm_rope_sig = {
+            'QKV': '*fp32', 'Q_out': '*fp32',
+            'K_cache': '*fp32', 'V_cache': '*fp32',
+            'CosTable': '*fp32', 'SinTable': '*fp32',
+            'NormQ': '*fp32', 'NormK': '*fp32',
+            'n_head': 'i32', 'q_size': 'i32', 'kv_size': 'i32',
+            'pos': 'i32', 'half_rot': 'i32', 'cache_offset': 'i32',
+            'eps': 'fp32',
+            'BLOCK_HD': 'constexpr',
+        }
+        self._fused_qknorm_rope_result = self.cache.get_or_compile(
+            fused_qknorm_rope_qkv_kernel, self._fused_qknorm_rope_sig,
             {'BLOCK_HD': BS_hd}, num_warps=_nw(BS_hd))
 
         # --- Prefill RoPE Q (multi-token) ---
@@ -1648,16 +1678,34 @@ class WebGPUModel:
             if K is None:
                 K = x.shape[1]
 
-        # Use wide kernel for large N (avoids chunked dispatch)
+        # N-tiled matvec for iGPUs (fewer workgroups, better for small schedulers)
+        # Wide kernel is faster on discrete GPUs with large schedulers
         if N > self.MAX_DISPATCH_DIM and T == 1:
-            grid_y = self.MAX_DISPATCH_DIM
-            grid_x = (N + grid_y - 1) // grid_y
-            out = self.cache.run(
-                self._linear_fp16w_wide_result, grid=(grid_x, grid_y),
-                buffers={
-                    'X': x if x_is_gpu else x.ravel(),
-                    'W': w_fp16 if w_is_gpu else w_fp16.ravel(),
-                    'Bias': bias,
+            use_matvec = (hasattr(self, '_linear_fp16w_matvec_result')
+                          and getattr(self, '_gpu_vendor', '') != 'nvidia')
+            if use_matvec:
+                BN = self._matvec_block_n
+                grid_n = (N + BN - 1) // BN
+                out = self.cache.run(
+                    self._linear_fp16w_matvec_result, grid=(grid_n,),
+                    buffers={
+                        'X': x if x_is_gpu else x.ravel(),
+                        'W': w_fp16 if w_is_gpu else w_fp16.ravel(),
+                        'Bias': bias,
+                        'Y': np.zeros(N, dtype=np.float32),
+                    },
+                    scalars={'K': K, 'stride_w': K, 'N': N},
+                    gpu_outputs={'Y'} if gpu_out else None)
+            else:
+                # Fallback to wide kernel
+                grid_y = self.MAX_DISPATCH_DIM
+                grid_x = (N + grid_y - 1) // grid_y
+                out = self.cache.run(
+                    self._linear_fp16w_wide_result, grid=(grid_x, grid_y),
+                    buffers={
+                        'X': x if x_is_gpu else x.ravel(),
+                        'W': w_fp16 if w_is_gpu else w_fp16.ravel(),
+                        'Bias': bias,
                     'Y': np.zeros(N, dtype=np.float32),
                 },
                 scalars={'K': K, 'stride_x': K, 'stride_w': K,

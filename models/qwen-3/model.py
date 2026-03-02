@@ -159,13 +159,15 @@ class Qwen3WebGPU(WebGPUModel):
             self._dequantize_all_weights()
         self._precompute_rope_tables()
         self._upload_weights_to_gpu()
+        self._has_qk_norm = any("q_norm" in k for k in self._gpu_weights)
         if self._decode_mode == 'gpu':
             self._init_gpu_kv_cache()
 
     def _compile_model_kernels(self):
-        """Compile Qwen-specific kernels: RMSNorm, SiLU*mul."""
+        """Compile Qwen-specific kernels: RMSNorm, SiLU*mul, argmax."""
         self._compile_rms_norm()
         self._compile_silu_mul()
+        self._compile_argmax()
 
     def _fuse_weights(self):
         """Fuse Q/K/V weights+biases and gate/up weights into single matrices."""
@@ -567,7 +569,13 @@ class Qwen3WebGPU(WebGPUModel):
 
         pl_rn,    bgl_rn    = get_pl(self._rn_result)
         pl_arn,   bgl_arn   = get_pl(self._add_rn_result)
-        pl_fused, bgl_fused = get_pl(self._fused_rope_result)
+        pl_q4a,   bgl_q4a   = get_pl(self._linear_q4_add_result)  # fused matmul+add
+        if self._has_qk_norm:
+            pl_fused, bgl_fused = get_pl(self._fused_qknorm_rope_result)
+            nbb_fused = len(self._fused_qknorm_rope_result.buffer_bindings)
+        else:
+            pl_fused, bgl_fused = get_pl(self._fused_rope_result)
+            nbb_fused = len(self._fused_rope_result.buffer_bindings)
         pl_attn,  bgl_attn  = get_pl(self._gqa_attn_result)
         pl_aip,   bgl_aip   = get_pl(self._add_ip_result)
         pl_silu,  bgl_silu  = get_pl(self._smf_result)
@@ -575,7 +583,6 @@ class Qwen3WebGPU(WebGPUModel):
 
         nbb_rn = len(self._rn_result.buffer_bindings)
         nbb_arn = len(self._add_rn_result.buffer_bindings)
-        nbb_fused = len(self._fused_rope_result.buffer_bindings)
         nbb_attn = len(self._gqa_attn_result.buffer_bindings)
         nbb_aip = len(self._add_ip_result.buffer_bindings)
         nbb_silu = len(self._smf_result.buffer_bindings)
@@ -607,12 +614,15 @@ class Qwen3WebGPU(WebGPUModel):
             })
 
         q4_qkv_p = mk_q4_params('q4_qkv_p', E, qkv_N)
-        q4_oproj_p = mk_q4_params('q4_oproj_p', E, E)
+        q4_oproj_p = mk_q4_params('q4_oproj_p', q_size, E)
         q4_gateup_p = mk_q4_params('q4_gateup_p', E, 2 * IM)
         q4_down_p = mk_q4_params('q4_down_p', IM, E)
 
         # Dynamic params (updated per token)
-        fused_rope_ph = mkbuf('fused_rope_p', 28)
+        if self._has_qk_norm:
+            fused_rope_ph = mkbuf('fused_rope_p', 32)  # extra eps field
+        else:
+            fused_rope_ph = mkbuf('fused_rope_p', 28)
         attn_ph = mkbuf('attn_p', 24)
 
         cos_h = self._rope_cos_gpu.handle
@@ -683,13 +693,26 @@ class Qwen3WebGPU(WebGPUModel):
                 (5, qkv_buf[0], qkv_buf[1]),
                 (nbb_q4, q4_qkv_p[0], q4_qkv_p[1])])
 
-            bg_frope = mk_bg(bgl_fused, [
-                (0, qkv_buf[0], qkv_buf[1]),
-                (1, q_rot[0], q_rot[1]),
-                (2, K_cache.handle, K_cache.size),
-                (3, V_cache.handle, V_cache.size),
-                (4, cos_h, cos_sz), (5, sin_h, sin_sz),
-                (nbb_fused, fused_rope_ph[0], fused_rope_ph[1])])
+            if self._has_qk_norm:
+                norm_q_w = self._gpu_weights[pfx + "self_attn.q_norm.weight"]
+                norm_k_w = self._gpu_weights[pfx + "self_attn.k_norm.weight"]
+                bg_frope = mk_bg(bgl_fused, [
+                    (0, qkv_buf[0], qkv_buf[1]),
+                    (1, q_rot[0], q_rot[1]),
+                    (2, K_cache.handle, K_cache.size),
+                    (3, V_cache.handle, V_cache.size),
+                    (4, cos_h, cos_sz), (5, sin_h, sin_sz),
+                    (6, norm_q_w.handle, norm_q_w.size),
+                    (7, norm_k_w.handle, norm_k_w.size),
+                    (nbb_fused, fused_rope_ph[0], fused_rope_ph[1])])
+            else:
+                bg_frope = mk_bg(bgl_fused, [
+                    (0, qkv_buf[0], qkv_buf[1]),
+                    (1, q_rot[0], q_rot[1]),
+                    (2, K_cache.handle, K_cache.size),
+                    (3, V_cache.handle, V_cache.size),
+                    (4, cos_h, cos_sz), (5, sin_h, sin_sz),
+                    (nbb_fused, fused_rope_ph[0], fused_rope_ph[1])])
 
             bg_att = mk_bg(bgl_attn, [
                 (0, q_rot[0], q_rot[1]),
@@ -733,6 +756,17 @@ class Qwen3WebGPU(WebGPUModel):
                 (5, proj_out[0], proj_out[1]),
                 (nbb_q4, q4_down_p[0], q4_down_p[1])])
 
+            # Fused down_proj + residual_add: writes directly to x_buf
+            nbb_q4a = len(self._linear_q4_add_result.buffer_bindings)
+            bg_dn_add = mk_bg(bgl_q4a, [
+                (0, silu_out[0], silu_out[1]),
+                (1, dn_wq.handle, dn_wq.size),
+                (2, dn_sc.handle, dn_sc.size),
+                (3, dn_zr.handle, dn_zr.size),
+                (4, bias_e.handle, bias_e.size),
+                (5, x_buf[0], x_buf[1]),
+                (nbb_q4a, q4_down_p[0], q4_down_p[1])])
+
             bg_res = mk_bg(bgl_aip, [
                 (0, x_buf[0], x_buf[1]),
                 (1, proj_out[0], proj_out[1]),
@@ -741,13 +775,13 @@ class Qwen3WebGPU(WebGPUModel):
             if i < self.n_layer - 1:
                 next_norm1_w = self._gpu_weights[
                     f"layers.{i+1}.input_layernorm.weight"]
-                bg_arn_next = mk_bg(bgl_arn, [
+                # Plain RMSNorm (no addition — down_proj already added to x_buf)
+                bg_rn_next = mk_bg(bgl_rn, [
                     (0, x_buf[0], x_buf[1]),
-                    (1, proj_out[0], proj_out[1]),
-                    (2, norm_out[0], norm_out[1]),
-                    (3, next_norm1_w.handle, next_norm1_w.size),
-                    (4, rstd[0], rstd[1]),
-                    (nbb_arn, arn_p[0], arn_p[1])])
+                    (1, norm_out[0], norm_out[1]),
+                    (2, next_norm1_w.handle, next_norm1_w.size),
+                    (3, rstd[0], rstd[1]),
+                    (nbb_rn, rn_p[0], rn_p[1])])
                 dispatches = []
                 if i == 0:
                     dispatches.append((pl_rn, bg_n1, (1,)))
@@ -759,20 +793,19 @@ class Qwen3WebGPU(WebGPUModel):
                     (pl_arn,   bg_arn2,     (1,)),
                     (pl_q4,    bg_gu,       (1, 2 * IM)),
                     (pl_silu,  bg_silu,     silu_g),
-                    (pl_q4,    bg_dn,       (1, E)),
-                    (pl_arn,   bg_arn_next, (1,)),
+                    (pl_q4a,   bg_dn_add,  (1, E)),
+                    (pl_rn,    bg_rn_next,  (1,)),
                 ])
             else:
                 dispatches = [
-                    (pl_q4,    bg_qkv,  (1, qkv_N)),
-                    (pl_fused, bg_frope, (n_head + n_kv,)),
-                    (pl_attn,  bg_att,   (n_head,)),
-                    (pl_q4,    bg_op,    (1, E)),
-                    (pl_arn,   bg_arn2,  (1,)),
-                    (pl_q4,    bg_gu,    (1, 2 * IM)),
-                    (pl_silu,  bg_silu,  silu_g),
-                    (pl_q4,    bg_dn,    (1, E)),
-                    (pl_aip,   bg_res,   aip_g),
+                    (pl_q4,    bg_qkv,    (1, qkv_N)),
+                    (pl_fused, bg_frope,   (n_head + n_kv,)),
+                    (pl_attn,  bg_att,     (n_head,)),
+                    (pl_q4,    bg_op,      (1, E)),
+                    (pl_arn,   bg_arn2,    (1,)),
+                    (pl_q4,    bg_gu,      (1, 2 * IM)),
+                    (pl_silu,  bg_silu,    silu_g),
+                    (pl_q4a,   bg_dn_add, (1, E)),
                 ]
             layer_dispatches.append(dispatches)
 
@@ -806,17 +839,66 @@ class Qwen3WebGPU(WebGPUModel):
             (3, logits_buf[0], logits_buf[1]),
             (nbb_lmh, lmh_p[0], lmh_p[1])])
 
-        final_dispatches = [
-            (pl_rn,  bg_final_rn, (1,)),
-            (pl_lmh, bg_lmh,      (lm_gx, lm_gy)),
-        ]
+        # Use N-tiled matvec for LM head on iGPUs (8× fewer workgroups)
+        # Discrete GPUs prefer the wide kernel (larger scheduler)
+        use_matvec = (hasattr(self, '_linear_fp16w_matvec_result')
+                      and self._gpu_vendor != 'nvidia')
+        if use_matvec:
+            pl_lmh_mv, bgl_lmh_mv = get_pl(self._linear_fp16w_matvec_result)
+            nbb_lmh_mv = len(self._linear_fp16w_matvec_result.buffer_bindings)
+            BN = self._matvec_block_n
+            lm_grid_n = (self.n_vocab + BN - 1) // BN
+            lmh_mv_p = mk_params('lmh_mv_p',
+                                  self._linear_fp16w_matvec_result.param_fields,
+                                  {'K': E, 'stride_w': E, 'N': self.n_vocab})
+            bg_lmh_mv = mk_bg(bgl_lmh_mv, [
+                (0, norm_out[0], norm_out[1]),
+                (1, lm_w_fp16.handle, lm_w_fp16.size),
+                (2, bias_v.handle, bias_v.size),
+                (3, logits_buf[0], logits_buf[1]),
+                (nbb_lmh_mv, lmh_mv_p[0], lmh_mv_p[1])])
+            final_dispatches = [
+                (pl_rn,  bg_final_rn, (1,)),
+                (pl_lmh_mv, bg_lmh_mv, (lm_grid_n,)),
+            ]
+        else:
+            final_dispatches = [
+                (pl_rn,  bg_final_rn, (1,)),
+                (pl_lmh, bg_lmh,      (lm_gx, lm_gy)),
+            ]
 
         self._fd_x_h = x_buf[0]
         self._fd_logits_h = logits_buf[0]
         self._fd_logits_sz = logits_buf[1]
         self._fd_fused_rope_ph = fused_rope_ph[0]
         self._fd_attn_ph = attn_ph[0]
-        self._fd_all_batches = layer_dispatches + [final_dispatches]
+
+        # GPU argmax: readback 4 bytes instead of 592KB
+        # Only beneficial on iGPUs where buffer mapping is slow
+        self._fd_use_gpu_argmax = (self._gpu_vendor != 'nvidia')
+        if self._fd_use_gpu_argmax:
+            token_id_buf = mkbuf('token_id', 4)
+            pl_am, bgl_am = get_pl(self._argmax_result)
+            nbb_am = len(self._argmax_result.buffer_bindings)
+            am_p = mk_params('am_p', self._argmax_result.param_fields,
+                              {'N': self.n_vocab})
+            bg_am = mk_bg(bgl_am, [
+                (0, logits_buf[0], logits_buf[1]),
+                (1, token_id_buf[0], token_id_buf[1]),
+                (nbb_am, am_p[0], am_p[1])])
+            argmax_dispatch = [(pl_am, bg_am, (1,))]
+            self._fd_token_id_h = token_id_buf[0]
+            self._fd_token_id_sz = token_id_buf[1]
+
+        # Full pipeline
+        if self._fd_use_gpu_argmax:
+            self._fd_all_batches = (
+                layer_dispatches +
+                [final_dispatches] +
+                [argmax_dispatch]
+            )
+        else:
+            self._fd_all_batches = layer_dispatches + [final_dispatches]
 
         self._fd_all_flat = []
         for batch in self._fd_all_batches:
@@ -830,10 +912,19 @@ class Qwen3WebGPU(WebGPUModel):
                 merged.extend(batch)
             self._fd_merged_batches.append(merged)
 
-        self._fd_frope_buf = bytearray(28)
-        struct.pack_into('<iii', self._fd_frope_buf, 0,
-                         n_head, q_size, kv_size)
-        struct.pack_into('<i', self._fd_frope_buf, 16, half_rot)
+        if self._has_qk_norm:
+            self._fd_frope_buf = bytearray(32)
+            struct.pack_into('<iii', self._fd_frope_buf, 0,
+                             n_head, q_size, kv_size)
+            struct.pack_into('<i', self._fd_frope_buf, 16, half_rot)
+            # eps at offset 24
+            struct.pack_into('<f', self._fd_frope_buf, 24,
+                             float(np.float32(self.rms_norm_eps)))
+        else:
+            self._fd_frope_buf = bytearray(28)
+            struct.pack_into('<iii', self._fd_frope_buf, 0,
+                             n_head, q_size, kv_size)
+            struct.pack_into('<i', self._fd_frope_buf, 16, half_rot)
         self._fd_attn_buf = bytearray(24)
         struct.pack_into('<ii', self._fd_attn_buf, 0, n_kv * HD, n_rep)
         struct.pack_into('<ff', self._fd_attn_buf, 12,
@@ -895,8 +986,14 @@ class Qwen3WebGPU(WebGPUModel):
                 group_dispatches = []
                 for bi in range(group_start, group_end):
                     group_dispatches.extend(self._fd_all_batches[bi])
-                readback = ((self._fd_logits_h, self._fd_logits_sz,
-                             np.float32) if is_last else None)
+                if is_last and self._fd_use_gpu_argmax:
+                    readback = (self._fd_token_id_h, self._fd_token_id_sz,
+                                np.int32)
+                elif is_last:
+                    readback = (self._fd_logits_h, self._fd_logits_sz,
+                                np.float32)
+                else:
+                    readback = None
                 result = runner.submit_dispatches(
                     group_dispatches, readback=readback)
                 t1 = _time.perf_counter_ns()
@@ -906,14 +1003,27 @@ class Qwen3WebGPU(WebGPUModel):
                     name=f"{label}({n_disp}disp)",
                     begin_ns=t0, end_ns=t1, link_id=link))
                 if is_last:
-                    logits = result
+                    if self._fd_use_gpu_argmax:
+                        logits = np.full(self.n_vocab, -1e9, dtype=np.float32)
+                        logits[int(result[0])] = 1.0
+                    else:
+                        logits = result
                 group_start = group_end
                 group_idx += 1
         else:
-            logits = runner.submit_dispatches_pipelined(
-                self._fd_all_batches,
-                readback=(self._fd_logits_h, self._fd_logits_sz,
-                          np.float32))
+            if self._fd_use_gpu_argmax:
+                # Readback token_id (4 bytes) instead of logits (592KB)
+                token_np = runner.submit_dispatches_pipelined(
+                    self._fd_all_batches,
+                    readback=(self._fd_token_id_h, self._fd_token_id_sz,
+                              np.int32))
+                logits = np.full(self.n_vocab, -1e9, dtype=np.float32)
+                logits[int(token_np[0])] = 1.0
+            else:
+                logits = runner.submit_dispatches_pipelined(
+                    self._fd_all_batches,
+                    readback=(self._fd_logits_h, self._fd_logits_sz,
+                              np.float32))
 
         return logits.reshape(1, self.n_vocab)
 
@@ -939,6 +1049,24 @@ class Qwen3WebGPU(WebGPUModel):
         for layer in range(self.n_layer):
             x = self._transformer_block(x, layer, use_cache=use_cache,
                                         positions=positions)
+
+        # Sync CPU KV cache to GPU for subsequent fast decode steps
+        if (use_cache and self._decode_mode == 'gpu'
+                and hasattr(self, '_gpu_kv_cache') and self.kv_cache):
+            runner = self.cache.runner
+            HD = self.head_dim
+            n_kv = self.n_kv_heads
+            for layer_idx in range(self.n_layer):
+                if layer_idx not in self.kv_cache:
+                    continue
+                K_cpu, V_cpu = self.kv_cache[layer_idx]
+                T_cached = K_cpu.shape[0]
+                K_gpu, V_gpu, _ = self._gpu_kv_cache[layer_idx]
+                k_bytes = K_cpu.ravel().astype(np.float32).tobytes()
+                v_bytes = V_cpu.ravel().astype(np.float32).tobytes()
+                runner.write_buffer(K_gpu.handle, k_bytes)
+                runner.write_buffer(V_gpu.handle, v_bytes)
+                self._gpu_kv_cache[layer_idx] = (K_gpu, V_gpu, T_cached)
 
         x = self._rms_norm(x, self._gpu_weights["norm.weight"])
 

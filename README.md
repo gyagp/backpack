@@ -14,18 +14,18 @@ Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes
 
 All models run fully on Triton WebGPU — no PyTorch at inference time.
 
-| Model | Type | Params | Precision | RTX 5080 | Radeon iGPU | Status |
-|-------|------|--------|-----------|----------|-------------|--------|
+| Model | Type | Params | Precision | RTX 5080 (TTFT / TPS) | Radeon iGPU (TTFT / TPS) | Status |
+|-------|------|--------|-----------|------------------------|--------------------------|--------|
 | [**Flux-Klein**](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image Gen | 4B | FP16 | 5.6s/step (512²) | — | |
-| [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | 60ms TTFT, 97.5 tok/s | — | Done |
-| [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | 1.2s TTFT, 38.4 tok/s | — | Done |
-| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | 35ms TTFT, 120 tok/s | — | Done |
-| [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | 148ms TTFT, 220 tok/s | — | Done |
-| [**Qwen-3**](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | 0.6B | FP16 | 580ms TTFT, 44.6 tok/s | 640ms TTFT, 7.1 tok/s | |
-| [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | 2.4s TTFT, 4.9 tok/s | — | |
+| [**GPT-2**](https://huggingface.co/openai-community/gpt2) | LLM | 124M | FP32 | 60ms / 97.5 | — | Done |
+| [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | 1.2s / 38.4 | — | Done |
+| [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | 35ms / 120 | — | Done |
+| [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | 148ms / 220 | — | Done |
+| [**Qwen-3**](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | 0.6B | INT4 | 400ms / 354 | 1.7s / 15.1 | |
+| [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | 2.4s / 4.9 | — | |
 | [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | 8.6s/step (512²) | — | Done |
-| [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | 133ms TTFT, 208 tok/s | — | Done |
-| [**Whisper**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech | 809M | FP16 | 8.0s enc, 6.3 tok/s dec | — | Done |
+| [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | 133ms / 208 | — | Done |
+| [**Whisper**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech | 809M | FP16 | 8.0s enc, 6.3 dec | — | Done |
 | [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | 12s/step (512²) | — | |
 
 **GPUs**: NVIDIA GeForce RTX 5080 (discrete, D3D12) · AMD Radeon Graphics (RDNA 2 integrated, D3D12). All models support `--device low` for integrated GPUs.
