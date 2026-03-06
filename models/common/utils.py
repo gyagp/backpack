@@ -25,19 +25,25 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def add_device_arg(parser):
-    """Add --device argument to an argparse parser for GPU selection.
+    """Add --device and --backend arguments for GPU and backend selection.
 
-    Options: high (discrete, default), low (integrated)
+    --device: high (discrete, default), low (integrated)
+    --backend: d3d12 (default on Windows), vulkan, metal
     """
     parser.add_argument("--device", type=str, default=None,
                         choices=["high", "low"],
                         help="GPU: high (discrete, default), low (integrated)")
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=["d3d12", "vulkan", "d3d11", "metal"],
+                        help="GPU backend: d3d12 (default/Windows), vulkan, metal")
 
 
 def apply_device_arg(args):
-    """Set DAWN_GPU env var from --device arg. Call BEFORE creating model."""
+    """Set DAWN_GPU and DAWN_BACKEND env vars. Call BEFORE creating model."""
     if getattr(args, 'device', None) is not None:
         os.environ["DAWN_GPU"] = args.device
+    if getattr(args, 'backend', None) is not None:
+        os.environ["DAWN_BACKEND"] = args.backend
 
 
 def add_perf_args(parser):
