@@ -150,7 +150,6 @@ enable subgroups;
 @group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
 
 const TILE_N: u32 = 8u;
-const BLOCK_SIZE: u32 = 32u;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -168,44 +167,62 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    // Each lane processes 4 elements per 128-element stride
-    // 128 elements = 4 Q8_0 blocks (32 elements each)
-    // lane 0-7 → block 0, lane 8-15 → block 1, etc.
-    let block_in_stride = lane / 8u;
-    let n_strides = K / 128u;
-    let stride_w = K / 4u;  // u32 elements per weight row
+    // K_PER_ITER=8: each lane processes 8 elements per 256-element stride
+    // (32 lanes × 8 elem/lane = 256 elements = 8 Q8_0 blocks per stride)
+    let n_strides = K / 256u;
+    let stride_w = K / 4u;  // u32 per weight row
 
     var acc: f32 = 0.0;
 
     if (col < N) {
         let w_base = col * stride_w;
-        let n_blocks = K / BLOCK_SIZE;
+        let n_blocks = K / 32u;
         let s_base = col * n_blocks;
 
         for (var g = 0u; g < n_strides; g = g + 1u) {
-            // Read 4 fp32 activations
-            let k_base = g * 128u + lane * 4u;
-            let x0 = X[x_base + k_base];
-            let x1 = X[x_base + k_base + 1u];
-            let x2 = X[x_base + k_base + 2u];
-            let x3 = X[x_base + k_base + 3u];
+            // Read 8 fp32 activations (two vec4 loads)
+            let k_base = g * 256u + lane * 8u;
+            let xv0 = vec4<f32>(X[x_base + k_base],
+                                X[x_base + k_base + 1u],
+                                X[x_base + k_base + 2u],
+                                X[x_base + k_base + 3u]);
+            let xv1 = vec4<f32>(X[x_base + k_base + 4u],
+                                X[x_base + k_base + 5u],
+                                X[x_base + k_base + 6u],
+                                X[x_base + k_base + 7u]);
 
-            // Read packed int8 weights (4 int8 values as one u32)
-            let packed_w = W_Q8[w_base + g * 32u + lane];
+            // Read 2 packed u32 weights (8 int8 values)
+            let w_off = w_base + g * 64u + lane * 2u;
+            let pw0 = W_Q8[w_off];
+            let pw1 = W_Q8[w_off + 1u];
 
-            // Extract 4 signed int8 values via sign-extending extractBits
-            let w0 = f32(extractBits(i32(packed_w), 0u, 8u));
-            let w1 = f32(extractBits(i32(packed_w), 8u, 8u));
-            let w2 = f32(extractBits(i32(packed_w), 16u, 8u));
-            let w3 = f32(extractBits(i32(packed_w), 24u, 8u));
+            // Extract int8 → f32 and form vec4 for dot product
+            let wv0 = vec4<f32>(f32(extractBits(i32(pw0), 0u, 8u)),
+                                f32(extractBits(i32(pw0), 8u, 8u)),
+                                f32(extractBits(i32(pw0), 16u, 8u)),
+                                f32(extractBits(i32(pw0), 24u, 8u)));
+            let wv1 = vec4<f32>(f32(extractBits(i32(pw1), 0u, 8u)),
+                                f32(extractBits(i32(pw1), 8u, 8u)),
+                                f32(extractBits(i32(pw1), 16u, 8u)),
+                                f32(extractBits(i32(pw1), 24u, 8u)));
 
-            // Read per-block scale (fp16 packed in u32)
-            let si = s_base + g * 4u + block_in_stride;
-            let sp = unpack2x16float(Scales[si / 2u]);
-            let scale = select(sp.x, sp.y, (si & 1u) != 0u);
+            // Per-block scales: 2 blocks per 8 elements
+            // block_idx = (g * 256 + lane * 8) / 32
+            let bi = g * 8u + lane / 4u;
+            let si0 = s_base + bi;
+            let si1 = si0 + 1u;
+            // Correction: lane * 8 spans TWO 32-element blocks when lane >= 4
+            // Block for first 4 elements: (g*256 + lane*8) / 32 = g*8 + lane/4
+            // Block for second 4 elements: (g*256 + lane*8 + 4) / 32
+            let block0 = g * 8u + (lane * 8u) / 32u;
+            let block1 = g * 8u + (lane * 8u + 4u) / 32u;
+            let sp0 = unpack2x16float(Scales[(s_base + block0) / 2u]);
+            let scale0 = select(sp0.x, sp0.y, ((s_base + block0) & 1u) != 0u);
+            let sp1 = unpack2x16float(Scales[(s_base + block1) / 2u]);
+            let scale1 = select(sp1.x, sp1.y, ((s_base + block1) & 1u) != 0u);
 
-            // Dequant + dot product: w_fp32 = w_int8 * scale
-            acc += (x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3) * scale;
+            // vec4 dot products with per-block scaling
+            acc += dot(xv0, wv0) * scale0 + dot(xv1, wv1) * scale1;
         }
     }
 
