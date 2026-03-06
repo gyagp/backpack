@@ -681,6 +681,23 @@ class Qwen3WebGPU(WebGPUModel):
             pl_fused, bgl_fused = get_pl(self._fused_rope_result)
             nbb_fused = len(self._fused_rope_result.buffer_bindings)
         pl_attn,  bgl_attn  = get_pl(self._gqa_attn_result)
+
+        # Chunked GQA attention (two-pass for high GPU occupancy)
+        from common.wgsl_kernels import (
+            WGSL_GQA_CHUNKED_PASS1, WGSL_GQA_CHUNKED_PASS2,
+            GQA_CHUNKED_PASS1_BINDINGS, GQA_CHUNKED_PASS2_BINDINGS,
+            GQA_CHUNK_SIZE,
+        )
+        pl_attn_p1, bgl_attn_p1 = runner.get_pipeline_info(
+            WGSL_GQA_CHUNKED_PASS1, GQA_CHUNKED_PASS1_BINDINGS, [])
+        pl_attn_p2, bgl_attn_p2 = runner.get_pipeline_info(
+            WGSL_GQA_CHUNKED_PASS2, GQA_CHUNKED_PASS2_BINDINGS, [])
+        max_n_chunks = (self.MAX_SEQ_LEN + GQA_CHUNK_SIZE - 1) // GQA_CHUNK_SIZE
+        self._gqa_chunk_size = GQA_CHUNK_SIZE
+        partial_stride = HD + 2
+        partials_buf = mkbuf('attn_partials',
+                             n_head * max_n_chunks * partial_stride * 4)
+
         pl_aip,   bgl_aip   = get_pl(self._add_ip_result)
         pl_silu,  bgl_silu  = get_pl(self._smf_result)
         if not self._use_q8_gpu:
@@ -745,6 +762,9 @@ class Qwen3WebGPU(WebGPUModel):
         else:
             fused_rope_ph = mkbuf('fused_rope_p', 28)
         attn_ph = mkbuf('attn_p', 24)
+        # Chunked attention params: kv_stride, n_rep, T_total, chunk_size,
+        # n_chunks, scale_bits, neg_inf_bits (7 u32 = 28 bytes, pad to 32)
+        chunked_attn_ph = mkbuf('chunked_attn_p', 32)
 
         cos_h = self._rope_cos_gpu.handle
         cos_sz = self._rope_cos_gpu.size
@@ -911,6 +931,20 @@ class Qwen3WebGPU(WebGPUModel):
                 (3, attn_out_buf[0], attn_out_buf[1]),
                 (nbb_attn, attn_ph[0], attn_ph[1])])
 
+            # Chunked attention pass 1: Q, K_cache, V_cache → Partials
+            bg_attn_p1 = mk_bg(bgl_attn_p1, [
+                (0, q_rot[0], q_rot[1]),
+                (1, K_cache.handle, K_cache.size),
+                (2, V_cache.handle, V_cache.size),
+                (3, partials_buf[0], partials_buf[1]),
+                (4, chunked_attn_ph[0], chunked_attn_ph[1])])
+
+            # Chunked attention pass 2: Partials → attn_out
+            bg_attn_p2 = mk_bg(bgl_attn_p2, [
+                (0, partials_buf[0], partials_buf[1]),
+                (1, attn_out_buf[0], attn_out_buf[1]),
+                (2, chunked_attn_ph[0], chunked_attn_ph[1])])
+
             bg_arn2 = mk_bg(bgl_arn, [
                 (0, x_buf[0], x_buf[1]),
                 (1, proj_out[0], proj_out[1]),
@@ -945,7 +979,8 @@ class Qwen3WebGPU(WebGPUModel):
                 dispatches.extend([
                     (pl_mm,    bg_qkv,     qkv_grid),
                     (pl_fused, bg_frope,    (n_head + n_kv,)),
-                    (pl_attn,  bg_att,      (n_head,)),
+                    (pl_attn_p1, bg_attn_p1, (n_head, max_n_chunks)),
+                    (pl_attn_p2, bg_attn_p2, (n_head,)),
                     (pl_mm,    bg_op,       op_grid),
                     (pl_arn,   bg_arn2,     (1,)),
                     (pl_mm,    bg_gu,       gu_grid),
@@ -958,7 +993,8 @@ class Qwen3WebGPU(WebGPUModel):
                 dispatches = [
                     (pl_mm,    bg_qkv,    qkv_grid),
                     (pl_fused, bg_frope,   (n_head + n_kv,)),
-                    (pl_attn,  bg_att,     (n_head,)),
+                    (pl_attn_p1, bg_attn_p1, (n_head, max_n_chunks)),
+                    (pl_attn_p2, bg_attn_p2, (n_head,)),
                     (pl_mm,    bg_op,      op_grid),
                     (pl_arn,   bg_arn2,    (1,)),
                     (pl_mm,    bg_gu,      gu_grid),
@@ -1031,6 +1067,7 @@ class Qwen3WebGPU(WebGPUModel):
         self._fd_logits_sz = logits_buf[1]
         self._fd_fused_rope_ph = fused_rope_ph[0]
         self._fd_attn_ph = attn_ph[0]
+        self._fd_chunked_attn_ph = chunked_attn_ph[0]
 
         # GPU argmax: readback 4 bytes instead of 592KB
         # Only beneficial on iGPUs where buffer mapping is slow
@@ -1070,7 +1107,8 @@ class Qwen3WebGPU(WebGPUModel):
             names.extend([
                 pfx + mm_label + "_qkv",
                 pfx + "fused_rope",
-                pfx + "gqa_attn",
+                pfx + "attn_chunk",
+                pfx + "attn_reduce",
                 pfx + mm_label + "_oproj",
                 pfx + "add_rms_norm",
                 pfx + mm_label + "_gateup",
@@ -1117,6 +1155,22 @@ class Qwen3WebGPU(WebGPUModel):
                          float(np.float32(1.0 / np.sqrt(HD))),
                          float(np.float32(-1e9)))
 
+        # Chunked attention params: [kv_stride, n_rep, T_total, chunk_size,
+        #   n_chunks, scale_bits, neg_inf_bits] = 7 u32s = 28 bytes → pad to 32
+        self._fd_chunked_attn_buf = bytearray(32)
+        struct.pack_into('<II', self._fd_chunked_attn_buf, 0,
+                         n_kv * HD, n_rep)
+        # T_total at offset 8 (updated per token)
+        struct.pack_into('<I', self._fd_chunked_attn_buf, 12,
+                         GQA_CHUNK_SIZE)
+        # n_chunks at offset 16 (updated per token)
+        struct.pack_into('<i', self._fd_chunked_attn_buf, 20,
+                         struct.unpack('<i', struct.pack('<f',
+                             float(np.float32(1.0 / np.sqrt(HD)))))[0])
+        struct.pack_into('<i', self._fd_chunked_attn_buf, 24,
+                         struct.unpack('<i', struct.pack('<f',
+                             float(np.float32(-1e9))))[0])
+
         self._fast_decode_ready = True
         print(f"  Fast decode initialized "
               f"({sum(len(b) for b in self._fd_all_batches)} "
@@ -1147,6 +1201,14 @@ class Qwen3WebGPU(WebGPUModel):
                             bytes(self._fd_frope_buf))
         struct.pack_into('<i', self._fd_attn_buf, 8, T_total)
         runner.write_buffer(self._fd_attn_ph, bytes(self._fd_attn_buf))
+
+        # Update chunked attention params
+        n_chunks = (T_total + self._gqa_chunk_size - 1) // self._gqa_chunk_size
+        struct.pack_into('<I', self._fd_chunked_attn_buf, 8, T_total)
+        struct.pack_into('<I', self._fd_chunked_attn_buf, 16, n_chunks)
+        runner.write_buffer(self._fd_chunked_attn_ph,
+                            bytes(self._fd_chunked_attn_buf))
+
         if _p: p._cpu.end("fast_decode/params")
 
         for layer in range(self.n_layer):

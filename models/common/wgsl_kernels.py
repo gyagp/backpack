@@ -678,3 +678,163 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 """
 
 
+# ---------------------------------------------------------------------------
+# Chunked GQA decode attention — two-pass for high GPU occupancy
+# ---------------------------------------------------------------------------
+#
+# At seq_len=1024+, the single-workgroup-per-head attention kernel achieves
+# only ~3% memory bandwidth utilization (16 WGs × 128 threads = 2048
+# threads on a GPU with 172K capacity). Splitting T into chunks gives
+# n_head × n_chunks workgroups, increasing occupancy proportionally.
+#
+# Pass 1: grid=(n_head, n_chunks). Each WG computes partial online softmax
+#   (max_score, sum_exp, weighted_v_acc) over chunk_size T positions.
+# Pass 2: grid=(n_head,). Merges partials across chunks.
+
+GQA_CHUNK_SIZE = 64
+
+GQA_CHUNKED_PASS1_BINDINGS = [
+    BufferBinding(name='Q', binding=0, access='read_write', elem_type='f32'),
+    BufferBinding(name='K_cache', binding=1, access='read_write', elem_type='f32'),
+    BufferBinding(name='V_cache', binding=2, access='read_write', elem_type='f32'),
+    BufferBinding(name='Partials', binding=3, access='read_write', elem_type='f32'),
+    BufferBinding(name='_params_', binding=4, access='read_write', elem_type='u32'),
+]
+
+GQA_CHUNKED_PASS2_BINDINGS = [
+    BufferBinding(name='Partials', binding=0, access='read_write', elem_type='f32'),
+    BufferBinding(name='Out', binding=1, access='read_write', elem_type='f32'),
+    BufferBinding(name='_params_', binding=2, access='read_write', elem_type='u32'),
+]
+
+
+def pack_gqa_chunked_params(kv_stride, n_rep, T_total, chunk_size,
+                             n_chunks, scale_bits, neg_inf_bits):
+    data = struct.pack('<IIIIIii', kv_stride, n_rep, T_total, chunk_size,
+                       n_chunks, scale_bits, neg_inf_bits)
+    while len(data) < 32:
+        data += b'\x00'
+    return np.frombuffer(data, dtype=np.uint32).copy()
+
+
+WGSL_GQA_CHUNKED_PASS1 = """
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(1) var<storage, read_write> K_cache: array<f32>;
+@group(0) @binding(2) var<storage, read_write> V_cache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Partials: array<f32>;
+@group(0) @binding(4) var<storage, read_write> _params_: array<u32>;
+
+const HD: u32 = 128u;
+const CHUNK: u32 = 64u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let head = wid.x;
+    let chunk_id = wid.y;
+    let hd_idx = lid.x;
+
+    let kv_stride = _params_[0];
+    let n_rep = _params_[1];
+    let T_total = _params_[2];
+    let n_chunks = _params_[4];
+    let scale = bitcast<f32>(_params_[5]);
+    let neg_inf = bitcast<f32>(_params_[6]);
+
+    let kv_head = head / n_rep;
+    let kv_off = kv_head * HD;
+    let q_val = Q[head * HD + hd_idx];
+
+    let t_start = chunk_id * CHUNK;
+
+    var acc: f32 = 0.0;
+    var m_prev: f32 = neg_inf;
+    var l_prev: f32 = 0.0;
+
+    // Uniform loop: always CHUNK iterations, mask invalid positions
+    for (var i = 0u; i < CHUNK; i = i + 1u) {
+        let t = t_start + i;
+        let valid = t < T_total;
+
+        let k_idx = select(0u, t * kv_stride + kv_off + hd_idx, valid);
+        let k_val = select(0.0, K_cache[k_idx], valid);
+        let dot = subgroupAdd(q_val * k_val);
+        let raw_score = subgroupBroadcastFirst(dot) * scale;
+        let score = select(neg_inf, raw_score, valid);
+
+        let m_new = max(m_prev, score);
+        let exp_prev = exp(m_prev - m_new);
+        let exp_score = exp(score - m_new);
+        let l_new = l_prev * exp_prev + exp_score;
+
+        let v_idx = select(0u, t * kv_stride + kv_off + hd_idx, valid);
+        let v_val = select(0.0, V_cache[v_idx], valid);
+        acc = acc * (l_prev * exp_prev / max(l_new, 1e-10)) +
+              v_val * (exp_score / max(l_new, 1e-10));
+
+        m_prev = m_new;
+        l_prev = l_new;
+    }
+
+    let partial_stride = HD + 2u;
+    let base = head * n_chunks * partial_stride + chunk_id * partial_stride;
+    if (hd_idx == 0u) {
+        Partials[base] = m_prev;
+        Partials[base + 1u] = l_prev;
+    }
+    Partials[base + 2u + hd_idx] = acc;
+}
+"""
+
+WGSL_GQA_CHUNKED_PASS2 = """
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read_write> Partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(2) var<storage, read_write> _params_: array<u32>;
+
+const HD: u32 = 128u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let head = wid.x;
+    let hd_idx = lid.x;
+
+    let n_chunks = _params_[4];
+    let neg_inf = bitcast<f32>(_params_[6]);
+
+    let partial_stride = HD + 2u;
+    let head_base = head * n_chunks * partial_stride;
+
+    var acc: f32 = 0.0;
+    var m_prev: f32 = neg_inf;
+    var l_prev: f32 = 0.0;
+
+    for (var c = 0u; c < n_chunks; c = c + 1u) {
+        let base = head_base + c * partial_stride;
+        let m_chunk = Partials[base];
+        let l_chunk = Partials[base + 1u];
+        let v_chunk = Partials[base + 2u + hd_idx];
+
+        if (l_chunk > 0.0) {
+            let m_new = max(m_prev, m_chunk);
+            let exp_prev = exp(m_prev - m_new);
+            let exp_chunk = exp(m_chunk - m_new);
+            let l_new = l_prev * exp_prev + l_chunk * exp_chunk;
+
+            acc = acc * (l_prev * exp_prev / max(l_new, 1e-10)) +
+                  v_chunk * (l_chunk * exp_chunk / max(l_new, 1e-10));
+
+            m_prev = m_new;
+            l_prev = l_new;
+        }
+    }
+
+    Out[head * HD + hd_idx] = acc;
+}
+"""
+
+
