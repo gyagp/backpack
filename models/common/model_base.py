@@ -2931,12 +2931,13 @@ class WebGPUModel:
         return out['Out'].reshape(T, BHD)[:, :HD]
 
     def _causal_attention_multihead(self, Q, K, V,
-                                    n_rep: int) -> np.ndarray:
+                                    n_rep: int,
+                                    gpu_out: bool = False):
         """Multi-head causal attention with GQA: all heads in one dispatch.
 
         Q: (T, n_head, HD), K: (T, n_kv, HD), V: (T, n_kv, HD)
         Accepts numpy arrays or GPUBuffer objects.
-        Returns: (T, n_head, HD)
+        Returns: (T, n_head, HD) as numpy or GPUBuffer if gpu_out=True
         """
         if isinstance(Q, GPUBuffer):
             T = Q.shape[0] if Q.shape else 1
@@ -2971,7 +2972,12 @@ class WebGPUModel:
                 'stride_o_t': n_head * BHD, 'stride_o_h': BHD,
                 'n_rep': n_rep, 'scale': scale,
                 'neg_inf': float(-1e9),
-            })
+            },
+            gpu_outputs={'Out'} if gpu_out else None)
+        if gpu_out:
+            buf = out['Out']
+            buf.shape = (T, n_head, BHD)
+            return buf
         return out['Out'].reshape(T, n_head, BHD)[:, :, :HD]
 
     def _full_attention(self, q: np.ndarray, k: np.ndarray,
