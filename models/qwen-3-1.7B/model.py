@@ -468,24 +468,29 @@ class Qwen3WebGPU(WebGPUModel):
             attn_out = self._causal_attention_multihead(
                 Q_gpu, K_gpu, V_gpu, n_rep)
 
-            # Write K/V directly to GPU KV cache (no CPU round-trip)
+            # Write K/V directly to GPU KV cache via GPU-to-GPU copy
             if use_cache and hasattr(self, '_gpu_kv_cache'):
                 runner = self.cache.runner
                 K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
                 kv_bytes = T * n_kv * HD * 4
-                runner._lib.wgpuCommandEncoderCopyBufferToBuffer
-                # Use direct GPU-to-GPU copy
-                K_np = runner.readback(K_gpu).reshape(T, n_kv, HD)
-                V_np = runner.readback(V_gpu).reshape(T, n_kv, HD)
-                runner.write_buffer(K_cache_gpu.handle,
-                                    K_np.ravel().astype(np.float32).tobytes())
-                runner.write_buffer(V_cache_gpu.handle,
-                                    V_np.ravel().astype(np.float32).tobytes())
+                if runner.is_batching:
+                    # GPU-to-GPU copy within batch (no fence)
+                    runner.copy_buffer_in_batch(
+                        K_gpu.handle, 0, K_cache_gpu.handle, 0, kv_bytes)
+                    runner.copy_buffer_in_batch(
+                        V_gpu.handle, 0, V_cache_gpu.handle, 0, kv_bytes)
+                else:
+                    # Fallback: readback + write
+                    K_np = runner.readback(K_gpu).reshape(T, n_kv, HD)
+                    V_np = runner.readback(V_gpu).reshape(T, n_kv, HD)
+                    runner.write_buffer(K_cache_gpu.handle,
+                                        K_np.ravel().astype(np.float32).tobytes())
+                    runner.write_buffer(V_cache_gpu.handle,
+                                        V_np.ravel().astype(np.float32).tobytes())
+                    if self.kv_cache is None:
+                        self.kv_cache = {}
+                    self.kv_cache[layer] = (K_np, V_np)
                 self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
-                # Also store in CPU cache for fallback
-                if self.kv_cache is None:
-                    self.kv_cache = {}
-                self.kv_cache[layer] = (K_np, V_np)
 
             attn_flat = attn_out.reshape(T, q_dim)
             return self._proj(attn_flat, pfx + "o_proj.weight",
