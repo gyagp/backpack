@@ -475,7 +475,7 @@ class Qwen3WebGPU(WebGPUModel):
 
         attn_flat = attn_out.reshape(T, q_dim)
         return self._proj(attn_flat, pfx + "o_proj.weight",
-                          "zero_bias_E", E, K=q_dim)
+                          "zero_bias_E", E, K=q_dim, gpu_out=True)
 
     # -- MLP --
 
