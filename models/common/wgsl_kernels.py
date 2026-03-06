@@ -251,6 +251,159 @@ WSGL_Q8_0_ADD_KERNEL = WSGL_Q8_0_KERNEL.replace(
 
 
 # ---------------------------------------------------------------------------
+# Cooperative matrix Q8_0 matmul — using subgroupMatrixMultiplyAccumulate
+# ---------------------------------------------------------------------------
+#
+# Uses chromium_experimental_subgroup_matrix for hardware tensor core matmul.
+# Available on Vulkan+NVIDIA (not D3D12).
+#
+# Tile sizes: 32×32 output tile, 32-element K steps
+# Workgroup: 128 threads (4 subgroups of 32)
+# Each subgroup handles a 16×16 subtile using MMA(16,16,16)
+# A (activations): loaded from global → shared memory (fp32)
+# B (Q8_0 weights): dequantized from global → shared memory (fp32)
+#
+# Grid: (ceil(M/32), ceil(N/32))
+# M = number of tokens (prefill), N = output features, K = input features
+
+SUBGROUP_MATRIX_Q8_BINDINGS = [
+    BufferBinding(name='X', binding=0, access='read_write', elem_type='f32'),
+    BufferBinding(name='W_Q8', binding=1, access='read_write', elem_type='u32'),
+    BufferBinding(name='Scales', binding=2, access='read_write', elem_type='u32'),
+    BufferBinding(name='Bias', binding=3, access='read_write', elem_type='f32'),
+    BufferBinding(name='Y', binding=4, access='read_write', elem_type='f32'),
+    BufferBinding(name='_params_', binding=5, access='read_write', elem_type='u32'),
+]
+
+
+def pack_subgroup_matrix_params(M, N, K):
+    """Pack M, N, K as 3 u32 params."""
+    data = struct.pack('<III', M, N, K)
+    while len(data) < 16:
+        data += b'\x00'
+    return np.frombuffer(data, dtype=np.uint32).copy()
+
+
+WGSL_SUBGROUP_MATRIX_Q8_KERNEL = """
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> W_Q8: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
+
+const TILE_M: u32 = 32u;
+const TILE_N: u32 = 32u;
+const TILE_K: u32 = 16u;
+const MAX_K_ITERS: u32 = 384u;  // max K/TILE_K = 6144/16 = 384
+
+// Shared memory tiles (row-major)
+var<workgroup> tile_A: array<f32, 1024>;  // max(TILE_M×TILE_K, TILE_M×TILE_N)
+var<workgroup> tile_B: array<f32, 512>;   // TILE_N × TILE_K
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(subgroup_id) sg_id: u32,
+        @builtin(subgroup_invocation_id) sg_lane: u32) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let tid = lid.x;
+
+    let tile_row_base = wid.x * TILE_M;  // output row start
+    let tile_col_base = wid.y * TILE_N;  // output col start
+
+    // 4 subgroups: arrange as 2×2 grid of 16×16 subtiles
+    let subtile_row = sg_id / 2u;   // 0 or 1
+    let subtile_col = sg_id % 2u;   // 0 or 1
+
+    // Accumulators: each subgroup accumulates one 16×16 result
+    var matC: subgroup_matrix_result<f32, 16, 16>;
+
+    // Iterate over K in TILE_K steps (uniform loop: always MAX_K_ITERS,
+    // skip work for iterations beyond actual K)
+    let k_iters = K / TILE_K;
+    for (var k_step: u32 = 0u; k_step < MAX_K_ITERS; k_step += 1u) {
+        let k_idx = k_step * TILE_K;
+        let k_valid = k_step < k_iters;
+        // Load tile_A: TILE_M × TILE_K from X
+        // 128 threads load 32×16 = 512 elements, ~4 per thread
+        for (var i = tid; i < TILE_M * TILE_K; i += 128u) {
+            let r = i / TILE_K;
+            let c = i % TILE_K;
+            let global_r = tile_row_base + r;
+            let global_c = k_idx + c;
+            if (k_valid && global_r < M && global_c < K) {
+                tile_A[r * TILE_K + c] = X[global_r * K + global_c];
+            } else {
+                tile_A[r * TILE_K + c] = 0.0;
+            }
+        }
+
+        // Load tile_B: TILE_N × TILE_K from Q8_0 weights (dequantize)
+        for (var i = tid; i < TILE_N * TILE_K; i += 128u) {
+            let n_local = i / TILE_K;
+            let k_local = i % TILE_K;
+            let global_n = tile_col_base + n_local;
+            let global_k = k_idx + k_local;
+            if (k_valid && global_n < N && global_k < K) {
+                // Dequantize: w_f32 = int8_val * scale
+                let w_u32_idx = global_n * (K / 4u) + global_k / 4u;
+                let byte_idx = global_k % 4u;
+                let packed = W_Q8[w_u32_idx];
+                let w_int8 = f32(extractBits(i32(packed), byte_idx * 8u, 8u));
+
+                // Scale: one fp16 per 32-element block
+                let block_idx = global_n * (K / 32u) + global_k / 32u;
+                let sp = unpack2x16float(Scales[block_idx / 2u]);
+                let scale = select(sp.x, sp.y, (block_idx & 1u) != 0u);
+
+                // Store column-major for right operand (B^T)
+                tile_B[n_local * TILE_K + k_local] = w_int8 * scale;
+            } else {
+                tile_B[n_local * TILE_K + k_local] = 0.0;
+            }
+        }
+
+        workgroupBarrier();
+
+        // Cooperative matrix multiply: C += A_subtile × B_subtile
+        let a_offset = subtile_row * 16u * TILE_K;
+        let b_offset = subtile_col * 16u * TILE_K;
+
+        var matA = subgroupMatrixLoad<subgroup_matrix_left<f32, 16, 16>>(
+            &tile_A, a_offset, false, TILE_K);
+        var matB = subgroupMatrixLoad<subgroup_matrix_right<f32, 16, 16>>(
+            &tile_B, b_offset, false, TILE_K);
+        matC = subgroupMatrixMultiplyAccumulate(matA, matB, matC);
+
+        workgroupBarrier();
+    }
+
+    // Store results to shared memory (tile_A repurposed as 32×32 output scratch)
+    let store_offset = subtile_row * 16u * TILE_N + subtile_col * 16u;
+    subgroupMatrixStore(&tile_A, store_offset, matC, false, TILE_N);
+    workgroupBarrier();
+
+    // Write to global output Y
+    for (var i = tid; i < TILE_M * TILE_N; i += 128u) {
+        let r = i / TILE_N;
+        let c = i % TILE_N;
+        let global_r = tile_row_base + r;
+        let global_c = tile_col_base + c;
+        if (global_r < M && global_c < N) {
+            Y[global_r * N + global_c] = tile_A[r * TILE_N + c] + Bias[global_c];
+        }
+    }
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # FP16-weight GEMM kernel — multi-output tiled, subgroupAdd reduction
 # ---------------------------------------------------------------------------
 #
