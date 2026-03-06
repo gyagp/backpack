@@ -234,6 +234,21 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 """
 
+# Q8_0 matmul + residual add: Y += matmul + bias (fuses down_proj + add)
+Q8_ADD_BINDINGS = [
+    BufferBinding(name='X', binding=0, access='read_write', elem_type='f32'),
+    BufferBinding(name='W_Q8', binding=1, access='read_write', elem_type='u32'),
+    BufferBinding(name='Scales', binding=2, access='read_write', elem_type='u32'),
+    BufferBinding(name='Bias', binding=3, access='read_write', elem_type='f32'),
+    BufferBinding(name='Y', binding=4, access='read_write', elem_type='f32'),
+    BufferBinding(name='_params_', binding=5, access='read_write', elem_type='u32'),
+]
+
+WSGL_Q8_0_ADD_KERNEL = WSGL_Q8_0_KERNEL.replace(
+    "Y[row * N + col] = warp_sum + Bias[col];",
+    "Y[row * N + col] += warp_sum + Bias[col];"
+)
+
 
 # ---------------------------------------------------------------------------
 # FP16-weight GEMM kernel — multi-output tiled, subgroupAdd reduction

@@ -667,9 +667,12 @@ class Qwen3WebGPU(WebGPUModel):
         if self._use_q8_gpu:
             from common.wgsl_kernels import (
                 WSGL_Q8_0_KERNEL, Q8_DP4A_BINDINGS, pack_q8_params, Q8_TILE_N,
+                WSGL_Q8_0_ADD_KERNEL, Q8_ADD_BINDINGS,
             )
             pl_matmul, bgl_matmul = runner.get_pipeline_info(
                 WSGL_Q8_0_KERNEL, Q8_DP4A_BINDINGS, [])
+            pl_matmul_add, bgl_matmul_add = runner.get_pipeline_info(
+                WSGL_Q8_0_ADD_KERNEL, Q8_ADD_BINDINGS, [])
             nbb_matmul = len(Q8_DP4A_BINDINGS)
             MATMUL_TILE = Q8_TILE_N
         else:
@@ -837,6 +840,17 @@ class Qwen3WebGPU(WebGPUModel):
                     pfx + "mlp.down_proj.weight",
                     bias_e, proj_out, matmul_down_p)
 
+                # Fused down_proj + residual add: writes directly to x_buf
+                dn_w = self._gpu_weights[pfx + "mlp.down_proj.weight.q8.gpu"]
+                dn_s = self._gpu_weights[pfx + "mlp.down_proj.weight.q8_scales.gpu"]
+                bg_dn_add = mk_bg(bgl_matmul_add, [
+                    (0, silu_out[0], silu_out[1]),
+                    (1, dn_w.handle, dn_w.size),
+                    (2, dn_s.handle, dn_s.size),
+                    (3, bias_e.handle, bias_e.size),
+                    (4, x_buf[0], x_buf[1]),
+                    (5, matmul_down_p[0], matmul_down_p[1])])
+
                 qkv_grid = (1, (qkv_N + MATMUL_TILE - 1) // MATMUL_TILE)
                 op_grid  = (1, (E + MATMUL_TILE - 1) // MATMUL_TILE)
                 gu_grid  = (1, (2 * IM + MATMUL_TILE - 1) // MATMUL_TILE)
@@ -985,8 +999,9 @@ class Qwen3WebGPU(WebGPUModel):
                     (pl_arn,   bg_arn2,     (1,)),
                     (pl_mm,    bg_gu,       gu_grid),
                     (pl_silu,  bg_silu,     silu_g),
-                    (pl_mm,    bg_dn,       dn_grid),
-                    (pl_aip,   bg_res,      aip_g),
+                    (pl_matmul_add if self._use_q8_gpu else pl_mm,
+                     bg_dn_add if self._use_q8_gpu else bg_dn,
+                     dn_grid),
                     (pl_rn,    bg_rn_next,  (1,)),
                 ])
             else:
@@ -999,8 +1014,9 @@ class Qwen3WebGPU(WebGPUModel):
                     (pl_arn,   bg_arn2,    (1,)),
                     (pl_mm,    bg_gu,      gu_grid),
                     (pl_silu,  bg_silu,    silu_g),
-                    (pl_mm,    bg_dn,      dn_grid),
-                    (pl_aip,   bg_res,     aip_g),
+                    (pl_matmul_add if self._use_q8_gpu else pl_mm,
+                     bg_dn_add if self._use_q8_gpu else bg_dn,
+                     dn_grid),
                 ]
             layer_dispatches.append(dispatches)
 
@@ -1113,8 +1129,7 @@ class Qwen3WebGPU(WebGPUModel):
                 pfx + "add_rms_norm",
                 pfx + mm_label + "_gateup",
                 pfx + "silu_mul",
-                pfx + mm_label + "_down",
-                pfx + "add_inplace",
+                pfx + mm_label + "_down_add",
             ])
             if i < self.n_layer - 1:
                 names.append(pfx + "rms_norm_next")
