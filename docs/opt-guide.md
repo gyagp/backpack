@@ -1735,6 +1735,69 @@ layout can eliminate layout transforms during attention computation.
 Our flat `[MAX_SEQ, n_kv, HD]` layout is already sequential-read
 friendly for the attention kernel.
 
+### 9.4 Attention & Matmul Optimization Opportunities (from llama.cpp)
+
+Lessons from llama.cpp's Vulkan backend (`mul_mat_vec.comp`,
+`flash_attn_cm1.comp`) that apply to our WebGPU kernels:
+
+1. **vec4 loads from KV cache**: Load 4 floats at a time from K/V
+   instead of scalar loads.  GPU memory controllers are optimized for
+   128-bit (vec4) transactions.  Each vec4 load gives 4 floats in one
+   memory request, improving bandwidth utilization by up to 4×.
+
+   ```wgsl
+   // Current: one f32 per load (32-bit transaction)
+   let k_val = K_cache[t * kv_stride + hd_idx];
+
+   // Optimized: four f32 per load (128-bit transaction)
+   let k4_idx = (t * kv_stride + hd_base) / 4u;
+   let k4 = vec4<f32>(K_u32[k4_idx], K_u32[k4_idx+1],
+                       K_u32[k4_idx+2], K_u32[k4_idx+3]);
+   ```
+
+   For our Q8 matmul kernel, weight loads are already packed as u32
+   (4 int8 per load), which is equivalent to vec4 for 8-bit data.
+
+2. **fp16 KV cache**: Store K/V cache as fp16 instead of fp32,
+   halving attention memory reads.  At seq=1024, this reduces KV reads
+   from 4MB to 2MB per head per layer — directly cutting the
+   dominant decode cost.  Use the `u32` + `unpack2x16float()` pattern
+   to work around D3D12's typed buffer limitation:
+
+   ```wgsl
+   // fp16 KV cache stored as u32 (two fp16 per u32):
+   let packed = K_cache_u32[(t * kv_stride + hd_idx) / 2u];
+   let pair = unpack2x16float(packed);
+   let k_lo = pair.x;
+   let k_hi = pair.y;
+   ```
+
+   **Precision trade-off**: fp16 introduces ~0.1% relative error in
+   KV values.  For attention (which applies softmax), this is
+   well within tolerance.  llama.cpp uses fp16 KV cache by default.
+
+3. **Multiple output rows per workgroup (TILE_N)**: Each workgroup
+   computes multiple output elements, reusing the activation vector
+   from L1 cache across outputs.  Our Q8 matmul already uses
+   TILE_N=8 (8 outputs per WG via 8 warps).  ✅ Already implemented.
+
+4. **K_PER_ITER=8**: Process 8 K elements per thread per loop
+   iteration instead of 4.  This reduces loop overhead (branch,
+   increment, bounds check) by 2× and increases instruction-level
+   parallelism.  llama.cpp uses K_PER_ITER=8 for all quantized types.
+
+   ```wgsl
+   // Current: 4 elements per iter (one u32 = 4 int8)
+   let packed_w = W[w_base + lane];
+   let w0 = extractBits(i32(packed_w), 0u, 8u);
+   // ... process 4 elements
+
+   // Optimized: 8 elements per iter (two u32 = 8 int8)
+   let packed_w0 = W[w_base + lane * 2u];
+   let packed_w1 = W[w_base + lane * 2u + 1u];
+   // ... process 8 elements, 2× less loop overhead
+   ```
+
 ---
 
 ## 10. Decision Checklist
