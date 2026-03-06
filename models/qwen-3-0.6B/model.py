@@ -19,10 +19,10 @@ Optimizations:
   - Fast decode pipeline (pre-recorded dispatches)
 
 Usage:
-    python models/qwen-3/model.py --verify
-    python models/qwen-3/model.py --prompt "Hello"
-    python models/qwen-3/model.py --quantize
-    python models/qwen-3/model.py --prompt "Hello" --decode-mode gpu
+    python models/qwen-3-0.6B/model.py --verify
+    python models/qwen-3-0.6B/model.py --prompt "Hello"
+    python models/qwen-3-0.6B/model.py --quantize
+    python models/qwen-3-0.6B/model.py --prompt "Hello" --decode-mode gpu
 
 Requirements:
     pip install requests tokenizers
@@ -41,7 +41,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg,
+    add_common_args, apply_device_arg, run_inference,
 )
 
 
@@ -1305,26 +1305,18 @@ def verify_with_random_weights():
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Qwen3 on WebGPU via Triton")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify pipeline with random weights")
+        description="Qwen3-0.6B on WebGPU via Triton")
+    add_common_args(parser)
     parser.add_argument("--model", type=str, default="0.6B",
                         choices=["0.6B"],
                         help="Model size")
-    parser.add_argument("--prompt", type=str,
-                        default="The future of AI is",
-                        help="Prompt for text generation")
-    parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--weights-dir", type=str, default=None)
     parser.add_argument("--quantize", action="store_true",
                         help="Quantize weights to INT4 and save")
+    parser.add_argument("--use-q4", action="store_true",
+                        help="Use INT4 weights_q4.npz for faster inference (lower quality)")
     parser.add_argument("--decode-mode", type=str, default="gpu",
                         choices=["cpu", "gpu"],
                         help="Decode mode: cpu or gpu (fast decode)")
-    parser.add_argument("--profile", action="store_true",
-                        help="Enable profiling")
-    add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -1402,19 +1394,8 @@ def main():
         decode_mode=args.decode_mode)
     print(f"Model created, kernels compiled (decode={args.decode_mode})")
 
-    if args.profile:
-        model.enable_profiling()
-        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
-
-    # Warmup fast decode before generating
-    model._warmup_fast_decode()
-
-    generate(model, args.prompt, tokenizer,
-             max_tokens=args.max_tokens,
-             temperature=args.temperature)
-
-    if args.profile:
-        model.save_profile(_SCRIPT_DIR, f"Qwen3-{args.model}")
+    run_inference(model, args, tokenizer,
+                  model_name=f"Qwen3-{args.model}", script_dir=_SCRIPT_DIR)
 
 
 if __name__ == "__main__":

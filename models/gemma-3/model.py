@@ -35,7 +35,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg,
+    add_common_args, apply_device_arg, run_inference,
 )
 
 
@@ -521,18 +521,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(
         description="Gemma 3 on WebGPU via Triton")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify pipeline with random weights")
+    add_common_args(parser)
     parser.add_argument("--model", type=str, default="2B",
                         choices=["2B"],
                         help="Model size")
-    parser.add_argument("--prompt", type=str,
-                        default="The future of AI is",
-                        help="Prompt for text generation")
-    parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--weights-dir", type=str, default=None)
-    add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -564,9 +556,8 @@ def main():
         final_logit_softcapping=config["final_logit_softcapping"])
     print("Model created, kernels compiled")
 
-    generate(model, args.prompt, tokenizer,
-             max_tokens=args.max_tokens,
-             temperature=args.temperature)
+    run_inference(model, args, tokenizer,
+                  model_name="Gemma3-2B", script_dir=_SCRIPT_DIR)
 
 
 if __name__ == "__main__":

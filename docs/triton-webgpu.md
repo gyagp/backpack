@@ -25,6 +25,49 @@ Triton Kernel (.py)
 
 **Compilation pipeline**: Triton's existing frontend and MLIR passes produce LLVM IR targeting `spir64-unknown-unknown`. A custom LLVM IR → WGSL translator converts this into WebGPU compute shaders executed via the Dawn native WebGPU implementation.
 
+## GGUF / llama.cpp Porting Strategy
+
+Goal: support GGUF checkpoints natively in the Triton WebGPU runtime with output quality close to llama.cpp, while preserving the current Backpack model API.
+
+### Why quality regressed in naive INT4 repacking
+
+- GGUF files such as `Q4_K_M` are mixed-block formats (`Q4_K`, `Q5_K`, `Q6_K`) with per-block scaling behavior tuned for llama.cpp kernels.
+- Repacking these tensors into Backpack's simple min-max INT4 groups loses important quantization structure and creates large layerwise error accumulation on Qwen-3.5.
+- Immediate quality-first workaround is GGUF -> fp16 NPZ conversion, then native WebGPU inference.
+
+### Phased implementation plan
+
+1. **Phase A: GGUF ingestion and fp16 baseline (done/in progress)**
+     - Parse GGUF tensors and map to Backpack tensor keys.
+     - Convert to `weights_fp16_from_gguf.npz` for quality-first correctness checks.
+     - Keep model execution fully on Triton WebGPU (no llama.cpp runtime dependency).
+
+2. **Phase B: Native K-quant kernel support (target parity path)**
+     - Add dedicated weight formats for `Q4_K`, `Q5_K`, `Q6_K` (block metadata + packed data).
+     - Implement Triton kernels for `X @ W_kquant` that match llama.cpp block math and accumulation order.
+     - Add runtime dispatch in model code: prefer K-quant kernels, fallback to fp16 path when unavailable.
+
+3. **Phase C: Parity verification and tuning**
+     - Add layerwise checks against a reference implementation for selected prompts:
+         - QKV projections
+         - attention output
+         - MLP outputs
+         - logits top-k overlap
+     - Track drift metrics (L2, cosine, top-k agreement) and regression gates in CI/manual bench scripts.
+
+### Acceptance criteria for llama.cpp parity
+
+- **Correctness**:
+    - Stable non-garbled generations on long prompts in Qwen-3.5 GGUF runs.
+    - Layerwise cosine similarity above agreed thresholds for sampled layers.
+    - High top-k overlap with reference logits on deterministic decode settings.
+- **Performance**:
+    - K-quant path faster than fp16 GGUF-converted path for decode throughput.
+    - No large TTFT regressions vs current quantized baseline.
+- **Operational**:
+    - Single CLI entrypoint supports GGUF weights for convert/run flows.
+    - Profiling reports include K-quant kernel timing buckets.
+
 ## End-to-End: From Triton Kernel to Deployment
 
 This section explains how the Triton WebGPU pipeline works in practice — the offline/runtime split, why Triton matters, and how to deploy as a standalone C++ binary.

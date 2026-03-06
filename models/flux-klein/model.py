@@ -1084,7 +1084,7 @@ def encode_prompt(prompt: str, tokenizer, text_encoder, device="cpu",
     )
 
     input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
+    attention_mask = inputs["attention_mask"].to(device).bool()
 
     with torch.no_grad():
         output = text_encoder(
@@ -1101,7 +1101,8 @@ def encode_prompt(prompt: str, tokenizer, text_encoder, device="cpu",
 
     B, C, S, D = stacked.shape
     prompt_embeds = stacked.permute(0, 2, 1, 3).reshape(B, S, C * D)
-    # prompt_embeds: (1, seq_len, 7680)
+    # Strip padded tokens; keep only valid sequence positions.
+    prompt_embeds = prompt_embeds[:, attention_mask[0], :]
 
     return prompt_embeds.float().cpu().numpy()
 
@@ -1193,12 +1194,11 @@ def generate_image(model: FluxKleinWebGPU,
     # Scheduler: compute sigmas with dynamic shifting
     image_seq_len = latents.shape[0]
     mu = compute_empirical_mu(image_seq_len, num_steps)
-    sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
-
-    # Apply exponential shift
+    # Apply dynamic shift schedule.
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
         FlowMatchEulerDiscreteScheduler,
     )
+    import torch
     scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0, use_dynamic_shifting=True)
     scheduler.set_timesteps(num_steps, mu=mu)
     timesteps = scheduler.timesteps.numpy()
@@ -1209,6 +1209,8 @@ def generate_image(model: FluxKleinWebGPU,
     print(f"  Steps: {num_steps}, mu={mu:.3f}")
     print(f"  Sigmas: {sigmas_sched[:4]}...")
 
+    latents_t = torch.from_numpy(latents.astype(np.float32)).unsqueeze(0)
+
     for i, t in enumerate(timesteps):
         t0 = time.time()
 
@@ -1216,16 +1218,23 @@ def generate_image(model: FluxKleinWebGPU,
         timestep_frac = t.item() / 1000.0
 
         noise_pred = model.forward(
-            latents, pe,
+            latents_t[0].cpu().numpy(), pe,
             timestep=timestep_frac,
             img_ids=img_ids,
             txt_ids=txt_ids,
         )
 
-        # Euler step: latents = latents + (sigma_next - sigma) * vel
+        # Match diffusers scheduler update.
+        latents_t = scheduler.step(
+            torch.from_numpy(noise_pred.astype(np.float32)).unsqueeze(0),
+            torch.tensor(float(t), dtype=torch.float32),
+            latents_t,
+            return_dict=False,
+        )[0]
+
+        latents = latents_t[0].cpu().numpy()
         sigma_next = sigmas_sched[i + 1] if i + 1 < len(sigmas_sched) else 0.0
         dt = sigma_next - sigma
-        latents = latents + dt * noise_pred
 
         elapsed = time.time() - t0
         print(f"  Step {i+1}/{num_steps}: t={t.item():.1f}, "

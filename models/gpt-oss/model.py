@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 import numpy as np
 
 from common.model_base import WebGPUModel
-from common.utils import _parse_safetensors, load_tokenizer, generate, add_device_arg, apply_device_arg
+from common.utils import _parse_safetensors, load_tokenizer, generate, add_common_args, apply_device_arg, run_inference
 from triton.backends.webgpu.dawn_runner import GPUBuffer
 
 # ---------------------------------------------------------------------------
@@ -860,23 +860,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(
         description="GPT-OSS-20B on WebGPU via Triton")
-    parser.add_argument("--prompt", type=str,
-                        default="The future of AI is",
-                        help="Prompt for text generation")
-    parser.add_argument("--max-tokens", type=int, default=50,
-                        help="Maximum tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Sampling temperature")
-    parser.add_argument("--weights-dir", type=str,
-                        default=None,
-                        help="Directory for cached weights")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify with random weights (no download)")
+    add_common_args(parser, default_prompt="The future of AI is")
     parser.add_argument("--verify-real", action="store_true",
                         help="Quick verification with real weights")
-    parser.add_argument("--profile", action="store_true",
-                        help="Profile a short generation and save HTML report")
-    add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -932,16 +918,17 @@ def main():
         tokenizer = load_tokenizer(tokenizer_path)
         generate(model, args.prompt, tokenizer=tokenizer,
                  max_tokens=min(args.max_tokens, 10),
-                 temperature=args.temperature)
+                 temperature=args.temperature,
+                 prompt_length=getattr(args, 'prompt_length', None),
+                 gen_length=getattr(args, 'gen_length', None))
 
         model.save_profile(_SCRIPT_DIR, "GPT-OSS-20B")
         return
 
     # Generate text
     tokenizer = load_tokenizer(tokenizer_path)
-    generate(model, args.prompt, tokenizer=tokenizer,
-             max_tokens=args.max_tokens,
-             temperature=args.temperature)
+    run_inference(model, args, tokenizer,
+                  model_name="GPT-OSS-20B", script_dir=_SCRIPT_DIR)
 
 
 if __name__ == "__main__":

@@ -34,7 +34,8 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     _parse_safetensors, load_weights, download_weights,
-    load_tokenizer, generate, add_device_arg, apply_device_arg,
+    load_tokenizer, generate, add_common_args, apply_device_arg,
+    run_inference,
 )
 
 
@@ -1600,28 +1601,15 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(
         description="SmolLM2 on WebGPU via Triton")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify pipeline with random weights")
+    add_common_args(parser)
     parser.add_argument("--model", type=str, default="1.7B",
                         choices=["135M", "360M", "1.7B"],
                         help="Model size: 135M, 360M, or 1.7B")
-    parser.add_argument("--prompt", type=str,
-                        default="The future of AI is",
-                        help="Prompt for text generation")
-    parser.add_argument("--max-tokens", type=int, default=50,
-                        help="Maximum tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.8,
-                        help="Sampling temperature")
-    parser.add_argument("--weights-dir", type=str, default=None,
-                        help="Directory for cached weights")
-    parser.add_argument("--profile", action="store_true",
-                        help="Profile inference and generate HTML report")
     parser.add_argument("--quantize", action="store_true",
                         help="Quantize weights to INT4 and save")
     parser.add_argument("--decode-mode", type=str, default='auto',
                         choices=['auto', 'cpu', 'gpu'],
                         help="Decode mode: cpu, gpu, or auto (gpu for 1.7B+)")
-    add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -1757,9 +1745,8 @@ def main():
         return
 
     # Generate
-    generate(model, args.prompt, tokenizer,
-             max_tokens=args.max_tokens,
-             temperature=args.temperature)
+    run_inference(model, args, tokenizer,
+                  model_name=f"SmolLM2-{args.model}", script_dir=_SCRIPT_DIR)
 
 
 if __name__ == "__main__":

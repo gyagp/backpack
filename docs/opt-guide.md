@@ -857,8 +857,90 @@ Two decode TPS numbers are reported:
 Weight upload happens during model loading, before `generate()` starts,
 and is never included in either timer.
 
-To reproduce, always use `≥ 50` decode tokens so that per-token
+**Standard perf measurement flags** (`-pl` / `-gl`):
+
+All LLM models support `-pl` (prompt length) and `-gl` (generation
+length) for deterministic, reproducible performance measurement:
+
+```bash
+python models/qwen-3-1.7B/model.py \
+    --gguf-file path/to/model.gguf --use-q8-gpu \
+    -pl 128 -gl 100
+```
+
+When both `-pl` and `-gl` are specified:
+- The prompt is padded/truncated to exactly `pl` tokens
+- Exactly `gl` tokens are generated with **greedy decoding** (temp=0)
+- Token-by-token printing is suppressed (no I/O overhead)
+- Output is fully deterministic — same tokens every run
+
+This eliminates all sources of measurement variance: prompt content,
+sampling randomness, token length, and stdout flush timing.
+
+**Recommended benchmark configurations**:
+
+| Purpose | Flags | Notes |
+|---------|-------|-------|
+| Quick check | `-pl 5 -gl 50` | ~1s, good for iteration |
+| Standard benchmark | `-pl 128 -gl 100` | Stable TPS, standard prompt |
+| Long decode | `-pl 5 -gl 500` | Tests KV cache scaling |
+| Long prefill | `-pl 1024 -gl 10` | Tests prefill throughput |
+
+To reproduce results, always use `≥ 50` decode tokens so that per-token
 variance averages out.
+
+### 3.11 Performance Measurement vs Profiling
+
+**Do not use `--profile` for performance measurement.**  Profiling adds
+measurable overhead and should only be used for identifying bottlenecks.
+
+The profiling path changes the execution flow in ways that affect
+throughput:
+
+| Overhead source | Impact | Why |
+|----------------|--------|-----|
+| Per-dispatch GPU timestamps | Each dispatch gets its own compute pass with `timestampWrites`, breaking batched submissions into individual passes | ~10-30% decode slowdown |
+| CPU-timed dispatch events | `perf_counter_ns()` calls + `GPUDispatchEvent` allocation per dispatch | ~1-2% |
+| Profiler `resolve_and_read()` | Resolves all GPU timestamp queries at the end — blocks until GPU finishes | Adds latency to last token |
+
+**Correct workflow**:
+
+1. **Measure** (without `--profile`): Get the throughput baseline.
+   ```bash
+   python models/qwen-3-1.7B/model.py \
+       --gguf-file path/to/model.gguf --use-q8-gpu \
+       -pl 128 -gl 100
+   ```
+   Report the `forward() only` tok/s from the `--- Performance ---`
+   output.  This is the true model throughput with no instrumentation.
+
+2. **Profile** (with `--profile`): Identify where time is spent.
+   ```bash
+   python models/qwen-3-1.7B/model.py \
+       --gguf-file path/to/model.gguf --use-q8-gpu \
+       -pl 128 -gl 30 --profile
+   ```
+   Use the GPU Kernels (HW Timestamps) breakdown to find the hottest
+   kernels.  The per-kernel percentages are accurate even though
+   absolute times are inflated.
+
+3. **Optimize**: Make changes targeting the kernels identified in step 2.
+
+4. **Re-measure** (without `--profile`): Confirm throughput improvement.
+
+**Example** (Qwen3-1.7B Q8 W8A32, RTX 5080):
+
+| Mode | Decode tok/s (forward-only) |
+|------|---------------------------|
+| No profiling | **172.7 tok/s** |
+| With `--profile` | 132.7 tok/s |
+
+Profiling shows ~23% overhead in this case, entirely from per-dispatch
+timestamp query passes.  The per-kernel percentage breakdown is still
+valid for identifying bottlenecks — the relative proportions are stable.
+
+**Rule**: Always report the **non-profiled** number as the model's
+throughput.  Profiling numbers are for internal optimization only.
 
 ---
 
@@ -1449,6 +1531,124 @@ default.  INT4/INT8 quantization may be acceptable for some layers
 (e.g., FFN) but should be validated visually on representative prompts
 before deploying.  The `u32` + `unpack2x16float()` pattern (§7.4)
 enables fp16 storage on D3D12 without the `f16` typed buffer bug.
+
+### 7.6 Q8_0 W8A32 (INT8 Weights, FP32 Activations)
+
+Keep GGUF Q8_0 weights packed as int8 on GPU — no dequantization at
+load time.  The WGSL kernel extracts int8 values on-the-fly via
+`extractBits()`, multiplies with fp32 activations, and applies per-block
+scales.  This is the W8A32 strategy: 1 byte/param weight storage with
+full fp32 activation precision.
+
+**Q8_0 block format** (34 bytes per 32 elements):
+```
+[2 bytes fp16 scale][32 bytes int8 values]
+```
+
+**GPU repacking** (`repack_q8_0_for_gpu` in `gguf_utils.py`):
+The raw Q8_0 blocks are split into two GPU buffers:
+- `weights_u32`: `(N, K/4)` uint32 — 4 int8 values packed per u32
+- `scales_fp16`: `(N, K/32)` float16 — one scale per 32-element block
+
+No dequantization occurs.  The repacking is a pure byte rearrangement
+that takes ~2.4s for 1.7B parameters (mmap + numpy reshape).
+
+**WGSL kernel** (`WSGL_Q8_0_KERNEL` in `wgsl_kernels.py`):
+```wgsl
+enable subgroups;
+// 256 threads (8 warps × 32), TILE_N=8 outputs per workgroup
+
+// Each lane reads 4 int8 values from one u32:
+let packed_w = W_Q8[w_base + g * 32u + lane];
+let w0 = f32(extractBits(i32(packed_w), 0u, 8u));   // sign-extend
+let w1 = f32(extractBits(i32(packed_w), 8u, 8u));
+let w2 = f32(extractBits(i32(packed_w), 16u, 8u));
+let w3 = f32(extractBits(i32(packed_w), 24u, 8u));
+
+// Per-block scale from fp16 (packed in u32):
+let sp = unpack2x16float(Scales[si / 2u]);
+let scale = select(sp.x, sp.y, (si & 1u) != 0u);
+
+// Dequant + dot: w_fp32 = w_int8 * scale
+acc += (x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3) * scale;
+
+// subgroupAdd for warp-level reduction
+let warp_sum = subgroupAdd(acc);
+```
+
+Key design decisions:
+- `extractBits(i32, offset, 8)` gives sign-extended int8→i32 (no branch)
+- 128-element stride per iteration (4 Q8_0 blocks × 32 elements)
+- `subgroupAdd` for warp reduction (no shared memory needed)
+- TILE_N=8: each workgroup computes 8 output elements (8× fewer dispatches)
+- No zero-point (Q8_0 is symmetric: `w_fp32 = w_int8 * scale`)
+
+**Correctness**: Kernel vs CPU reference: max_err=0.000034, correlation=1.0.
+
+**Integration** (Qwen3-1.7B, `models/qwen-3-1.7B/model.py`):
+
+The Q8 path integrates into the existing fast decode pipeline.  The
+`_init_fast_decode()` method conditionally creates Q8 or Q4 bind groups
+based on `self._use_q8_gpu`:
+
+```python
+# Q8: 6 bindings (X, W_Q8, Scales, Bias, Y, _params_)
+# Q4: 7 bindings (X, W_Q4, Scales, Zeros, Bias, Y, _params_)
+if self._use_q8_gpu:
+    pl_matmul, bgl_matmul = runner.get_pipeline_info(
+        WSGL_Q8_0_KERNEL, Q8_DP4A_BINDINGS, [])
+else:
+    pl_q4, bgl_q4 = get_pl(self._linear_q4_result)
+```
+
+QKV and gate_up weights are fused by concatenating along the N axis
+during GGUF loading (`load_gguf_qwen3_q8()`), keeping the same fused
+projection pattern as INT4.
+
+**Benchmarks** (Qwen3-1.7B Q8_0, RTX 5080, `--decode-mode gpu`):
+
+| Metric | Dequant fp16 | Q8 W8A32 |
+|--------|-------------|----------|
+| Decode (forward-only) | 32.7 tok/s | **172.7 tok/s** |
+| GPU VRAM (layers) | 2688 MB | **1428 MB** (−47%) |
+| GPU VRAM (total) | 4470 MB | **3210 MB** (−28%) |
+| Load time | 6.3s | **2.4s** (2.6×) |
+
+The fp16 path lacks a fast decode pipeline, which explains most of the
+throughput gap.  With fast decode, the Q8 kernel achieves 172 tok/s
+forward-only because all 28 layers + LM head run as pre-recorded
+batched dispatches with zero per-token Python overhead.
+
+**Per-kernel GPU profile** (HW timestamps, 50-token decode):
+
+| Kernel | Avg/call | % of GPU time | Notes |
+|--------|----------|---------------|-------|
+| q8_matmul_gateup | 56µs | 27% | N=12288, K=2048 |
+| lm_head | 1151µs | 20% | N=151936 (fp16, not Q8) |
+| q8_matmul_down | 35µs | 17% | N=2048, K=6144 |
+| q8_matmul_qkv | 25µs | 12% | N=4096, K=2048 |
+| gqa_attn | 13µs | 6% | |
+| q8_matmul_oproj | 11µs | 5% | N=2048, K=2048 |
+
+The 4 Q8 matmuls total 127µs/layer — this is the GPU compute floor for
+the 1.7B model at T=1 decode.  The LM head (fp16, 151936 outputs) is
+the single most expensive dispatch at 1.15ms but runs only once per token.
+
+**When to use Q8_0 vs INT4**:
+- Q8_0 is ideal when GGUF files are the primary weight source (no
+  conversion step needed) and VRAM budget allows ~1 byte/param
+- INT4 halves memory further (~0.5 bytes/param) but requires a
+  quantization step and may degrade output quality for small models
+- For models ≤3B parameters, Q8_0 fits comfortably in 8GB VRAM
+
+**Usage**:
+```bash
+python models/qwen-3-1.7B/model.py \
+    --gguf-file path/to/Qwen3-1.7B-Q8_0.gguf \
+    --use-q8-gpu \
+    --prompt "Hello" \
+    --profile
+```
 
 ---
 

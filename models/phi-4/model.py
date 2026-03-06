@@ -45,7 +45,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_device_arg, apply_device_arg, profile_model,
+    add_common_args, apply_device_arg, run_inference, profile_model,
 )
 
 _t_imports_done = time.perf_counter_ns()
@@ -2256,27 +2256,17 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(
         description="Phi-4 mini on WebGPU via Triton")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify pipeline with random weights")
+    add_common_args(parser)
     parser.add_argument("--quantize", action="store_true",
                         help="Quantize weights to INT4 + fp16 and save")
-    parser.add_argument("--prompt", type=str,
-                        default="The future of AI is",
-                        help="Prompt for text generation")
-    parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--weights-dir", type=str, default=None)
     parser.add_argument("--decode-mode", type=str, default="gpu",
                         choices=["cpu", "gpu"],
                         help="Decode mode: 'gpu' (GPU dispatch) or 'cpu' (numpy BLAS)")
-    parser.add_argument("--profile", action="store_true",
-                        help="Enable CPU+GPU profiling")
     parser.add_argument("--batch-layers", type=int, default=1, metavar="N",
                         help="Progressive batching: submit every N layers "
                              "(0=off, 1=per-layer, 4=every 4 layers, 32=single batch)")
     parser.add_argument("--use-dp4a", action="store_true",
                         help="Use DP4A (dot4I8Packed) for INT4 matmul")
-    add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -2385,9 +2375,8 @@ def main():
     model.warmup()
     print(f"Warmup forward: {(_wt.perf_counter()-_w0)*1000:.0f}ms")
 
-    generate(model, args.prompt, tokenizer,
-             max_tokens=args.max_tokens,
-             temperature=args.temperature)
+    run_inference(model, args, tokenizer,
+                  model_name="Phi-4 mini", script_dir=_SCRIPT_DIR)
 
 
 if __name__ == "__main__":

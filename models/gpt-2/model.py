@@ -28,7 +28,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     _parse_safetensors, load_weights, download_weights, generate,
-    add_device_arg, apply_device_arg,
+    add_common_args, apply_device_arg, run_inference,
 )
 
 
@@ -384,20 +384,7 @@ def verify_with_random_weights():
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="GPT-2 on WebGPU via Triton")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify pipeline with random weights (no download)")
-    parser.add_argument("--prompt", type=str,
-                        default="The future of AI is",
-                        help="Prompt for text generation")
-    parser.add_argument("--max-tokens", type=int, default=50,
-                        help="Maximum tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.8,
-                        help="Sampling temperature")
-    parser.add_argument("--weights-dir", type=str, default=None,
-                        help="Directory for cached weights")
-    parser.add_argument("--profile", action="store_true",
-                        help="Enable profiling with GPU timestamps")
-    add_device_arg(parser)
+    add_common_args(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -414,17 +401,8 @@ def main():
     model = GPT2WebGPU(weights)
     print("Model created, kernels compiled")
 
-    if args.profile:
-        model.enable_profiling()
-        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
-
-    # Generate (GPT-2 uses tiktoken, no tokenizer.json)
-    generate(model, args.prompt, tokenizer=None,
-             max_tokens=args.max_tokens,
-             temperature=args.temperature)
-
-    if args.profile:
-        model.save_profile(_SCRIPT_DIR, "GPT-2")
+    run_inference(model, args, None,
+                  model_name="GPT-2", script_dir=_SCRIPT_DIR)
 
 
 if __name__ == "__main__":

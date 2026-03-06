@@ -783,7 +783,7 @@ class InferenceProfiler:
         print("=" * 70)
 
         # --- CPU Summary ---
-        print("\n--- CPU Timeline ---")
+        print("\n--- CPU Ops ---")
         if cpu_events:
             # Group by scope
             scope_totals: Dict[str, float] = {}
@@ -801,12 +801,13 @@ class InferenceProfiler:
 
             # Aggregate by operation type across layers
             agg: Dict[str, Tuple[float, int]] = {}  # name -> (total_ms, count)
-            # Init/structural phases that aren't per-token ops
+            # Structural/GPU phases — not CPU-only ops
             _structural = {"total", "scope_total", "layers", "norm_lm_head",
                            "fast_decode_init", "attn", "mlp",
                            "imports", "download_check",
                            "weight_loading", "model_init", "kernel_compile",
-                           "weight_upload", "warmup", "kv_cache_alloc"}
+                           "weight_upload", "warmup", "kv_cache_alloc",
+                           "forward", "prefill", "gpu"}
             for key, times in op_times.items():
                 parts = key.split("/")
                 # Use the last part as the operation name
@@ -814,6 +815,12 @@ class InferenceProfiler:
                 if op_name in _structural:
                     continue
                 if (op_name.startswith("L") and op_name[1:].isdigit()):
+                    continue
+                # Skip per-token decode wrappers (decode_0, decode_1, ...)
+                if op_name.startswith("decode_"):
+                    continue
+                # Skip GPU dispatch labels (fast/L0-3, L28-27+lmh, etc.)
+                if op_name.startswith("fast/"):
                     continue
                 if op_name not in agg:
                     agg[op_name] = (0.0, 0)
@@ -901,12 +908,26 @@ class InferenceProfiler:
         # --- Hotspot Analysis ---
         print("\n--- Hotspot Analysis ---")
         if cpu_events:
-            # Find the top CPU consumers
+            # Find the top CPU consumers (exclude structural/GPU wrappers)
+            _hotspot_skip = {"total", "scope_total", "forward", "prefill",
+                             "gpu", "layers", "attn", "mlp"}
             all_ops = []
             for e in cpu_events:
-                if e.name not in ("total", "scope_total"):
-                    all_ops.append((e.duration_ms, e.name,
-                                   e.scope, e.gpu_dispatch))
+                # Skip structural names
+                leaf = e.name.split("/")[-1]
+                if leaf in _hotspot_skip:
+                    continue
+                if leaf.startswith("decode_"):
+                    continue
+                if leaf.startswith("fast/") or leaf.startswith("fast_decode/"):
+                    continue
+                # Also skip by full name
+                if e.name in _hotspot_skip:
+                    continue
+                if e.name.startswith("fast_decode/"):
+                    continue
+                all_ops.append((e.duration_ms, e.name,
+                                e.scope, e.gpu_dispatch))
 
             all_ops.sort(key=lambda x: -x[0])
             print(f"  Top {min(top_n, len(all_ops))} slowest individual operations:")

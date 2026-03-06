@@ -21,12 +21,12 @@ All models run fully on Triton WebGPU — no PyTorch at inference time.
 | [**GPT-OSS**](https://huggingface.co/openai/gpt-oss-20b) | LLM (MoE) | 20B | MXFP4 | 1.2s / 38.4 | — | Done |
 | [**Phi-4**](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | 3.8B | INT4 | 35ms / 120 | — | Done |
 | [**Qwen-2.5**](https://huggingface.co/Qwen/Qwen2.5-1.5B) | LLM | 1.5B | INT4 | 148ms / 220 | — | Done |
-| [**Qwen-3**](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | 0.6B | INT4 | 400ms / 354 | 1.7s / 15.1 | |
+| [**Qwen-3**](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | 0.6B | INT4 | 364ms / 319 (`--use-q4`) | 1.7s / 15.1 | Done |
 | [**Qwen-3.5**](https://huggingface.co/Qwen/Qwen3.5-27B) | LLM | 27B | INT4 | 2.4s / 4.9 | — | |
 | [**SDXL-Turbo**](https://huggingface.co/stabilityai/sdxl-turbo) | Image Gen | ~5B | FP16 | 8.6s/step (512²) | — | Done |
 | [**SmolLM-2**](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | LLM | 1.7B | INT4 | 133ms / 208 | — | Done |
 | [**Whisper**](https://huggingface.co/openai/whisper-large-v3-turbo) | Speech | 809M | FP16 | 8.0s enc, 6.3 dec | — | Done |
-| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | 7.0s/step (512²) | — | |
+| [**Z-Image-Turbo**](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image Gen | ~12B | FP16 | 7.0s/step (512²) | — | Done |
 
 **GPUs**: NVIDIA GeForce RTX 5080 (discrete, D3D12) · AMD Radeon Graphics (RDNA 2 integrated, D3D12). All models support `--device low` for integrated GPUs.
 
@@ -43,6 +43,55 @@ python models/qwen-3/model.py --prompt "Hello" --device low
 ```
 
 Device-specific optimizations are applied automatically based on the GPU vendor detected via Dawn's `wgpuAdapterGetInfo` API.
+
+## Qwen-3.5 GGUF on WebGPU
+
+Backpack now supports converting Qwen-3.5 GGUF checkpoints into Backpack-native NPZ formats for Triton WebGPU inference.
+If a `.gguf` file is placed under `gitignore/models/qwen-3.5/weights/`, commands can auto-detect it without `--gguf-file`.
+
+```powershell
+# 1) Quality-first path: convert GGUF to fp16 NPZ (recommended for correctness)
+python models/qwen-3.5/model.py --convert-gguf-fp16 --gguf-file "E:\models\Qwen3.5-27B-Q4_K_M.gguf"
+
+# 2) Run native WebGPU inference with GGUF-derived fp16 weights
+python models/qwen-3.5/model.py --use-gguf-fp16 --prompt "Explain lunar phases in two sentences."
+
+# 3) Optional faster path: convert GGUF to Backpack INT4 cache (lower quality)
+python models/qwen-3.5/model.py --quantize-gguf --gguf-file "E:\models\Qwen3.5-27B-Q4_K_M.gguf"
+python models/qwen-3.5/model.py --use-q4 --prompt "Explain lunar phases in two sentences."
+
+# 4) Inspect auto-detected GGUF compatibility (no path arg needed)
+python models/qwen-3.5/model.py --inspect-gguf
+
+# 4.1) Validate GGUF K-quant reference decode math (CPU parity checks)
+python models/qwen-3.5/model.py --check-gguf-kquant-ref
+
+# 5) Direct GGUF runtime mode (no intermediate NPZ file)
+python models/qwen-3.5/model.py --use-gguf-direct-q4 --prompt "Explain lunar phases in two sentences."
+
+# 6) Recommended direct mode for better fidelity with Q4_K_M
+#    (keeps Q5_K/Q6_K tensors in fp16 at runtime)
+python models/qwen-3.5/model.py --use-gguf-direct-mixed --prompt "Explain lunar phases in two sentences."
+
+# 6.1) Increase quality by forcing earliest full-attention layers to fp16
+python models/qwen-3.5/model.py --use-gguf-direct-mixed --gguf-mixed-promote-attn-layers 6 --prompt "Explain lunar phases in two sentences."
+
+# 7) Experimental direct mode (default raw Q4_K only)
+python models/qwen-3.5/model.py --use-gguf-direct-mixed-exp-q4k --prompt "Explain lunar phases in two sentences."
+
+# 7.1) Experimental subset routing (example: Q4_K only)
+python models/qwen-3.5/model.py --use-gguf-direct-mixed-exp-q4k --gguf-exp-raw-q4k --prompt "Explain lunar phases in two sentences."
+
+# 7.2) Opt in additional raw-k kernels (Q5_K/Q6_K)
+python models/qwen-3.5/model.py --use-gguf-direct-mixed-exp-q4k --gguf-exp-raw-q4k --gguf-exp-raw-q5k --gguf-exp-raw-q6k --prompt "Explain lunar phases in two sentences."
+
+# 7.3) Kernel parity diagnostics (GPU raw-k kernel vs CPU reference)
+python models/qwen-3.5/model.py --check-gguf-rawk-parity --rawk-kind q4k --rawk-max-rows 64
+```
+
+Notes:
+- `--use-gguf-fp16` keeps GGUF-derived weights in fp16 and stays fully on the Triton WebGPU backend.
+- `--use-q4` is faster but can degrade Qwen-3.5 output quality compared with fp16.
 
 ## Project Structure
 ```

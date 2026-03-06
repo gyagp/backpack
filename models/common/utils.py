@@ -40,6 +40,81 @@ def apply_device_arg(args):
         os.environ["DAWN_GPU"] = args.device
 
 
+def add_perf_args(parser):
+    """Add standard performance measurement args to an argparse parser.
+
+    Adds:
+      -pl / --prompt-length: number of prompt tokens (for perf measurement)
+      -gl / --gen-length:    number of tokens to generate (for perf measurement)
+
+    When both are specified, generate() uses a fixed dummy prompt of exactly
+    `prompt_length` tokens and generates exactly `gen_length` tokens with
+    greedy decoding (temperature=0).  This provides deterministic,
+    reproducible performance measurements independent of prompt content.
+    """
+    parser.add_argument("-pl", "--prompt-length", type=int, default=None,
+                        help="Prompt length in tokens (perf measurement mode)")
+    parser.add_argument("-gl", "--gen-length", type=int, default=None,
+                        help="Generation length in tokens (perf measurement mode)")
+
+
+def add_common_args(parser, default_prompt="The future of AI is"):
+    """Add all standard args shared by LLM models.
+
+    Adds: --prompt, --max-tokens, --temperature, --verify, --weights-dir,
+          --profile, --device, -pl, -gl
+
+    Model-specific args (--model, --quantize, --decode-mode, --gguf-file,
+    etc.) should be added separately in each model's main().
+    """
+    parser.add_argument("--verify", action="store_true",
+                        help="Verify pipeline with random weights")
+    parser.add_argument("--prompt", type=str, default=default_prompt,
+                        help="Prompt for text generation")
+    parser.add_argument("--max-tokens", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--weights-dir", type=str, default=None)
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling")
+    add_device_arg(parser)
+    add_perf_args(parser)
+
+
+def run_inference(model, args, tokenizer, model_name: str = None,
+                  script_dir: str = None):
+    """Run text generation with profiling/perf measurement support.
+
+    Handles the common post-model-creation sequence:
+      1. Enable profiling if --profile
+      2. Warm up fast decode pipeline if available
+      3. Call generate() with all common args
+      4. Save profile report if --profile
+
+    Args:
+        model: WebGPUModel instance (already created)
+        args: parsed argparse.Namespace with common args
+        tokenizer: loaded tokenizer
+        model_name: name for profile report (e.g. "Qwen3-1.7B")
+        script_dir: directory for profile output (model's _SCRIPT_DIR)
+    """
+    if getattr(args, 'profile', False):
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+
+    # Warmup fast decode before generating (if available)
+    if hasattr(model, '_warmup_fast_decode'):
+        model._warmup_fast_decode()
+
+    generate(model, args.prompt, tokenizer,
+             max_tokens=args.max_tokens,
+             temperature=args.temperature,
+             prompt_length=getattr(args, 'prompt_length', None),
+             gen_length=getattr(args, 'gen_length', None))
+
+    if getattr(args, 'profile', False) and model_name and script_dir:
+        model.save_profile(script_dir, model_name)
+
+
 # ---------------------------------------------------------------------------
 # Safetensors parsing
 # ---------------------------------------------------------------------------
@@ -319,11 +394,19 @@ def load_tokenizer(tokenizer_path: str):
 
 def generate(model, prompt: str, tokenizer=None,
              max_tokens: int = 50,
-             temperature: float = 0.8, top_k: int = 40) -> str:
+             temperature: float = 0.8, top_k: int = 40,
+             prompt_length: int = None,
+             gen_length: int = None) -> str:
     """Generate text from a prompt using a WebGPU model.
 
     Uses KV-cache for incremental decoding with separate
     prefill/decode performance reporting.
+
+    Performance measurement mode:
+        When prompt_length and gen_length are both set, uses a fixed
+        dummy prompt of exactly prompt_length tokens and generates
+        exactly gen_length tokens with greedy decoding (temperature=0).
+        This provides deterministic, reproducible measurements.
 
     Args:
         model: WebGPUModel subclass with forward() method
@@ -333,10 +416,18 @@ def generate(model, prompt: str, tokenizer=None,
         max_tokens: number of tokens to generate
         temperature: sampling temperature
         top_k: top-k sampling parameter
+        prompt_length: if set, override prompt with dummy tokens of this length
+        gen_length: if set, override max_tokens with this value
 
     Returns:
         generated text string
     """
+    # Performance measurement mode: fixed prompt + greedy decode
+    perf_mode = (prompt_length is not None and gen_length is not None)
+    if perf_mode:
+        max_tokens = gen_length
+        temperature = 0  # greedy — deterministic
+
     if tokenizer is not None:
         tokens = tokenizer.encode(prompt)
         dec_fn = lambda ids: tokenizer.decode(ids)
@@ -356,11 +447,26 @@ def generate(model, prompt: str, tokenizer=None,
             dec_one = lambda t: chr(t) if t < 128 else "?"
 
     token_ids = np.array(tokens, dtype=np.int32)
-    generated = list(tokens)
 
-    print(f"\nPrompt: {prompt}")
-    print(f"Generating {max_tokens} tokens...\n")
-    print(prompt, end="", flush=True)
+    # Performance measurement mode: pad/truncate prompt to exact length
+    if perf_mode and prompt_length is not None:
+        if len(token_ids) < prompt_length:
+            # Repeat tokens to fill prompt_length
+            repeats = (prompt_length + len(token_ids) - 1) // len(token_ids)
+            token_ids = np.tile(token_ids, repeats)[:prompt_length]
+        elif len(token_ids) > prompt_length:
+            token_ids = token_ids[:prompt_length]
+        token_ids = token_ids.astype(np.int32)
+
+    generated = list(token_ids.tolist())
+
+    if perf_mode:
+        print(f"\n[Perf mode] prompt_length={len(token_ids)}, "
+              f"gen_length={max_tokens}, greedy decoding")
+    else:
+        print(f"\nPrompt: {prompt}")
+        print(f"Generating {max_tokens} tokens...\n")
+        print(prompt, end="", flush=True)
 
     # Profiler hooks (if available)
     _p = hasattr(model, 'profiler') and model.profiler and model.profiler.enabled
@@ -428,7 +534,8 @@ def generate(model, prompt: str, tokenizer=None,
         if _p: _cpu.end(f"decode_{step}/sampling")
 
         # Decode and print
-        print(dec_one(int(next_token)), end="", flush=True)
+        if not perf_mode:
+            print(dec_one(int(next_token)), end="", flush=True)
         if _p: _cpu.end(f"decode_{step}")
 
         # After the 1st token is output, mark end of prefill / start of decode
@@ -445,13 +552,13 @@ def generate(model, prompt: str, tokenizer=None,
     decode_ms = (decode_end - decode_start) * 1000 if decode_start else 0
     decode_fwd_ms = decode_forward_ns / 1e6
     total_ms = (decode_end - prefill_start) * 1000
-    prompt_len = len(tokens)
+    prompt_len = len(token_ids)
     decode_tps = decode_tokens / (decode_ms / 1000) if decode_ms > 0 else 0
     decode_fwd_tps = decode_tokens / (decode_fwd_ms / 1000) \
         if decode_fwd_ms > 0 else 0
     overall_tps = (prompt_len + max_tokens) / (total_ms / 1000) \
         if total_ms > 0 else 0
-    print(f"\n\n--- Performance ---")
+    print(f"\n--- Performance ---")
     print(f"  Prefill (TTFT): {prefill_ms:.1f}ms "
           f"({prompt_len} prompt + 1st token)")
     print(f"  Decode:  {decode_tokens} tokens in {decode_ms:.1f}ms "

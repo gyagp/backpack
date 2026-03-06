@@ -442,7 +442,9 @@ class WebGPUModel:
                 weight_bytes += sum(buf.size for _, _, buf in chunks[1:])
 
         # CPU weight memory
-        cpu_weight_bytes = sum(w.nbytes for w in self.weights.values())
+        cpu_weight_bytes = sum(
+            w.nbytes for w in self.weights.values()
+            if hasattr(w, 'nbytes'))
 
         return {
             'gpu_total_mb': round(gpu_stats['total_allocated_mb'], 1),
@@ -1338,6 +1340,78 @@ class WebGPUModel:
         z_buf = runner.upload_to_gpu(z_flat, name + ".zeros.gpu")
         self._gpu_weights[name + ".zeros.gpu"] = z_buf
 
+    def _upload_q8_weight(self, name: str, N: int, K: int):
+        """Upload Q8_0 repacked weights + scales to GPU.
+
+        Expects self.weights to contain:
+          name + '.q8':        uint32 packed (N, K/4) — 4 int8 per u32
+          name + '.q8_scales': fp16 (N, K/32) — one per 32-element block
+        """
+        runner = self.cache.runner
+        q8 = self.weights[name + ".q8"]
+        scales = self.weights[name + ".q8_scales"]
+
+        q8_buf = runner.upload_to_gpu(
+            q8.ravel().view(np.uint32), name + ".q8.gpu")
+        self._gpu_weights[name + ".q8.gpu"] = q8_buf
+
+        s_flat = scales.ravel()
+        if s_flat.dtype != np.float16:
+            s_flat = s_flat.astype(np.float16)
+        s_buf = runner.upload_to_gpu(s_flat, name + ".q8_scales.gpu")
+        self._gpu_weights[name + ".q8_scales.gpu"] = s_buf
+
+    def _upload_q4k_weight(self, name: str, N: int, K: int):
+        """Upload raw GGUF Q4_K rows for experimental direct-decode kernel.
+
+        Expects self.weights to contain:
+          name + '.q4k': uint8 matrix (N, n_blocks * 144)
+        """
+        runner = self.cache.runner
+        raw = self.weights[name + ".q4k"]
+        if raw.dtype != np.uint8:
+            raw = raw.astype(np.uint8, copy=False)
+        raw_flat = np.ascontiguousarray(raw.ravel())
+        assert raw_flat.nbytes % 4 == 0
+        raw_u32 = raw_flat.view(np.uint32)
+        buf = runner.upload_to_gpu(raw_u32, name + ".q4k.gpu")
+        self._gpu_weights[name + ".q4k.gpu"] = buf
+
+    def _upload_q5k_weight(self, name: str, N: int, K: int):
+        """Upload raw GGUF Q5_K rows for experimental direct-decode kernel.
+
+        Expects self.weights to contain:
+          name + '.q5k': uint8 matrix (N, n_blocks * 176)
+        """
+        runner = self.cache.runner
+        raw = self.weights[name + ".q5k"]
+        if raw.dtype != np.uint8:
+            raw = raw.astype(np.uint8, copy=False)
+        raw_flat = np.ascontiguousarray(raw.ravel())
+        assert raw_flat.nbytes % 4 == 0
+        raw_u32 = raw_flat.view(np.uint32)
+        buf = runner.upload_to_gpu(raw_u32, name + ".q5k.gpu")
+        self._gpu_weights[name + ".q5k.gpu"] = buf
+
+    def _upload_q6k_weight(self, name: str, N: int, K: int):
+        """Upload raw GGUF Q6_K rows for experimental direct-decode kernel.
+
+        Expects self.weights to contain:
+          name + '.q6k': uint8 matrix (N, n_blocks * 210)
+        """
+        runner = self.cache.runner
+        raw = self.weights[name + ".q6k"]
+        if raw.dtype != np.uint8:
+            raw = raw.astype(np.uint8, copy=False)
+        raw_flat = np.ascontiguousarray(raw.ravel())
+        # Q6_K rows are 210 bytes; total bytes can be non-multiple of 4.
+        if raw_flat.nbytes % 4 != 0:
+            pad = 4 - (raw_flat.nbytes % 4)
+            raw_flat = np.pad(raw_flat, (0, pad), mode='constant')
+        raw_u32 = raw_flat.view(np.uint32)
+        buf = runner.upload_to_gpu(raw_u32, name + ".q6k.gpu")
+        self._gpu_weights[name + ".q6k.gpu"] = buf
+
     def _upload_bias(self, name: str) -> GPUBuffer:
         """Upload a bias vector to GPU."""
         runner = self.cache.runner
@@ -1990,6 +2064,68 @@ class WebGPUModel:
             return gpu_buf
         return out['Y'].reshape(T, N)
 
+    def _linear_q8(self, x, w_q8, scales, bias,
+                   out_features: int, K: int = None,
+                   gpu_out: bool = False):
+        """Q8_0 matmul using hand-crafted WGSL (W8A32).
+
+        Int8 weights stay packed on GPU — no dequantization at load time.
+        extractBits in the kernel decodes int8 to fp32 on-the-fly.
+        subgroupAdd for warp-level reduction, TILE_N=8 for tiled output.
+
+        w_q8:   GPUBuffer of (N, K/4) u32 packed int8 weights
+        scales: GPUBuffer of (N, K/32) fp16 scales (stored as u32 pairs)
+        """
+        from common.wgsl_kernels import (
+            WSGL_Q8_0_KERNEL, Q8_DP4A_BINDINGS, pack_q8_params, Q8_TILE_N,
+        )
+
+        N = out_features
+        x_is_gpu = isinstance(x, GPUBuffer)
+
+        if x_is_gpu:
+            T = x.shape[0] if x.shape else 1
+            if K is None:
+                K = x.shape[1] if (x.shape and len(x.shape) > 1) else self.n_embd
+        else:
+            T = x.shape[0]
+            if K is None:
+                K = x.shape[1]
+
+        params = pack_q8_params(K, N)
+
+        runner = self.cache.runner
+        params_key = f"__q8_params_{K}_{N}"
+        if not hasattr(self, '_q8_params_cache'):
+            self._q8_params_cache = {}
+        if params_key not in self._q8_params_cache:
+            self._q8_params_cache[params_key] = \
+                runner.upload_to_gpu(params, params_key)
+        params_gpu = self._q8_params_cache[params_key]
+
+        out = runner.run_kernel(
+            wgsl_code=WSGL_Q8_0_KERNEL,
+            buffer_bindings=Q8_DP4A_BINDINGS,
+            param_fields=[],
+            workgroup_size=256,
+            grid=(T, (N + Q8_TILE_N - 1) // Q8_TILE_N),
+            buffers={
+                'X': x if x_is_gpu else x.ravel().astype(np.float32),
+                'W_Q8': w_q8,
+                'Scales': scales,
+                'Bias': bias,
+                'Y': np.zeros(T * N, dtype=np.float32),
+                '_params_': params_gpu,
+            },
+            scalars={},
+            gpu_outputs={'Y'} if gpu_out else None)
+
+        if gpu_out:
+            gpu_buf = out['Y']
+            gpu_buf.shape = (T, N)
+            return gpu_buf
+        return out['Y'].reshape(T, N)
+
     def _linear_fp16w_wgsl(self, x, w_fp16_u32, bias, out_features: int,
                             K: int = None, gpu_out: bool = False):
         """FP16 GEMM using hand-crafted WGSL with subgroupAdd + vec4 dot.
@@ -2036,6 +2172,165 @@ class WebGPUModel:
             buffers={
                 'X': x if x_is_gpu else x.ravel().astype(np.float32),
                 'W': w_fp16_u32,
+                'Bias': bias,
+                'Y': np.zeros(T * N, dtype=np.float32),
+                '_params_': params_gpu,
+            },
+            scalars={},
+            gpu_outputs={'Y'} if gpu_out else None)
+
+        if gpu_out:
+            gpu_buf = out['Y']
+            gpu_buf.shape = (T, N)
+            return gpu_buf
+        return out['Y'].reshape(T, N)
+
+    def _linear_q4k_wgsl(self, x, w_q4k_u32, bias, out_features: int,
+                          K: int = None, gpu_out: bool = False):
+        """Experimental GGUF Q4_K matvec kernel (direct block decode)."""
+        from common.wgsl_kernels import (
+            WGSL_Q4K_KERNEL, Q4K_BINDINGS, pack_q4k_params, Q4K_TILE_N,
+        )
+
+        N = out_features
+        x_is_gpu = isinstance(x, GPUBuffer)
+        if x_is_gpu:
+            T = x.shape[0] if x.shape else 1
+            if K is None:
+                K = x.shape[1] if (x.shape and len(x.shape) > 1) else self.n_embd
+        else:
+            T = x.shape[0]
+            if K is None:
+                K = x.shape[1]
+
+        n_blocks = (K + 255) // 256
+        row_stride_words = n_blocks * 36
+        params = pack_q4k_params(K, N, n_blocks, row_stride_words)
+
+        runner = self.cache.runner
+        params_key = f"__q4k_params_{K}_{N}"
+        if not hasattr(self, '_q4k_params_cache'):
+            self._q4k_params_cache = {}
+        if params_key not in self._q4k_params_cache:
+            self._q4k_params_cache[params_key] = \
+                runner.upload_to_gpu(params, params_key)
+        params_gpu = self._q4k_params_cache[params_key]
+
+        out = runner.run_kernel(
+            wgsl_code=WGSL_Q4K_KERNEL,
+            buffer_bindings=Q4K_BINDINGS,
+            param_fields=[],
+            workgroup_size=64,
+            grid=(T, (N + Q4K_TILE_N - 1) // Q4K_TILE_N),
+            buffers={
+                'X': x if x_is_gpu else x.ravel().astype(np.float32),
+                'W_Q4K': w_q4k_u32,
+                'Bias': bias,
+                'Y': np.zeros(T * N, dtype=np.float32),
+                '_params_': params_gpu,
+            },
+            scalars={},
+            gpu_outputs={'Y'} if gpu_out else None)
+
+        if gpu_out:
+            gpu_buf = out['Y']
+            gpu_buf.shape = (T, N)
+            return gpu_buf
+        return out['Y'].reshape(T, N)
+
+    def _linear_q5k_wgsl(self, x, w_q5k_u32, bias, out_features: int,
+                          K: int = None, gpu_out: bool = False):
+        """Experimental GGUF Q5_K matvec kernel (direct block decode)."""
+        from common.wgsl_kernels import (
+            WGSL_Q5K_KERNEL, Q5K_BINDINGS, pack_q5k_params, Q5K_TILE_N,
+        )
+
+        N = out_features
+        x_is_gpu = isinstance(x, GPUBuffer)
+        if x_is_gpu:
+            T = x.shape[0] if x.shape else 1
+            if K is None:
+                K = x.shape[1] if (x.shape and len(x.shape) > 1) else self.n_embd
+        else:
+            T = x.shape[0]
+            if K is None:
+                K = x.shape[1]
+
+        n_blocks = (K + 255) // 256
+        row_stride_words = n_blocks * 44
+        params = pack_q5k_params(K, N, n_blocks, row_stride_words)
+
+        runner = self.cache.runner
+        params_key = f"__q5k_params_{K}_{N}"
+        if not hasattr(self, '_q5k_params_cache'):
+            self._q5k_params_cache = {}
+        if params_key not in self._q5k_params_cache:
+            self._q5k_params_cache[params_key] = \
+                runner.upload_to_gpu(params, params_key)
+        params_gpu = self._q5k_params_cache[params_key]
+
+        out = runner.run_kernel(
+            wgsl_code=WGSL_Q5K_KERNEL,
+            buffer_bindings=Q5K_BINDINGS,
+            param_fields=[],
+            workgroup_size=64,
+            grid=(T, (N + Q5K_TILE_N - 1) // Q5K_TILE_N),
+            buffers={
+                'X': x if x_is_gpu else x.ravel().astype(np.float32),
+                'W_Q5K': w_q5k_u32,
+                'Bias': bias,
+                'Y': np.zeros(T * N, dtype=np.float32),
+                '_params_': params_gpu,
+            },
+            scalars={},
+            gpu_outputs={'Y'} if gpu_out else None)
+
+        if gpu_out:
+            gpu_buf = out['Y']
+            gpu_buf.shape = (T, N)
+            return gpu_buf
+        return out['Y'].reshape(T, N)
+
+    def _linear_q6k_wgsl(self, x, w_q6k_u32, bias, out_features: int,
+                          K: int = None, gpu_out: bool = False):
+        """Experimental GGUF Q6_K matvec kernel (direct block decode)."""
+        from common.wgsl_kernels import (
+            WGSL_Q6K_KERNEL, Q6K_BINDINGS, pack_q6k_params, Q6K_TILE_N,
+        )
+
+        N = out_features
+        x_is_gpu = isinstance(x, GPUBuffer)
+        if x_is_gpu:
+            T = x.shape[0] if x.shape else 1
+            if K is None:
+                K = x.shape[1] if (x.shape and len(x.shape) > 1) else self.n_embd
+        else:
+            T = x.shape[0]
+            if K is None:
+                K = x.shape[1]
+
+        n_blocks = (K + 255) // 256
+        row_stride_bytes = n_blocks * 210
+        params = pack_q6k_params(K, N, n_blocks, row_stride_bytes)
+
+        runner = self.cache.runner
+        params_key = f"__q6k_params_{K}_{N}"
+        if not hasattr(self, '_q6k_params_cache'):
+            self._q6k_params_cache = {}
+        if params_key not in self._q6k_params_cache:
+            self._q6k_params_cache[params_key] = \
+                runner.upload_to_gpu(params, params_key)
+        params_gpu = self._q6k_params_cache[params_key]
+
+        out = runner.run_kernel(
+            wgsl_code=WGSL_Q6K_KERNEL,
+            buffer_bindings=Q6K_BINDINGS,
+            param_fields=[],
+            workgroup_size=64,
+            grid=(T, (N + Q6K_TILE_N - 1) // Q6K_TILE_N),
+            buffers={
+                'X': x if x_is_gpu else x.ravel().astype(np.float32),
+                'W_Q6K': w_q6k_u32,
                 'Bias': bias,
                 'Y': np.zeros(T * N, dtype=np.float32),
                 '_params_': params_gpu,
