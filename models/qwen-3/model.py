@@ -1,5 +1,5 @@
 """
-Qwen3-1.7B inference on WebGPU via Triton.
+Qwen3-0.6B/1.7B inference on WebGPU via Triton.
 
 Qwen3 is a LLaMA-family model featuring:
   - RoPE (rotary position embeddings)
@@ -10,18 +10,20 @@ Qwen3 is a LLaMA-family model featuring:
   - Tied word embeddings (embed_tokens == lm_head)
 
 Optimizations:
-  - Q8_0 GGUF weights kept packed on GPU (W8A32, ~1 byte/param)
+  - INT4 per-group weight quantization (4× memory reduction)
   - Fused QKV projection (3→1 dispatch)
   - Fused gate+up MLP projection (2→1 dispatch)
+  - fp16 weight storage (2× bandwidth reduction)
   - Pre-computed RoPE tables
   - GPU-resident KV cache with fused RoPE+scatter
-  - Fast decode pipeline (pre-recorded dispatches, 160+ tok/s)
+  - Fast decode pipeline (pre-recorded dispatches)
 
 Usage:
-    python models/qwen-3-1.7B/model.py --verify
-    python models/qwen-3-1.7B/model.py --gguf-file path/to/Qwen3-1.7B-Q8_0.gguf --prompt "Hello"
-    python models/qwen-3-1.7B/model.py --gguf-file path/to/Qwen3-1.7B-Q8_0.gguf --use-q8-gpu --prompt "Hello"
-    python models/qwen-3-1.7B/model.py --gguf-file path/to/Qwen3-1.7B-Q8_0.gguf --use-q8-gpu --profile
+    python models/qwen-3/model.py --verify
+    python models/qwen-3/model.py --prompt "Hello"
+    python models/qwen-3/model.py --quantize
+    python models/qwen-3/model.py --prompt "Hello" --decode-mode gpu
+    python models/qwen-3/model.py --model 1.7B --gguf-file path/to/Qwen3-1.7B-Q8_0.gguf --prompt "Hello"
 
 Requirements:
     pip install requests tokenizers
@@ -40,7 +42,7 @@ import numpy as np
 from common.model_base import WebGPUModel
 from common.utils import (
     load_weights, download_weights, load_tokenizer, generate,
-    add_common_args, apply_device_arg, run_inference,
+    add_device_arg, apply_device_arg,
 )
 
 
@@ -98,6 +100,15 @@ def dequantize_int4(q_packed, scales, zeros, K_orig,
 
 # Qwen3 model configs
 QWEN_CONFIGS = {
+    "0.6B": {
+        "n_layer": 28, "n_head": 16, "n_kv_heads": 8,
+        "n_embd": 1024, "intermediate_size": 3072,
+        "n_vocab": 151936, "rope_theta": 1000000.0,
+        "rms_norm_eps": 1e-6, "head_dim": 128,
+        "hf_repo": "Qwen/Qwen3-0.6B",
+        "attention_bias": False,
+        "tie_word_embeddings": True,
+    },
     "1.7B": {
         "n_layer": 28, "n_head": 16, "n_kv_heads": 8,
         "n_embd": 2048, "intermediate_size": 6144,
@@ -412,88 +423,10 @@ class Qwen3WebGPU(WebGPUModel):
 
         # Fused QKV (single dispatch)
         bias_key = (pfx + "qkv_proj.bias") if self.attention_bias else "zero_bias_QKV"
+        qkv = self._proj(x, pfx + "qkv_proj.weight", bias_key, self.qkv_out, K=E)
 
+        # Split
         q_dim = n_head * HD
-
-        # GPU prefill path: keep QKV on GPU, do QK-norm+RoPE on GPU
-        if (T > 1 and self._has_qk_norm
-                and hasattr(self, '_qknorm_rope_prefill_result')):
-            qkv_gpu = self._proj(x, pfx + "qkv_proj.weight", bias_key,
-                                 self.qkv_out, K=E, gpu_out=True)
-
-            if positions is None:
-                positions = np.arange(T, dtype=np.int32)
-            half = HD // 2
-            cos = self._rope_cos[positions]
-            sin = self._rope_sin[positions]
-
-            q_norm_w = self.weights.get(pfx + "q_norm.weight")
-            k_norm_w = self.weights.get(pfx + "k_norm.weight")
-
-            q_stride_t = n_head * HD
-            kv_stride_t = n_kv * HD
-            qkv_stride_t = self.qkv_out
-
-            out = self.cache.run(
-                self._qknorm_rope_prefill_result,
-                grid=(T, n_head + n_kv),
-                buffers={
-                    'QKV': qkv_gpu,
-                    'Q_out': np.zeros(T * n_head * HD, dtype=np.float32),
-                    'K_out': np.zeros(T * n_kv * HD, dtype=np.float32),
-                    'V_out': np.zeros(T * n_kv * HD, dtype=np.float32),
-                    'CosTable': cos.astype(np.float32).ravel(),
-                    'SinTable': sin.astype(np.float32).ravel(),
-                    'NormQ': q_norm_w.astype(np.float32),
-                    'NormK': k_norm_w.astype(np.float32),
-                },
-                scalars={
-                    'n_head': n_head, 'q_size': q_dim,
-                    'kv_size': self.kv_dim,
-                    'qkv_stride_t': qkv_stride_t,
-                    'q_stride_t': q_stride_t,
-                    'kv_stride_t': kv_stride_t,
-                    'half_rot': half, 'eps': float(self.rms_norm_eps),
-                },
-                gpu_outputs={'Q_out', 'K_out', 'V_out'})
-
-            Q_gpu = out['Q_out']
-            K_gpu = out['K_out']
-            V_gpu = out['V_out']
-            Q_gpu.shape = (T, n_head, HD)
-            K_gpu.shape = (T, n_kv, HD)
-            V_gpu.shape = (T, n_kv, HD)
-
-            # GPU causal attention
-            attn_out = self._causal_attention_multihead(
-                Q_gpu, K_gpu, V_gpu, n_rep)
-
-            # Write K/V directly to GPU KV cache (no CPU round-trip)
-            if use_cache and hasattr(self, '_gpu_kv_cache'):
-                runner = self.cache.runner
-                K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
-                kv_bytes = T * n_kv * HD * 4
-                runner._lib.wgpuCommandEncoderCopyBufferToBuffer
-                # Use direct GPU-to-GPU copy
-                K_np = runner.readback(K_gpu).reshape(T, n_kv, HD)
-                V_np = runner.readback(V_gpu).reshape(T, n_kv, HD)
-                runner.write_buffer(K_cache_gpu.handle,
-                                    K_np.ravel().astype(np.float32).tobytes())
-                runner.write_buffer(V_cache_gpu.handle,
-                                    V_np.ravel().astype(np.float32).tobytes())
-                self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
-                # Also store in CPU cache for fallback
-                if self.kv_cache is None:
-                    self.kv_cache = {}
-                self.kv_cache[layer] = (K_np, V_np)
-
-            attn_flat = attn_out.reshape(T, q_dim)
-            return self._proj(attn_flat, pfx + "o_proj.weight",
-                              "zero_bias_E", E, K=q_dim, gpu_out=True)
-
-        # Standard CPU path (T=1 decode or no QK-norm)
-        qkv = self._proj(x, pfx + "qkv_proj.weight", bias_key,
-                         self.qkv_out, K=E)
         q = qkv[:, :q_dim]
         k = qkv[:, q_dim:q_dim + self.kv_dim]
         v = qkv[:, q_dim + self.kv_dim:]
@@ -553,7 +486,7 @@ class Qwen3WebGPU(WebGPUModel):
 
         attn_flat = attn_out.reshape(T, q_dim)
         return self._proj(attn_flat, pfx + "o_proj.weight",
-                          "zero_bias_E", E, K=q_dim, gpu_out=True)
+                          "zero_bias_E", E, K=q_dim)
 
     # -- MLP --
 
@@ -1165,7 +1098,7 @@ class Qwen3WebGPU(WebGPUModel):
             result = runner.submit_dispatches_pipelined(
                 self._fd_all_batches,
                 readback=readback,
-                profiler=p,
+                profiler=p._gpu if p.gpu_enabled else None,
                 dispatch_names=self._fd_dispatch_names)
 
             t1 = _time.perf_counter_ns()
@@ -1231,12 +1164,9 @@ class Qwen3WebGPU(WebGPUModel):
             for layer_idx in range(self.n_layer):
                 if layer_idx not in self.kv_cache:
                     continue
-                K_gpu, V_gpu, cached_len = self._gpu_kv_cache[layer_idx]
-                # Skip if already synced by GPU prefill path
-                if cached_len > 0:
-                    continue
                 K_cpu, V_cpu = self.kv_cache[layer_idx]
                 T_cached = K_cpu.shape[0]
+                K_gpu, V_gpu, _ = self._gpu_kv_cache[layer_idx]
                 k_bytes = K_cpu.ravel().astype(np.float32).tobytes()
                 v_bytes = V_cpu.ravel().astype(np.float32).tobytes()
                 runner.write_buffer(K_gpu.handle, k_bytes)
@@ -1718,11 +1648,18 @@ def verify_with_random_weights():
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Qwen3-1.7B on WebGPU via Triton")
-    add_common_args(parser)
-    parser.add_argument("--model", type=str, default="1.7B",
-                        choices=["1.7B"],
+        description="Qwen3 on WebGPU via Triton")
+    parser.add_argument("--verify", action="store_true",
+                        help="Verify pipeline with random weights")
+    parser.add_argument("--model", type=str, default="0.6B",
+                        choices=["0.6B", "1.7B"],
                         help="Model size")
+    parser.add_argument("--prompt", type=str,
+                        default="The future of AI is",
+                        help="Prompt for text generation")
+    parser.add_argument("--max-tokens", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--weights-dir", type=str, default=None)
     parser.add_argument("--gguf-file", type=str, default=None,
                         help="Path to GGUF file (loads directly, no safetensors conversion)")
     parser.add_argument("--quantize", action="store_true",
@@ -1734,6 +1671,9 @@ def main():
     parser.add_argument("--decode-mode", type=str, default="gpu",
                         choices=["cpu", "gpu"],
                         help="Decode mode: cpu or gpu (fast decode)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling")
+    add_device_arg(parser)
     args = parser.parse_args()
     apply_device_arg(args)
 
@@ -1789,21 +1729,8 @@ def main():
         tokenizer_path = os.path.join(
             os.path.dirname(args.gguf_file), "tokenizer.json")
         if not os.path.exists(tokenizer_path):
-            # Check in gitignore weights dir
-            tokenizer_path = os.path.join(weights_dir, "tokenizer.json")
-        if not os.path.exists(tokenizer_path):
-            # Download tokenizer only from HuggingFace
-            import requests
-            hf_repo = config["hf_repo"]
-            url = f"https://huggingface.co/{hf_repo}/resolve/main/tokenizer.json"
-            print(f"Downloading tokenizer from {hf_repo}...")
-            os.makedirs(weights_dir, exist_ok=True)
-            tokenizer_path = os.path.join(weights_dir, "tokenizer.json")
-            resp = requests.get(url)
-            resp.raise_for_status()
-            with open(tokenizer_path, "wb") as f:
-                f.write(resp.content)
-            print(f"  Saved tokenizer to {tokenizer_path}")
+            # Download tokenizer from HuggingFace
+            _, tokenizer_path = download_qwen_weights(args.model, weights_dir)
         tokenizer = load_tokenizer(tokenizer_path)
     else:
         npz_path, tokenizer_path = download_qwen_weights(
@@ -1879,8 +1806,19 @@ def main():
         q8_mode=getattr(args, 'use_q8_gpu', False))
     print(f"Model created, kernels compiled (decode={args.decode_mode})")
 
-    run_inference(model, args, tokenizer,
-                  model_name="Qwen3-1.7B", script_dir=_SCRIPT_DIR)
+    if args.profile:
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+
+    # Warmup fast decode before generating
+    model._warmup_fast_decode()
+
+    generate(model, args.prompt, tokenizer,
+             max_tokens=args.max_tokens,
+             temperature=args.temperature)
+
+    if args.profile:
+        model.save_profile(_SCRIPT_DIR, f"Qwen3-{args.model}")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ from common.kernels import (
     full_attn_kernel, full_attn_multihead_kernel, gqa_decode_attn_kernel,
     partial_rope_decode_kernel, rope_kv_scatter_kernel,
     fused_rope_qkv_kernel, fused_qknorm_rope_qkv_kernel,
+    qknorm_rope_prefill_kernel,
     partial_rope_prefill_kernel, rope_kv_scatter_prefill_kernel,
     group_norm_kernel,
     linear_mxfp4_kernel, gptoss_gate_kernel,
@@ -751,6 +752,21 @@ class WebGPUModel:
         }
         self._fused_qknorm_rope_result = self.cache.get_or_compile(
             fused_qknorm_rope_qkv_kernel, self._fused_qknorm_rope_sig,
+            {'BLOCK_HD': BS_hd}, num_warps=_nw(BS_hd))
+
+        # --- Fused QK-norm + RoPE for prefill (multi-token, GQA) ---
+        self._qknorm_rope_prefill_sig = {
+            'QKV': '*fp32', 'Q_out': '*fp32',
+            'K_out': '*fp32', 'V_out': '*fp32',
+            'CosTable': '*fp32', 'SinTable': '*fp32',
+            'NormQ': '*fp32', 'NormK': '*fp32',
+            'n_head': 'i32', 'q_size': 'i32', 'kv_size': 'i32',
+            'qkv_stride_t': 'i32', 'q_stride_t': 'i32',
+            'kv_stride_t': 'i32', 'half_rot': 'i32', 'eps': 'fp32',
+            'BLOCK_HD': 'constexpr',
+        }
+        self._qknorm_rope_prefill_result = self.cache.get_or_compile(
+            qknorm_rope_prefill_kernel, self._qknorm_rope_prefill_sig,
             {'BLOCK_HD': BS_hd}, num_warps=_nw(BS_hd))
 
         # --- Prefill RoPE Q (multi-token) ---
@@ -2914,26 +2930,38 @@ class WebGPUModel:
             })
         return out['Out'].reshape(T, BHD)[:, :HD]
 
-    def _causal_attention_multihead(self, Q: np.ndarray, K: np.ndarray,
-                                    V: np.ndarray, n_rep: int) -> np.ndarray:
+    def _causal_attention_multihead(self, Q, K, V,
+                                    n_rep: int) -> np.ndarray:
         """Multi-head causal attention with GQA: all heads in one dispatch.
 
         Q: (T, n_head, HD), K: (T, n_kv, HD), V: (T, n_kv, HD)
+        Accepts numpy arrays or GPUBuffer objects.
         Returns: (T, n_head, HD)
         """
-        T, n_head, HD = Q.shape
-        n_kv = K.shape[1]
+        if isinstance(Q, GPUBuffer):
+            T = Q.shape[0] if Q.shape else 1
+            n_head = Q.shape[1] if Q.shape and len(Q.shape) > 1 else self.n_head
+            HD = Q.shape[2] if Q.shape and len(Q.shape) > 2 else self.head_dim
+            n_kv = K.shape[1] if K.shape and len(K.shape) > 1 else self.n_kv_heads
+        else:
+            T, n_head, HD = Q.shape
+            n_kv = K.shape[1]
         BHD = self._attn_bhd
         scale = float(1.0 / np.sqrt(HD))
 
-        Q_c = np.ascontiguousarray(Q, dtype=np.float32)
-        K_c = np.ascontiguousarray(K, dtype=np.float32)
-        V_c = np.ascontiguousarray(V, dtype=np.float32)
+        if isinstance(Q, GPUBuffer):
+            Q_buf, K_buf, V_buf = Q, K, V
+        else:
+            Q_buf = np.ascontiguousarray(Q, dtype=np.float32)
+            K_buf = np.ascontiguousarray(K, dtype=np.float32)
+            V_buf = np.ascontiguousarray(V, dtype=np.float32)
 
         out = self.cache.run(
             self._mh_attn_result, grid=(T, n_head),
             buffers={
-                'Q': Q_c.ravel(), 'K': K_c.ravel(), 'V': V_c.ravel(),
+                'Q': Q_buf if isinstance(Q_buf, GPUBuffer) else Q_buf.ravel(),
+                'K': K_buf if isinstance(K_buf, GPUBuffer) else K_buf.ravel(),
+                'V': V_buf if isinstance(V_buf, GPUBuffer) else V_buf.ravel(),
                 'Out': np.zeros(T * n_head * BHD, dtype=np.float32),
             },
             scalars={

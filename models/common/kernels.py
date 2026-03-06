@@ -1209,6 +1209,82 @@ def fused_rope_qkv_kernel(QKV, Q_out, K_cache, V_cache,
 
 
 @triton.jit
+def qknorm_rope_prefill_kernel(QKV, Q_out, K_out, V_out,
+                                CosTable, SinTable, NormQ, NormK,
+                                n_head, q_size, kv_size,
+                                qkv_stride_t, q_stride_t, kv_stride_t,
+                                half_rot, eps,
+                                BLOCK_HD: tl.constexpr):
+    """Multi-token fused QK-norm + RoPE for GQA prefill.
+
+    Applies per-head RMSNorm on Q and K, then RoPE, outputs to separate
+    Q/K/V buffers. Handles different Q vs KV head counts.
+
+    Grid: (T, n_head + n_kv_heads)
+      - pid_y < n_head: process Q heads
+      - pid_y >= n_head: process K+V heads
+
+    QKV layout per token: [Q(n_head*HD), K(n_kv*HD), V(n_kv*HD)]
+    Q_out: (T, n_head, HD), K_out: (T, n_kv, HD), V_out: (T, n_kv, HD)
+    """
+    t = tl.program_id(0)
+    pid = tl.program_id(1)
+    hd = tl.arange(0, BLOCK_HD)
+
+    is_q = pid < n_head
+    kv_head = pid - n_head
+
+    # Source offset in QKV buffer
+    src = t * qkv_stride_t + tl.where(is_q, pid * BLOCK_HD,
+                                       q_size + kv_head * BLOCK_HD)
+    x = tl.load(QKV + src + hd).to(tl.float32)
+
+    # Per-head RMSNorm
+    x_sq = x * x
+    mean_sq = tl.sum(x_sq, axis=0) / BLOCK_HD
+    rms_inv = 1.0 / tl.sqrt(mean_sq + eps)
+    norm_w_q = tl.load(NormQ + hd).to(tl.float32)
+    norm_w_k = tl.load(NormK + hd).to(tl.float32)
+    norm_w = tl.where(is_q, norm_w_q, norm_w_k)
+    x = x * rms_inv * norm_w
+
+    # RoPE (half-rotation convention)
+    cs_idx = hd % half_rot
+    is_rotary = hd < half_rot * 2
+    cos_v = tl.load(CosTable + t * half_rot + cs_idx,
+                    mask=is_rotary, other=1.0).to(tl.float32)
+    sin_v = tl.load(SinTable + t * half_rot + cs_idx,
+                    mask=is_rotary, other=0.0).to(tl.float32)
+    sign = tl.where(hd < half_rot, -1.0, 1.0)
+    partner_hd = tl.where(hd < half_rot, hd + half_rot, hd - half_rot)
+    partner_hd = tl.where(is_rotary, partner_hd, hd)
+
+    # Normed partner for rotation
+    partner_raw = tl.load(QKV + src + partner_hd).to(tl.float32)
+    norm_w_partner_q = tl.load(NormQ + partner_hd).to(tl.float32)
+    norm_w_partner_k = tl.load(NormK + partner_hd).to(tl.float32)
+    norm_w_partner = tl.where(is_q, norm_w_partner_q, norm_w_partner_k)
+    partner = partner_raw * rms_inv * norm_w_partner
+
+    rotated = x * cos_v + sign * partner * sin_v
+    y = tl.where(is_rotary, rotated, x)
+
+    # Q heads → Q_out
+    tl.store(Q_out + t * q_stride_t + pid * BLOCK_HD + hd, y, mask=is_q)
+
+    # K heads → K_out
+    kv_mask = is_q == 0
+    tl.store(K_out + t * kv_stride_t + kv_head * BLOCK_HD + hd, y,
+             mask=kv_mask)
+
+    # V heads → V_out (straight copy, no norm/RoPE)
+    v_src = t * qkv_stride_t + q_size + kv_size + kv_head * BLOCK_HD
+    v = tl.load(QKV + v_src + hd, mask=kv_mask, other=0.0).to(tl.float32)
+    tl.store(V_out + t * kv_stride_t + kv_head * BLOCK_HD + hd, v,
+             mask=kv_mask)
+
+
+@triton.jit
 def fused_qknorm_rope_qkv_kernel(QKV, Q_out, K_cache, V_cache,
                                   CosTable, SinTable, NormQ, NormK,
                                   n_head, q_size, kv_size, pos, half_rot,
