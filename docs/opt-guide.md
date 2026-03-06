@@ -911,8 +911,8 @@ throughput:
        --gguf-file path/to/model.gguf --use-q8-gpu \
        -pl 128 -gl 100
    ```
-   Report the `forward() only` tok/s from the `--- Performance ---`
-   output.  This is the true model throughput with no instrumentation.
+   Report the decode tok/s from the `--- Performance ---`
+   output.  This is the true model throughput.
 
 2. **Profile** (with `--profile`): Identify where time is spent.
    ```bash
@@ -930,10 +930,10 @@ throughput:
 
 **Example** (Qwen3-1.7B Q8 W8A32, RTX 5080):
 
-| Mode | Decode tok/s (forward-only) |
-|------|---------------------------|
-| No profiling | **172.7 tok/s** |
-| With `--profile` | 132.7 tok/s |
+| Mode | Decode tok/s |
+|------|--------------|
+| No profiling | **173.0 tok/s** |
+| With `--profile` | 124.7 tok/s |
 
 Profiling shows ~23% overhead in this case, entirely from per-dispatch
 timestamp query passes.  The per-kernel percentage breakdown is still
@@ -1609,7 +1609,7 @@ projection pattern as INT4.
 
 | Metric | Dequant fp16 | Q8 W8A32 |
 |--------|-------------|----------|
-| Decode (forward-only) | 32.7 tok/s | **172.7 tok/s** |
+| Decode tok/s | 32.2 | **173.0** |
 | GPU VRAM (layers) | 2688 MB | **1428 MB** (−47%) |
 | GPU VRAM (total) | 4470 MB | **3210 MB** (−28%) |
 | Load time | 6.3s | **2.4s** (2.6×) |

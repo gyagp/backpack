@@ -496,7 +496,6 @@ def generate(model, prompt: str, tokenizer=None,
 
     _token_buf = np.empty(1, dtype=np.int32)  # reusable buffer
     decode_tokens = 0
-    decode_forward_ns = 0  # accumulated forward() time only
     decode_start = None
     for step in range(max_tokens):
         if _p: _cpu.begin(f"decode_{step}")
@@ -505,11 +504,9 @@ def generate(model, prompt: str, tokenizer=None,
             if _p: _cpu.begin(f"decode_{step}/forward/embed")
             _token_buf[0] = generated[-1]
             if _p: _cpu.end(f"decode_{step}/forward/embed")
-            _fwd_t0 = time.perf_counter_ns()
             logits = model.forward(
                 _token_buf, use_cache=True,
                 pos_offset=len(generated) - 1)
-            _fwd_t1 = time.perf_counter_ns()
             next_logits = logits[-1, :]
             if _p: _cpu.end(f"decode_{step}/forward")
 
@@ -544,18 +541,14 @@ def generate(model, prompt: str, tokenizer=None,
             decode_start = time.perf_counter()
         else:
             decode_tokens += 1
-            decode_forward_ns += (_fwd_t1 - _fwd_t0)
 
     decode_end = time.perf_counter()
 
     prefill_ms = (prefill_end - prefill_start) * 1000
     decode_ms = (decode_end - decode_start) * 1000 if decode_start else 0
-    decode_fwd_ms = decode_forward_ns / 1e6
     total_ms = (decode_end - prefill_start) * 1000
     prompt_len = len(token_ids)
     decode_tps = decode_tokens / (decode_ms / 1000) if decode_ms > 0 else 0
-    decode_fwd_tps = decode_tokens / (decode_fwd_ms / 1000) \
-        if decode_fwd_ms > 0 else 0
     overall_tps = (prompt_len + max_tokens) / (total_ms / 1000) \
         if total_ms > 0 else 0
     print(f"\n--- Performance ---")
@@ -563,8 +556,6 @@ def generate(model, prompt: str, tokenizer=None,
           f"({prompt_len} prompt + 1st token)")
     print(f"  Decode:  {decode_tokens} tokens in {decode_ms:.1f}ms "
           f"({decode_tps:.1f} tok/s)")
-    print(f"    forward() only: {decode_fwd_ms:.1f}ms "
-          f"({decode_fwd_tps:.1f} tok/s)")
     print(f"  Total:   {prompt_len + max_tokens} tokens in {total_ms:.1f}ms "
           f"({overall_tps:.1f} tok/s)")
 
