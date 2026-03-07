@@ -110,5 +110,7 @@ private:
     void computeRopeTables();
 
     const CompiledPipeline& loadKernel(const std::string& name);
+    WGPUBindGroup makeBG(const CompiledPipeline& pl,
+                         const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
     std::unordered_map<std::string, const CompiledPipeline*> kernelCache_;
 };

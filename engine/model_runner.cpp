@@ -12,6 +12,31 @@ static std::string read_file(const std::string& path) {
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
+WGPUBindGroup ModelRunner::makeBG(
+        const CompiledPipeline& pl,
+        const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings) {
+    fprintf(stderr, "  makeBG: %zu bindings, layout=%p\n",
+            bindings.size(), (void*)pl.bgLayout); fflush(stderr);
+    WGPUBindGroupEntry entries[16];
+    for (size_t i = 0; i < bindings.size() && i < 16; i++) {
+        memset(&entries[i], 0, sizeof(WGPUBindGroupEntry));
+        entries[i].binding = bindings[i].first;
+        entries[i].buffer  = bindings[i].second.handle;
+        entries[i].size    = bindings[i].second.size;
+        if (!entries[i].buffer) {
+            fprintf(stderr, "  ERROR: binding %u has null buffer!\n", entries[i].binding);
+        }
+    }
+    WGPUBindGroupDescriptor d;
+    memset(&d, 0, sizeof(d));
+    d.layout = pl.bgLayout;
+    d.entryCount = (uint32_t)bindings.size();
+    d.entries = entries;
+    auto result = wgpuDeviceCreateBindGroup(gpu->device, &d);
+    fprintf(stderr, "  makeBG result: %p\n", (void*)result); fflush(stderr);
+    return result;
+}
+
 // ─── Load kernel from bundle ─────────────────────────────────────────────────
 
 const CompiledPipeline& ModelRunner::loadKernel(const std::string& name) {
@@ -80,11 +105,11 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& dir,
     // Load weights from GGUF
     loadWeights(ggufPath);
 
+    // Compute RoPE tables (needed before decode pipeline)
+    computeRopeTables();
+
     // Build decode pipeline
     buildDecodePipeline();
-
-    // Compute RoPE tables
-    computeRopeTables();
 
     return true;
 }
@@ -360,18 +385,23 @@ void ModelRunner::loadWeights(const std::string& ggufPath) {
                     float v = embeddingCPU[j];
                     uint32_t fb; memcpy(&fb, &v, 4);
                     uint32_t s = (fb >> 16) & 0x8000;
-                    uint32_t e = ((fb >> 23) & 0xFF) - 112;
+                    int32_t e = ((fb >> 23) & 0xFF) - 112;
                     uint32_t m = (fb >> 13) & 0x3FF;
                     if (e <= 0) fp16[j] = (uint16_t)s;
                     else if (e > 30) fp16[j] = (uint16_t)(s | 0x7C00);
                     else fp16[j] = (uint16_t)(s | (e << 10) | m);
                 }
-                // LM head stores as u32 (2 fp16 per u32) for unpack2x16float
-                uint32_t nU32 = (nel + 1) / 2;
-                lmHeadW = gpu->createBuffer("lm_head_fp16", nU32 * 4);
-                gpu->writeBuffer(lmHeadW, fp16.data(), nel * 2);
-                printf("  LM head: tied embeddings (fp16, %u KB)\n",
-                       (unsigned)(nel * 2 / 1024));
+                // Upload in chunks (Dawn's writeBuffer can fail on very large writes)
+                uint64_t totalBytes = (uint64_t)nel * 2;
+                lmHeadW = gpu->createBuffer("lm_head_fp16", totalBytes);
+                const uint64_t CHUNK = 128 * 1024 * 1024; // 128MB chunks
+                for (uint64_t off = 0; off < totalBytes; off += CHUNK) {
+                    uint64_t sz = std::min(CHUNK, totalBytes - off);
+                    wgpuQueueWriteBuffer(gpu->queue, lmHeadW.handle, off,
+                                         (const uint8_t*)fp16.data() + off, sz);
+                }
+                printf("  LM head: tied embeddings (fp16, %llu MB)\n",
+                       (unsigned long long)(totalBytes / 1048576));
             }
         }
     }
@@ -405,6 +435,9 @@ void ModelRunner::computeRopeTables() {
 
 void ModelRunner::buildDecodePipeline() {
     printf("  Building decode pipeline...\n"); fflush(stdout);
+    printf("  sizeof(WGPUBindGroupEntry)=%zu sizeof(WGPUBindGroupLayoutEntry)=%zu\n",
+           sizeof(WGPUBindGroupEntry), sizeof(WGPUBindGroupLayoutEntry));
+    fflush(stdout);
 
     qDim = nHead * headDim;
     kvDim = nKvHeads * headDim;
@@ -514,26 +547,11 @@ void ModelRunner::buildDecodePipeline() {
         gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
     }
 
-    // Helper to create a bind group for Q8 matmul
-    // Bindings: X(0), W_Q8(1), Scales(2), Bias(3), Y(4), _params_(5)
-    printf("    Creating bind groups...\n"); fflush(stdout);
-    auto mkQ8BG = [&](const CompiledPipeline& pl,
-                       GPUBuffer x, GPUBuffer w, GPUBuffer s,
-                       GPUBuffer bias, GPUBuffer y, GPUBuffer params) {
-        return gpu->createBindGroup(pl, {
-            {0, x}, {1, w}, {2, s}, {3, bias}, {4, y}, {5, params}});
-    };
-
     // Build per-layer dispatches
+    allDecodeDispatches.reserve(nLayer * 11 + 2);  // 11 per layer + 2 final
     for (uint32_t i = 0; i < nLayer; i++) {
         auto& lw = layerWeights[i];
-        printf("    layer %u: checking buffers... ", i); fflush(stdout);
-        printf("qkv=%p o=%p gu=%p dn=%p in=%p pan=%p qn=%p kn=%p\n",
-               (void*)lw.qkvW.handle, (void*)lw.oW.handle,
-               (void*)lw.guW.handle, (void*)lw.dnW.handle,
-               (void*)lw.inputNorm.handle, (void*)lw.postAttnNorm.handle,
-               (void*)lw.qNorm.handle, (void*)lw.kNorm.handle);
-        fflush(stdout);
+        if (i % 7 == 0) { printf("    building layer %u/%u...\r", i, nLayer); fflush(stdout); }
 
         // Check weight availability
         if (!lw.qkvW.handle || !lw.oW.handle || !lw.guW.handle || !lw.dnW.handle) {
@@ -562,42 +580,24 @@ void ModelRunner::buildDecodePipeline() {
 
         // RMSNorm (first layer only)
         if (i == 0) {
-            printf("    layer 0: creating RMSNorm bind group (5 entries)...\n"); fflush(stdout);
-            printf("      xBuf=%p(%llu) normOut=%p(%llu) inputNorm=%p(%llu) rstd=%p(%llu) rmsP=%p(%llu)\n",
-                   (void*)xBuf.handle, (unsigned long long)xBuf.size,
-                   (void*)normOutBuf.handle, (unsigned long long)normOutBuf.size,
-                   (void*)lw.inputNorm.handle, (unsigned long long)lw.inputNorm.size,
-                   (void*)rstdBuf.handle, (unsigned long long)rstdBuf.size,
-                   (void*)paramsBufs["rms"].handle, (unsigned long long)paramsBufs["rms"].size);
-            fflush(stdout);
-            auto bg = gpu->createBindGroup(plRmsNorm, {
+            auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, lw.inputNorm},
                 {3, rstdBuf}, {4, paramsBufs["rms"]}});
-            printf("    layer 0: RMSNorm bind group OK\n"); fflush(stdout);
             allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1});
         }
 
         // QKV matmul
-        printf("    layer %u: QKV bg (qkvW=%p(%llu) qkvS=%p(%llu) qkvP=%p(%llu))...\n", i,
-               (void*)lw.qkvW.handle, (unsigned long long)lw.qkvW.size,
-               (void*)lw.qkvS.handle, (unsigned long long)lw.qkvS.size,
-               (void*)q8QkvParams.handle, (unsigned long long)q8QkvParams.size);
-        fflush(stdout);
-        printf("    normOut=%p(%llu) zeroBiasQKV=%p(%llu) qkvBuf=%p(%llu)\n",
-               (void*)normOutBuf.handle, (unsigned long long)normOutBuf.size,
-               (void*)zeroBiasQKV.handle, (unsigned long long)zeroBiasQKV.size,
-               (void*)qkvBuf.handle, (unsigned long long)qkvBuf.size);
-        fflush(stdout);
         {
-            auto bg = mkQ8BG(plQ8Matmul, normOutBuf, lw.qkvW, lw.qkvS,
-                             zeroBiasQKV, qkvBuf, q8QkvParams);
+            auto bg = makeBG(plQ8Matmul, {
+                {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
+                {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
             allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
                 1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1});
         }
 
         // Fused QKnorm + RoPE + KV scatter
         {
-            auto bg = gpu->createBindGroup(plFusedRope, {
+            auto bg = makeBG(plFusedRope, {
                 {0, qkvBuf}, {1, qRotBuf},
                 {2, kvCache[i].K}, {3, kvCache[i].V},
                 {4, ropeCosBuf}, {5, ropeSinBuf},
@@ -609,16 +609,23 @@ void ModelRunner::buildDecodePipeline() {
 
         // Chunked attention pass 1
         {
-            auto bg = gpu->createBindGroup(plChunkP1, {
-                {0, qRotBuf}, {1, kvCache[i].K}, {2, kvCache[i].V},
-                {3, attnPartialsBuf}, {4, chunkedAttnParamsBuf}});
+            fprintf(stderr, "  about to create chunk1 vector...\n"); fflush(stderr);
+            auto* cattn1 = new std::vector<std::pair<uint32_t, GPUBuffer>>();
+            cattn1->push_back({0, qRotBuf});
+            cattn1->push_back({1, kvCache[i].K});
+            cattn1->push_back({2, kvCache[i].V});
+            cattn1->push_back({3, attnPartialsBuf});
+            cattn1->push_back({4, chunkedAttnParamsBuf});
+            fprintf(stderr, "  chunk pass 1: %zu bindings\n", cattn1->size());
+            auto bg = makeBG(plChunkP1, *cattn1);
+            delete cattn1;
             allDecodeDispatches.push_back({plChunkP1.pipeline, bg,
                 nHead, maxChunks, 1});  // n_chunks updated dynamically via params
         }
 
         // Chunked attention pass 2
         {
-            auto bg = gpu->createBindGroup(plChunkP2, {
+            auto bg = makeBG(plChunkP2, {
                 {0, attnPartialsBuf}, {1, attnOutBuf},
                 {2, chunkedAttnParamsBuf}});
             allDecodeDispatches.push_back({plChunkP2.pipeline, bg,
@@ -627,15 +634,14 @@ void ModelRunner::buildDecodePipeline() {
 
         // O projection
         {
-            auto bg = mkQ8BG(plQ8Matmul, attnOutBuf, lw.oW, lw.oS,
-                             zeroBiasE, projOutBuf, q8OprojParams);
+            auto bg = makeBG(plQ8Matmul, {{0,attnOutBuf},{1,lw.oW},{2,lw.oS},{3,zeroBiasE},{4,projOutBuf},{5,q8OprojParams}});
             allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
                 1, (nEmbd + Q8_TILE - 1) / Q8_TILE, 1});
         }
 
         // Add + RMSNorm (fused residual + next norm)
         {
-            auto bg = gpu->createBindGroup(plAddRmsNorm, {
+            auto bg = makeBG(plAddRmsNorm, {
                 {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
                 {3, lw.postAttnNorm}, {4, rstdBuf},
                 {5, paramsBufs["rms"]}});
@@ -645,15 +651,14 @@ void ModelRunner::buildDecodePipeline() {
 
         // Gate+Up matmul
         {
-            auto bg = mkQ8BG(plQ8Matmul, normOutBuf, lw.guW, lw.guS,
-                             zeroBiasGU, gateUpBuf, q8GuParams);
+            auto bg = makeBG(plQ8Matmul, {{0,normOutBuf},{1,lw.guW},{2,lw.guS},{3,zeroBiasGU},{4,gateUpBuf},{5,q8GuParams}});
             allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
                 1, (2 * intermediateSize + Q8_TILE - 1) / Q8_TILE, 1});
         }
 
         // SiLU * mul (fused)
         {
-            auto bg = gpu->createBindGroup(plSiluMul, {
+            auto bg = makeBG(plSiluMul, {
                 {0, gateUpBuf}, {1, siluOutBuf}, {2, paramsBufs["silu"]}});
             allDecodeDispatches.push_back({plSiluMul.pipeline, bg,
                 (intermediateSize + 127) / 128, 1, 1});
@@ -661,15 +666,14 @@ void ModelRunner::buildDecodePipeline() {
 
         // Down projection + residual add (fused)
         {
-            auto bg = mkQ8BG(plQ8MatAdd, siluOutBuf, lw.dnW, lw.dnS,
-                             zeroBiasE, xBuf, q8DnParams);
+            auto bg = makeBG(plQ8MatAdd, {{0,siluOutBuf},{1,lw.dnW},{2,lw.dnS},{3,zeroBiasE},{4,xBuf},{5,q8DnParams}});
             allDecodeDispatches.push_back({plQ8MatAdd.pipeline, bg,
                 1, (nEmbd + Q8_TILE - 1) / Q8_TILE, 1});
         }
 
         // RMSNorm for next layer (or final)
         if (i < nLayer - 1) {
-            auto bg = gpu->createBindGroup(plRmsNorm, {
+            auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, layerWeights[i+1].inputNorm},
                 {3, rstdBuf}, {4, paramsBufs["rms"]}});
             allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1});
@@ -678,7 +682,7 @@ void ModelRunner::buildDecodePipeline() {
 
     // Final RMSNorm + LM head
     {
-        auto bg = gpu->createBindGroup(plRmsNorm, {
+        auto bg = makeBG(plRmsNorm, {
             {0, xBuf}, {1, normOutBuf}, {2, finalNormW},
             {3, rstdBuf}, {4, paramsBufs["rms"]}});
         allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1});
@@ -689,7 +693,7 @@ void ModelRunner::buildDecodePipeline() {
     {
         // Grid for fp16 GEMM: (T=1, ceil(N/8))
         uint32_t FP16_TILE = 8;
-        auto bg = gpu->createBindGroup(plFp16Gemm, {
+        auto bg = makeBG(plFp16Gemm, {
             {0, normOutBuf}, {1, lmHeadW}, {2, zeroBiasV},
             {3, logitsBuf}, {4, paramsBufs["lmhead"]}});
         allDecodeDispatches.push_back({plFp16Gemm.pipeline, bg,
@@ -751,3 +755,11 @@ int32_t ModelRunner::argmax(const std::vector<float>& logits) {
     return (int32_t)std::distance(logits.begin(),
         std::max_element(logits.begin(), logits.end()));
 }
+
+
+
+
+
+
+
+

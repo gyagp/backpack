@@ -155,26 +155,12 @@ const CompiledPipeline& GPUContext::getOrCreatePipeline(
     smD.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&src);
     p.shader = wgpuDeviceCreateShaderModule(device, &smD);
 
-    std::vector<WGPUBindGroupLayoutEntry> entries(numBindings);
-    for (uint32_t i = 0; i < numBindings; i++) {
-        entries[i] = {};
-        entries[i].binding = i;
-        entries[i].visibility = WGPUShaderStage_Compute;
-        entries[i].buffer.type = WGPUBufferBindingType_Storage;
-    }
-    WGPUBindGroupLayoutDescriptor bglD{};
-    bglD.entryCount = numBindings;
-    bglD.entries = entries.data();
-    p.bgLayout = wgpuDeviceCreateBindGroupLayout(device, &bglD);
-
-    WGPUPipelineLayoutDescriptor plD{};
-    plD.bindGroupLayoutCount = 1;
-    plD.bindGroupLayouts = &p.bgLayout;
-    p.pplLayout = wgpuDeviceCreatePipelineLayout(device, &plD);
-
+    // Use auto layout — let Dawn infer binding types from the WGSL shader.
+    // This correctly handles read vs read_write storage buffers.
     WGPUComputePipelineDescriptor cpD{};
+    memset(&cpD, 0, sizeof(cpD));
     cpD.label = {name.c_str(), name.size()};
-    cpD.layout = p.pplLayout;
+    cpD.layout = nullptr;  // auto layout
     cpD.compute.module = p.shader;
     cpD.compute.entryPoint = {"main", 4};
     p.pipeline = wgpuDeviceCreateComputePipeline(device, &cpD);
@@ -182,6 +168,14 @@ const CompiledPipeline& GPUContext::getOrCreatePipeline(
         fprintf(stderr, "FATAL: pipeline creation failed: %s\n", name.c_str());
         exit(1);
     }
+
+    // Get the auto-generated bind group layout
+    p.bgLayout = wgpuComputePipelineGetBindGroupLayout(p.pipeline, 0);
+    if (!p.bgLayout) {
+        fprintf(stderr, "FATAL: GetBindGroupLayout(0) returned null for: %s\n", name.c_str());
+        exit(1);
+    }
+    p.pplLayout = nullptr;
 
     pipelines_[name] = p;
     return pipelines_[name];
@@ -194,17 +188,23 @@ WGPUBindGroup GPUContext::createBindGroup(
         const std::vector<std::pair<uint32_t, GPUBuffer>>& entries) {
     std::vector<WGPUBindGroupEntry> bge(entries.size());
     for (size_t i = 0; i < entries.size(); i++) {
-        bge[i] = {};
+        memset(&bge[i], 0, sizeof(WGPUBindGroupEntry));
         bge[i].binding = entries[i].first;
         bge[i].buffer  = entries[i].second.handle;
         bge[i].offset  = 0;
         bge[i].size    = entries[i].second.size;
     }
     WGPUBindGroupDescriptor d{};
+    memset(&d, 0, sizeof(d));
     d.layout = pl.bgLayout;
-    d.entryCount = bge.size();
+    d.entryCount = (uint32_t)bge.size();
     d.entries = bge.data();
-    return wgpuDeviceCreateBindGroup(device, &d);
+    WGPUBindGroup result = wgpuDeviceCreateBindGroup(device, &d);
+    if (!result) {
+        fprintf(stderr, "FATAL: wgpuDeviceCreateBindGroup returned null! entries=%u layout=%p\n",
+                (unsigned)bge.size(), (void*)pl.bgLayout);
+    }
+    return result;
 }
 
 // ─── Dispatch ────────────────────────────────────────────────────────────────
