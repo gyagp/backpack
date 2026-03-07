@@ -1,0 +1,970 @@
+{
+  "version": 1,
+  "model": {
+    "n_layer": 28,
+    "n_head": 16,
+    "n_kv_heads": 8,
+    "n_embd": 2048,
+    "intermediate_size": 6144,
+    "n_vocab": 151936,
+    "rope_theta": 1000000.0,
+    "rms_norm_eps": 1e-06,
+    "head_dim": 128,
+    "attention_bias": false,
+    "tie_word_embeddings": true,
+    "model_type": "qwen3"
+  },
+  "kernels": [
+    {
+      "name": "rms_norm",
+      "file": "kernels/rms_norm.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W",
+          "binding": 2,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Rstd",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "stride",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "N",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "eps",
+          "wgsl_type": "f32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "c2799a7452f7ce1d"
+    },
+    {
+      "name": "add_rms_norm",
+      "file": "kernels/add_rms_norm.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Residual",
+          "binding": 1,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W",
+          "binding": 3,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Rstd",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "stride",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "N",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "eps",
+          "wgsl_type": "f32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "34d617e90c103e73"
+    },
+    {
+      "name": "silu_mul_fused",
+      "file": "kernels/silu_mul_fused.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "GateUp",
+          "binding": 0,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Out",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "N",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "bca4a4396d4606fe"
+    },
+    {
+      "name": "argmax",
+      "file": "kernels/argmax.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "Logits",
+          "binding": 0,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "TokenOut",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "i32"
+        }
+      ],
+      "params": [
+        {
+          "name": "N",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "e555c27e98684bc6"
+    },
+    {
+      "name": "causal_attn_multihead",
+      "file": "kernels/causal_attn_multihead.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "Q",
+          "binding": 0,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "K",
+          "binding": 1,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "V",
+          "binding": 2,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Out",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "stride_q_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_q_h",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_k_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_k_h",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_v_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_v_h",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_o_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "stride_o_h",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "n_rep",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "scale",
+          "wgsl_type": "f32",
+          "byte_size": 4
+        },
+        {
+          "name": "neg_inf",
+          "wgsl_type": "f32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "eca605c7b547764a"
+    },
+    {
+      "name": "fused_qknorm_rope",
+      "file": "kernels/fused_qknorm_rope.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "QKV",
+          "binding": 0,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Q_out",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "K_cache",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "V_cache",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "CosTable",
+          "binding": 4,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "SinTable",
+          "binding": 5,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "NormQ",
+          "binding": 6,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "NormK",
+          "binding": 7,
+          "access": "read",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "n_head",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "q_size",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "kv_size",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "pos",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "half_rot",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "cache_offset",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "eps",
+          "wgsl_type": "f32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "2f23f8b2f08053ca"
+    },
+    {
+      "name": "qknorm_rope_prefill",
+      "file": "kernels/qknorm_rope_prefill.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "QKV",
+          "binding": 0,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Q_out",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "K_out",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "V_out",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "CosTable",
+          "binding": 4,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "SinTable",
+          "binding": 5,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "NormQ",
+          "binding": 6,
+          "access": "read",
+          "elem_type": "f32"
+        },
+        {
+          "name": "NormK",
+          "binding": 7,
+          "access": "read",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "n_head",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "q_size",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "kv_size",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "qkv_stride_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "q_stride_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "kv_stride_t",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "half_rot",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        },
+        {
+          "name": "eps",
+          "wgsl_type": "f32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "a0c9b25426b9542c"
+    },
+    {
+      "name": "add_inplace",
+      "file": "kernels/add_inplace.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 1,
+          "access": "read",
+          "elem_type": "f32"
+        }
+      ],
+      "params": [
+        {
+          "name": "N",
+          "wgsl_type": "i32",
+          "byte_size": 4
+        }
+      ],
+      "wgsl_hash": "06f238aab5663ee3"
+    },
+    {
+      "name": "q8_matmul",
+      "file": "kernels/q8_matmul.wgsl",
+      "workgroup_size": 256,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W_Q8",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Scales",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Bias",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 5,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "3a40594168115abe"
+    },
+    {
+      "name": "q8_matmul_add",
+      "file": "kernels/q8_matmul_add.wgsl",
+      "workgroup_size": 256,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W_Q8",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Scales",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Bias",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 5,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "72ab9ae3e8296623"
+    },
+    {
+      "name": "fp16_gemm",
+      "file": "kernels/fp16_gemm.wgsl",
+      "workgroup_size": 256,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Bias",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "dff2139241de6006"
+    },
+    {
+      "name": "gqa_chunked_pass1",
+      "file": "kernels/gqa_chunked_pass1.wgsl",
+      "workgroup_size": 32,
+      "bindings": [
+        {
+          "name": "Q",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "K_cache",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "V_cache",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Partials",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "98009235f3c67115"
+    },
+    {
+      "name": "gqa_chunked_pass2",
+      "file": "kernels/gqa_chunked_pass2.wgsl",
+      "workgroup_size": 32,
+      "bindings": [
+        {
+          "name": "Partials",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Out",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "79e8660d4a974589"
+    },
+    {
+      "name": "subgroup_matrix_q8",
+      "file": "kernels/subgroup_matrix_q8.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W_Q8",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Scales",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Bias",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 5,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "bdebc656925e64a1"
+    },
+    {
+      "name": "subgroup_matrix_q8_add",
+      "file": "kernels/subgroup_matrix_q8_add.wgsl",
+      "workgroup_size": 128,
+      "bindings": [
+        {
+          "name": "X",
+          "binding": 0,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "W_Q8",
+          "binding": 1,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Scales",
+          "binding": 2,
+          "access": "read_write",
+          "elem_type": "u32"
+        },
+        {
+          "name": "Bias",
+          "binding": 3,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "Y",
+          "binding": 4,
+          "access": "read_write",
+          "elem_type": "f32"
+        },
+        {
+          "name": "_params_",
+          "binding": 5,
+          "access": "read_write",
+          "elem_type": "u32"
+        }
+      ],
+      "params": [],
+      "wgsl_hash": "d1b658c295122f67"
+    }
+  ],
+  "decode_plan": {
+    "buffers": {
+      "x": 8192,
+      "norm_out": 8192,
+      "qkv_out": 16384,
+      "q_rot": 8192,
+      "attn_out": 8192,
+      "proj_out": 8192,
+      "gate_up": 49152,
+      "silu_out": 24576,
+      "rstd": 16,
+      "logits": 607744,
+      "attn_partials": 266240
+    },
+    "n_layers": 28,
+    "layer_dispatches": [
+      {
+        "kernel": "q8_matmul",
+        "grid": [
+          1,
+          512
+        ],
+        "inputs": [
+          "norm_out"
+        ],
+        "weights": [
+          "qkv_proj"
+        ],
+        "output": "qkv_out",
+        "params_type": "q8",
+        "K": 2048,
+        "N": 4096
+      },
+      {
+        "kernel": "fused_qknorm_rope",
+        "grid_expr": "n_head + n_kv",
+        "inputs": [
+          "qkv_out"
+        ],
+        "output": "q_rot",
+        "kv_cache": true
+      },
+      {
+        "kernel": "gqa_chunked_pass1",
+        "grid": [
+          "n_head",
+          "max_n_chunks"
+        ],
+        "inputs": [
+          "q_rot"
+        ],
+        "kv_cache": true,
+        "output": "attn_partials"
+      },
+      {
+        "kernel": "gqa_chunked_pass2",
+        "grid": [
+          "n_head"
+        ],
+        "inputs": [
+          "attn_partials"
+        ],
+        "output": "attn_out"
+      },
+      {
+        "kernel": "q8_matmul",
+        "grid": [
+          1,
+          256
+        ],
+        "inputs": [
+          "attn_out"
+        ],
+        "weights": [
+          "o_proj"
+        ],
+        "output": "proj_out",
+        "params_type": "q8",
+        "K": 2048,
+        "N": 2048
+      },
+      {
+        "kernel": "add_rms_norm",
+        "grid": [
+          1
+        ],
+        "inputs": [
+          "x",
+          "proj_out"
+        ],
+        "output": "norm_out",
+        "weights": [
+          "post_attn_norm"
+        ]
+      },
+      {
+        "kernel": "q8_matmul",
+        "grid": [
+          1,
+          1536
+        ],
+        "inputs": [
+          "norm_out"
+        ],
+        "weights": [
+          "gate_up_proj"
+        ],
+        "output": "gate_up",
+        "params_type": "q8",
+        "K": 2048,
+        "N": 12288
+      },
+      {
+        "kernel": "silu_mul_fused",
+        "grid": [
+          48
+        ],
+        "inputs": [
+          "gate_up"
+        ],
+        "output": "silu_out"
+      },
+      {
+        "kernel": "q8_matmul_add",
+        "grid": [
+          1,
+          256
+        ],
+        "inputs": [
+          "silu_out"
+        ],
+        "weights": [
+          "down_proj"
+        ],
+        "output": "x",
+        "params_type": "q8",
+        "K": 6144,
+        "N": 2048
+      }
+    ],
+    "first_layer_prefix": [
+      {
+        "kernel": "rms_norm",
+        "grid": [
+          1
+        ],
+        "inputs": [
+          "x"
+        ],
+        "output": "norm_out",
+        "weights": [
+          "input_norm"
+        ]
+      }
+    ],
+    "inter_layer_suffix": [
+      {
+        "kernel": "rms_norm",
+        "grid": [
+          1
+        ],
+        "inputs": [
+          "x"
+        ],
+        "output": "norm_out",
+        "weights": [
+          "next_input_norm"
+        ]
+      }
+    ],
+    "final_dispatches": [
+      {
+        "kernel": "rms_norm",
+        "grid": [
+          1
+        ],
+        "inputs": [
+          "x"
+        ],
+        "output": "norm_out",
+        "weights": [
+          "final_norm"
+        ]
+      },
+      {
+        "kernel": "fp16_gemm",
+        "grid_expr": "lm_head_grid",
+        "inputs": [
+          "norm_out"
+        ],
+        "weights": [
+          "lm_head"
+        ],
+        "output": "logits"
+      }
+    ],
+    "gqa_chunk_size": 64,
+    "max_seq_len": 2048,
+    "max_n_chunks": 32
+  },
+  "gguf_file": "Qwen3-1.7B-Q8_0.gguf"
+}
