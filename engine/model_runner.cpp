@@ -209,8 +209,32 @@ void ModelRunner::loadWeights(const std::string& ggufPath) {
         }
 
         loadQ8(pfx + "attn_output.weight", nEmbd, qDim, lw.oW, lw.oS);
-        loadQ8(pfx + "ffn_gate.weight", intermediateSize, nEmbd, lw.guW, lw.guS);
-        // TODO: fuse gate+up projection (need to concatenate ffn_gate + ffn_up)
+
+        // Fuse gate + up into single gate_up weight
+        {
+            std::string gateName = pfx + "ffn_gate.weight";
+            std::string upName = pfx + "ffn_up.weight";
+            auto gi = gguf.tensor_index.find(gateName);
+            auto ui = gguf.tensor_index.find(upName);
+            if (gi != gguf.tensor_index.end() && ui != gguf.tensor_index.end()) {
+                auto& gt = gguf.tensors[gi->second];
+                auto& ut = gguf.tensors[ui->second];
+                auto gr = repack_q8_0(fileData.data() + gguf.data_offset + gt.offset,
+                                       intermediateSize, nEmbd);
+                auto ur = repack_q8_0(fileData.data() + gguf.data_offset + ut.offset,
+                                       intermediateSize, nEmbd);
+                Q8Repacked fused;
+                fused.N = 2 * intermediateSize; fused.K = nEmbd;
+                fused.weights.reserve(gr.weights.size() + ur.weights.size());
+                fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
+                fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
+                fused.scales.reserve(gr.scales.size() + ur.scales.size());
+                fused.scales.insert(fused.scales.end(), gr.scales.begin(), gr.scales.end());
+                fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
+                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
+            }
+        }
+
         loadQ8(pfx + "ffn_down.weight", nEmbd, intermediateSize, lw.dnW, lw.dnS);
 
         // Norm weights (fp32)
@@ -279,14 +303,76 @@ void ModelRunner::loadWeights(const std::string& ggufPath) {
     };
     loadNormGlobal("output_norm.weight", finalNormW);
 
-    // Embedding (fp32 or fp16 → fp32)
+    // Embedding (fp32 or fp16 → fp32, stored CPU-side for per-token lookup)
     {
         auto it = gguf.tensor_index.find("token_embd.weight");
         if (it != gguf.tensor_index.end()) {
             auto& ti = gguf.tensors[it->second];
-            printf("  Embedding: type=%u\n", ti.type);
-            // Store as CPU-side for token lookup
-            // (embedding is not a GPU kernel — we do CPU lookup + upload per token)
+            uint32_t nel = 1;
+            for (auto d : ti.shape) nel *= (uint32_t)d;
+            const uint8_t* data = fileData.data() + gguf.data_offset + ti.offset;
+            embeddingCPU.resize(nel);
+            if (ti.type == GGUF_TYPE_F16) {
+                const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(data);
+                for (uint32_t j = 0; j < nel; j++) {
+                    uint32_t h = fp16[j]; uint32_t sign = (h>>15)&1;
+                    uint32_t exp = (h>>10)&0x1F; uint32_t mant = h&0x3FF;
+                    uint32_t f;
+                    if (exp==0) f=(sign<<31)|(mant<<13);
+                    else if (exp==31) f=(sign<<31)|0x7F800000|(mant<<13);
+                    else f=(sign<<31)|((exp+112)<<23)|(mant<<13);
+                    memcpy(&embeddingCPU[j], &f, 4);
+                }
+            } else if (ti.type == GGUF_TYPE_Q8_0) {
+                // Dequantize Q8_0 blocks to fp32
+                uint32_t rows = (uint32_t)ti.shape[1];
+                uint32_t cols = (uint32_t)ti.shape[0];
+                uint32_t nBlocks = cols / 32;
+                const Q8_0Block* blocks = reinterpret_cast<const Q8_0Block*>(data);
+                for (uint32_t r = 0; r < rows; r++) {
+                    for (uint32_t b = 0; b < nBlocks; b++) {
+                        const auto& blk = blocks[r * nBlocks + b];
+                        uint32_t h = blk.d; uint32_t sign = (h>>15)&1;
+                        uint32_t exp_v = (h>>10)&0x1F; uint32_t mant = h&0x3FF;
+                        uint32_t f;
+                        if (exp_v==0) f=(sign<<31)|(mant<<13);
+                        else if (exp_v==31) f=(sign<<31)|0x7F800000|(mant<<13);
+                        else f=(sign<<31)|((exp_v+112)<<23)|(mant<<13);
+                        float scale; memcpy(&scale, &f, 4);
+                        for (int q = 0; q < 32; q++) {
+                            embeddingCPU[r * cols + b * 32 + q] =
+                                (float)blk.qs[q] * scale;
+                        }
+                    }
+                }
+            } else {
+                memcpy(embeddingCPU.data(), data, nel * 4);
+            }
+            printf("  Embedding: %u tokens × %u dims (%s)\n",
+                   nVocab, nEmbd,
+                   ti.type == GGUF_TYPE_Q8_0 ? "Q8_0→f32" :
+                   ti.type == GGUF_TYPE_F16 ? "f16→f32" : "f32");
+
+            // Also upload as fp16 for LM head (tied embeddings)
+            if (tieWordEmbeddings) {
+                std::vector<uint16_t> fp16(nel);
+                for (uint32_t j = 0; j < nel; j++) {
+                    float v = embeddingCPU[j];
+                    uint32_t fb; memcpy(&fb, &v, 4);
+                    uint32_t s = (fb >> 16) & 0x8000;
+                    uint32_t e = ((fb >> 23) & 0xFF) - 112;
+                    uint32_t m = (fb >> 13) & 0x3FF;
+                    if (e <= 0) fp16[j] = (uint16_t)s;
+                    else if (e > 30) fp16[j] = (uint16_t)(s | 0x7C00);
+                    else fp16[j] = (uint16_t)(s | (e << 10) | m);
+                }
+                // LM head stores as u32 (2 fp16 per u32) for unpack2x16float
+                uint32_t nU32 = (nel + 1) / 2;
+                lmHeadW = gpu->createBuffer("lm_head_fp16", nU32 * 4);
+                gpu->writeBuffer(lmHeadW, fp16.data(), nel * 2);
+                printf("  LM head: tied embeddings (fp16, %u KB)\n",
+                       (unsigned)(nel * 2 / 1024));
+            }
         }
     }
 
@@ -318,25 +404,347 @@ void ModelRunner::computeRopeTables() {
 // ─── Build decode pipeline ───────────────────────────────────────────────────
 
 void ModelRunner::buildDecodePipeline() {
-    printf("  Building decode pipeline...\n");
-    // TODO: Pre-build all dispatch sequences from manifest decode_plan
-    // This is the key performance optimization: all bind groups are pre-created
-    // and dispatches are just pipeline + bind_group + grid triples.
-    printf("  [TODO] Pre-recorded decode dispatches\n");
+    printf("  Building decode pipeline...\n"); fflush(stdout);
+
+    qDim = nHead * headDim;
+    kvDim = nKvHeads * headDim;
+    qkvOut = qDim + 2 * kvDim;
+    uint32_t Q8_TILE = 8;
+    uint32_t maxChunks = (maxSeqLen + gqaChunkSize - 1) / gqaChunkSize;
+
+    // Load all needed kernels
+    printf("    Loading kernels...\n"); fflush(stdout);
+    auto& plRmsNorm    = loadKernel("rms_norm");
+    printf("      rms_norm OK\n"); fflush(stdout);
+    auto& plAddRmsNorm = loadKernel("add_rms_norm");
+    printf("      add_rms_norm OK\n"); fflush(stdout);
+    auto& plQ8Matmul   = loadKernel("q8_matmul");
+    printf("      q8_matmul OK\n"); fflush(stdout);
+    auto& plQ8MatAdd   = loadKernel("q8_matmul_add");
+    printf("      q8_matmul_add OK\n"); fflush(stdout);
+    auto& plFusedRope  = loadKernel("fused_qknorm_rope");
+    printf("      fused_qknorm_rope OK\n"); fflush(stdout);
+    auto& plChunkP1    = loadKernel("gqa_chunked_pass1");
+    printf("      gqa_chunked_pass1 OK\n"); fflush(stdout);
+    auto& plChunkP2    = loadKernel("gqa_chunked_pass2");
+    printf("      gqa_chunked_pass2 OK\n"); fflush(stdout);
+    auto& plSiluMul    = loadKernel("silu_mul_fused");
+    printf("      silu_mul_fused OK\n"); fflush(stdout);
+    auto& plFp16Gemm   = loadKernel("fp16_gemm");
+    printf("      fp16_gemm OK\n"); fflush(stdout);
+
+    // Create static params buffers
+    printf("    Creating params...\n"); fflush(stdout);
+    // Q8 params: [K, N] as 2 u32, padded to 16 bytes
+    auto makeQ8Params = [&](const std::string& name, uint32_t K, uint32_t N) -> GPUBuffer {
+        uint32_t data[4] = {K, N, 0, 0};
+        auto buf = gpu->createBuffer(name, 16);
+        gpu->writeBuffer(buf, data, 16);
+        return buf;
+    };
+
+    auto q8QkvParams   = makeQ8Params("p_qkv", nEmbd, qkvOut);
+    printf("    q8_qkv params OK\n"); fflush(stdout);
+    auto q8OprojParams = makeQ8Params("p_oproj", qDim, nEmbd);
+    auto q8GuParams    = makeQ8Params("p_gu", nEmbd, 2 * intermediateSize);
+    auto q8DnParams    = makeQ8Params("p_dn", intermediateSize, nEmbd);
+    printf("    All Q8 params OK\n"); fflush(stdout);
+
+    // RMSNorm params: [stride, N, eps] = 3 values, stride=N=nEmbd
+    printf("    Creating norm params...\n"); fflush(stdout);
+    {
+        uint32_t rn[4];
+        rn[0] = nEmbd; rn[1] = nEmbd;
+        float eps = rmsNormEps; memcpy(&rn[2], &eps, 4);
+        rn[3] = 0;
+        auto buf = gpu->createBuffer("p_rms", 16);
+        gpu->writeBuffer(buf, rn, 16);
+        paramsBufs["rms"] = buf;
+    }
+
+    // SiluMul params: [N]
+    {
+        uint32_t sm[4] = {intermediateSize, 0, 0, 0};
+        auto buf = gpu->createBuffer("p_silu", 16);
+        gpu->writeBuffer(buf, sm, 16);
+        paramsBufs["silu"] = buf;
+    }
+
+    // FP16 GEMM params: [K, N] for LM head
+    printf("    Creating lmhead params...\n"); fflush(stdout);
+    {
+        uint32_t fp[4] = {nEmbd, nVocab, 0, 0};
+        auto buf = gpu->createBuffer("p_lmhead", 16);
+        gpu->writeBuffer(buf, fp, 16);
+        paramsBufs["lmhead"] = buf;
+    }
+
+    // Fused RoPE params
+    printf("    Creating rope params...\n"); fflush(stdout);
+    {
+        ropeParamData.resize(32, 0);
+        auto* p = reinterpret_cast<int32_t*>(ropeParamData.data());
+        p[0] = nHead;      // n_head
+        p[1] = qDim;       // q_size
+        p[2] = kvDim;      // kv_size
+        p[3] = 0;          // pos (dynamic)
+        p[4] = headDim/2;  // half_rot
+        p[5] = 0;          // cache_offset (dynamic)
+        float eps = rmsNormEps;
+        memcpy(&p[6], &eps, 4);
+        fusedRopeParamsBuf = gpu->createBuffer("p_frope", 32);
+        gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
+    }
+
+    // Chunked attention params
+    printf("    Creating chunked attn params...\n"); fflush(stdout);
+    {
+        chunkedAttnParamData.resize(32, 0);
+        auto* p = reinterpret_cast<uint32_t*>(chunkedAttnParamData.data());
+        p[0] = nKvHeads * headDim;  // kv_stride
+        p[1] = nHead / nKvHeads;    // n_rep
+        p[2] = 0;                   // T_total (dynamic)
+        p[3] = gqaChunkSize;        // chunk_size
+        p[4] = 0;                   // n_chunks (dynamic)
+        float scale = 1.0f / sqrtf((float)headDim);
+        float neg_inf = -1e9f;
+        memcpy(&p[5], &scale, 4);
+        memcpy(&p[6], &neg_inf, 4);
+        chunkedAttnParamsBuf = gpu->createBuffer("p_cattn", 32);
+        gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
+    }
+
+    // Helper to create a bind group for Q8 matmul
+    // Bindings: X(0), W_Q8(1), Scales(2), Bias(3), Y(4), _params_(5)
+    printf("    Creating bind groups...\n"); fflush(stdout);
+    auto mkQ8BG = [&](const CompiledPipeline& pl,
+                       GPUBuffer x, GPUBuffer w, GPUBuffer s,
+                       GPUBuffer bias, GPUBuffer y, GPUBuffer params) {
+        return gpu->createBindGroup(pl, {
+            {0, x}, {1, w}, {2, s}, {3, bias}, {4, y}, {5, params}});
+    };
+
+    // Build per-layer dispatches
+    for (uint32_t i = 0; i < nLayer; i++) {
+        auto& lw = layerWeights[i];
+        printf("    layer %u: checking buffers... ", i); fflush(stdout);
+        printf("qkv=%p o=%p gu=%p dn=%p in=%p pan=%p qn=%p kn=%p\n",
+               (void*)lw.qkvW.handle, (void*)lw.oW.handle,
+               (void*)lw.guW.handle, (void*)lw.dnW.handle,
+               (void*)lw.inputNorm.handle, (void*)lw.postAttnNorm.handle,
+               (void*)lw.qNorm.handle, (void*)lw.kNorm.handle);
+        fflush(stdout);
+
+        // Check weight availability
+        if (!lw.qkvW.handle || !lw.oW.handle || !lw.guW.handle || !lw.dnW.handle) {
+            fprintf(stderr, "\n  ERROR: layer %u missing weight buffers\n", i);
+            exit(1);
+        }
+        if (!lw.inputNorm.handle || !lw.postAttnNorm.handle) {
+            fprintf(stderr, "\n  ERROR: layer %u missing norm weights\n", i);
+            exit(1);
+        }
+        if (!lw.qNorm.handle || !lw.kNorm.handle) {
+            fprintf(stderr, "\n  WARNING: layer %u missing QK norm weights, using dummy\n", i);
+            // Create small zero buffers as placeholders
+            if (!lw.qNorm.handle) lw.qNorm = gpu->createBuffer("qnorm_dummy_" + std::to_string(i), headDim * 4);
+            if (!lw.kNorm.handle) lw.kNorm = gpu->createBuffer("knorm_dummy_" + std::to_string(i), headDim * 4);
+        }
+
+        if (!lw.guW.handle || !lw.guS.handle) {
+            fprintf(stderr, "\n  ERROR: layer %u missing gate_up weights!\n", i);
+            exit(1);
+        }
+        if (!lw.dnW.handle || !lw.dnS.handle) {
+            fprintf(stderr, "\n  ERROR: layer %u missing down weights!\n", i);
+            exit(1);
+        }
+
+        // RMSNorm (first layer only)
+        if (i == 0) {
+            printf("    layer 0: creating RMSNorm bind group (5 entries)...\n"); fflush(stdout);
+            printf("      xBuf=%p(%llu) normOut=%p(%llu) inputNorm=%p(%llu) rstd=%p(%llu) rmsP=%p(%llu)\n",
+                   (void*)xBuf.handle, (unsigned long long)xBuf.size,
+                   (void*)normOutBuf.handle, (unsigned long long)normOutBuf.size,
+                   (void*)lw.inputNorm.handle, (unsigned long long)lw.inputNorm.size,
+                   (void*)rstdBuf.handle, (unsigned long long)rstdBuf.size,
+                   (void*)paramsBufs["rms"].handle, (unsigned long long)paramsBufs["rms"].size);
+            fflush(stdout);
+            auto bg = gpu->createBindGroup(plRmsNorm, {
+                {0, xBuf}, {1, normOutBuf}, {2, lw.inputNorm},
+                {3, rstdBuf}, {4, paramsBufs["rms"]}});
+            printf("    layer 0: RMSNorm bind group OK\n"); fflush(stdout);
+            allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1});
+        }
+
+        // QKV matmul
+        printf("    layer %u: QKV bg (qkvW=%p(%llu) qkvS=%p(%llu) qkvP=%p(%llu))...\n", i,
+               (void*)lw.qkvW.handle, (unsigned long long)lw.qkvW.size,
+               (void*)lw.qkvS.handle, (unsigned long long)lw.qkvS.size,
+               (void*)q8QkvParams.handle, (unsigned long long)q8QkvParams.size);
+        fflush(stdout);
+        printf("    normOut=%p(%llu) zeroBiasQKV=%p(%llu) qkvBuf=%p(%llu)\n",
+               (void*)normOutBuf.handle, (unsigned long long)normOutBuf.size,
+               (void*)zeroBiasQKV.handle, (unsigned long long)zeroBiasQKV.size,
+               (void*)qkvBuf.handle, (unsigned long long)qkvBuf.size);
+        fflush(stdout);
+        {
+            auto bg = mkQ8BG(plQ8Matmul, normOutBuf, lw.qkvW, lw.qkvS,
+                             zeroBiasQKV, qkvBuf, q8QkvParams);
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1});
+        }
+
+        // Fused QKnorm + RoPE + KV scatter
+        {
+            auto bg = gpu->createBindGroup(plFusedRope, {
+                {0, qkvBuf}, {1, qRotBuf},
+                {2, kvCache[i].K}, {3, kvCache[i].V},
+                {4, ropeCosBuf}, {5, ropeSinBuf},
+                {6, lw.qNorm}, {7, lw.kNorm},
+                {8, fusedRopeParamsBuf}});
+            allDecodeDispatches.push_back({plFusedRope.pipeline, bg,
+                nHead + nKvHeads, 1, 1});
+        }
+
+        // Chunked attention pass 1
+        {
+            auto bg = gpu->createBindGroup(plChunkP1, {
+                {0, qRotBuf}, {1, kvCache[i].K}, {2, kvCache[i].V},
+                {3, attnPartialsBuf}, {4, chunkedAttnParamsBuf}});
+            allDecodeDispatches.push_back({plChunkP1.pipeline, bg,
+                nHead, maxChunks, 1});  // n_chunks updated dynamically via params
+        }
+
+        // Chunked attention pass 2
+        {
+            auto bg = gpu->createBindGroup(plChunkP2, {
+                {0, attnPartialsBuf}, {1, attnOutBuf},
+                {2, chunkedAttnParamsBuf}});
+            allDecodeDispatches.push_back({plChunkP2.pipeline, bg,
+                nHead, 1, 1});
+        }
+
+        // O projection
+        {
+            auto bg = mkQ8BG(plQ8Matmul, attnOutBuf, lw.oW, lw.oS,
+                             zeroBiasE, projOutBuf, q8OprojParams);
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                1, (nEmbd + Q8_TILE - 1) / Q8_TILE, 1});
+        }
+
+        // Add + RMSNorm (fused residual + next norm)
+        {
+            auto bg = gpu->createBindGroup(plAddRmsNorm, {
+                {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
+                {3, lw.postAttnNorm}, {4, rstdBuf},
+                {5, paramsBufs["rms"]}});
+            allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg,
+                1, 1, 1});
+        }
+
+        // Gate+Up matmul
+        {
+            auto bg = mkQ8BG(plQ8Matmul, normOutBuf, lw.guW, lw.guS,
+                             zeroBiasGU, gateUpBuf, q8GuParams);
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                1, (2 * intermediateSize + Q8_TILE - 1) / Q8_TILE, 1});
+        }
+
+        // SiLU * mul (fused)
+        {
+            auto bg = gpu->createBindGroup(plSiluMul, {
+                {0, gateUpBuf}, {1, siluOutBuf}, {2, paramsBufs["silu"]}});
+            allDecodeDispatches.push_back({plSiluMul.pipeline, bg,
+                (intermediateSize + 127) / 128, 1, 1});
+        }
+
+        // Down projection + residual add (fused)
+        {
+            auto bg = mkQ8BG(plQ8MatAdd, siluOutBuf, lw.dnW, lw.dnS,
+                             zeroBiasE, xBuf, q8DnParams);
+            allDecodeDispatches.push_back({plQ8MatAdd.pipeline, bg,
+                1, (nEmbd + Q8_TILE - 1) / Q8_TILE, 1});
+        }
+
+        // RMSNorm for next layer (or final)
+        if (i < nLayer - 1) {
+            auto bg = gpu->createBindGroup(plRmsNorm, {
+                {0, xBuf}, {1, normOutBuf}, {2, layerWeights[i+1].inputNorm},
+                {3, rstdBuf}, {4, paramsBufs["rms"]}});
+            allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1});
+        }
+    }
+
+    // Final RMSNorm + LM head
+    {
+        auto bg = gpu->createBindGroup(plRmsNorm, {
+            {0, xBuf}, {1, normOutBuf}, {2, finalNormW},
+            {3, rstdBuf}, {4, paramsBufs["rms"]}});
+        allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1});
+    }
+
+    // LM head (fp16 GEMM): normOut × lmHeadW → logits
+    // FP16 GEMM bindings: X(0), W(1), Bias(2), Y(3), _params_(4)
+    {
+        // Grid for fp16 GEMM: (T=1, ceil(N/8))
+        uint32_t FP16_TILE = 8;
+        auto bg = gpu->createBindGroup(plFp16Gemm, {
+            {0, normOutBuf}, {1, lmHeadW}, {2, zeroBiasV},
+            {3, logitsBuf}, {4, paramsBufs["lmhead"]}});
+        allDecodeDispatches.push_back({plFp16Gemm.pipeline, bg,
+            1, (nVocab + FP16_TILE - 1) / FP16_TILE, 1});
+    }
+
+    printf("  Pre-recorded %zu decode dispatches (%u layers)\n",
+           allDecodeDispatches.size(), nLayer);
 }
 
 // ─── Inference ───────────────────────────────────────────────────────────────
 
-std::vector<float> ModelRunner::prefill(const std::vector<int32_t>& tokenIds) {
-    // TODO: implement multi-token prefill
-    printf("[TODO] prefill %zu tokens\n", tokenIds.size());
-    return std::vector<float>(nVocab, 0.0f);
+void ModelRunner::uploadEmbedding(int32_t tokenId) {
+    // CPU embedding lookup + GPU upload
+    if (tokenId < 0 || (uint32_t)tokenId >= nVocab) tokenId = 0;
+    const float* emb = embeddingCPU.data() + tokenId * nEmbd;
+    gpu->writeBuffer(xBuf, emb, nEmbd * 4);
+}
+
+void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
+    // Update fused RoPE params: pos at offset 12, cache_offset at offset 20
+    auto* p = reinterpret_cast<int32_t*>(ropeParamData.data());
+    p[3] = pos;                                 // pos
+    p[5] = cacheLen * nKvHeads * headDim;       // cache_offset
+    gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
+
+    // Update chunked attention params: T_total at offset 8, n_chunks at offset 16
+    uint32_t T_total = cacheLen + 1;
+    uint32_t n_chunks = (T_total + gqaChunkSize - 1) / gqaChunkSize;
+    auto* cp = reinterpret_cast<uint32_t*>(chunkedAttnParamData.data());
+    cp[2] = T_total;
+    cp[4] = n_chunks;
+    gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
 }
 
 std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
-    // TODO: implement single-token decode via pre-recorded dispatches
-    printf("[TODO] decode token %d at pos %u\n", tokenId, posOffset);
-    return std::vector<float>(nVocab, 0.0f);
+    // 1. Upload embedding
+    uploadEmbedding(tokenId);
+
+    // 2. Update dynamic params
+    uint32_t cacheLen = kvCache[0].len;
+    updateDecodeParams(posOffset, cacheLen);
+
+    // 3. Submit all dispatches + readback logits
+    auto result = gpu->submitAndReadback(
+        allDecodeDispatches, logitsBuf, nVocab * 4);
+
+    // 4. Update KV cache lengths
+    for (uint32_t i = 0; i < nLayer; i++)
+        kvCache[i].len++;
+
+    // 5. Return logits as float vector
+    std::vector<float> logits(nVocab);
+    memcpy(logits.data(), result.data(), nVocab * 4);
+    return logits;
 }
 
 int32_t ModelRunner::argmax(const std::vector<float>& logits) {

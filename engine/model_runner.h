@@ -63,36 +63,52 @@ struct ModelRunner {
     // Params buffers (static per-shape)
     std::unordered_map<std::string, GPUBuffer> paramsBufs;
 
-    // Pre-built decode pipeline
-    std::vector<LayerDispatches> decodeLayerDispatches;
-    std::vector<Dispatch> decodeFinalDispatches;
+    // Pre-built decode pipeline: all dispatches for one token
+    std::vector<Dispatch> allDecodeDispatches;
+    // Logits readback (persistently mapped if possible)
+    GPUBuffer readbackBuf;
+    void*     readbackPtr = nullptr;  // mapped pointer or nullptr
+
+    // Embedding table (CPU-side for token lookup)
+    std::vector<float> embeddingCPU;
 
     // RoPE tables
     GPUBuffer ropeCosBuf, ropeSinBuf;
 
-    // Dynamic params (updated per token)
-    GPUBuffer fusedRopeParams, attnParams, chunkedAttnParams;
+    // Dynamic params buffers (written per-token via writeBuffer)
+    GPUBuffer fusedRopeParamsBuf;
+    GPUBuffer chunkedAttnParamsBuf;
+
+    // Static param layout for fused rope
+    std::vector<uint8_t> ropeParamData;
+    std::vector<uint8_t> chunkedAttnParamData;
+
+    // Derived dimensions
+    uint32_t qDim = 0, kvDim = 0, qkvOut = 0;
+    uint32_t maxSeqLen = 2048;
+    uint32_t gqaChunkSize = 64;
 
     // --- API ---
     bool load(GPUContext& ctx, const std::string& bundleDir,
               const std::string& ggufPath);
 
-    /// Run prefill: process all prompt tokens, populate KV cache.
-    /// Returns logits for the last token.
-    std::vector<float> prefill(const std::vector<int32_t>& tokenIds);
-
-    /// Run one decode step. Returns logits for the generated token.
+    /// Run one decode step. Updates KV cache, returns logits.
     std::vector<float> decode(int32_t tokenId, uint32_t posOffset);
 
     /// Greedy decode: return the argmax token from logits.
     static int32_t argmax(const std::vector<float>& logits);
+
+    /// Get embedding for a token (CPU lookup + GPU upload)
+    void uploadEmbedding(int32_t tokenId);
+
+    /// Update dynamic params for this decode step
+    void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
 
 private:
     void loadWeights(const std::string& ggufPath);
     void buildDecodePipeline();
     void computeRopeTables();
 
-    // Compile pipelines from bundle
     const CompiledPipeline& loadKernel(const std::string& name);
     std::unordered_map<std::string, const CompiledPipeline*> kernelCache_;
 };
