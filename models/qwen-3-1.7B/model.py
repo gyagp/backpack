@@ -375,13 +375,15 @@ class Qwen3WebGPU(WebGPUModel):
 
     # -- Projection helper --
 
-    def _proj(self, x, name, bias_key, N, K=None, gpu_out=False):
+    def _proj(self, x, name, bias_key, N, K=None, gpu_out=False,
+              prefer_subgroup_matrix: bool = False):
         """Linear projection using best available kernel (Q8/Q4/fp16/fp32)."""
         if self._use_q8_gpu:
             return self._linear_q8(
                 x, self._gpu_weights[name + ".q8.gpu"],
                 self._gpu_weights[name + ".q8_scales.gpu"],
-                self._gpu_weights[bias_key], N, K=K, gpu_out=gpu_out)
+                self._gpu_weights[bias_key], N, K=K, gpu_out=gpu_out,
+                prefer_subgroup_matrix=prefer_subgroup_matrix)
         if self._use_q4_gpu:
             return self._linear_q4(
                 x, self._gpu_weights[name + ".q4.gpu"],
@@ -419,7 +421,8 @@ class Qwen3WebGPU(WebGPUModel):
         if (T > 1 and self._has_qk_norm
                 and hasattr(self, '_qknorm_rope_prefill_result')):
             qkv_gpu = self._proj(x, pfx + "qkv_proj.weight", bias_key,
-                                 self.qkv_out, K=E, gpu_out=True)
+                                 self.qkv_out, K=E, gpu_out=True,
+                                 prefer_subgroup_matrix=True)
 
             if positions is None:
                 positions = np.arange(T, dtype=np.int32)
@@ -466,35 +469,32 @@ class Qwen3WebGPU(WebGPUModel):
 
             # GPU causal attention
             attn_out = self._causal_attention_multihead(
-                Q_gpu, K_gpu, V_gpu, n_rep)
+                Q_gpu, K_gpu, V_gpu, n_rep, gpu_out=True)
 
             # Write K/V directly to GPU KV cache via GPU-to-GPU copy
-            if use_cache and hasattr(self, '_gpu_kv_cache'):
+            if use_cache:
                 runner = self.cache.runner
-                K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
-                kv_bytes = T * n_kv * HD * 4
-                if runner.is_batching:
-                    # GPU-to-GPU copy within batch (no fence)
-                    runner.copy_buffer_in_batch(
-                        K_gpu.handle, 0, K_cache_gpu.handle, 0, kv_bytes)
-                    runner.copy_buffer_in_batch(
-                        V_gpu.handle, 0, V_cache_gpu.handle, 0, kv_bytes)
-                else:
-                    # Fallback: readback + write
-                    K_np = runner.readback(K_gpu).reshape(T, n_kv, HD)
-                    V_np = runner.readback(V_gpu).reshape(T, n_kv, HD)
+                # Always readback K/V to CPU cache for non-fast decode paths
+                K_np = runner.readback(K_gpu).reshape(T, n_kv, HD)
+                V_np = runner.readback(V_gpu).reshape(T, n_kv, HD)
+                if self.kv_cache is None:
+                    self.kv_cache = {}
+                self.kv_cache[layer] = (K_np, V_np)
+
+                if hasattr(self, '_gpu_kv_cache'):
+                    K_cache_gpu, V_cache_gpu, _ = self._gpu_kv_cache[layer]
+                    kv_bytes = T * n_kv * HD * 4
                     runner.write_buffer(K_cache_gpu.handle,
                                         K_np.ravel().astype(np.float32).tobytes())
                     runner.write_buffer(V_cache_gpu.handle,
                                         V_np.ravel().astype(np.float32).tobytes())
-                    if self.kv_cache is None:
-                        self.kv_cache = {}
-                    self.kv_cache[layer] = (K_np, V_np)
-                self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
+                    self._gpu_kv_cache[layer] = (K_cache_gpu, V_cache_gpu, T)
 
-            attn_flat = attn_out.reshape(T, q_dim)
+            attn_out.shape = (T, q_dim)
+            attn_flat = attn_out
             return self._proj(attn_flat, pfx + "o_proj.weight",
-                              "zero_bias_E", E, K=q_dim, gpu_out=True)
+                              "zero_bias_E", E, K=q_dim, gpu_out=True,
+                              prefer_subgroup_matrix=True)
 
         # Standard CPU path (T=1 decode or no QK-norm)
         qkv = self._proj(x, pfx + "qkv_proj.weight", bias_key,
@@ -564,13 +564,18 @@ class Qwen3WebGPU(WebGPUModel):
 
     def _mlp_block(self, x, layer: int, gpu_out: bool = False):
         """SwiGLU MLP with fused gate+up projection."""
+        from common.model_base import GPUBuffer
         E, IM = self.n_embd, self.intermediate_size
         pfx = f"layers.{layer}.mlp."
+        use_prefill_subgroup = isinstance(x, GPUBuffer) and x.shape[0] > 1
         gate_up = self._proj(x, pfx + "gate_up_proj.weight",
-                             "zero_bias_GU", self.gate_up_out, K=E, gpu_out=True)
+                             "zero_bias_GU", self.gate_up_out, K=E,
+                             gpu_out=True,
+                             prefer_subgroup_matrix=use_prefill_subgroup)
         h = self._silu_mul_fused(gate_up, IM, gpu_out=True)
         return self._proj(h, pfx + "down_proj.weight",
-                          "zero_bias_E", E, K=IM, gpu_out=gpu_out)
+                          "zero_bias_E", E, K=IM, gpu_out=gpu_out,
+                          prefer_subgroup_matrix=use_prefill_subgroup)
 
     # -- Transformer block --
 
@@ -1085,8 +1090,11 @@ class Qwen3WebGPU(WebGPUModel):
         self._fd_attn_ph = attn_ph[0]
         self._fd_chunked_attn_ph = chunked_attn_ph[0]
 
-        # GPU argmax: readback 4 bytes instead of 592KB
-        # Only beneficial on iGPUs where buffer mapping is slow
+        # GPU argmax: readback 4 bytes instead of 592KB.
+        # On discrete NVIDIA GPUs, buffer mapping has fixed PCIe latency
+        # regardless of size, so the extra dispatch hurts more than the
+        # smaller readback helps. On integrated GPUs the mapping cost
+        # scales with buffer size, so GPU argmax is beneficial there.
         self._fd_use_gpu_argmax = (self._gpu_vendor != 'nvidia')
         if self._fd_use_gpu_argmax:
             token_id_buf = mkbuf('token_id', 4)
@@ -1111,6 +1119,23 @@ class Qwen3WebGPU(WebGPUModel):
             )
         else:
             self._fd_all_batches = layer_dispatches + [final_dispatches]
+
+        # Set up persistently-mapped readback buffer (Dawn-specific).
+        # With skip_validation enabled, the buffer stays mapped while being
+        # used as COPY_DST, eliminating the BufferMapAsync/WaitAny/Unmap
+        # cycle (~4ms per token).
+        try:
+            if self._fd_use_gpu_argmax:
+                rb_size = 4
+                rb_dtype = np.int32
+            else:
+                rb_size = self.n_vocab * 4
+                rb_dtype = np.float32
+            prb_buf, prb_view = runner.create_persistently_mapped_readback(
+                "__persistent_rb__", rb_size, rb_dtype)
+            runner._persistent_rb = (prb_buf, prb_view, rb_size)
+        except Exception:
+            runner._persistent_rb = None
 
         # Per-dispatch names for GPU timestamp profiling
         mm_label = "q8_matmul" if self._use_q8_gpu else "q4_matmul"
@@ -1217,7 +1242,6 @@ class Qwen3WebGPU(WebGPUModel):
         struct.pack_into('<i', self._fd_attn_buf, 8, T_total)
         runner.write_buffer(self._fd_attn_ph, bytes(self._fd_attn_buf))
 
-        # Update chunked attention params
         n_chunks = (T_total + self._gqa_chunk_size - 1) // self._gqa_chunk_size
         struct.pack_into('<I', self._fd_chunked_attn_buf, 8, T_total)
         struct.pack_into('<I', self._fd_chunked_attn_buf, 16, n_chunks)
@@ -1230,19 +1254,18 @@ class Qwen3WebGPU(WebGPUModel):
             K, V, c = self._gpu_kv_cache[layer]
             self._gpu_kv_cache[layer] = (K, V, c + 1)
 
+        if self._fd_use_gpu_argmax:
+            readback = (self._fd_token_id_h, self._fd_token_id_sz,
+                        np.int32)
+        else:
+            readback = (self._fd_logits_h, self._fd_logits_sz,
+                        np.float32)
+
         if _p:
             from common.profiler import GPUDispatchEvent
 
-            # Submit with per-dispatch GPU timestamps
             p._cpu.begin("fast_decode/gpu")
             t0 = _time.perf_counter_ns()
-
-            if self._fd_use_gpu_argmax:
-                readback = (self._fd_token_id_h, self._fd_token_id_sz,
-                            np.int32)
-            else:
-                readback = (self._fd_logits_h, self._fd_logits_sz,
-                            np.float32)
 
             result = runner.submit_dispatches_pipelined(
                 self._fd_all_batches,
@@ -1259,25 +1282,15 @@ class Qwen3WebGPU(WebGPUModel):
             p._dispatch_events.append(GPUDispatchEvent(
                 name=f"fast_decode({n_disp}disp)",
                 begin_ns=t0, end_ns=t1, link_id=link))
-
-            if self._fd_use_gpu_argmax:
-                logits = np.full(self.n_vocab, -1e9, dtype=np.float32)
-                logits[int(result[0])] = 1.0
-            else:
-                logits = result
         else:
-            if self._fd_use_gpu_argmax:
-                token_np = runner.submit_dispatches_pipelined(
-                    self._fd_all_batches,
-                    readback=(self._fd_token_id_h, self._fd_token_id_sz,
-                              np.int32))
-                logits = np.full(self.n_vocab, -1e9, dtype=np.float32)
-                logits[int(token_np[0])] = 1.0
-            else:
-                logits = runner.submit_dispatches_pipelined(
-                    self._fd_all_batches,
-                    readback=(self._fd_logits_h, self._fd_logits_sz,
-                              np.float32))
+            result = runner.submit_dispatches_pipelined(
+                self._fd_all_batches, readback=readback)
+
+        if self._fd_use_gpu_argmax:
+            logits = np.full(self.n_vocab, -1e9, dtype=np.float32)
+            logits[int(result[0])] = 1.0
+        else:
+            logits = result
 
         return logits.reshape(1, self.n_vocab)
 

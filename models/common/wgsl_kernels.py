@@ -251,19 +251,23 @@ WSGL_Q8_0_ADD_KERNEL = WSGL_Q8_0_KERNEL.replace(
 
 
 # ---------------------------------------------------------------------------
-# Cooperative matrix Q8_0 matmul — using subgroupMatrixMultiplyAccumulate
+# Cooperative matrix Q8_0 matmul — ORT/llama.cpp-style tiled prefill GEMM
 # ---------------------------------------------------------------------------
 #
-# Uses chromium_experimental_subgroup_matrix for hardware tensor core matmul.
-# Available on Vulkan+NVIDIA (not D3D12).
+# Uses chromium_experimental_subgroup_matrix for hardware cooperative matrix
+# multiply-accumulate. This path is intended for multi-token prefill GEMMs
+# (MxK @ KxN, M>1) where a tiled kernel can amortize dispatch overhead.
 #
-# Tile sizes: 32×32 output tile, 32-element K steps
-# Workgroup: 128 threads (4 subgroups of 32)
-# Each subgroup handles a 16×16 subtile using MMA(16,16,16)
-# A (activations): loaded from global → shared memory (fp32)
-# B (Q8_0 weights): dequantized from global → shared memory (fp32)
+# The current implementation targets the Vulkan configs exposed by Dawn on
+# NVIDIA today: f16 inputs with f32 accumulation at 16x16x16. Activations
+# and dequantized Q8 weights are staged into f16 workgroup tiles, multiplied
+# via subgroup-matrix MMA, then written back as fp32.
 #
-# Grid: (ceil(M/32), ceil(N/32))
+# Q8_0 layout matches the existing WGSL Q8 path:
+# - W_Q8: u32 packed int8 weights, 4 weights per word, row-major by output row
+# - Scales: fp16 per 32-element block, packed as two fp16 per u32
+#
+# Grid: (ceil(N/64), ceil(M/32))
 # M = number of tokens (prefill), N = output features, K = input features
 
 SUBGROUP_MATRIX_Q8_BINDINGS = [
@@ -285,6 +289,7 @@ def pack_subgroup_matrix_params(M, N, K):
 
 
 WGSL_SUBGROUP_MATRIX_Q8_KERNEL = """
+enable f16;
 enable subgroups;
 enable chromium_experimental_subgroup_matrix;
 
@@ -295,112 +300,114 @@ enable chromium_experimental_subgroup_matrix;
 @group(0) @binding(4) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
 
-const TILE_M: u32 = 32u;
-const TILE_N: u32 = 32u;
+// 32×32 output tile, 4 subgroups each computing a 16×16 sub-tile
+// Subgroup layout: 2×2 grid, sg_row = sg_id & 1, sg_col = sg_id >> 1
+const TILE_ROWS: u32 = 32u;
+const TILE_COLS: u32 = 32u;
 const TILE_K: u32 = 16u;
-const MAX_K_ITERS: u32 = 384u;  // max K/TILE_K = 6144/16 = 384
+const SCALE_BLOCK: u32 = 32u;
+const MAX_K_TILES: u32 = 384u;
+const WG_SIZE: u32 = 128u;
 
-// Shared memory tiles (row-major)
-var<workgroup> tile_A: array<f32, 1024>;  // max(TILE_M×TILE_K, TILE_M×TILE_N)
-var<workgroup> tile_B: array<f32, 512>;   // TILE_N × TILE_K
+var<workgroup> tile_A: array<f16, TILE_ROWS * TILE_K>;   // 32×16
+var<workgroup> tile_B: array<f16, TILE_COLS * TILE_K>;   // 32×16
+var<workgroup> tile_C: array<f32, TILE_ROWS * TILE_COLS>; // 32×32
 
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(subgroup_id) sg_id: u32,
-        @builtin(subgroup_invocation_id) sg_lane: u32) {
+        @builtin(subgroup_id) subgroup_id: u32) {
     let M = _params_[0];
     let N = _params_[1];
     let K = _params_[2];
-    let tid = lid.x;
+    let local_idx = lid.x;
 
-    let tile_row_base = wid.x * TILE_M;  // output row start
-    let tile_col_base = wid.y * TILE_N;  // output col start
+    let row_base = wid.y * TILE_ROWS;
+    let col_base = wid.x * TILE_COLS;
 
-    // 4 subgroups: arrange as 2×2 grid of 16×16 subtiles
-    let subtile_row = sg_id / 2u;   // 0 or 1
-    let subtile_col = sg_id % 2u;   // 0 or 1
+    // Each subgroup owns a 16×16 sub-tile of the 32×32 output
+    let sg_row = subgroup_id & 1u;
+    let sg_col = subgroup_id >> 1u;
 
-    // Accumulators: each subgroup accumulates one 16×16 result
+    let weight_stride = K / 4u;
+    let scale_stride = K / SCALE_BLOCK;
+
     var matC: subgroup_matrix_result<f32, 16, 16>;
+    for (var tile_idx = 0u; tile_idx < MAX_K_TILES; tile_idx += 1u) {
+        let k_base = tile_idx * TILE_K;
 
-    // Iterate over K in TILE_K steps (uniform loop: always MAX_K_ITERS,
-    // skip work for iterations beyond actual K)
-    let k_iters = K / TILE_K;
-    for (var k_step: u32 = 0u; k_step < MAX_K_ITERS; k_step += 1u) {
-        let k_idx = k_step * TILE_K;
-        let k_valid = k_step < k_iters;
-        // Load tile_A: TILE_M × TILE_K from X
-        // 128 threads load 32×16 = 512 elements, ~4 per thread
-        for (var i = tid; i < TILE_M * TILE_K; i += 128u) {
-            let r = i / TILE_K;
-            let c = i % TILE_K;
-            let global_r = tile_row_base + r;
-            let global_c = k_idx + c;
-            if (k_valid && global_r < M && global_c < K) {
-                tile_A[r * TILE_K + c] = X[global_r * K + global_c];
+        // Load tile_A: 32×16 (128 threads, 4 elements each)
+        for (var i = local_idx; i < TILE_ROWS * TILE_K; i += WG_SIZE) {
+            let local_row = i / TILE_K;
+            let local_k = i % TILE_K;
+            let global_row = row_base + local_row;
+            let global_k = k_base + local_k;
+            if (global_row < M && global_k < K) {
+                tile_A[i] = f16(X[global_row * K + global_k]);
             } else {
-                tile_A[r * TILE_K + c] = 0.0;
+                tile_A[i] = 0.0h;
             }
         }
 
-        // Load tile_B: TILE_N × TILE_K from Q8_0 weights (dequantize)
-        for (var i = tid; i < TILE_N * TILE_K; i += 128u) {
-            let n_local = i / TILE_K;
-            let k_local = i % TILE_K;
-            let global_n = tile_col_base + n_local;
-            let global_k = k_idx + k_local;
-            if (k_valid && global_n < N && global_k < K) {
-                // Dequantize: w_f32 = int8_val * scale
-                let w_u32_idx = global_n * (K / 4u) + global_k / 4u;
-                let byte_idx = global_k % 4u;
-                let packed = W_Q8[w_u32_idx];
-                let w_int8 = f32(extractBits(i32(packed), byte_idx * 8u, 8u));
-
-                // Scale: one fp16 per 32-element block
-                let block_idx = global_n * (K / 32u) + global_k / 32u;
-                let sp = unpack2x16float(Scales[block_idx / 2u]);
-                let scale = select(sp.x, sp.y, (block_idx & 1u) != 0u);
-
-                // Store column-major for right operand (B^T)
-                tile_B[n_local * TILE_K + k_local] = w_int8 * scale;
+        // Load tile_B: 32×16 dequantized Q8_0 weights
+        for (var i = local_idx; i < TILE_COLS * TILE_K; i += WG_SIZE) {
+            let local_col = i / TILE_K;
+            let local_k = i % TILE_K;
+            let global_col = col_base + local_col;
+            let global_k = k_base + local_k;
+            if (global_col < N && global_k < K) {
+                let packed = W_Q8[global_col * weight_stride + global_k / 4u];
+                let shift = (global_k & 3u) * 8u;
+                let q = f32(extractBits(i32(packed), shift, 8u));
+                let scale_idx = global_col * scale_stride + global_k / SCALE_BLOCK;
+                let sp = unpack2x16float(Scales[scale_idx / 2u]);
+                let scale = select(sp.x, sp.y, (scale_idx & 1u) != 0u);
+                tile_B[i] = f16(q * scale);
             } else {
-                tile_B[n_local * TILE_K + k_local] = 0.0;
+                tile_B[i] = 0.0h;
             }
         }
 
         workgroupBarrier();
 
-        // Cooperative matrix multiply: C += A_subtile × B_subtile
-        let a_offset = subtile_row * 16u * TILE_K;
-        let b_offset = subtile_col * 16u * TILE_K;
+        // Each subgroup loads its 16×16 sub-tile and does MMA
+        let a_offset = sg_row * 16u * TILE_K;        // row offset in tile_A
+        let b_offset = sg_col * 16u * TILE_K;        // col offset in tile_B
 
-        var matA = subgroupMatrixLoad<subgroup_matrix_left<f32, 16, 16>>(
+        let matA = subgroupMatrixLoad<subgroup_matrix_left<f16, 16, 16>>(
             &tile_A, a_offset, false, TILE_K);
-        var matB = subgroupMatrixLoad<subgroup_matrix_right<f32, 16, 16>>(
-            &tile_B, b_offset, false, TILE_K);
+        let matB = subgroupMatrixLoad<subgroup_matrix_right<f16, 16, 16>>(
+            &tile_B, b_offset, true, TILE_K);
         matC = subgroupMatrixMultiplyAccumulate(matA, matB, matC);
 
         workgroupBarrier();
     }
 
-    // Store results to shared memory (tile_A repurposed as 32×32 output scratch)
-    let store_offset = subtile_row * 16u * TILE_N + subtile_col * 16u;
-    subgroupMatrixStore(&tile_A, store_offset, matC, false, TILE_N);
+    // Store each subgroup's 16×16 result into the 32×32 tile_C
+    let c_offset = sg_row * 16u * TILE_COLS + sg_col * 16u;
+    subgroupMatrixStore(&tile_C, c_offset, matC, false, TILE_COLS);
     workgroupBarrier();
 
-    // Write to global output Y
-    for (var i = tid; i < TILE_M * TILE_N; i += 128u) {
-        let r = i / TILE_N;
-        let c = i % TILE_N;
-        let global_r = tile_row_base + r;
-        let global_c = tile_col_base + c;
-        if (global_r < M && global_c < N) {
-            Y[global_r * N + global_c] = tile_A[r * TILE_N + c] + Bias[global_c];
+    // Write tile_C to global Y with bias
+    for (var i = local_idx; i < TILE_ROWS * TILE_COLS; i += WG_SIZE) {
+        let local_row = i / TILE_COLS;
+        let local_col = i % TILE_COLS;
+        let global_row = row_base + local_row;
+        let global_col = col_base + local_col;
+        if (global_row < M && global_col < N) {
+            Y[global_row * N + global_col] = tile_C[i] + Bias[global_col];
         }
     }
 }
 """
+
+# Cooperative matrix Q8_0 + residual add: Y[i] += matmul + bias
+SUBGROUP_MATRIX_Q8_ADD_BINDINGS = list(SUBGROUP_MATRIX_Q8_BINDINGS)  # same layout
+
+WSGL_SUBGROUP_MATRIX_Q8_ADD_KERNEL = WGSL_SUBGROUP_MATRIX_Q8_KERNEL.replace(
+    "Y[global_row * N + global_col] = tile_C[i] + Bias[global_col];",
+    "Y[global_row * N + global_col] += tile_C[i] + Bias[global_col];"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -913,13 +920,15 @@ enable subgroups;
 
 const HD: u32 = 128u;
 const CHUNK: u32 = 64u;
+// Each thread processes HD_PER_THREAD elements, total 32 * 4 = 128
+const HD_PER_THREAD: u32 = 4u;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
     let head = wid.x;
     let chunk_id = wid.y;
-    let hd_idx = lid.x;
+    let lane = lid.x;
 
     let kv_stride = _params_[0];
     let n_rep = _params_[1];
@@ -930,34 +939,54 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
-    let q_val = Q[head * HD + hd_idx];
+    let q_base = head * HD;
+
+    // Load Q into registers (4 elements per thread)
+    let q0 = Q[q_base + lane * HD_PER_THREAD];
+    let q1 = Q[q_base + lane * HD_PER_THREAD + 1u];
+    let q2 = Q[q_base + lane * HD_PER_THREAD + 2u];
+    let q3 = Q[q_base + lane * HD_PER_THREAD + 3u];
 
     let t_start = chunk_id * CHUNK;
 
-    var acc: f32 = 0.0;
+    var acc0: f32 = 0.0; var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0; var acc3: f32 = 0.0;
     var m_prev: f32 = neg_inf;
     var l_prev: f32 = 0.0;
 
-    // Uniform loop: always CHUNK iterations, mask invalid positions
     for (var i = 0u; i < CHUNK; i = i + 1u) {
         let t = t_start + i;
         let valid = t < T_total;
 
-        let k_idx = select(0u, t * kv_stride + kv_off + hd_idx, valid);
-        let k_val = select(0.0, K_cache[k_idx], valid);
-        let dot = subgroupAdd(q_val * k_val);
-        let raw_score = subgroupBroadcastFirst(dot) * scale;
+        let k_base = select(0u, t * kv_stride + kv_off, valid);
+        let k0 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD], valid);
+        let k1 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 1u], valid);
+        let k2 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 2u], valid);
+        let k3 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 3u], valid);
+
+        // Full 128-element dot product via 4-element partial + subgroupAdd
+        let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
+        let dot = subgroupAdd(partial);
+        let raw_score = dot * scale;
         let score = select(neg_inf, raw_score, valid);
 
         let m_new = max(m_prev, score);
         let exp_prev = exp(m_prev - m_new);
         let exp_score = exp(score - m_new);
         let l_new = l_prev * exp_prev + exp_score;
+        let rescale = l_prev * exp_prev / max(l_new, 1e-10);
+        let w = exp_score / max(l_new, 1e-10);
 
-        let v_idx = select(0u, t * kv_stride + kv_off + hd_idx, valid);
-        let v_val = select(0.0, V_cache[v_idx], valid);
-        acc = acc * (l_prev * exp_prev / max(l_new, 1e-10)) +
-              v_val * (exp_score / max(l_new, 1e-10));
+        let v_base = select(0u, t * kv_stride + kv_off, valid);
+        let v0 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD], valid);
+        let v1 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 1u], valid);
+        let v2 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 2u], valid);
+        let v3 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 3u], valid);
+
+        acc0 = acc0 * rescale + v0 * w;
+        acc1 = acc1 * rescale + v1 * w;
+        acc2 = acc2 * rescale + v2 * w;
+        acc3 = acc3 * rescale + v3 * w;
 
         m_prev = m_new;
         l_prev = l_new;
@@ -965,11 +994,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     let partial_stride = HD + 2u;
     let base = head * n_chunks * partial_stride + chunk_id * partial_stride;
-    if (hd_idx == 0u) {
+    if (lane == 0u) {
         Partials[base] = m_prev;
         Partials[base + 1u] = l_prev;
     }
-    Partials[base + 2u + hd_idx] = acc;
+    Partials[base + 2u + lane * HD_PER_THREAD] = acc0;
+    Partials[base + 2u + lane * HD_PER_THREAD + 1u] = acc1;
+    Partials[base + 2u + lane * HD_PER_THREAD + 2u] = acc2;
+    Partials[base + 2u + lane * HD_PER_THREAD + 3u] = acc3;
 }
 """
 
@@ -981,12 +1013,13 @@ enable subgroups;
 @group(0) @binding(2) var<storage, read_write> _params_: array<u32>;
 
 const HD: u32 = 128u;
+const HD_PER_THREAD: u32 = 4u;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
     let head = wid.x;
-    let hd_idx = lid.x;
+    let lane = lid.x;
 
     let n_chunks = _params_[4];
     let neg_inf = bitcast<f32>(_params_[6]);
@@ -994,7 +1027,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let partial_stride = HD + 2u;
     let head_base = head * n_chunks * partial_stride;
 
-    var acc: f32 = 0.0;
+    var acc0: f32 = 0.0; var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0; var acc3: f32 = 0.0;
     var m_prev: f32 = neg_inf;
     var l_prev: f32 = 0.0;
 
@@ -1002,23 +1036,33 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let base = head_base + c * partial_stride;
         let m_chunk = Partials[base];
         let l_chunk = Partials[base + 1u];
-        let v_chunk = Partials[base + 2u + hd_idx];
+        let v0 = Partials[base + 2u + lane * HD_PER_THREAD];
+        let v1 = Partials[base + 2u + lane * HD_PER_THREAD + 1u];
+        let v2 = Partials[base + 2u + lane * HD_PER_THREAD + 2u];
+        let v3 = Partials[base + 2u + lane * HD_PER_THREAD + 3u];
 
         if (l_chunk > 0.0) {
             let m_new = max(m_prev, m_chunk);
             let exp_prev = exp(m_prev - m_new);
             let exp_chunk = exp(m_chunk - m_new);
             let l_new = l_prev * exp_prev + l_chunk * exp_chunk;
+            let rescale = l_prev * exp_prev / max(l_new, 1e-10);
+            let w = l_chunk * exp_chunk / max(l_new, 1e-10);
 
-            acc = acc * (l_prev * exp_prev / max(l_new, 1e-10)) +
-                  v_chunk * (l_chunk * exp_chunk / max(l_new, 1e-10));
+            acc0 = acc0 * rescale + v0 * w;
+            acc1 = acc1 * rescale + v1 * w;
+            acc2 = acc2 * rescale + v2 * w;
+            acc3 = acc3 * rescale + v3 * w;
 
             m_prev = m_new;
             l_prev = l_new;
         }
     }
 
-    Out[head * HD + hd_idx] = acc;
+    Out[head * HD + lane * HD_PER_THREAD] = acc0;
+    Out[head * HD + lane * HD_PER_THREAD + 1u] = acc1;
+    Out[head * HD + lane * HD_PER_THREAD + 2u] = acc2;
+    Out[head * HD + lane * HD_PER_THREAD + 3u] = acc3;
 }
 """
 

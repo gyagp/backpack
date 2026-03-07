@@ -14,6 +14,7 @@ import sys
 import time
 import json
 import struct
+import ctypes
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 
@@ -225,6 +226,71 @@ def _next_pow2(n):
     return p
 
 
+def _query_runner_subgroup_matrix_configs(runner) -> list:
+    """Query adapter-advertised subgroup-matrix configs from DawnRunner."""
+    if not getattr(runner, 'has_subgroup_matrix', False):
+        return []
+
+    try:
+        # Import the same types that dawn_runner registered with ctypes argtypes
+        from triton.backends.webgpu.dawn_runner import (
+            WGPUAdapterInfo, WGPUChainedStruct,
+        )
+    except ImportError:
+        return []
+
+    class _WGPUSubgroupMatrixConfig(ctypes.Structure):
+        _fields_ = [
+            ('componentType', ctypes.c_uint32),
+            ('resultComponentType', ctypes.c_uint32),
+            ('M', ctypes.c_uint32),
+            ('N', ctypes.c_uint32),
+            ('K', ctypes.c_uint32),
+        ]
+
+    class _WGPUAdapterPropertiesSubgroupMatrixConfigs(ctypes.Structure):
+        _fields_ = [
+            ('chain', type(WGPUChainedStruct())),
+            ('configCount', ctypes.c_size_t),
+            ('configs', ctypes.POINTER(_WGPUSubgroupMatrixConfig)),
+        ]
+
+    info = WGPUAdapterInfo()
+    ctypes.memset(ctypes.byref(info), 0, ctypes.sizeof(WGPUAdapterInfo))
+    configs = _WGPUAdapterPropertiesSubgroupMatrixConfigs()
+    ctypes.memset(
+        ctypes.byref(configs), 0,
+        ctypes.sizeof(_WGPUAdapterPropertiesSubgroupMatrixConfigs))
+    configs.chain.next = None
+    configs.chain.sType = 0x0005003B
+    info.nextInChain = ctypes.cast(
+        ctypes.pointer(configs.chain), ctypes.POINTER(WGPUChainedStruct))
+
+    status = runner._lib.wgpuAdapterGetInfo(runner._adapter, ctypes.byref(info))
+    if status != 1:
+        return []
+
+    type_names = {
+        0x00000001: 'F32',
+        0x00000002: 'F16',
+        0x00000003: 'U32',
+        0x00000004: 'I32',
+        0x00000005: 'U8',
+        0x00000006: 'I8',
+    }
+    out = []
+    for i in range(int(configs.configCount)):
+        config = configs.configs[i]
+        out.append({
+            'M': int(config.M),
+            'N': int(config.N),
+            'K': int(config.K),
+            'componentType': type_names.get(config.componentType, str(config.componentType)),
+            'resultComponentType': type_names.get(config.resultComponentType, str(config.resultComponentType)),
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # WebGPU model base class
 # ---------------------------------------------------------------------------
@@ -318,6 +384,20 @@ class WebGPUModel:
         info = runner.adapter_info
         vendor = info.get('vendor', '').lower()
         self._gpu_vendor = vendor
+        self._gpu_backend = info.get('backend', '').lower()
+        # Auto-enable subgroup-matrix prefill when the adapter supports it.
+        # Set WEBGPU_SUBGROUP_MATRIX_PREFILL=0 to force-disable.
+        sg_env = os.environ.get('WEBGPU_SUBGROUP_MATRIX_PREFILL', '').lower()
+        self._disable_subgroup_matrix_prefill = sg_env in {'0', 'false', 'no'}
+        self._subgroup_matrix_q8_config = None
+        for config in _query_runner_subgroup_matrix_configs(runner):
+            if (config.get('componentType') == 'F16'
+                    and config.get('resultComponentType') == 'F32'
+                    and config.get('M') == 16
+                    and config.get('N') == 16
+                    and config.get('K') == 16):
+                self._subgroup_matrix_q8_config = config
+                break
 
     @staticmethod
     def _nw(block_size):
@@ -2082,7 +2162,8 @@ class WebGPUModel:
 
     def _linear_q8(self, x, w_q8, scales, bias,
                    out_features: int, K: int = None,
-                   gpu_out: bool = False):
+                   gpu_out: bool = False,
+                   prefer_subgroup_matrix: bool = False):
         """Q8_0 matmul using hand-crafted WGSL (W8A32).
 
         Int8 weights stay packed on GPU — no dequantization at load time.
@@ -2108,6 +2189,11 @@ class WebGPUModel:
             if K is None:
                 K = x.shape[1]
 
+        if self._can_use_q8_subgroup_matrix(
+                x, T, N, K, prefer_subgroup_matrix):
+            return self._linear_q8_subgroup_matrix(
+                x, w_q8, scales, bias, N, T=T, K=K, gpu_out=gpu_out)
+
         params = pack_q8_params(K, N)
 
         runner = self.cache.runner
@@ -2127,6 +2213,72 @@ class WebGPUModel:
             grid=(T, (N + Q8_TILE_N - 1) // Q8_TILE_N),
             buffers={
                 'X': x if x_is_gpu else x.ravel().astype(np.float32),
+                'W_Q8': w_q8,
+                'Scales': scales,
+                'Bias': bias,
+                'Y': np.zeros(T * N, dtype=np.float32),
+                '_params_': params_gpu,
+            },
+            scalars={},
+            gpu_outputs={'Y'} if gpu_out else None)
+
+        if gpu_out:
+            gpu_buf = out['Y']
+            gpu_buf.shape = (T, N)
+            return gpu_buf
+        return out['Y'].reshape(T, N)
+
+    def _can_use_q8_subgroup_matrix(self, x, T: int, N: int, K: int,
+                                    prefer_subgroup_matrix: bool) -> bool:
+        """Return True when the experimental subgroup-matrix prefill GEMM fits."""
+        runner = self.cache.runner
+        return (
+            prefer_subgroup_matrix
+            and not self._disable_subgroup_matrix_prefill
+            and isinstance(x, GPUBuffer)
+            and T > 1
+            and self._gpu_backend == 'vulkan'
+            and runner.has_subgroup_matrix
+            and runner.has_f16
+            and self._subgroup_matrix_q8_config is not None
+            and K % 32 == 0
+        )
+
+    def _linear_q8_subgroup_matrix(self, x, w_q8, scales, bias,
+                                   out_features: int, T: int, K: int,
+                                   gpu_out: bool = False):
+        """Multi-token Q8_0 prefill GEMM via subgroup matrices.
+
+        Uses 4-subgroup 32x32 tiled cooperative matrix multiply on Vulkan.
+        Auto-enabled when the adapter advertises f16->f32 16x16x16 configs.
+        Set WEBGPU_SUBGROUP_MATRIX_PREFILL=0 to force-disable.
+        """
+        from common.wgsl_kernels import (
+            WGSL_SUBGROUP_MATRIX_Q8_KERNEL,
+            SUBGROUP_MATRIX_Q8_BINDINGS,
+            pack_subgroup_matrix_params,
+        )
+
+        N = out_features
+        params = pack_subgroup_matrix_params(T, N, K)
+
+        runner = self.cache.runner
+        params_key = f"__sgq8_params_{T}_{N}_{K}"
+        if not hasattr(self, '_sgq8_params_cache'):
+            self._sgq8_params_cache = {}
+        if params_key not in self._sgq8_params_cache:
+            self._sgq8_params_cache[params_key] = runner.upload_to_gpu(
+                params, params_key)
+        params_gpu = self._sgq8_params_cache[params_key]
+
+        out = runner.run_kernel(
+            wgsl_code=WGSL_SUBGROUP_MATRIX_Q8_KERNEL,
+            buffer_bindings=SUBGROUP_MATRIX_Q8_BINDINGS,
+            param_fields=[],
+            workgroup_size=128,
+            grid=((N + 31) // 32, (T + 31) // 32),
+            buffers={
+                'X': x,
                 'W_Q8': w_q8,
                 'Scales': scales,
                 'Bias': bias,
