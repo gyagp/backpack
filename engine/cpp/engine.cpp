@@ -182,9 +182,31 @@ int main(int argc, char* argv[]) {
 
     // Print GPU profile report if profiling was enabled
     if (profile) {
-        // Place profile.html next to the GGUF file
-        auto profileDir = fs::path(gguf_path).parent_path();
-        auto profilePath = (profileDir / "profile.html").string();
+        // Derive model name from GGUF path (parent directory name)
+        auto modelName = fs::path(gguf_path).parent_path().filename().string();
+
+        // Place profile.html under gitignore/models/<model_name>/ in this repo
+        // Find repo root: walk up from executable looking for .gitignore
+        fs::path repoRoot;
+        auto exeDir = fs::path(argv[0]).parent_path();
+        if (exeDir.empty()) exeDir = fs::current_path();
+        for (auto p = fs::absolute(exeDir); !p.empty() && p != p.parent_path(); p = p.parent_path()) {
+            if (fs::exists(p / ".gitignore") && fs::exists(p / "engine")) {
+                repoRoot = p;
+                break;
+            }
+        }
+
+        std::string profilePath;
+        if (!repoRoot.empty()) {
+            auto profileDir = repoRoot / "gitignore" / "models" / modelName;
+            fs::create_directories(profileDir);
+            profilePath = (profileDir / "profile.html").string();
+        } else {
+            // Fallback: current directory
+            profilePath = "profile.html";
+        }
+
         model.printProfileReport(nDecode, (int)promptTokens.size(),
                                  (double)prefillMs, (double)decodeMs,
                                  profilePath);
