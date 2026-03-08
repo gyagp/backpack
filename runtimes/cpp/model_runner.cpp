@@ -738,7 +738,7 @@ void ModelRunner::initPrefillResources() {
     auto& kQ8M     = getKernel("q8_matmul_mma");
     auto& kDnSiluM = getKernel("q8_down_silu_add_mma");
     auto& kRopeB   = getKernel("rope_batched_simple");
-    auto& kCausal  = getKernel("causal_attn");
+    auto& kAttnMQ  = getKernel("flash_attn_mma");
 
     // Build bind groups (stable — buffer handles don't change)
     pfCache.layerBGs.resize(cfg.nLayer);
@@ -761,7 +761,7 @@ void ModelRunner::initPrefillResources() {
             {6, lw.qNorm}, {7, lw.kNorm},
             {8, pfCache.ropeParams[li]}});
 
-        bg.attn = makeBG(kCausal, {
+        bg.attn = makeBG(kAttnMQ, {
             {0, pfCache.pQRot}, {1, kvCache[li].K}, {2, kvCache[li].V},
             {3, pfCache.pAttn}, {4, pfCache.attnParams[li]}});
 
@@ -1083,7 +1083,7 @@ int32_t ModelRunner::prefillBatched(
     auto& kQ8M     = getKernel("q8_matmul_mma");
     auto& kDnSiluM = getKernel("q8_down_silu_add_mma");
     auto& kRopeB   = getKernel("rope_batched_simple");
-    auto& kCausal  = getKernel("causal_attn");
+    auto& kAttnMQ  = getKernel("flash_attn_mma");
 
     // MMA grid: (ceil(N/32), ceil(M/32)) where M=T
     const uint32_t MMA_TILE = 32u;
@@ -1098,7 +1098,7 @@ int32_t ModelRunner::prefillBatched(
             (qkvOutL + MMA_TILE - 1) / MMA_TILE, (T + MMA_TILE - 1) / MMA_TILE, 1, "pf_qkv"});
         allPrefill.push_back({kRopeB.pipeline,   bg.rope,
             cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"});
-        allPrefill.push_back({kCausal.pipeline,  bg.attn,     cfg.nHead, T, 1, "pf_attn"});
+        allPrefill.push_back({kAttnMQ.pipeline,  bg.attn,     cfg.nHead, (T + 3u) / 4u, 1, "pf_attn"});
         allPrefill.push_back({kQ8M.pipeline,     bg.oproj,
             (cfg.nEmbd + MMA_TILE - 1) / MMA_TILE, (T + MMA_TILE - 1) / MMA_TILE, 1, "pf_oproj"});
         allPrefill.push_back({kAddRmsB.pipeline, bg.addrms,   T, 1, 1, "pf_add_rms"});
