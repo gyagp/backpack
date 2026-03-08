@@ -602,6 +602,17 @@ void ModelRunner::buildDecodePipeline() {
     {
         auto& plArgmax = getKernel("argmax");
         argmaxResultBuf = gpu->createBuffer("argmax_result", 4);
+
+        // Double-buffered MAP_READ staging buffers for async readback
+        for (int i = 0; i < 2; i++) {
+            WGPUBufferDescriptor bd{};
+            bd.usage = BUF_MAP_READ | BUF_COPY_DST;
+            bd.size = 4;
+            char label[32];
+            snprintf(label, sizeof(label), "staging_%d", i);
+            bd.label = {label, (uint32_t)strlen(label)};
+            stagingBufs[i] = wgpuDeviceCreateBuffer(gpu->device, &bd);
+        }
         GPUBuffer argmaxParams;
         {
             uint32_t p[4] = {cfg.nVocab, 0, 0, 0};
@@ -714,24 +725,24 @@ int32_t ModelRunner::decodeArgmax(int32_t tokenId, uint32_t posOffset) {
 }
 
 void ModelRunner::decodeAutoregressive(uint32_t posOffset) {
-    // No CPU embedding upload needed — embed_gather reads from argmaxResultBuf
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
-    // Submit all dispatches: embed_gather + decode + argmax (no readback)
-    gpu->submitOnly(autoDecodeDispatches, true);
+    // Submit dispatches + copy argmax to staging buffer (ONE command buffer)
+    // Double-buffered: alternate between staging buffers 0 and 1
+    gpu->submitAndCopyAsync(autoDecodeDispatches,
+                             argmaxResultBuf, 4,
+                             stagingBufs[stagingIdx]);
 
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len++;
 }
 
 int32_t ModelRunner::readLastArgmax() {
-    // Wait for GPU to finish, then copy argmax result to a readback buffer
-    gpu->waitForQueue();
-
-    auto result = gpu->readBuffer(argmaxResultBuf, 4);
-    int32_t token;
-    memcpy(&token, result.data(), 4);
+    // Wait for the staging buffer map to complete and read the result
+    int32_t token = gpu->completeAsyncMapI32(stagingBufs[stagingIdx]);
+    // Flip to the other staging buffer for next token
+    stagingIdx ^= 1;
     return token;
 }
 

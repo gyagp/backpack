@@ -134,6 +134,16 @@ struct GPUContext {
         GPUBuffer src, uint64_t readSize,
         GPUProfiler& profiler);
 
+    /// Submit dispatches + copy src to a staging buffer in ONE command buffer.
+    /// Then start async map on the staging buffer (non-blocking).
+    /// Call completeAsyncMap() later to get the result.
+    void submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
+                            GPUBuffer src, uint64_t readSize,
+                            WGPUBuffer stagingBuf);
+
+    /// Wait for a previously started async map and read the data.
+    int32_t completeAsyncMapI32(WGPUBuffer stagingBuf);
+
     /// Block until all submitted GPU work completes.
     void waitForQueue();
 
@@ -146,4 +156,7 @@ private:
     uint64_t   readbackBufSize_ = 0;
 
     WGPUBuffer getOrCreateReadbackBuf(uint64_t size);
+
+    // Pending async map future (for double-buffered readback)
+    WGPUFuture pendingMapFuture_{};
 };

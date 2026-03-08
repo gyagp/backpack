@@ -49,8 +49,12 @@ struct ModelRunner {
 
     // GPU argmax + embedding gather (for zero-readback decode)
     GPUBuffer argmaxResultBuf;
-    GPUBuffer embeddingGpuBuf;     // full embedding table on GPU (fp32)
-    std::vector<Dispatch> autoDecodeDispatches;  // embed_gather + full decode  // single i32
+    GPUBuffer embeddingGpuBuf;
+    std::vector<Dispatch> autoDecodeDispatches;
+
+    // Double-buffered readback staging
+    WGPUBuffer stagingBufs[2] = {nullptr, nullptr};
+    int stagingIdx = 0;  // alternates 0/1  // single i32
 
     // Embedding (CPU-side)
     std::vector<float> embeddingCPU;

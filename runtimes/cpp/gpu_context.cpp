@@ -490,6 +490,50 @@ std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
     return out;
 }
 
+void GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
+                                     GPUBuffer src, uint64_t readSize,
+                                     WGPUBuffer stagingBuf) {
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
+
+    WGPUComputePassDescriptor cpD{};
+    auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+    for (auto& d : dispatches) {
+        wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+    }
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+
+    wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, 0,
+                                          stagingBuf, 0, readSize);
+
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(queue, 1, &cb);
+    wgpuCommandEncoderRelease(enc);
+    wgpuCommandBufferRelease(cb);
+
+    // Start async map (non-blocking until WaitAny is called)
+    WGPUBufferMapCallbackInfo mcb{};
+    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
+    mcb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void*, void*) {};
+    pendingMapFuture_ = wgpuBufferMapAsync(stagingBuf, 1, 0, readSize, mcb);
+}
+
+int32_t GPUContext::completeAsyncMapI32(WGPUBuffer stagingBuf) {
+    // Wait for the pending map to complete
+    WGPUFutureWaitInfo fw{pendingMapFuture_, 0};
+    wgpuInstanceWaitAny(instance, 1, &fw, UINT64_MAX);
+
+    int32_t val = 0;
+    auto ptr = wgpuBufferGetConstMappedRange(stagingBuf, 0, 4);
+    if (ptr) memcpy(&val, ptr, 4);
+    wgpuBufferUnmap(stagingBuf);
+    return val;
+}
+
 void GPUContext::waitForQueue() {
     struct { bool done; } s{false};
     WGPUBufferMapCallbackInfo cb{};  // same struct layout as QueueWorkDoneCallbackInfo
