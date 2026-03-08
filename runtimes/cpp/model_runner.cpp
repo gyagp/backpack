@@ -870,9 +870,12 @@ std::vector<float> ModelRunner::prefillFinish(int32_t tokenId, uint32_t posOffse
 
 std::vector<float> ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
-    // For T=1, use the proven serial decode path
-    if (T == 1) {
-        return decode(tokenIds[0], posOffset);
+    // For small T, serial path is faster (avoids buffer allocation overhead)
+    if (T <= 16) {
+        if (T == 1) return decode(tokenIds[0], posOffset);
+        for (uint32_t t = 0; t + 1 < T; t++)
+            prefillStep(tokenIds[t], posOffset + t);
+        return prefillFinish(tokenIds[T - 1], posOffset + T - 1);
     }
 
     // ── True batched prefill for T>1 ─────────────────────────────────
@@ -908,9 +911,6 @@ std::vector<float> ModelRunner::prefillBatched(
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
     auto& kQ8B     = getKernel("q8_matmul_batched");
     auto& kDnSiluB = getKernel("q8_down_silu_add_batched");
-    auto& kRope    = getKernel("fused_qknorm_rope");
-    auto& kAttnP1  = getKernel("gqa_chunked_pass1");
-    auto& kAttnP2  = getKernel("gqa_chunked_pass2");
 
     // Batched params
     auto mkP = [&](const std::string& n, uint32_t a, uint32_t b, uint32_t c, uint32_t d = 0) {
@@ -932,11 +932,7 @@ std::vector<float> ModelRunner::prefillBatched(
         gpu->writeBuffer(pRmsP, d, 16);
     }
 
-    // Per-token RoPE param buffer (reused)
-    GPUBuffer pRopeP = gpu->createBuffer("pp_rope", 32);
-
     uint32_t cacheLen = kvCache[0].len;
-    uint32_t maxChunks = (maxSeqLen + gqaChunkSize - 1) / gqaChunkSize;
 
     // ── Per-layer processing ─────────────────────────────────────────
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
@@ -962,79 +958,55 @@ std::vector<float> ModelRunner::prefillBatched(
             gpu->submitOnly(d, true);
         }
 
-        // 3. Per-token RoPE + KV scatter + attention (serial)
-        for (uint32_t t = 0; t < T; t++) {
-            uint32_t pos = posOffset + t;
-            uint32_t cl = cacheLen + t;
+        // 3. Batched RoPE + KV scatter (single dispatch for all T tokens)
+        {
+            uint32_t ropeP[8] = {};
+            ropeP[0] = cfg.nHead;
+            ropeP[1] = qDimL;
+            ropeP[2] = kvDimL;
+            ropeP[3] = posOffset;
+            ropeP[4] = cfg.headDim / 2;
+            ropeP[5] = cacheLen;
+            float eps_f = cfg.rmsNormEps;
+            memcpy(&ropeP[6], &eps_f, 4);
+            ropeP[7] = cfg.nKvHeads;
+            auto pRP = gpu->createBuffer("pp_rope_L" + std::to_string(li), 32);
+            gpu->writeBuffer(pRP, ropeP, 32);
 
-            // Set up RoPE params
-            auto* rp = reinterpret_cast<int32_t*>(ropeParamData.data());
-            rp[3] = pos;
-            rp[5] = cl * cfg.nKvHeads * cfg.headDim;
-            gpu->writeBuffer(pRopeP, ropeParamData.data(), 32);
+            auto& kRopeB = getKernel("rope_batched_simple");
+            auto bg = makeBG(kRopeB, {
+                {0, pQkv}, {1, pQRot},
+                {2, kvCache[li].K}, {3, kvCache[li].V},
+                {4, ropeCosBuf}, {5, ropeSinBuf},
+                {6, lw.qNorm}, {7, lw.kNorm},
+                {8, pRP}});
+            std::vector<Dispatch> d = {{kRopeB.pipeline, bg,
+                cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"}};
+            gpu->submitOnly(d, true);
+        }
 
-            // Copy row t of pQkv → qkvBuf (T=1)
-            {
-                WGPUCommandEncoderDescriptor enD{};
-                auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-                wgpuCommandEncoderCopyBufferToBuffer(enc,
-                    pQkv.handle, (uint64_t)t * qkvOutL * 4,
-                    qkvBuf.handle, 0, qkvOutL * 4);
-                WGPUCommandBufferDescriptor cbD{};
-                auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-                wgpuQueueSubmit(gpu->queue, 1, &cb);
-                wgpuCommandEncoderRelease(enc);
-                wgpuCommandBufferRelease(cb);
-            }
+        // 3b. Batched causal attention (all T queries at once)
+        {
+            uint32_t T_total = cacheLen + T;
+            uint32_t ap[8] = {};
+            ap[0] = cfg.nKvHeads * cfg.headDim;   // kv_stride
+            ap[1] = cfg.nHead / cfg.nKvHeads;     // n_rep
+            ap[2] = T_total;
+            ap[3] = cacheLen;                      // cache_offset
+            float sc = 1.0f / sqrtf((float)cfg.headDim);
+            float ni = -1e9f;
+            memcpy(&ap[5], &sc, 4);
+            memcpy(&ap[6], &ni, 4);
+            auto pAP = gpu->createBuffer("pp_attn_L" + std::to_string(li), 32);
+            gpu->writeBuffer(pAP, ap, 32);
 
-            // RoPE (T=1 kernel: qkvBuf → qRotBuf + KV cache)
-            {
-                auto bg = makeBG(kRope, {
-                    {0, qkvBuf}, {1, qRotBuf},
-                    {2, kvCache[li].K}, {3, kvCache[li].V},
-                    {4, ropeCosBuf}, {5, ropeSinBuf},
-                    {6, lw.qNorm}, {7, lw.kNorm},
-                    {8, pRopeP}});
-                std::vector<Dispatch> d = {{kRope.pipeline, bg,
-                    cfg.nHead + cfg.nKvHeads, 1, 1, "pf_rope"}};
-                gpu->submitOnly(d, true);
-            }
-
-            // Attention (T=1: chunked GQA using decode kernel)
-            {
-                uint32_t T_total = cl + 1;
-                uint32_t nch = (T_total + gqaChunkSize - 1) / gqaChunkSize;
-
-                auto* cp = reinterpret_cast<uint32_t*>(chunkedAttnParamData.data());
-                cp[2] = T_total;
-                cp[4] = nch;
-                gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
-
-                auto bg1 = makeBG(kAttnP1, {
-                    {0, qRotBuf}, {1, kvCache[li].K}, {2, kvCache[li].V},
-                    {3, attnPartialsBuf}, {4, chunkedAttnParamsBuf}});
-                auto bg2 = makeBG(kAttnP2, {
-                    {0, attnPartialsBuf}, {1, attnOutBuf},
-                    {2, chunkedAttnParamsBuf}});
-                std::vector<Dispatch> d = {
-                    {kAttnP1.pipeline, bg1, cfg.nHead, maxChunks, 1, "pf_attn1"},
-                    {kAttnP2.pipeline, bg2, cfg.nHead, 1, 1, "pf_attn2"}};
-                gpu->submitOnly(d, true);
-            }
-
-            // Copy attnOutBuf → row t of pAttn
-            {
-                WGPUCommandEncoderDescriptor enD{};
-                auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-                wgpuCommandEncoderCopyBufferToBuffer(enc,
-                    attnOutBuf.handle, 0,
-                    pAttn.handle, (uint64_t)t * qDimL * 4, qDimL * 4);
-                WGPUCommandBufferDescriptor cbD{};
-                auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-                wgpuQueueSubmit(gpu->queue, 1, &cb);
-                wgpuCommandEncoderRelease(enc);
-                wgpuCommandBufferRelease(cb);
-            }
+            auto& kCausal = getKernel("causal_attn");
+            auto bg = makeBG(kCausal, {
+                {0, pQRot}, {1, kvCache[li].K}, {2, kvCache[li].V},
+                {3, pAttn}, {4, pAP}});
+            std::vector<Dispatch> d = {{kCausal.pipeline, bg,
+                cfg.nHead, T, 1, "pf_attn"}};
+            gpu->submitOnly(d, true);
         }
 
         // 4. Batched O projection: pAttn[T×qD] × W → pProj[T×E]
