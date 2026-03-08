@@ -1,0 +1,680 @@
+"""
+Shared utilities for WebGPU model inference.
+
+Provides:
+  - add_device_arg() / apply_device_arg(): GPU device selection via --device
+  - _parse_safetensors(): parse safetensors files into numpy arrays
+  - load_weights(): load weights from npz files
+  - download_weights(): generic HuggingFace weight downloader
+  - load_tokenizer(): load tokenizer from tokenizer.json
+  - generate(): unified text generation with prefill/decode timing
+"""
+import os
+import sys
+import time
+import json
+import struct
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# GPU device selection
+# ---------------------------------------------------------------------------
+
+def add_device_arg(parser):
+    """Add --device and --backend arguments for GPU and backend selection.
+
+    --device: high (discrete, default), low (integrated)
+    --backend: d3d12 (default on Windows), vulkan, metal
+    """
+    parser.add_argument("--device", type=str, default=None,
+                        choices=["high", "low"],
+                        help="GPU: high (discrete, default), low (integrated)")
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=["d3d12", "vulkan", "d3d11", "metal"],
+                        help="GPU backend: d3d12 (default/Windows), vulkan, metal")
+
+
+def apply_device_arg(args):
+    """Set DAWN_GPU and DAWN_BACKEND env vars. Call BEFORE creating model."""
+    if getattr(args, 'device', None) is not None:
+        os.environ["DAWN_GPU"] = args.device
+    if getattr(args, 'backend', None) is not None:
+        os.environ["DAWN_BACKEND"] = args.backend
+
+
+def add_perf_args(parser):
+    """Add standard performance measurement args to an argparse parser.
+
+    Adds:
+      -pl / --prompt-length: number of prompt tokens (for perf measurement)
+      -gl / --gen-length:    number of tokens to generate (for perf measurement)
+
+    When both are specified, generate() uses a fixed dummy prompt of exactly
+    `prompt_length` tokens and generates exactly `gen_length` tokens with
+    greedy decoding (temperature=0).  This provides deterministic,
+    reproducible performance measurements independent of prompt content.
+    """
+    parser.add_argument("-pl", "--prompt-length", type=int, default=None,
+                        help="Prompt length in tokens (perf measurement mode)")
+    parser.add_argument("-gl", "--gen-length", type=int, default=None,
+                        help="Generation length in tokens (perf measurement mode)")
+
+
+def add_common_args(parser, default_prompt="The future of AI is"):
+    """Add all standard args shared by LLM models.
+
+    Adds: --prompt, --max-tokens, --temperature, --verify, --weights-dir,
+          --profile, --device, -pl, -gl
+
+    Model-specific args (--model, --quantize, --decode-mode, --gguf-file,
+    etc.) should be added separately in each model's main().
+    """
+    parser.add_argument("--verify", action="store_true",
+                        help="Verify pipeline with random weights")
+    parser.add_argument("--prompt", type=str, default=default_prompt,
+                        help="Prompt for text generation")
+    parser.add_argument("--max-tokens", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--weights-dir", type=str, default=None)
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling")
+    add_device_arg(parser)
+    add_perf_args(parser)
+
+
+def run_inference(model, args, tokenizer, model_name: str = None,
+                  script_dir: str = None):
+    """Run text generation with profiling/perf measurement support.
+
+    Handles the common post-model-creation sequence:
+      1. Enable profiling if --profile
+      2. Warm up fast decode pipeline if available
+      3. Call generate() with all common args
+      4. Save profile report if --profile
+
+    Args:
+        model: WebGPUModel instance (already created)
+        args: parsed argparse.Namespace with common args
+        tokenizer: loaded tokenizer
+        model_name: name for profile report (e.g. "Qwen3-1.7B")
+        script_dir: directory for profile output (model's _SCRIPT_DIR)
+    """
+    if getattr(args, 'profile', False):
+        model.enable_profiling()
+        print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+
+    # Warmup fast decode before generating (if available)
+    if hasattr(model, '_warmup_fast_decode'):
+        model._warmup_fast_decode()
+
+    generate(model, args.prompt, tokenizer,
+             max_tokens=args.max_tokens,
+             temperature=args.temperature,
+             prompt_length=getattr(args, 'prompt_length', None),
+             gen_length=getattr(args, 'gen_length', None))
+
+    if getattr(args, 'profile', False) and model_name and script_dir:
+        model.save_profile(script_dir, model_name)
+
+
+# ---------------------------------------------------------------------------
+# Safetensors parsing
+# ---------------------------------------------------------------------------
+
+def _parse_safetensors(path: str) -> Dict[str, np.ndarray]:
+    """Parse a safetensors file into a dict of numpy arrays."""
+    DTYPE_MAP = {
+        "F32": (np.float32, 4),
+        "F16": (np.float16, 2),
+        "BF16": (np.float16, 2),  # will be converted
+        "I32": (np.int32, 4),
+        "I64": (np.int64, 8),
+        "U8": (np.uint8, 1),
+    }
+
+    with open(path, "rb") as f:
+        header_size = struct.unpack("<Q", f.read(8))[0]
+        header_json = f.read(header_size).decode("utf-8")
+        header = json.loads(header_json)
+        data_start = 8 + header_size
+
+        tensors = {}
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            dtype_str = meta["dtype"]
+            shape = meta["shape"]
+            offsets = meta["data_offsets"]
+            start, end = offsets
+
+            np_dtype, elem_size = DTYPE_MAP.get(dtype_str, (np.float32, 4))
+            f.seek(data_start + start)
+            raw = f.read(end - start)
+
+            if dtype_str == "BF16":
+                bf16 = np.frombuffer(raw, dtype=np.uint16)
+                f32 = np.zeros(len(bf16), dtype=np.float32)
+                f32_view = f32.view(np.uint32)
+                f32_view[:] = bf16.astype(np.uint32) << 16
+                tensors[name] = f32.reshape(shape)
+            else:
+                tensors[name] = np.frombuffer(raw, dtype=np_dtype).reshape(
+                    shape).copy()
+
+        return tensors
+
+
+def load_weights(path: str) -> Dict[str, np.ndarray]:
+    """Load weights from npz file (memory-mapped for fast startup)."""
+    data = np.load(path, mmap_mode='r')
+    return {k: data[k].astype(np.float32) for k in data.files}
+
+
+def load_weights_mmap(path: str) -> Dict[str, np.ndarray]:
+    """Load weights from npz via memory-mapping for fast startup.
+
+    Memory-mapping avoids reading the entire file into RAM upfront.
+    Instead, pages are loaded on-demand as weights are accessed (e.g.,
+    during GPU upload).  This can reduce weight loading time from
+    seconds to near-instant for large models (10–20 GB).
+
+    The returned arrays are read-only memory-mapped views.  They must
+    be copied before modification (e.g., quantization, dtype cast).
+    GPU upload (wgpuQueueWriteBuffer) reads directly from the mapped
+    pages, so the OS page cache provides the I/O.
+
+    Usage:
+        weights = load_weights_mmap("weights_q4.npz")
+        # weights[k] is a read-only mmap view — fast to iterate
+        model = Model(weights)  # GPU upload reads from mmap on demand
+
+    Falls back to regular np.load if mmap is not supported (e.g.,
+    compressed npz).
+    """
+    try:
+        data = np.load(path, mmap_mode='r')
+        return {k: data[k] for k in data.files}
+    except ValueError:
+        # Compressed npz doesn't support mmap — fall back to regular load
+        data = np.load(path)
+        return {k: data[k] for k in data.files}
+
+
+# ---------------------------------------------------------------------------
+# Weight downloading
+# ---------------------------------------------------------------------------
+
+def _download_tokenizer(hf_repo: str, tokenizer_path: str, headers: dict = None):
+    """Download tokenizer.json from HuggingFace."""
+    import requests
+    if headers is None:
+        headers = {}
+    base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
+    tok_url = f"{base_url}/tokenizer.json"
+    print(f"Downloading tokenizer from {hf_repo}...")
+    resp = requests.get(tok_url, headers=headers)
+    resp.raise_for_status()
+    with open(tokenizer_path, 'wb') as f:
+        f.write(resp.content)
+    print(f"  Saved tokenizer to {tokenizer_path}")
+
+
+def download_weights(hf_repo: str, model_dir: str,
+                     safetensors_files: list = None,
+                     key_transform=None,
+                     download_tokenizer: bool = True) -> Tuple[str, Optional[str]]:
+    """Download model weights from HuggingFace and convert to npz.
+
+    Skips download entirely if converted weights already exist (weights.npz
+    or weights_q4.npz). Original safetensors are NOT required once converted.
+
+    Args:
+        hf_repo: HuggingFace repo ID (e.g. "openai-community/gpt2")
+        model_dir: local directory for caching files
+        safetensors_files: list of safetensors filenames to download
+                          (default: ["model.safetensors"])
+        key_transform: function(key, arr) -> (new_key, new_arr) or None
+                       to rename/transform weights. Return None to skip a key.
+        download_tokenizer: whether to download tokenizer.json
+
+    Returns:
+        (npz_path, tokenizer_path) — tokenizer_path is None if not downloaded
+    """
+    os.makedirs(model_dir, exist_ok=True)
+    npz_path = os.path.join(model_dir, "weights.npz")
+    q4_path = os.path.join(model_dir, "weights_q4.npz")
+    tokenizer_path = os.path.join(model_dir, "tokenizer.json") \
+        if download_tokenizer else None
+
+    # Skip download if ANY converted weights exist in the directory
+    # (handles renamed files like gpt2_weights.npz, whisper_*_fp16.npz, etc.)
+    existing_npz = [f for f in os.listdir(model_dir) if f.endswith('.npz')] \
+        if os.path.isdir(model_dir) else []
+    if os.path.exists(npz_path) or os.path.exists(q4_path) or existing_npz:
+        found = npz_path if os.path.exists(npz_path) else \
+                q4_path if os.path.exists(q4_path) else \
+                os.path.join(model_dir, existing_npz[0])
+        print(f"Weights already cached at {found}")
+        if download_tokenizer and tokenizer_path and not os.path.exists(tokenizer_path):
+            _download_tokenizer(hf_repo, tokenizer_path)
+        elif download_tokenizer and tokenizer_path:
+            print(f"Tokenizer already cached at {tokenizer_path}")
+        return npz_path, tokenizer_path
+
+    import requests
+    base_url = f"https://huggingface.co/{hf_repo}/resolve/main"
+
+    # Build auth headers if HF token is available
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
+        "HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        token_file = os.path.join(
+            os.path.expanduser("~"), ".cache", "huggingface", "token")
+        if os.path.exists(token_file):
+            with open(token_file) as f:
+                hf_token = f.read().strip()
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    # Download tokenizer
+    if download_tokenizer:
+        if os.path.exists(tokenizer_path):
+            print(f"Tokenizer already cached at {tokenizer_path}")
+        else:
+            _download_tokenizer(hf_repo, tokenizer_path, headers)
+
+    if safetensors_files is None:
+        safetensors_files = ["model.safetensors"]
+
+    print(f"Downloading weights from {hf_repo}...")
+
+    # Download safetensors files
+    all_weights = {}
+    for st_file in safetensors_files:
+        st_path = os.path.join(model_dir, st_file)
+        if os.path.exists(st_path):
+            # Validate file size via HEAD request to detect partial downloads
+            try:
+                head_resp = requests.head(
+                    f"{base_url}/{st_file}", headers=headers,
+                    allow_redirects=True, timeout=10)
+                expected_size = int(head_resp.headers.get('content-length', 0))
+                actual_size = os.path.getsize(st_path)
+                if expected_size and actual_size < expected_size:
+                    print(f"  {st_file} incomplete ({actual_size // (1024*1024)}MB / "
+                          f"{expected_size // (1024*1024)}MB), re-downloading...")
+                    os.remove(st_path)
+                else:
+                    print(f"  {st_file} already cached")
+            except Exception:
+                print(f"  {st_file} already cached (size check skipped)")
+        if not os.path.exists(st_path):
+            st_url = f"{base_url}/{st_file}"
+            print(f"  Downloading {st_file}...")
+            resp = requests.get(st_url, headers=headers, stream=True)
+            resp.raise_for_status()
+            total = int(resp.headers.get('content-length', 0))
+            downloaded = 0
+            with open(st_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded * 100 // total
+                        print(f"\r  Progress: {pct}% "
+                              f"({downloaded // (1024*1024)}MB / "
+                              f"{total // (1024*1024)}MB)",
+                              end="", flush=True)
+            print()
+
+        print(f"  Parsing {st_file}...")
+        weights = _parse_safetensors(st_path)
+        all_weights.update(weights)
+
+    # Apply key transformation
+    renamed = {}
+    for key, arr in all_weights.items():
+        val = arr.astype(np.float32)
+        if key_transform is not None:
+            result = key_transform(key, val)
+            if result is None:
+                continue
+            new_key, val = result
+        else:
+            new_key = key
+        renamed[new_key] = val
+
+    print(f"  Loaded {len(renamed)} tensors")
+    np.savez(npz_path, **renamed)
+    print(f"  Saved to {npz_path}")
+    return npz_path, tokenizer_path
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
+
+def load_tokenizer(tokenizer_path: str):
+    """Load tokenizer from tokenizer.json.
+
+    Tries the `tokenizers` library first, then `transformers`.
+    Returns an object with encode() and decode() methods.
+    """
+    try:
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(tokenizer_path)
+
+        class TokenizerWrapper:
+            def __init__(self, tok):
+                self._tok = tok
+
+            def encode(self, text):
+                return self._tok.encode(text).ids
+
+            def decode(self, ids):
+                return self._tok.decode(ids)
+
+        return TokenizerWrapper(tok)
+    except ImportError:
+        pass
+
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(
+            os.path.dirname(tokenizer_path))
+        return tok
+    except ImportError:
+        pass
+
+    print("WARNING: No tokenizer library available. "
+          "Install 'tokenizers' or 'transformers'.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Text generation
+# ---------------------------------------------------------------------------
+
+def generate(model, prompt: str, tokenizer=None,
+             max_tokens: int = 50,
+             temperature: float = 0.8, top_k: int = 40,
+             prompt_length: int = None,
+             gen_length: int = None) -> str:
+    """Generate text from a prompt using a WebGPU model.
+
+    Uses KV-cache for incremental decoding with separate
+    prefill/decode performance reporting.
+
+    Performance measurement mode:
+        When prompt_length and gen_length are both set, uses a fixed
+        dummy prompt of exactly prompt_length tokens and generates
+        exactly gen_length tokens with greedy decoding (temperature=0).
+        This provides deterministic, reproducible measurements.
+
+    Args:
+        model: WebGPUModel subclass with forward() method
+        prompt: input text prompt
+        tokenizer: tokenizer with encode()/decode() methods
+                   If None, uses tiktoken gpt2 encoding (GPT-2 compat)
+        max_tokens: number of tokens to generate
+        temperature: sampling temperature
+        top_k: top-k sampling parameter
+        prompt_length: if set, override prompt with dummy tokens of this length
+        gen_length: if set, override max_tokens with this value
+
+    Returns:
+        generated text string
+    """
+    # Performance measurement mode: fixed prompt + greedy decode
+    perf_mode = (prompt_length is not None and gen_length is not None)
+    if perf_mode:
+        max_tokens = gen_length
+        temperature = 0  # greedy — deterministic
+
+    if tokenizer is not None:
+        tokens = tokenizer.encode(prompt)
+        dec_fn = lambda ids: tokenizer.decode(ids)
+        dec_one = lambda t: tokenizer.decode([t])
+    else:
+        # Fallback: try tiktoken for GPT-2
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("gpt2")
+            tokens = enc.encode(prompt)
+            dec_fn = lambda ids: enc.decode(ids)
+            dec_one = lambda t: enc.decode([t])
+        except ImportError:
+            tokens = [ord(c) for c in prompt]
+            dec_fn = lambda ids: "".join(
+                chr(t) if t < 128 else "?" for t in ids)
+            dec_one = lambda t: chr(t) if t < 128 else "?"
+
+    token_ids = np.array(tokens, dtype=np.int32)
+
+    # Performance measurement mode: pad/truncate prompt to exact length
+    if perf_mode and prompt_length is not None:
+        if len(token_ids) < prompt_length:
+            # Repeat tokens to fill prompt_length
+            repeats = (prompt_length + len(token_ids) - 1) // len(token_ids)
+            token_ids = np.tile(token_ids, repeats)[:prompt_length]
+        elif len(token_ids) > prompt_length:
+            token_ids = token_ids[:prompt_length]
+        token_ids = token_ids.astype(np.int32)
+
+    generated = list(token_ids.tolist())
+
+    if perf_mode:
+        print(f"\n[Perf mode] prompt_length={len(token_ids)}, "
+              f"gen_length={max_tokens}, greedy decoding")
+    else:
+        print(f"\nPrompt: {prompt}")
+        print(f"Generating {max_tokens} tokens...\n")
+        print(prompt, end="", flush=True)
+
+    # Profiler hooks (if available)
+    _p = hasattr(model, 'profiler') and model.profiler and model.profiler.enabled
+    _cpu = model.profiler._cpu if _p else None
+
+    # Reset KV cache
+    model.kv_cache = None
+    if hasattr(model, '_gpu_kv_cache'):
+        for layer in model._gpu_kv_cache:
+            k, v, _ = model._gpu_kv_cache[layer]
+            model._gpu_kv_cache[layer] = (k, v, 0)
+
+    # Prefill timer starts here (TTFT = time to first token)
+    prefill_start = time.perf_counter()
+
+    # Prefill: process full prompt, populate KV cache
+    if _p: _cpu.begin("prefill")
+    if _p: _cpu.begin("prefill/forward")
+    logits = model.forward(token_ids, use_cache=True, pos_offset=0)
+    if _p: _cpu.end("prefill/forward")
+    if _p: _cpu.end("prefill")
+    next_logits = logits[-1, :]
+
+    # Warm up fast decode pipeline (if available)
+    if hasattr(model, '_warmup_fast_decode'):
+        model._warmup_fast_decode()
+
+    _token_buf = np.empty(1, dtype=np.int32)  # reusable buffer
+    decode_tokens = 0
+    decode_start = None
+    for step in range(max_tokens):
+        if _p: _cpu.begin(f"decode_{step}")
+        if step > 0:
+            if _p: _cpu.begin(f"decode_{step}/forward")
+            if _p: _cpu.begin(f"decode_{step}/forward/embed")
+            _token_buf[0] = generated[-1]
+            if _p: _cpu.end(f"decode_{step}/forward/embed")
+            logits = model.forward(
+                _token_buf, use_cache=True,
+                pos_offset=len(generated) - 1)
+            next_logits = logits[-1, :]
+            if _p: _cpu.end(f"decode_{step}/forward")
+
+        # Top-k sampling: only compute softmax on top-k logits
+        if _p: _cpu.begin(f"decode_{step}/sampling")
+        if top_k > 0 and temperature > 0:
+            top_k_idx = np.argpartition(next_logits, -top_k)[-top_k:]
+            top_k_vals = next_logits[top_k_idx] / temperature
+            top_k_vals -= top_k_vals.max()
+            top_k_probs = np.exp(top_k_vals)
+            top_k_probs /= top_k_probs.sum()
+            next_token = top_k_idx[np.random.choice(top_k, p=top_k_probs)]
+        elif temperature > 0:
+            next_logits = next_logits / temperature
+            next_logits -= next_logits.max()
+            probs = np.exp(next_logits)
+            probs /= probs.sum()
+            next_token = np.random.choice(len(probs), p=probs)
+        else:
+            next_token = next_logits.argmax()
+        generated.append(int(next_token))
+        if _p: _cpu.end(f"decode_{step}/sampling")
+
+        # Decode and print
+        if not perf_mode:
+            print(dec_one(int(next_token)), end="", flush=True)
+        if _p: _cpu.end(f"decode_{step}")
+
+        # After the 1st token is output, mark end of prefill / start of decode
+        if step == 0:
+            prefill_end = time.perf_counter()
+            decode_start = time.perf_counter()
+        else:
+            decode_tokens += 1
+
+    decode_end = time.perf_counter()
+
+    prefill_ms = (prefill_end - prefill_start) * 1000
+    decode_ms = (decode_end - decode_start) * 1000 if decode_start else 0
+    total_ms = (decode_end - prefill_start) * 1000
+    prompt_len = len(token_ids)
+    decode_tps = decode_tokens / (decode_ms / 1000) if decode_ms > 0 else 0
+    overall_tps = (prompt_len + max_tokens) / (total_ms / 1000) \
+        if total_ms > 0 else 0
+    print(f"\n--- Performance ---")
+    print(f"  Prefill (TTFT): {prefill_ms:.1f}ms "
+          f"({prompt_len} prompt + 1st token)")
+    print(f"  Decode:  {decode_tokens} tokens in {decode_ms:.1f}ms "
+          f"({decode_tps:.1f} tok/s)")
+    print(f"  Total:   {prompt_len + max_tokens} tokens in {total_ms:.1f}ms "
+          f"({overall_tps:.1f} tok/s)")
+
+    return dec_fn(generated)
+
+
+# ---------------------------------------------------------------------------
+# Common profiling
+# ---------------------------------------------------------------------------
+
+def profile_model(model, prompt: str, tokenizer,
+                  script_dir: str, model_name: str,
+                  max_tokens: int = 10,
+                  temperature: float = 0.0,
+                  init_timestamps: list = None,
+                  extra_reset=None):
+    """Run a profiled inference session and generate HTML timeline.
+
+    This is the common profiling path for all models. It:
+    1. Enables profiling with GPU timestamps
+    2. Injects pre-recorded init phase events (imports, weight loading, etc.)
+    3. Runs a warmup forward pass (recorded in timeline)
+    4. Profiles prefill + N decode steps with per-step scoping
+    5. Generates HTML flamechart report
+
+    Args:
+        model: WebGPUModel subclass with forward() method
+        prompt: text prompt to generate from
+        tokenizer: tokenizer with encode()/decode() methods
+        script_dir: model's script directory (for saving profile.html)
+        model_name: human-readable name (e.g., "Phi-4 mini", "Qwen3.5-27B")
+        max_tokens: number of tokens to generate (profile uses min(this, 10))
+        temperature: sampling temperature (0.0 = greedy)
+        init_timestamps: list of (name, begin_ns, end_ns[, scope]) tuples
+                         for pre-profiler events (imports, weight_loading, etc.)
+        extra_reset: optional callable to reset model-specific state (e.g., SSM)
+    """
+    model.enable_profiling()
+    print(f"Profiling enabled (GPU timestamps: {model.profiler.gpu_enabled})")
+
+    # Inject pre-recorded init timeline events
+    if init_timestamps:
+        model.profiler.inject_init_events(init_timestamps)
+    if hasattr(model, '_init_phases'):
+        model.profiler.inject_init_events(model._init_phases)
+
+    # Tokenize
+    tokens = tokenizer.encode(prompt)
+    token_ids = np.array(tokens, dtype=np.int32)
+
+    # Reset caches
+    model.kv_cache = None
+    if hasattr(model, '_gpu_kv_cache'):
+        for layer in model._gpu_kv_cache:
+            k, v, _ = model._gpu_kv_cache[layer]
+            model._gpu_kv_cache[layer] = (k, v, 0)
+    if extra_reset:
+        extra_reset()
+
+    # Warmup (recorded in timeline)
+    with model.profiler.cpu("warmup"):
+        if hasattr(model, 'warmup'):
+            model.warmup()
+        else:
+            model.forward(np.array([1], dtype=np.int32),
+                          use_cache=True, pos_offset=0)
+            model.kv_cache = None
+            if hasattr(model, '_gpu_kv_cache'):
+                for layer in model._gpu_kv_cache:
+                    k, v, _ = model._gpu_kv_cache[layer]
+                    model._gpu_kv_cache[layer] = (k, v, 0)
+            if extra_reset:
+                extra_reset()
+
+    # Prefill
+    print("\n--- Prefill Breakdown ---")
+    t0 = time.perf_counter()
+    with model.profiler.step("prefill"):
+        logits = model.forward(token_ids, use_cache=True, pos_offset=0)
+    t1 = time.perf_counter()
+    print(f"  Forward pass:       {(t1 - t0)*1000:.1f}ms")
+
+    # Fast decode init (if available)
+    t2 = time.perf_counter()
+    with model.profiler.cpu("fast_decode_init"):
+        if hasattr(model, '_warmup_fast_decode'):
+            model._warmup_fast_decode()
+    t3 = time.perf_counter()
+    print(f"  Fast decode init:   {(t3 - t2)*1000:.1f}ms")
+    print(f"  Total TTFT:         {(t3 - t0)*1000:.1f}ms")
+
+    # Decode
+    n_profile = min(max_tokens, 10)
+    generated = list(tokens)
+    next_logits = logits[-1, :].copy()
+    for step in range(n_profile):
+        if temperature > 0:
+            next_logits = next_logits / temperature
+            next_logits -= next_logits.max()
+            probs = np.exp(next_logits)
+            probs /= probs.sum()
+            next_token = int(np.random.choice(len(probs), p=probs))
+        else:
+            next_token = int(next_logits.argmax())
+        generated.append(next_token)
+
+        with model.profiler.step(f"decode_{step}"):
+            with model.profiler.scope("forward"):
+                logits = model.forward(
+                    np.array([next_token], dtype=np.int32),
+                    use_cache=True,
+                    pos_offset=len(generated) - 1)
+            with model.profiler.cpu("sampling"):
+                next_logits = logits[-1, :].copy()
+
+    model.save_profile(script_dir, model_name)

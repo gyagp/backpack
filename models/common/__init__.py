@@ -1,16 +1,10 @@
-"""Shared WebGPU inference infrastructure.
+"""Compatibility shim: models/common/ -> runtimes/python/common/ + compiler/
 
-Re-exports the most commonly used classes and functions so model files can do:
-    from common import WebGPUModel, GPUBuffer, load_weights, generate, ...
+Legacy per-model scripts import 'from common.model_base import ...'.
+This package proxies those imports to the new canonical locations.
 """
-from common.model_base import WebGPUModel, KernelCache, _next_pow2
-from common.utils import (
-    _parse_safetensors, load_weights, download_weights,
-    load_tokenizer, generate,
-)
-
-# Re-export GPUBuffer from the Dawn runner (used by some models directly)
-try:
-    from triton.backends.webgpu.dawn_runner import GPUBuffer
-except ImportError:
-    pass
+import sys, os
+_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+for p in [os.path.join(_root, 'runtimes', 'python'), _root]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
