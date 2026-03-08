@@ -1,5 +1,6 @@
 #include "model_runner.h"
 #include "wgsl_shaders.h"
+#include "clock_calibration.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -687,6 +688,19 @@ void ModelRunner::enableProfiling() {
         fprintf(stderr, "WARNING: GPU timestamp queries not available\n");
         delete profiler;
         profiler = nullptr;
+        return;
+    }
+
+    // Acquire CPU<->GPU clock calibration
+    auto cal = acquireClockCalibration(gpu->device, gpu->backendType);
+    if (cal.valid) {
+        calibration = new ClockCalibration(cal);
+        printf("  Clock calibration: GPU=%llu ns, CPU=%llu ns, deviation=%llu ns\n",
+               (unsigned long long)cal.gpuTimestampNs,
+               (unsigned long long)cal.cpuTimestampNs,
+               (unsigned long long)cal.maxDeviationNs);
+    } else {
+        printf("  Clock calibration: not available (GPU-only timing)\n");
     }
 }
 

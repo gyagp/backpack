@@ -70,6 +70,7 @@ struct ModelRunner {
 
     // Profiling
     GPUProfiler* profiler = nullptr;
+    struct ClockCalibration* calibration = nullptr;
 
     // --- API ---
     bool load(GPUContext& ctx, const std::string& ggufPath);

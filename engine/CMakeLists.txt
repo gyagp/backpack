@@ -16,16 +16,20 @@ add_executable(backpack_engine
     model_runner.cpp
     gguf_loader.cpp
     tokenizer.cpp
+    clock_calibration.cpp
 )
 
 target_include_directories(backpack_engine PRIVATE
     ${DAWN_SRC}/include
     ${DAWN_BUILD}/gen/include
+    ${DAWN_SRC}/include/dawn/native
 )
 
 # Link Dawn — use generated import library on Windows
 if(WIN32)
-    target_link_libraries(backpack_engine PRIVATE ${CMAKE_BINARY_DIR}/webgpu_dawn.lib)
+    target_link_libraries(backpack_engine PRIVATE
+        ${CMAKE_BINARY_DIR}/webgpu_dawn.lib
+        d3d12.lib dxgi.lib)
     add_custom_command(TARGET backpack_engine POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${DAWN_LIB}/webgpu_dawn.dll $<TARGET_FILE_DIR:backpack_engine>)
