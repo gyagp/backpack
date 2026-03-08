@@ -4,9 +4,10 @@ Analysis of llama.cpp's Vulkan backend architecture and the design
 patterns that give it a performance advantage over our WebGPU (Dawn)
 runtime on the same hardware.
 
-**Hardware**: RTX 5080, Qwen3-1.7B Q8_0
-**Decode**: llama.cpp 330 tok/s — Backpack 186 tok/s (**1.8× gap**)
-**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 194 tok/s (**77× gap**)
+**Hardware**: RTX 5080, Qwen3-1.7B Q8_0  
+**Decode**: llama.cpp 330 tok/s — Backpack 192 tok/s (**1.7× gap**)  
+**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 350 tok/s (**43× gap**)  
+**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 433 tok/s (**52× gap**)
 
 ---
 
@@ -50,9 +51,9 @@ For a 28-layer model, fusion eliminates ~80 dispatches per token.
 Each eliminated dispatch saves kernel launch overhead + the barrier
 that would precede it.
 
-**Our status**: No fusion. Every rms_norm, silu_mul, and residual add
-is a separate dispatch with its own barrier. Our 283 dispatches could
-drop to ~200 with equivalent fusions.
+**Our status**: SiLU·mul fused into down projection (`q8_down_silu_add`).
+Saves 28 dispatches per token. Other fusions (rms+matmul) regressed
+due to per-WG redundant norm computation.
 
 ---
 
@@ -74,9 +75,12 @@ C = coopMatMulAdd(Q_tile, K_tile, C);  // tensor core matmul
 for Q·K dot products. No cooperative matrix support in WGSL yet.
 Attention takes ~588µs/token vs estimated ~200µs with coopmat.
 
-**Blocker**: WGSL has no `subgroup_matrix` specification yet. Dawn is
-working on it but it's not available. When it lands, our attention
-kernels could be rewritten to use tensor cores.
+**Blocker**: Dawn supports `chromium_experimental_subgroup_matrix` with
+i8×i8→i32 MMA tiles (M=8, N=8, K=32). Confirmed working on RTX 5080.
+However, Q8_0's per-block scales (varying scale per 32-element K-block)
+prevent simple MMA accumulation — each K-block needs rescaling,
+requiring store/load round-trips that negate tensor core benefits.
+Subgroup matrix is most useful for fp16 matmul or Q8 with uniform scales.
 
 ---
 
@@ -141,10 +145,10 @@ result = float(q_sum) * scale_a * scale_b;
 The B vector (activations) is pre-quantized to Q8_1 format with
 per-block scales, cached in registers.
 
-**Our design**: Extract int8 values via `extractBits` and convert to
-fp32 for scalar dot products. WGSL has `dot4I8Packed` via
-`packed_4x8_integer_dot_product` language feature but we haven't
-adopted it yet.
+**Our design**: DP4A kernel (`q8_matmul_dp4a`) implemented and available.
+Uses `dot4I8Packed` via WGSL `packed_4x8_integer_dot_product`. At T=1
+decode, no measurable speedup (bandwidth-bound, not compute-bound).
+Used as default kernel for decode matmuls.
 
 ---
 
@@ -234,12 +238,18 @@ return zeros). Straightforward to implement.
 
 ---
 
-## 10. Prefill Architecture (77× gap)
+## 10. Prefill Architecture (43× gap, was 77×)
 
-The largest performance gap is in prefill (prompt processing):
-llama.cpp processes T tokens in parallel, reading each weight matrix
-**once** for all T tokens.  We process tokens one at a time, reading
-each weight matrix **T times**.
+**Status (March 2026)**: Batched prefill implemented. Matmuls read
+weights once for all T tokens. Batched RoPE and causal attention
+process all T tokens in single dispatches. All 225 dispatches submitted
+in a single `submitOnly` call.
+
+**Remaining gap** (43× vs llama.cpp at pl=128): Our batched matmul
+kernel (`q8_matmul_batched`) uses scalar dot products. llama.cpp uses
+cooperative matrix tiled GEMM with shared memory double-buffering.
+Our causal attention uses scalar online softmax (subgroupAdd).
+llama.cpp uses flash attention with cooperative matrix tiles.
 
 ### 10.1 llama.cpp Prefill Pipeline
 
@@ -262,53 +272,64 @@ reads the weight matrix **once** for all 128 tokens.
 
 **Weight bandwidth**: 1.83 GB read once = **1.83 GB total**.
 
-### 10.2 Our Current Prefill Pipeline
+### 10.2 Our Batched Prefill Pipeline (Implemented)
 
-For a 128-token prompt, per layer per token:
+For a 128-token prompt, per layer:
 
-| Operation | Dispatches per token | Notes |
-|-----------|---------------------|-------|
-| rms_norm | 1 | |
-| q8_qkv | 1 | T=1 matvec |
-| fused_rope | 1 | |
-| attn_p1 + attn_p2 | 2 | |
-| q8_oproj | 1 | |
-| add_rms | 1 | |
-| q8_gateup | 1 | |
-| q8_down_silu_add | 1 | |
-| rms_next | 1 (layers 0-26) | |
+| Operation | Dispatches | Notes |
+|-----------|-----------|-------|
+| Batched RMSNorm | 1 | T WGs, one per token row |
+| Batched Q8 QKV matmul | 1 | ceil(T/8) × ceil(N/8) WGs |
+| Batched RoPE + KV scatter | 1 | (n_head + n_kv) × T WGs |
+| Batched causal attention | 1 | n_head × T WGs, online softmax |
+| Batched Q8 O projection | 1 | ceil(T/8) × ceil(N/8) WGs |
+| Batched add + RMSNorm | 1 | T WGs |
+| Batched Q8 gate+up | 1 | ceil(T/8) × ceil(N/8) WGs |
+| Batched fused SiLU+down+add | 1 | ceil(T/8) × ceil(N/8) WGs |
 
-**Total**: ~255 dispatches × 128 tokens = **32,640 dispatches**.
-Each matmul reads the weight matrix **128 times** (once per token).
+**Total**: 8 dispatches per layer, 225 for 28 layers + final norm.
+All submitted in a single `submitOnly` call.
 
-**Weight bandwidth**: 1.83 GB × 128 = **234 GB total** (128× more).
+**Weight bandwidth**: 1.83 GB read once = **1.83 GB total**.
 
-### 10.3 What Batched Prefill Requires
+**Benchmark** (Qwen3-1.7B Q8_0, RTX 5080 Vulkan):
 
-| Component | Status | Effort |
-|-----------|--------|--------|
-| T×E intermediate buffers | Needed | Low — allocate larger buffers |
-| Batched Q8 matmul kernel (T×K → T×N) | Needed | Medium — new WGSL kernel with 2D grid |
-| Causal self-attention | Needed | Medium — mask upper triangle |
-| Batched RoPE for T positions | Needed | Low — extend existing kernel |
-| Batched add/norm for T rows | Needed | Low — extend existing kernels |
-| Pre-allocated max-T buffers | Needed | Low — allocate for MAX_PREFILL_T |
-| Cooperative matrix (subgroup_matrix) | Optional | High — requires Dawn experimental API |
+| Prompt | Serial tok/s | Batched tok/s | llama.cpp tok/s |
+|--------|-------------|--------------|----------------|
+| 128 | 192 | **350** | 14,967 |
+| 512 | 184 | **422** | 23,285 |
+| 1024 | 183 | **433** | 22,460 |
+| 4096 | 176 | **431** | 20,191 |
 
-### 10.4 Performance Projection
+### 10.3 Remaining Prefill Gaps
 
-With batched prefill (no cooperative matrix):
+| Component | Status | Remaining gap |
+|-----------|--------|--------------|
+| T×E intermediate buffers | ✅ Done | — |
+| Batched Q8 matmul kernel | ✅ Done (scalar) | No cooperative matrix |
+| Batched RoPE + KV scatter | ✅ Done | — |
+| Batched causal attention | ✅ Done (scalar) | No cooperative matrix flash attn |
+| Batched add/norm | ✅ Done | — |
+| Single-submit all dispatches | ✅ Done | — |
+| Cooperative matrix matmul | ⚠️ Available but blocked | Q8_0 per-block scales prevent simple MMA |
+| Shared memory tiled GEMM | ❌ Not yet | Would improve compute utilization |
+| Flash attention (coopmat) | ❌ Not yet | Needs cooperative matrix for tiles |
 
-| Prompt | Current | Projected | Improvement |
-|--------|---------|-----------|------------|
-| 128 tok | 660ms (194 tok/s) | ~8ms (~16,000 tok/s) | **80×** |
-| 512 tok | 2760ms (186 tok/s) | ~24ms (~21,000 tok/s) | **115×** |
-| 1024 tok | 5576ms (184 tok/s) | ~50ms (~20,000 tok/s) | **110×** |
+### 10.4 Performance Achieved vs Projected
 
-The projection assumes weight bandwidth is the bottleneck (1.83 GB
-at 960 GB/s = 1.9ms for weight reads, plus compute+attention).
-With cooperative matrix, prefill matmuls become compute-bound and
-would approach llama.cpp's ~15-23K tok/s.
+| Prompt | Original | Current batched | llama.cpp |
+|--------|---------|----------------|-----------|
+| 128 tok | 660ms (192 tok/s) | 366ms (**350 tok/s**) | ~9ms (14,967 tok/s) |
+| 512 tok | 2760ms (184 tok/s) | 1214ms (**422 tok/s**) | ~22ms (23,285 tok/s) |
+| 1024 tok | 5576ms (183 tok/s) | 2366ms (**433 tok/s**) | ~46ms (22,460 tok/s) |
+| 4096 tok | 23312ms (176 tok/s) | 9510ms (**431 tok/s**) | ~203ms (20,191 tok/s) |
+
+The remaining **43× gap** vs llama.cpp is primarily:
+- **No cooperative matrix**: Our matmuls use scalar dot products (1 FMA/cycle)
+  vs tensor cores (multiple FMAs/cycle). This is ~8-16× for compute-bound prefill.
+- **Dawn barrier overhead**: ~225 barriers × ~5µs = 1.1ms per submit.
+- **No shared memory tiling**: Our batched matmul reads X rows per-warp
+  from global memory, not from shared memory tiles.
 
 ---
 
