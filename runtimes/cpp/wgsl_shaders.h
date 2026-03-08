@@ -228,6 +228,128 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
+// [gguf_q8] q8_down_silu_add_mma (6 bindings)
+static const char* WGSL_Q8_DOWN_SILU_ADD_MMA = R"WGSL(
+enable f16;
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+
+// Subgroup-matrix tiled fused SiLU·mul + Q8_0 down-proj + residual add:
+//   Y[M×N] += silu_mul(GateUp[M×2*IM]) × W_down[N×K]^T + Bias[N]
+//
+// Same MMA approach as q8_matmul_mma but with SiLU activation applied
+// during tile_A load (reads gate+up, computes silu(gate)*up → f16).
+//
+// params: [K=IM, N=E, IM, M=T]
+// Grid: (ceil(N/32), ceil(M/32))
+
+@group(0) @binding(0) var<storage, read_write> GateUp: array<f32>;
+@group(0) @binding(1) var<storage, read_write> W_Q8: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
+
+const TILE_ROWS: u32 = 32u;
+const TILE_COLS: u32 = 32u;
+const TILE_K: u32 = 16u;
+const SCALE_BLOCK: u32 = 32u;
+const MAX_K_TILES: u32 = 384u;
+const WG_SIZE: u32 = 128u;
+
+var<workgroup> tile_A: array<f16, 512>;   // 32 × 16
+var<workgroup> tile_B: array<f16, 512>;   // 32 × 16
+var<workgroup> tile_C: array<f32, 1024>;  // 32 × 32
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(subgroup_id) subgroup_id: u32) {
+    let K = _params_[0];   // IM
+    let N = _params_[1];   // E
+    let IM = _params_[2];  // same as K
+    let M = _params_[3];   // T
+    let local_idx = lid.x;
+
+    let row_base = wid.y * TILE_ROWS;
+    let col_base = wid.x * TILE_COLS;
+
+    let sg_row = subgroup_id & 1u;
+    let sg_col = subgroup_id >> 1u;
+
+    let weight_stride = K / 4u;
+    let scale_stride = K / SCALE_BLOCK;
+
+    var matC: subgroup_matrix_result<f32, 16, 16>;
+    for (var tile_idx = 0u; tile_idx < MAX_K_TILES; tile_idx += 1u) {
+        let k_base = tile_idx * TILE_K;
+
+        // Load tile_A: SiLU-activated [32×16] → f16
+        for (var i = local_idx; i < TILE_ROWS * TILE_K; i += WG_SIZE) {
+            let local_row = i / TILE_K;
+            let local_k = i % TILE_K;
+            let global_row = row_base + local_row;
+            let global_k = k_base + local_k;
+            if (global_row < M && global_k < K) {
+                let gu_base = global_row * 2u * IM;
+                let gate = GateUp[gu_base + global_k];
+                let up   = GateUp[gu_base + IM + global_k];
+                tile_A[i] = f16(gate / (1.0 + exp(-gate)) * up);
+            } else {
+                tile_A[i] = 0.0h;
+            }
+        }
+
+        // Load tile_B: W_Q8[32×16] dequantized to f16
+        for (var i = local_idx; i < TILE_COLS * TILE_K; i += WG_SIZE) {
+            let local_col = i / TILE_K;
+            let local_k = i % TILE_K;
+            let global_col = col_base + local_col;
+            let global_k = k_base + local_k;
+            if (global_col < N && global_k < K) {
+                let packed = W_Q8[global_col * weight_stride + global_k / 4u];
+                let shift = (global_k & 3u) * 8u;
+                let q = f32(extractBits(i32(packed), shift, 8u));
+                let scale_idx = global_col * scale_stride + global_k / SCALE_BLOCK;
+                let sp = unpack2x16float(Scales[scale_idx / 2u]);
+                let scale = select(sp.x, sp.y, (scale_idx & 1u) != 0u);
+                tile_B[i] = f16(q * scale);
+            } else {
+                tile_B[i] = 0.0h;
+            }
+        }
+
+        workgroupBarrier();
+
+        let a_offset = sg_row * 16u * TILE_K;
+        let b_offset = sg_col * 16u * TILE_K;
+
+        let matA = subgroupMatrixLoad<subgroup_matrix_left<f16, 16, 16>>(
+            &tile_A, a_offset, false, TILE_K);
+        let matB = subgroupMatrixLoad<subgroup_matrix_right<f16, 16, 16>>(
+            &tile_B, b_offset, true, TILE_K);
+        matC = subgroupMatrixMultiplyAccumulate(matA, matB, matC);
+
+        workgroupBarrier();
+    }
+
+    let c_offset = sg_row * 16u * TILE_COLS + sg_col * 16u;
+    subgroupMatrixStore(&tile_C, c_offset, matC, false, TILE_COLS);
+    workgroupBarrier();
+
+    // Write with residual add
+    for (var i = local_idx; i < TILE_ROWS * TILE_COLS; i += WG_SIZE) {
+        let local_row = i / TILE_COLS;
+        let local_col = i % TILE_COLS;
+        let global_row = row_base + local_row;
+        let global_col = col_base + local_col;
+        if (global_row < M && global_col < N) {
+            Y[global_row * N + global_col] += tile_C[i] + Bias[global_col];
+        }
+    }
+}
+)WGSL";
+
 // [gguf_q8] q8_down_silu_add_tiled (6 bindings)
 static const char* WGSL_Q8_DOWN_SILU_ADD_TILED = R"WGSL(
 enable subgroups;
@@ -1303,6 +1425,127 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
+// [gguf_q8] q8_matmul_mma (6 bindings)
+static const char* WGSL_Q8_MATMUL_MMA = R"WGSL(
+enable f16;
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+
+// Subgroup-matrix tiled Q8_0 GEMM for batched prefill:
+//   Y[M×N] = X[M×K] × W[N×K]^T + Bias[N]
+//
+// Uses cooperative matrix multiply-accumulate (MMA) with fp16 tiles:
+//   - Activations (fp32) staged to fp16 in shared memory
+//   - Q8_0 weights dequantized to fp16 in shared memory
+//   - MMA: f16×f16 → f32 accumulation, 16×16×16 tiles
+//
+// 4 subgroups per WG, each computing a 16×16 sub-tile of the 32×32 output.
+// Grid: (ceil(N/32), ceil(M/32))
+//
+// params: [M, N, K, 0]
+
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> W_Q8: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
+
+const TILE_ROWS: u32 = 32u;
+const TILE_COLS: u32 = 32u;
+const TILE_K: u32 = 16u;
+const SCALE_BLOCK: u32 = 32u;
+const MAX_K_TILES: u32 = 384u;  // supports K up to 6144
+const WG_SIZE: u32 = 128u;
+
+var<workgroup> tile_A: array<f16, 512>;   // 32 × 16
+var<workgroup> tile_B: array<f16, 512>;   // 32 × 16
+var<workgroup> tile_C: array<f32, 1024>;  // 32 × 32
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(subgroup_id) subgroup_id: u32) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let local_idx = lid.x;
+
+    let row_base = wid.y * TILE_ROWS;
+    let col_base = wid.x * TILE_COLS;
+
+    let sg_row = subgroup_id & 1u;
+    let sg_col = subgroup_id >> 1u;
+
+    let weight_stride = K / 4u;
+    let scale_stride = K / SCALE_BLOCK;
+
+    var matC: subgroup_matrix_result<f32, 16, 16>;
+    for (var tile_idx = 0u; tile_idx < MAX_K_TILES; tile_idx += 1u) {
+        let k_base = tile_idx * TILE_K;
+
+        // Load tile_A: X[32×16] → f16
+        for (var i = local_idx; i < TILE_ROWS * TILE_K; i += WG_SIZE) {
+            let local_row = i / TILE_K;
+            let local_k = i % TILE_K;
+            let global_row = row_base + local_row;
+            let global_k = k_base + local_k;
+            if (global_row < M && global_k < K) {
+                tile_A[i] = f16(X[global_row * K + global_k]);
+            } else {
+                tile_A[i] = 0.0h;
+            }
+        }
+
+        // Load tile_B: W_Q8[32×16] dequantized to f16
+        for (var i = local_idx; i < TILE_COLS * TILE_K; i += WG_SIZE) {
+            let local_col = i / TILE_K;
+            let local_k = i % TILE_K;
+            let global_col = col_base + local_col;
+            let global_k = k_base + local_k;
+            if (global_col < N && global_k < K) {
+                let packed = W_Q8[global_col * weight_stride + global_k / 4u];
+                let shift = (global_k & 3u) * 8u;
+                let q = f32(extractBits(i32(packed), shift, 8u));
+                let scale_idx = global_col * scale_stride + global_k / SCALE_BLOCK;
+                let sp = unpack2x16float(Scales[scale_idx / 2u]);
+                let scale = select(sp.x, sp.y, (scale_idx & 1u) != 0u);
+                tile_B[i] = f16(q * scale);
+            } else {
+                tile_B[i] = 0.0h;
+            }
+        }
+
+        workgroupBarrier();
+
+        let a_offset = sg_row * 16u * TILE_K;
+        let b_offset = sg_col * 16u * TILE_K;
+
+        let matA = subgroupMatrixLoad<subgroup_matrix_left<f16, 16, 16>>(
+            &tile_A, a_offset, false, TILE_K);
+        let matB = subgroupMatrixLoad<subgroup_matrix_right<f16, 16, 16>>(
+            &tile_B, b_offset, true, TILE_K);
+        matC = subgroupMatrixMultiplyAccumulate(matA, matB, matC);
+
+        workgroupBarrier();
+    }
+
+    let c_offset = sg_row * 16u * TILE_COLS + sg_col * 16u;
+    subgroupMatrixStore(&tile_C, c_offset, matC, false, TILE_COLS);
+    workgroupBarrier();
+
+    for (var i = local_idx; i < TILE_ROWS * TILE_COLS; i += WG_SIZE) {
+        let local_row = i / TILE_COLS;
+        let local_col = i % TILE_COLS;
+        let global_row = row_base + local_row;
+        let global_col = col_base + local_col;
+        if (global_row < M && global_col < N) {
+            Y[global_row * N + global_col] = tile_C[i] + Bias[global_col];
+        }
+    }
+}
+)WGSL";
+
 // [gguf_q8] q8_matmul_norm (7 bindings)
 static const char* WGSL_Q8_MATMUL_NORM = R"WGSL(
 enable subgroups;
@@ -2084,26 +2327,9 @@ enable subgroups;
 // Batched causal self-attention for prefill.
 // Computes: out[T, n_head, HD] = softmax(Q·K^T / sqrt(HD), causal_mask) · V
 //
-// Q: [T, n_head, HD]  (query, T positions)
-// K: [T_kv, n_kv, HD] (key cache, T_kv = cache_len + T)
-// V: [T_kv, n_kv, HD] (value cache)
-//
-// GQA: Q heads are grouped, each group shares one KV head.
-//   kv_head = q_head / n_rep
-//
 // Each workgroup handles one Q head for one query position.
 // Grid: (n_head, T, 1)
 // WG: 32 threads (1 warp)
-//
-// Causal mask: Q at position q_pos can attend to K at position k_pos
-//   only if k_pos <= q_pos + cache_offset.
-//
-// Bindings:
-//   0: Q — rotated queries [T × n_head × HD]
-//   1: K_cache — key cache [T_total × n_kv × HD]
-//   2: V_cache — value cache [T_total × n_kv × HD]
-//   3: Out — attention output [T × n_head × HD]
-//   4: _params_ — [kv_stride, n_rep, T_total, cache_offset, 0, scale_u32, neg_inf_u32, 0]
 
 @group(0) @binding(0) var<storage, read_write> Q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> K_cache: array<f32>;
@@ -2113,38 +2339,34 @@ enable subgroups;
 
 const HD: u32 = 128u;
 const HD_PER_THREAD: u32 = 4u;  // 32 threads × 4 = 128
-const MAX_SEQ: u32 = 4096u;     // max sequence length
+const MAX_SEQ: u32 = 4096u;
 
 @compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
     let head = wid.x;
-    let q_idx = wid.y;   // which query position within the prefill batch
+    let q_idx = wid.y;
     let lane = lid.x;
 
-    let kv_stride = _params_[0];   // n_kv * HD
-    let n_rep = _params_[1];       // n_head / n_kv
-    let T_total = _params_[2];     // total KV length (cache_offset + T_prefill)
-    let cache_offset = _params_[3]; // how many tokens already in cache
+    let kv_stride = _params_[0];
+    let n_rep = _params_[1];
+    let T_total = _params_[2];
+    let cache_offset = _params_[3];
     let scale = bitcast<f32>(_params_[5]);
     let neg_inf = bitcast<f32>(_params_[6]);
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
+    let n_head_total = kv_stride / HD * n_rep;
 
-    // Load Q for this position
-    let n_head_total = kv_stride / HD * n_rep;  // total Q heads
     let q_base = q_idx * n_head_total * HD + head * HD;
     let q0 = Q[q_base + lane * HD_PER_THREAD];
     let q1 = Q[q_base + lane * HD_PER_THREAD + 1u];
     let q2 = Q[q_base + lane * HD_PER_THREAD + 2u];
     let q3 = Q[q_base + lane * HD_PER_THREAD + 3u];
 
-    // The causal boundary: this query at absolute position (cache_offset + q_idx)
-    // can attend to positions [0, cache_offset + q_idx] inclusive.
     let q_abs_pos = cache_offset + q_idx;
 
-    // Online softmax: streaming max and sum
     var acc0: f32 = 0.0; var acc1: f32 = 0.0;
     var acc2: f32 = 0.0; var acc3: f32 = 0.0;
     var m_prev: f32 = neg_inf;
@@ -2153,7 +2375,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     for (var t = 0u; t < MAX_SEQ; t = t + 1u) {
         let causal_valid = (t < T_total) && (t <= q_abs_pos);
 
-        // Only load K/V when position is valid (skip masked positions)
         let k_base = select(0u, t * kv_stride + kv_off, causal_valid);
         let k0 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD], causal_valid);
         let k1 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 1u], causal_valid);
@@ -2164,7 +2385,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let dot_qk = subgroupAdd(partial);
         let score = select(neg_inf, dot_qk * scale, causal_valid);
 
-        // Online softmax update
         let m_new = max(m_prev, score);
         let exp_prev = exp(m_prev - m_new);
         let exp_score = exp(score - m_new);
@@ -2172,7 +2392,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let rescale = l_prev * exp_prev / max(l_new, 1e-10);
         let w = exp_score / max(l_new, 1e-10);
 
-        let v_base = t * kv_stride + kv_off;
+        let v_base = select(0u, t * kv_stride + kv_off, causal_valid);
         let v0 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD], causal_valid);
         let v1 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 1u], causal_valid);
         let v2 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 2u], causal_valid);
@@ -2187,7 +2407,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         l_prev = l_new;
     }
 
-    // Write output
     let out_base = q_idx * n_head_total * HD + head * HD;
     Out[out_base + lane * HD_PER_THREAD]      = acc0;
     Out[out_base + lane * HD_PER_THREAD + 1u] = acc1;
@@ -3299,6 +3518,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
     static const std::unordered_map<std::string, ShaderInfo> kernels = {
         {"q8_down_silu_add", {WGSL_Q8_DOWN_SILU_ADD, 6}},
         {"q8_down_silu_add_batched", {WGSL_Q8_DOWN_SILU_ADD_BATCHED, 6}},
+        {"q8_down_silu_add_mma", {WGSL_Q8_DOWN_SILU_ADD_MMA, 6}},
         {"q8_down_silu_add_tiled", {WGSL_Q8_DOWN_SILU_ADD_TILED, 6}},
         {"q8_matmul", {WGSL_Q8_MATMUL, 6}},
         {"q8_matmul_add", {WGSL_Q8_MATMUL_ADD, 6}},
@@ -3310,6 +3530,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"q8_matmul_dp4a", {WGSL_Q8_MATMUL_DP4A, 6}},
         {"q8_matmul_fast", {WGSL_Q8_MATMUL_FAST, 6}},
         {"q8_matmul_lite", {WGSL_Q8_MATMUL_LITE, 6}},
+        {"q8_matmul_mma", {WGSL_Q8_MATMUL_MMA, 6}},
         {"q8_matmul_norm", {WGSL_Q8_MATMUL_NORM, 7}},
         {"q8_matmul_smem", {WGSL_Q8_MATMUL_SMEM, 6}},
         {"q8_matmul_tiled", {WGSL_Q8_MATMUL_TILED, 6}},
