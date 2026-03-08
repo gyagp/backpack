@@ -14,7 +14,7 @@ Supports:
   - Streaming text output
 
 Usage:
-    python -m engine.python.gguf_engine --model path/to/model.gguf \\
+    python -m engines.python.gguf_engine --model path/to/model.gguf \\
         --prompt "Hello" --max-tokens 50 [--profile]
 """
 
@@ -671,9 +671,21 @@ def main():
 
     t0 = time.time()
 
-    # 1. Parse GGUF
-    print(f"Loading GGUF: {args.model}")
-    gf = GGUFFile(args.model)
+    # 1. Resolve model path (file or directory)
+    model_path = args.model
+    if os.path.isdir(model_path):
+        # Find GGUF inside directory
+        gguf_files = [os.path.join(r, f)
+                      for r, _, files in os.walk(model_path)
+                      for f in files if f.endswith('.gguf')]
+        if not gguf_files:
+            print(f"No GGUF file found in: {model_path}")
+            sys.exit(1)
+        # Prefer Q8_0
+        model_path = next((g for g in gguf_files if 'Q8_0' in g), gguf_files[0])
+
+    print(f"Loading GGUF: {model_path}")
+    gf = GGUFFile(model_path)
     cfg = extract_config(gf)
     print(f"Model: {cfg['arch']} ({cfg['n_layer']} layers, "
           f"E={cfg['n_embd']}, HD={cfg['head_dim']}, "
