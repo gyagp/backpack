@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Generate runtimes/cpp/wgsl_shaders.h from compiler/kernels/*.wgsl.
+"""Generate wgsl_shaders.h from compiler/kernels/*.wgsl.
 
+C++ runtime build step: embeds WGSL kernel sources as C++ string constants.
 Run this whenever kernel .wgsl files change:
-    python compiler/gen_wgsl_shaders.py
+    python runtimes/cpp/gen_wgsl_shaders.py
 """
 import os
 import re
 
-KERNEL_DIR = os.path.join(os.path.dirname(__file__), "kernels")
-OUTPUT = os.path.join(os.path.dirname(__file__), "..", "runtimes", "cpp", "wgsl_shaders.h")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(os.path.dirname(_HERE))
+KERNEL_DIR = os.path.join(_ROOT, "compiler", "kernels")
+OUTPUT = os.path.join(_HERE, "wgsl_shaders.h")
 
 
 def count_bindings(src: str) -> int:
