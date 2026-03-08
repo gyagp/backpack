@@ -33,7 +33,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'models'))
 sys.path.insert(0, os.path.join(ROOT, 'runtimes', 'python'))
 
-from model_parser.resolver import resolve_model
+from model_parser.resolver import discover_model
 from model_parser.gguf_parser import GGUFFile, extract_gguf_config, GGUFTokenizer
 from model_parser.onnx_parser import extract_onnx_config, OnnxTokenizer
 from runtimes.python.gguf_engine import GGUFModel, load_gguf_weights
@@ -116,6 +116,8 @@ def main():
         description="LLM text generation (all architectures)")
     parser.add_argument("--model", required=True,
                         help="GGUF file, model directory, or model name")
+    parser.add_argument("--format", default=None, choices=['gguf', 'onnx'],
+                        help="Force specific model format")
     parser.add_argument("--prompt", default=None, help="Text prompt")
     parser.add_argument("--chat", default=None,
                         help="Chat message (auto-wrapped in template)")
@@ -130,8 +132,21 @@ def main():
     if not args.prompt and not args.chat:
         args.prompt = "Hello"
 
-    # Resolve model path and format
-    model_path, model_format = resolve_model(args.model)
+    # Discover model formats
+    info = discover_model(args.model)
+    print(f"Model: {info.summary()}")
+
+    # Select format
+    if args.format:
+        model_format = args.format
+        if model_format not in info.formats:
+            print(f"  Warning: {model_format} not available, "
+                  f"using {info.preferred_format}")
+            model_format = info.preferred_format
+    else:
+        model_format = info.preferred_format
+
+    model_path = info.formats[model_format]
 
     # Load model (GGUF or ONNX)
     t0 = time.time()
