@@ -27,9 +27,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Add models/ to path for shared WebGPU runtime imports
+# Add runtimes/python/ and project root to path
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'models'))
+_here = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.dirname(os.path.dirname(_here))
+for p in [_here, _root]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from common.gguf_utils import (
     GGUFFile, dequantize_q8_0, repack_q8_0_for_gpu,
