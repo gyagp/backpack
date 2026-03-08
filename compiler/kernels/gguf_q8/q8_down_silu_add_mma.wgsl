@@ -21,17 +21,17 @@ struct Params { K: u32, N: u32, IM: u32, M: u32, };
 @group(0) @binding(5) var<uniform> params: Params;
 
 const TM: u32 = 64u;
-const TN: u32 = 32u;
+const TN: u32 = 64u;
 const TK: u32 = 32u;
 const MK: u32 = 16u;
 const SB: u32 = 32u;
-const WG: u32 = 256u;
+const WG: u32 = 512u;
 const AB_A: u32 = 2048u;
-const AB_B: u32 = 1024u;
+const AB_B: u32 = 2048u;
 
 var<workgroup> tA: array<array<f16, 2048>, 2>;
-var<workgroup> tB: array<array<f16, 1024>, 2>;
-var<workgroup> tC: array<f32, 2048>;
+var<workgroup> tB: array<array<f16, 2048>, 2>;
+var<workgroup> tC: array<f32, 4096>;
 
 fn load_silu(gu: ptr<storage, array<f32>, read_write>, row: u32, k: u32, IM: u32) -> f16 {
     let base = row * 2u * IM;
@@ -40,7 +40,7 @@ fn load_silu(gu: ptr<storage, array<f32>, read_write>, row: u32, k: u32, IM: u32
     return f16(gate / (1.0 + exp(-gate)) * up);
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(512)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>,
         @builtin(subgroup_id) sg_id: u32) {

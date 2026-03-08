@@ -121,6 +121,12 @@ bool GPUContext::init(WGPUBackendType backend) {
 
     WGPULimits limits{};
     wgpuAdapterGetLimits(adapter, &limits);
+    printf("  maxComputeInvocationsPerWorkgroup: %u\n",
+           (unsigned)limits.maxComputeInvocationsPerWorkgroup);
+    printf("  maxComputeWorkgroupSizeX: %u\n",
+           (unsigned)limits.maxComputeWorkgroupSizeX);
+    printf("  maxStorageBufferBindingSize: %llu MB\n",
+           (unsigned long long)limits.maxStorageBufferBindingSize / 1048576);
 
     // Device features
     std::vector<WGPUFeatureName> feats;

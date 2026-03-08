@@ -1089,8 +1089,8 @@ int32_t ModelRunner::prefillBatched(
     auto& kRopeB   = getKernel("rope_batched_simple");
     auto& kAttnMQ  = getKernel("flash_attn_mma");
 
-    // MMA grid: both matmul and down_silu use TM=64, TN=32
-    const uint32_t MMA_N = 32u;
+    // MMA grid: both matmul and down_silu use TM=64, TN=64
+    const uint32_t MMA_N = 64u;
     const uint32_t MMA_M = 64u;
 
     std::vector<Dispatch> allPrefill;
