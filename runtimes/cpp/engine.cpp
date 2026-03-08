@@ -164,7 +164,7 @@ int main(int argc, char* argv[]) {
         printf("%s", text.c_str());
         fflush(stdout);
 
-        // Submit next decode (non-blocking) 
+        // Submit next decode (non-blocking)
         uint32_t pos = (uint32_t)(promptTokens.size() + step);
         model.decodeAutoregressive(pos);
 
