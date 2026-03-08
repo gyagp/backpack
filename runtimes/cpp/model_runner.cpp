@@ -386,12 +386,9 @@ void ModelRunner::buildDecodePipeline() {
     auto& plEmbGather  = getKernel("embed_gather");
 
     // Kernel selection per projection:
-    // dp4a: quantize activations to int8 on-the-fly, use dot4I8Packed
-    // Fused: q8_down_silu_add reads gateUpBuf, applies silu·mul, matmul, residual add
-    auto& plDp4a = getKernel("q8_matmul_dp4a");
-    auto& plQkv = plDp4a;                            // K=2048, N=4096
-    auto& plOp  = plDp4a;                            // K=2048, N=2048
-    auto& plGu  = plDp4a;                            // K=2048, N=12288
+    auto& plQkv = plQ8Matmul;                        // K=2048, N=4096
+    auto& plOp  = plQ8Matmul;                        // K=2048, N=2048
+    auto& plGu  = plQ8Matmul;                        // K=2048, N=12288
     auto& plDnSilu = getKernel("q8_down_silu_add");  // fused: silu_mul + down_add
 
     // Static params (shared between both sets — read-only)
@@ -1136,6 +1133,7 @@ std::vector<float> ModelRunner::prefillBatched(
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len += T;
 
+    // Debug
     // Copy last hidden state to xBuf for subsequent decode
     {
         WGPUCommandEncoderDescriptor enD{};

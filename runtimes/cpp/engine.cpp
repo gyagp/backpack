@@ -216,10 +216,11 @@ int main(int argc, char* argv[]) {
     for (auto t : promptTokens) printf("%d ", t);
     printf("\n");
 
-    // 5. Prefill — batched: process all prompt tokens in parallel
+    // 5. Prefill — simple sequential decode
     auto prefill_t0 = std::chrono::steady_clock::now();
-    auto logits = model.prefillBatched(promptTokens.data(),
-                                        (uint32_t)promptTokens.size(), 0);
+    std::vector<float> logits;
+    for (size_t i = 0; i < promptTokens.size(); i++)
+        logits = model.decode(promptTokens[i], (uint32_t)i);
 
     auto prefill_t1 = std::chrono::steady_clock::now();
     auto prefillMs = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -1,0 +1,24 @@
+GPU: NVIDIA GeForce RTX 5080 (NVIDIA: 591.44 591.44.0.0)
+Model: qwen3 (28 layers, E=2048, HD=128, V=151936, KV=8)
+  RoPE theta=1000000, RMSNorm eps=1.0e-06, QK-norm=yes
+  Backend: Vulkan, single-pass dispatch
+  Loading 310 tensors...
+  KV cache: 896 MB
+  loaded layer 7/28
+  loaded layer 14/28
+  loaded layer 21/28
+  loaded layer 28/28
+  Embedding: 151936 ? 2048 (Q8_0?f32)
+  LM head: tied embeddings (Q8, 315 MB)
+  Weights loaded in 1056ms
+  255 decode dispatches (28 layers)
+  Pool: 3 slots ? 128 pre-recorded CBs
+  Tokenizer: 151936 tokens, 151387 merges, EOS=151645
+Model loaded in 1806ms
+
+Warmup: 237ms (shader compilation)
+Prompt: "Hello"
+Tokens (1): 9707 
+
+--- Output ---
+Hello: I'm trying to understand
