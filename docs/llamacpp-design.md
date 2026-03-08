@@ -6,8 +6,8 @@ runtime on the same hardware.
 
 **Hardware**: RTX 5080, Qwen3-1.7B Q8_0
 **Decode**: llama.cpp 330 tok/s — Backpack 192 tok/s (**1.7× gap**)
-**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 1,061 tok/s (**14× gap**)
-**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 1,604 tok/s (**14× gap**)
+**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 1,135 tok/s (**13× gap**)
+**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 1,654 tok/s (**14× gap**)
 
 ---
 
@@ -298,10 +298,10 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Serial tok/s | Batched tok/s | llama.cpp tok/s |
 |--------|-------------|--------------|----------------|
-| 128 | 192 | **1,061** | 14,967 |
-| 512 | 184 | **1,524** | 23,285 |
-| 1024 | 183 | **1,604** | 22,460 |
-| 4096 | 176 | **1,558** | 20,191 |
+| 128 | 192 | **1,135** | 14,967 |
+| 512 | 184 | **1,557** | 23,285 |
+| 1024 | 183 | **1,654** | 22,460 |
+| 4096 | 176 | **1,667** | 20,191 |
 
 ### 10.3 Remaining Prefill Gaps
 
@@ -323,10 +323,10 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Original | Current batched | llama.cpp |
 |--------|---------|----------------|-----------|
-| 128 tok | 660ms (192 tok/s) | 121ms (**1,061 tok/s**) | ~9ms (14,967 tok/s) |
-| 512 tok | 2760ms (184 tok/s) | 336ms (**1,524 tok/s**) | ~22ms (23,285 tok/s) |
-| 1024 tok | 5576ms (183 tok/s) | 638ms (**1,604 tok/s**) | ~46ms (22,460 tok/s) |
-| 4096 tok | 23312ms (176 tok/s) | 2629ms (**1,558 tok/s**) | ~203ms (20,191 tok/s) |
+| 128 tok | 660ms (192 tok/s) | 113ms (**1,135 tok/s**) | ~9ms (14,967 tok/s) |
+| 512 tok | 2760ms (184 tok/s) | 329ms (**1,557 tok/s**) | ~22ms (23,285 tok/s) |
+| 1024 tok | 5576ms (183 tok/s) | 619ms (**1,654 tok/s**) | ~46ms (22,460 tok/s) |
+| 4096 tok | 23312ms (176 tok/s) | 2458ms (**1,667 tok/s**) | ~203ms (20,191 tok/s) |
 
 The remaining **14× gap** vs llama.cpp is primarily:
 - **Causal attention O(T²)**: ~40% of GPU time at T=4096, still scalar.
