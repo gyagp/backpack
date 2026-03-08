@@ -17,6 +17,7 @@ add_executable(backpack_engine
     gguf_loader.cpp
     tokenizer.cpp
     clock_calibration.cpp
+    profile_html.cpp
 )
 
 target_include_directories(backpack_engine PRIVATE

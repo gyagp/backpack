@@ -136,7 +136,8 @@ int main(int argc, char* argv[]) {
 
     // Print GPU profile report if profiling was enabled
     if (profile)
-        model.printProfileReport();
+        model.printProfileReport(nDecode, (int)promptTokens.size(),
+                                 (double)prefillMs, (double)decodeMs);
 
     gpu.destroy();
     return 0;

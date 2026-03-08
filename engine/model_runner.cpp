@@ -1,6 +1,7 @@
 #include "model_runner.h"
 #include "wgsl_shaders.h"
 #include "clock_calibration.h"
+#include "profile_html.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -704,7 +705,8 @@ void ModelRunner::enableProfiling() {
     }
 }
 
-void ModelRunner::printProfileReport() {
+void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
+                                     double prefillMs, double decodeMs) {
     if (!profiler || !profiler->enabled() || profiler->nextIndex == 0)
         return;
 
@@ -764,8 +766,6 @@ void ModelRunner::printProfileReport() {
         totalGpuUs += durUs;
     }
 
-    wgpuBufferUnmap(profiler->readbackBuf);
-
     // Sort by total time descending
     std::vector<std::pair<std::string, AggEntry>> sorted_agg(agg.begin(), agg.end());
     std::sort(sorted_agg.begin(), sorted_agg.end(),
@@ -786,7 +786,15 @@ void ModelRunner::printProfileReport() {
     }
     printf("%-20s %10.2f\n", "TOTAL", totalGpuUs / 1000.0);
 
+    // Generate HTML timeline report
+    generateProfileHTML(*gpu, *profiler, calibration, ptr,
+                        nDecodeTokens, nPrefillTokens,
+                        prefillMs, decodeMs);
+
+    wgpuBufferUnmap(profiler->readbackBuf);
+
     profiler->destroy();
     delete profiler;
     profiler = nullptr;
+    if (calibration) { delete calibration; calibration = nullptr; }
 }

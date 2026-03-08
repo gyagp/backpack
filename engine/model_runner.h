@@ -80,7 +80,8 @@ struct ModelRunner {
     static int32_t argmax(const std::vector<float>& logits);
 
     void enableProfiling();
-    void printProfileReport();
+    void printProfileReport(int nDecodeTokens = 0, int nPrefillTokens = 0,
+                            double prefillMs = 0, double decodeMs = 0);
 
     void uploadEmbedding(int32_t tokenId);
     void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
