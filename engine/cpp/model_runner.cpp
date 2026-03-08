@@ -685,6 +685,11 @@ int32_t ModelRunner::argmax(const std::vector<float>& logits) {
         std::max_element(logits.begin(), logits.end()));
 }
 
+void ModelRunner::resetKVCache() {
+    for (uint32_t i = 0; i < cfg.nLayer; i++)
+        kvCache[i].len = 0;
+}
+
 void ModelRunner::enableProfiling() {
     profiler = new GPUProfiler();
     if (!profiler->init(gpu->device, gpu->instance, gpu->queue)) {

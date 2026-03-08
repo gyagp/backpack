@@ -87,6 +87,7 @@ struct ModelRunner {
 
     void uploadEmbedding(int32_t tokenId);
     void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
+    void resetKVCache();
 
 private:
     void loadWeights(const GGUFFile& gguf, const std::vector<uint8_t>& fileData);

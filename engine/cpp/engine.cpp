@@ -115,7 +115,17 @@ int main(int argc, char* argv[]) {
     auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     printf("Model loaded in %lldms\n\n", (long long)loadMs);
 
-    // 4. Tokenize prompt
+    // 5. Warmup: run one dummy decode to trigger shader compilation
+    {
+        auto tw0 = std::chrono::steady_clock::now();
+        model.decode(0, 0);
+        model.resetKVCache();
+        auto tw1 = std::chrono::steady_clock::now();
+        auto warmupMs = std::chrono::duration_cast<std::chrono::milliseconds>(tw1 - tw0).count();
+        printf("Warmup: %lldms (shader compilation)\n", (long long)warmupMs);
+    }
+
+    // 6. Tokenize prompt
     auto promptTokens = tokenizer.encode(prompt);
 
     printf("Prompt: \"%s\"\n", prompt.c_str());
