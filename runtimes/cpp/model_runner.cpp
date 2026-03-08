@@ -377,12 +377,21 @@ void ModelRunner::buildDecodePipeline() {
     auto& plAddRmsNorm = getKernel("add_rms_norm");
     auto& plQ8Matmul   = getKernel("q8_matmul");
     auto& plQ8MatAdd   = getKernel("q8_matmul_add");
+    // Fast Q8 kernels: 16 elements/lane (requires K divisible by 512)
+    auto& plQ8Fast     = getKernel("q8_matmul_fast");
+    auto& plQ8AddFast  = getKernel("q8_matmul_add_fast");
     auto& plFusedRope  = getKernel("fused_qknorm_rope");
     auto& plChunkP1    = getKernel("gqa_chunked_pass1");
     auto& plChunkP2    = getKernel("gqa_chunked_pass2");
     auto& plSiluMul    = getKernel("silu_mul_fused");
     auto& plFp16Gemm   = getKernel("fp16_gemm");
     auto& plFp16Wide   = getKernel("fp16_gemm_wide");
+
+    // Use standard Q8 matmul for all projections
+    auto& plQkv = plQ8Matmul;
+    auto& plOp  = plQ8Matmul;
+    auto& plGu  = plQ8Matmul;
+    auto& plDn  = plQ8MatAdd;
 
     // Params buffers
     auto makeQ8Params = [&](const std::string& name, uint32_t K, uint32_t N) -> GPUBuffer {
@@ -491,10 +500,10 @@ void ModelRunner::buildDecodePipeline() {
 
         // 2. QKV matmul
         {
-            auto bg = makeBG(plQ8Matmul, {
+            auto bg = makeBG(plQkv, {
                 {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
                 {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
-            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+            allDecodeDispatches.push_back({plQkv.pipeline, bg,
                 1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_qkv"});
         }
 
@@ -530,10 +539,10 @@ void ModelRunner::buildDecodePipeline() {
 
         // 6. O projection
         {
-            auto bg = makeBG(plQ8Matmul, {
+            auto bg = makeBG(plOp, {
                 {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
                 {3, zeroBiasE}, {4, projOutBuf}, {5, q8OprojParams}});
-            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+            allDecodeDispatches.push_back({plOp.pipeline, bg,
                 1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_oproj"});
         }
 
@@ -547,10 +556,10 @@ void ModelRunner::buildDecodePipeline() {
 
         // 8. Gate+Up matmul
         {
-            auto bg = makeBG(plQ8Matmul, {
+            auto bg = makeBG(plGu, {
                 {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
                 {3, zeroBiasGU}, {4, gateUpBuf}, {5, q8GuParams}});
-            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+            allDecodeDispatches.push_back({plGu.pipeline, bg,
                 1, (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_gateup"});
         }
 
@@ -564,10 +573,10 @@ void ModelRunner::buildDecodePipeline() {
 
         // 10. Down projection + residual add
         {
-            auto bg = makeBG(plQ8MatAdd, {
+            auto bg = makeBG(plDn, {
                 {0, siluOutBuf}, {1, lw.dnW}, {2, lw.dnS},
                 {3, zeroBiasE}, {4, xBuf}, {5, q8DnParams}});
-            allDecodeDispatches.push_back({plQ8MatAdd.pipeline, bg,
+            allDecodeDispatches.push_back({plDn.pipeline, bg,
                 1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_add"});
         }
 
