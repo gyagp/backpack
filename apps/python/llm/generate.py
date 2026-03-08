@@ -35,6 +35,9 @@ sys.path.insert(0, os.path.join(ROOT, 'models'))
 from runtimes.python.gguf_engine import (
     GGUFModel, GGUFTokenizer, extract_config, load_gguf_weights,
 )
+from runtimes.python.onnx_loader import (
+    extract_onnx_config, load_onnx_tokenizer, load_onnx_weights,
+)
 from common.gguf_utils import GGUFFile
 
 
@@ -44,17 +47,20 @@ DEFAULT_MODEL_REPO = os.environ.get(
     "BACKPACK_MODELS", r"E:\workspace\project\ai-models")
 
 
-def resolve_model_path(path: str) -> str:
-    """Resolve a model path to a GGUF file.
+def resolve_model(path: str):
+    """Resolve a model path and detect format.
+
+    Returns: (model_path, format) where format is 'gguf' or 'onnx'.
 
     Accepts:
-      - Direct GGUF file path: model.gguf
-      - Model directory: finds *.gguf inside
-      - Model name: looks up in BACKPACK_MODELS env / default repo
+      - Direct GGUF file: model.gguf -> (path, 'gguf')
+      - Model directory with GGUF inside -> (gguf_path, 'gguf')
+      - Model directory with ONNX inside -> (dir_path, 'onnx')
+      - Model name: looks up in BACKPACK_MODELS
     """
     # Direct GGUF file
     if path.endswith('.gguf') and os.path.isfile(path):
-        return path
+        return path, 'gguf'
 
     # Model directory or model name
     search_dirs = []
@@ -66,25 +72,31 @@ def resolve_model_path(path: str) -> str:
             search_dirs.append(repo_path)
 
     for d in search_dirs:
+        # Check for GGUF files first
         gguf_files = []
         for root, _, files in os.walk(d):
             gguf_files.extend(os.path.join(root, f) for f in files
                               if f.endswith('.gguf'))
         if gguf_files:
-            # Prefer Q8_0 > Q4_K > any
             for gf in gguf_files:
-                if 'Q8_0' in gf: return gf
+                if 'Q8_0' in gf: return gf, 'gguf'
             for gf in gguf_files:
-                if 'Q4_K' in gf: return gf
-            return gguf_files[0]
+                if 'Q4_K' in gf: return gf, 'gguf'
+            return gguf_files[0], 'gguf'
 
-        # No GGUF — check for ONNX
-        if any(f.endswith('.onnx') for f in os.listdir(d)):
-            print(f"Note: {os.path.basename(d)} has ONNX model but no GGUF.")
-            print(f"  GGUF support coming soon, or convert manually.")
+        # Check for ONNX model
+        if os.path.exists(os.path.join(d, 'model.onnx')):
+            return d, 'onnx'
+
+        # Check subdirectories (e.g., phi-4-mini/webgpu/)
+        for sub in os.listdir(d):
+            sub_path = os.path.join(d, sub)
+            if os.path.isdir(sub_path) and os.path.exists(
+                    os.path.join(sub_path, 'model.onnx')):
+                return sub_path, 'onnx'
 
     raise FileNotFoundError(
-        f"No GGUF model found at: {path}\n"
+        f"No model found at: {path}\n"
         f"  Searched: {search_dirs or [path]}\n"
         f"  Model repo: {DEFAULT_MODEL_REPO}")
 
@@ -179,16 +191,25 @@ def main():
     if not args.prompt and not args.chat:
         args.prompt = "Hello"
 
-    # Resolve model path (GGUF file, directory, or model name)
-    model_path = resolve_model_path(args.model)
+    # Resolve model path and format
+    model_path, model_format = resolve_model(args.model)
 
-    # Load model
+    # Load model (GGUF or ONNX)
     t0 = time.time()
-    print(f"Loading: {model_path}")
-    gf = GGUFFile(model_path)
-    cfg = extract_config(gf)
-    tokenizer = GGUFTokenizer(gf)
-    weights = load_gguf_weights(gf, cfg)
+    print(f"Loading ({model_format}): {model_path}")
+
+    if model_format == 'onnx':
+        cfg = extract_onnx_config(model_path)
+        tokenizer = load_onnx_tokenizer(model_path)
+        weights = load_onnx_weights(model_path, cfg)
+        # ONNX weights are dequantized to fp16 — use fp16w path
+        cfg["model_format"] = "onnx"
+    else:
+        gf = GGUFFile(model_path)
+        cfg = extract_config(gf)
+        tokenizer = GGUFTokenizer(gf)
+        weights = load_gguf_weights(gf, cfg)
+
     model = GGUFModel(weights, cfg)
     print(f"Model: {cfg['arch']} ({cfg['n_layer']}L, E={cfg['n_embd']}, "
           f"V={cfg['n_vocab']}) loaded in {(time.time()-t0)*1000:.0f}ms\n")

@@ -303,7 +303,10 @@ class GGUFModel(WebGPUModel):
         self.tie_word_embeddings = cfg["tie_word_embeddings"]
         self._has_qk_norm = cfg["has_qk_norm"]
         self._decode_mode = 'gpu'
-        self._q8_mode = True
+
+        # Detect quantization mode from available weights
+        has_q8 = any(k.endswith('.q8') for k in weights)
+        self._q8_mode = has_q8
 
         q_dim = cfg["n_head"] * cfg["head_dim"]
         kv_dim = cfg["n_kv_heads"] * cfg["head_dim"]
@@ -366,12 +369,20 @@ class GGUFModel(WebGPUModel):
 
     def _proj(self, x, name, bias_key, N, K=None, gpu_out=False,
               prefer_subgroup_matrix: bool = False):
-        """Linear projection using Q8 kernel."""
-        return self._linear_q8(
-            x, self._gpu_weights[name + ".q8.gpu"],
-            self._gpu_weights[name + ".q8_scales.gpu"],
-            self._gpu_weights[bias_key], N, K=K, gpu_out=gpu_out,
-            prefer_subgroup_matrix=prefer_subgroup_matrix)
+        """Linear projection using best available kernel (Q8 or fp16)."""
+        q8_key = name + ".q8.gpu"
+        if q8_key in self._gpu_weights:
+            return self._linear_q8(
+                x, self._gpu_weights[q8_key],
+                self._gpu_weights[name + ".q8_scales.gpu"],
+                self._gpu_weights[bias_key], N, K=K, gpu_out=gpu_out,
+                prefer_subgroup_matrix=prefer_subgroup_matrix)
+        fp16_key = name + ".fp16"
+        if fp16_key in self._gpu_weights:
+            return self._linear_fp16w(
+                x, self._gpu_weights[fp16_key],
+                self._gpu_weights[bias_key], N, K=K, gpu_out=gpu_out)
+        raise KeyError(f"No GPU weights for {name}")
 
     # ─── Compile model-specific kernels ───────────────────────────────────
 
@@ -418,7 +429,7 @@ class GGUFModel(WebGPUModel):
         for i in range(self.n_layer):
             dst = f"layers.{i}."
 
-            # Q8 weights
+            # Linear projection weights (Q8 or fp16)
             for proj_name in ["self_attn.qkv_proj.weight",
                               "self_attn.o_proj.weight",
                               "mlp.gate_up_proj.weight",
@@ -427,10 +438,18 @@ class GGUFModel(WebGPUModel):
                 q8_key = full + ".q8"
                 if q8_key in self.weights:
                     q8 = self.weights[q8_key]
-                    scales = self.weights[full + ".q8_scales"]
                     N = q8.shape[0]
                     K = q8.shape[1] * 4
                     self._upload_q8_weight(full, N, K)
+                elif full in self.weights:
+                    # fp16 weight (from dequantized ONNX Q4)
+                    w = self.weights[full]
+                    if w.dtype != np.float16:
+                        w = w.astype(np.float16)
+                    fp16_name = full + ".fp16"
+                    self._gpu_weights[fp16_name] = runner.upload_to_gpu(
+                        w.ravel(), fp16_name)
+                    self._gpu_weights[fp16_name].shape = w.shape
 
             # Norm weights (fp32)
             for norm_name in ["input_layernorm.weight",
