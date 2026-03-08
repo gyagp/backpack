@@ -1089,10 +1089,9 @@ int32_t ModelRunner::prefillBatched(
     auto& kRopeB   = getKernel("rope_batched_simple");
     auto& kAttnMQ  = getKernel("flash_attn_mma");
 
-    // MMA grid: matmul uses TM=64,TN=32; down_silu uses TM=32,TN=32
+    // MMA grid: both matmul and down_silu use TM=64, TN=32
     const uint32_t MMA_N = 32u;
-    const uint32_t MMA_M = 64u;     // q8_matmul_mma TILE_M
-    const uint32_t MMA_M_DS = 32u;  // q8_down_silu_add_mma TILE_M
+    const uint32_t MMA_M = 64u;
 
     std::vector<Dispatch> allPrefill;
     allPrefill.reserve(cfg.nLayer * 8 + 2);
@@ -1113,7 +1112,7 @@ int32_t ModelRunner::prefillBatched(
             (T + MMA_M - 1) / MMA_M, 1, "pf_gateup"});
         allPrefill.push_back({kDnSiluM.pipeline, bg.downsilu,
             (cfg.nEmbd + MMA_N - 1) / MMA_N,
-            (T + MMA_M_DS - 1) / MMA_M_DS, 1, "pf_down_silu"});
+            (T + MMA_M - 1) / MMA_M, 1, "pf_down_silu"});
     }
     allPrefill.push_back({kRmsB.pipeline, pfCache.finalRmsBG, T, 1, 1, "pf_final_rms"});
 

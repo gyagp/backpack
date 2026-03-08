@@ -252,17 +252,18 @@ enable chromium_experimental_subgroup_matrix;
 struct Params { K: u32, N: u32, IM: u32, M: u32, };
 @group(0) @binding(5) var<uniform> params: Params;
 
-const TM: u32 = 32u;
+const TM: u32 = 64u;
 const TN: u32 = 32u;
 const TK: u32 = 32u;
 const MK: u32 = 16u;
 const SB: u32 = 32u;
-const WG: u32 = 128u;
-const AB: u32 = 1024u;
+const WG: u32 = 256u;
+const AB_A: u32 = 2048u;
+const AB_B: u32 = 1024u;
 
-var<workgroup> tA: array<array<f16, 1024>, 2>;
+var<workgroup> tA: array<array<f16, 2048>, 2>;
 var<workgroup> tB: array<array<f16, 1024>, 2>;
-var<workgroup> tC: array<f32, 1024>;
+var<workgroup> tC: array<f32, 2048>;
 
 fn load_silu(gu: ptr<storage, array<f32>, read_write>, row: u32, k: u32, IM: u32) -> f16 {
     let base = row * 2u * IM;
@@ -271,7 +272,7 @@ fn load_silu(gu: ptr<storage, array<f32>, read_write>, row: u32, k: u32, IM: u32
     return f16(gate / (1.0 + exp(-gate)) * up);
 }
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>,
         @builtin(subgroup_id) sg_id: u32) {
@@ -280,20 +281,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lx = lid.x;
     let rb = wid.y * TM;
     let cb = wid.x * TN;
-    let sr = sg_id & 1u;
-    let sc = sg_id >> 1u;
+    let sr = sg_id & 3u;
+    let sc = sg_id >> 2u;
     let ws = K / 4u;
     let nkt = K / TK;
 
     var mC: subgroup_matrix_result<f32, 16, 16>;
 
     // Prefetch tile 0
-    for (var i = lx; i < AB; i += WG) {
+    for (var i = lx; i < AB_A; i += WG) {
         let r = i / TK;  let c = i % TK;
         let gr = rb + r;
         tA[0][i] = select(0.0h, load_silu(&GateUp, gr, c, IM), gr < M);
     }
-    for (var i = lx; i < AB; i += WG) {
+    for (var i = lx; i < AB_B; i += WG) {
         let r = i / TK;  let c = i % TK;
         let gc = cb + r;
         if (gc < N) {
@@ -312,12 +313,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let kn = (ti + 1u) * TK;
 
         if (ti + 1u < nkt) {
-            for (var i = lx; i < AB; i += WG) {
+            for (var i = lx; i < AB_A; i += WG) {
                 let r = i / TK;  let c = i % TK;
                 let gr = rb + r;
                 tA[nxt][i] = select(0.0h, load_silu(&GateUp, gr, kn + c, IM), gr < M);
             }
-            for (var i = lx; i < AB; i += WG) {
+            for (var i = lx; i < AB_B; i += WG) {
                 let r = i / TK;  let c = i % TK;
                 let gc = cb + r;  let gk = kn + c;
                 if (gc < N) {
