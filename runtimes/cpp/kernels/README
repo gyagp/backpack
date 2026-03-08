@@ -1,0 +1,21 @@
+# C++ Runtime Kernel Organization
+#
+# All WGSL kernels are embedded in wgsl_shaders.h as C++ string constants.
+# They are organized by format:
+#
+# Shared (all formats):
+#   WGSL_RMS_NORM, WGSL_ADD_RMS_NORM       -- normalization
+#   WGSL_FUSED_QKNORM_ROPE                 -- QK-norm + RoPE + KV scatter
+#   WGSL_GQA_CHUNKED_PASS1/PASS2           -- chunked GQA attention
+#   WGSL_SILU_MUL_FUSED                    -- SiLU activation
+#   WGSL_FP16_GEMM, WGSL_FP16_GEMM_WIDE   -- FP16 weight GEMM (LM head)
+#   WGSL_ARGMAX                            -- GPU-side argmax
+#
+# GGUF Q8_0 specific:
+#   WGSL_Q8_MATMUL                         -- Q8_0 matvec (store)
+#   WGSL_Q8_MATMUL_ADD                     -- Q8_0 matvec + residual add
+#
+# To add new format support (e.g., ONNX Q4):
+#   1. Add kernel string to wgsl_shaders.h
+#   2. Register in getEmbeddedKernels()
+#   3. Use in model_runner.cpp's buildDecodePipeline()
