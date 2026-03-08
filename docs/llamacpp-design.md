@@ -6,8 +6,8 @@ runtime on the same hardware.
 
 **Hardware**: RTX 5080, Qwen3-1.7B Q8_0
 **Decode**: llama.cpp 330 tok/s — Backpack 192 tok/s (**1.7× gap**)
-**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 747 tok/s (**20× gap**)
-**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 1,099 tok/s (**20× gap**)
+**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 1,061 tok/s (**14× gap**)
+**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 1,604 tok/s (**14× gap**)
 
 ---
 
@@ -238,19 +238,19 @@ return zeros). Straightforward to implement.
 
 ---
 
-## 10. Prefill Architecture (20× gap, was 29×)
+## 10. Prefill Architecture (14× gap, was 20×)
 
 **Status (March 2026)**: Batched prefill implemented. Matmuls read
 weights once for all T tokens. Batched RoPE and causal attention
 process all T tokens in single dispatches. All 225 dispatches submitted
 in a single `submitOnly` call.
 
-**Remaining gap** (20× vs llama.cpp at pl=128): Our batched matmul
-kernel (`q8_matmul_tiled`) and fused down‐silu (`q8_down_silu_add_tiled`)
-use shared-memory-cached activation rows with scalar dot products.
-llama.cpp uses cooperative matrix tiled GEMM with shared memory
-double-buffering for both activations and weights.
-Our causal attention uses scalar online softmax (subgroupAdd).
+**Remaining gap** (14× vs llama.cpp at pl=128): Our batched matmul
+kernels (`q8_matmul_mma`, `q8_down_silu_add_mma`) now use
+`chromium_experimental_subgroup_matrix` for tensor-core-accelerated
+fp16→f32 MMA with 16×16×16 tiles (4 subgroups per WG, 32×32 output).
+Q8_0 weights are dequantized to fp16 in shared memory before MMA.
+Our causal attention still uses scalar online softmax (subgroupAdd).
 llama.cpp uses flash attention with cooperative matrix tiles.
 
 ### 10.1 llama.cpp Prefill Pipeline
@@ -298,24 +298,24 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Serial tok/s | Batched tok/s | llama.cpp tok/s |
 |--------|-------------|--------------|----------------|
-| 128 | 192 | **747** | 14,967 |
-| 512 | 184 | **1,030** | 23,285 |
-| 1024 | 183 | **1,099** | 22,460 |
-| 4096 | 176 | **1,084** | 20,191 |
+| 128 | 192 | **1,061** | 14,967 |
+| 512 | 184 | **1,524** | 23,285 |
+| 1024 | 183 | **1,604** | 22,460 |
+| 4096 | 176 | **1,558** | 20,191 |
 
 ### 10.3 Remaining Prefill Gaps
 
 | Component | Status | Remaining gap |
 |-----------|--------|--------------|
 | T×E intermediate buffers | ✅ Done | — |
-| Batched Q8 matmul kernel | ✅ Done (tiled smem) | No cooperative matrix |
+| Batched Q8 matmul kernel | ✅ Done (MMA) | Subgroup matrix 16×16×16 fp16→f32 |
 | Batched RoPE + KV scatter | ✅ Done | — |
-| Batched causal attention | ✅ Done (scalar) | No cooperative matrix flash attn |
+| Batched causal attention | ✅ Done (scalar) | No flash attention with MMA yet |
 | Batched add/norm | ✅ Done | — |
 | Single-submit all dispatches | ✅ Done | — |
 | Pre-allocated prefill resources | ✅ Done | Zero alloc on hot path |
 | GPU-side argmax (4B readback) | ✅ Done | Was 593KB logits readback |
-| Cooperative matrix matmul | ⚠️ Available but blocked | Q8_0 per-block scales prevent simple MMA |
+| Subgroup matrix matmul | ✅ Done | Q8→fp16 dequant in smem before MMA |
 | Shared memory tiled GEMM | ❌ Not yet | Would improve compute utilization |
 | Flash attention (coopmat) | ❌ Not yet | Needs cooperative matrix for tiles |
 
@@ -323,16 +323,16 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Original | Current batched | llama.cpp |
 |--------|---------|----------------|-----------|
-| 128 tok | 660ms (192 tok/s) | 171ms (**747 tok/s**) | ~9ms (14,967 tok/s) |
-| 512 tok | 2760ms (184 tok/s) | 497ms (**1,030 tok/s**) | ~22ms (23,285 tok/s) |
-| 1024 tok | 5576ms (183 tok/s) | 932ms (**1,099 tok/s**) | ~46ms (22,460 tok/s) |
-| 4096 tok | 23312ms (176 tok/s) | 3777ms (**1,084 tok/s**) | ~203ms (20,191 tok/s) |
+| 128 tok | 660ms (192 tok/s) | 121ms (**1,061 tok/s**) | ~9ms (14,967 tok/s) |
+| 512 tok | 2760ms (184 tok/s) | 336ms (**1,524 tok/s**) | ~22ms (23,285 tok/s) |
+| 1024 tok | 5576ms (183 tok/s) | 638ms (**1,604 tok/s**) | ~46ms (22,460 tok/s) |
+| 4096 tok | 23312ms (176 tok/s) | 2629ms (**1,558 tok/s**) | ~203ms (20,191 tok/s) |
 
-The remaining **20× gap** vs llama.cpp is primarily:
-- **No cooperative matrix**: Our matmuls use scalar dot products (1 FMA/cycle)
-  vs tensor cores (multiple FMAs/cycle). This is ~8-16× for compute-bound prefill.
+The remaining **14× gap** vs llama.cpp is primarily:
+- **Causal attention O(T²)**: ~40% of GPU time at T=4096, still scalar.
+  Needs flash attention with subgroup matrix MMA.
+- **fp16 staging overhead**: Q8→fp16 dequant in smem costs extra bandwidth.
 - **Dawn barrier overhead**: ~225 barriers × ~5µs = 1.1ms per submit.
-- **Causal attention O(T²)**: 41% of GPU time at T=4096, needs flash attention.
 
 ---
 
