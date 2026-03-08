@@ -1103,7 +1103,7 @@ int32_t ModelRunner::prefillBatched(
             (qkvOutL + MMA_N - 1) / MMA_N, (T + MMA_M - 1) / MMA_M, 1, "pf_qkv"});
         allPrefill.push_back({kRopeB.pipeline,   bg.rope,
             cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"});
-        allPrefill.push_back({kAttnMQ.pipeline,  bg.attn,     cfg.nHead, (T + 3u) / 4u, 1, "pf_attn"});
+        allPrefill.push_back({kAttnMQ.pipeline,  bg.attn,     cfg.nHead, (T + 15u) / 16u, 1, "pf_attn"});
         allPrefill.push_back({kQ8M.pipeline,     bg.oproj,
             (cfg.nEmbd + MMA_N - 1) / MMA_N, (T + MMA_M - 1) / MMA_M, 1, "pf_oproj"});
         allPrefill.push_back({kAddRmsB.pipeline, bg.addrms,   T, 1, 1, "pf_add_rms"});
