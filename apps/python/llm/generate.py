@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(ROOT, 'runtimes', 'python'))
 from model_parser.resolver import discover_model
 from model_parser.gguf_parser import GGUFFile, extract_gguf_config, GGUFTokenizer
 from model_parser.onnx_parser import extract_onnx_config, OnnxTokenizer
-from runtimes.python.gguf_engine import GGUFModel, load_gguf_weights
+from runtimes.python.gguf_runtime import GGUFModel, load_gguf_weights
 from runtimes.python.onnx_loader import load_onnx_weights
 
 

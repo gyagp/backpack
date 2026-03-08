@@ -14,7 +14,7 @@ Supports:
   - Streaming text output
 
 Usage:
-    python -m runtimes.python.gguf_engine --model path/to/model.gguf \\
+    python -m runtimes.python.gguf_runtime --model path/to/model.gguf \\
         --prompt "Hello" --max-tokens 50 [--profile]
 """
 

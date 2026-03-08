@@ -11,7 +11,7 @@ set(DAWN_LIB "${CMAKE_SOURCE_DIR}/../../third_party/triton-windows/third_party/w
     CACHE PATH "Dawn shared library")
 
 add_executable(backpack_runtime
-    engine.cpp
+    runtime.cpp
     gpu_context.cpp
     model_runner.cpp
     gguf_loader.cpp
