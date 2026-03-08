@@ -228,6 +228,24 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
                     if cfg["intermediate_size"] == 0:
                         cfg["intermediate_size"] = N
 
+        elif node.op_type == "MatMul":
+            # Non-quantized linear layer (fp16 weights)
+            w_name = node.input[1]
+            if w_name in init_map:
+                w_data = numpy_helper.to_array(init_map[w_name])
+                bp_name = _onnx_name_to_backpack(
+                    w_name, n_embd, q_dim, kv_dim, qkv_out)
+                if bp_name:
+                    # MatMul weight is [K, N], we store as [N, K]
+                    if w_data.ndim == 2:
+                        w_data = w_data.T
+                    out[bp_name] = w_data.astype(np.float16)
+                    # Infer intermediate_size
+                    if "gate_up_proj" in bp_name or "gate_proj" in bp_name:
+                        N = w_data.shape[0]
+                        if cfg["intermediate_size"] == 0:
+                            cfg["intermediate_size"] = N
+
         elif node.op_type == "SimplifiedLayerNormalization":
             w_name = node.input[1]
             if w_name in init_map:
@@ -243,6 +261,13 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
                 bp_name = _onnx_norm_to_backpack(w_name)
                 if bp_name:
                     out[bp_name] = w_data.astype(np.float32)
+
+        elif node.op_type == "Gather":
+            # Plain embedding lookup (non-quantized)
+            emb_name = node.input[0]
+            if emb_name in init_map and "embed" in emb_name.lower():
+                emb_data = numpy_helper.to_array(init_map[emb_name])
+                out["embed_tokens.weight"] = emb_data.astype(np.float16)
 
         elif node.op_type == "GatherBlockQuantized":
             # Quantized embedding — find the actual weight from the input chain
@@ -300,6 +325,38 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
         if "final_norm" in name or name in ("model.norm.weight", "norm.weight"):
             if "norm.weight" not in out:
                 out["norm.weight"] = numpy_helper.to_array(init).astype(np.float32)
+
+    # Fuse Q/K/V → QKV per layer (if not already fused)
+    for i in range(n_layer):
+        q_key = f"layers.{i}.self_attn.q_proj.weight"
+        k_key = f"layers.{i}.self_attn.k_proj.weight"
+        v_key = f"layers.{i}.self_attn.v_proj.weight"
+        qkv_key = f"layers.{i}.self_attn.qkv_proj.weight"
+
+        # Try Q4 fusion
+        if q_key + ".q4" in out and k_key + ".q4" in out:
+            for suffix in [".q4", ".q4_scales"]:
+                q = out.pop(q_key + suffix)
+                k = out.pop(k_key + suffix)
+                v = out.pop(v_key + suffix)
+                out[qkv_key + suffix] = np.concatenate([q, k, v], axis=0)
+            for suffix in [".q4_K", ".q4_N", ".q4_block_size"]:
+                q_val = out.pop(q_key + suffix, None)
+                out.pop(k_key + suffix, None)
+                out.pop(v_key + suffix, None)
+                if q_val is not None:
+                    out[qkv_key + suffix] = q_val
+            # Sum N for K and block_size reuse
+            if qkv_key + ".q4_N" in out:
+                # Recalculate total N
+                pass  # concatenation handles it
+
+        # Try fp16 fusion
+        elif q_key in out and k_key in out and v_key in out:
+            q = out.pop(q_key)
+            k = out.pop(k_key)
+            v = out.pop(v_key)
+            out[qkv_key] = np.concatenate([q, k, v], axis=0)
 
     # Fuse gate + up projections per layer
     for i in range(n_layer):
@@ -370,6 +427,9 @@ def _onnx_name_to_backpack(onnx_name: str, n_embd: int, q_dim: int,
     # Map ONNX names to our convention
     name_map = {
         "attn.qkv_proj": "self_attn.qkv_proj.weight",
+        "attn.q_proj": "self_attn.q_proj.weight",
+        "attn.k_proj": "self_attn.k_proj.weight",
+        "attn.v_proj": "self_attn.v_proj.weight",
         "attn.o_proj": "self_attn.o_proj.weight",
         "mlp.gate_up_proj": "mlp.gate_up_proj.weight",
         "mlp.gate_proj": "mlp.gate_proj.weight",
