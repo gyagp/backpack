@@ -31,74 +31,13 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'models'))
+sys.path.insert(0, os.path.join(ROOT, 'runtimes', 'python'))
 
-from runtimes.python.gguf_engine import (
-    GGUFModel, GGUFTokenizer, extract_config, load_gguf_weights,
-)
-from runtimes.python.onnx_loader import (
-    extract_onnx_config, load_onnx_tokenizer, load_onnx_weights,
-)
-from common.gguf_utils import GGUFFile
-
-
-# ─── Model path resolution ───────────────────────────────────────────────────
-
-DEFAULT_MODEL_REPO = os.environ.get(
-    "BACKPACK_MODELS", r"E:\workspace\project\ai-models")
-
-
-def resolve_model(path: str):
-    """Resolve a model path and detect format.
-
-    Returns: (model_path, format) where format is 'gguf' or 'onnx'.
-
-    Accepts:
-      - Direct GGUF file: model.gguf -> (path, 'gguf')
-      - Model directory with GGUF inside -> (gguf_path, 'gguf')
-      - Model directory with ONNX inside -> (dir_path, 'onnx')
-      - Model name: looks up in BACKPACK_MODELS
-    """
-    # Direct GGUF file
-    if path.endswith('.gguf') and os.path.isfile(path):
-        return path, 'gguf'
-
-    # Model directory or model name
-    search_dirs = []
-    if os.path.isdir(path):
-        search_dirs.append(path)
-    else:
-        repo_path = os.path.join(DEFAULT_MODEL_REPO, path)
-        if os.path.isdir(repo_path):
-            search_dirs.append(repo_path)
-
-    for d in search_dirs:
-        # Check for GGUF files first
-        gguf_files = []
-        for root, _, files in os.walk(d):
-            gguf_files.extend(os.path.join(root, f) for f in files
-                              if f.endswith('.gguf'))
-        if gguf_files:
-            for gf in gguf_files:
-                if 'Q8_0' in gf: return gf, 'gguf'
-            for gf in gguf_files:
-                if 'Q4_K' in gf: return gf, 'gguf'
-            return gguf_files[0], 'gguf'
-
-        # Check for ONNX model
-        if os.path.exists(os.path.join(d, 'model.onnx')):
-            return d, 'onnx'
-
-        # Check subdirectories (e.g., phi-4-mini/webgpu/)
-        for sub in os.listdir(d):
-            sub_path = os.path.join(d, sub)
-            if os.path.isdir(sub_path) and os.path.exists(
-                    os.path.join(sub_path, 'model.onnx')):
-                return sub_path, 'onnx'
-
-    raise FileNotFoundError(
-        f"No model found at: {path}\n"
-        f"  Searched: {search_dirs or [path]}\n"
-        f"  Model repo: {DEFAULT_MODEL_REPO}")
+from model_parser.resolver import resolve_model
+from model_parser.gguf_parser import GGUFFile, extract_gguf_config, GGUFTokenizer
+from model_parser.onnx_parser import extract_onnx_config, OnnxTokenizer
+from runtimes.python.gguf_engine import GGUFModel, load_gguf_weights
+from runtimes.python.onnx_loader import load_onnx_weights
 
 
 # ─── Chat template formatting ────────────────────────────────────────────────
@@ -200,13 +139,13 @@ def main():
 
     if model_format == 'onnx':
         cfg = extract_onnx_config(model_path)
-        tokenizer = load_onnx_tokenizer(model_path)
+        tokenizer = OnnxTokenizer(model_path)
         weights = load_onnx_weights(model_path, cfg)
         # ONNX weights are dequantized to fp16 — use fp16w path
         cfg["model_format"] = "onnx"
     else:
         gf = GGUFFile(model_path)
-        cfg = extract_config(gf)
+        cfg = extract_gguf_config(gf)
         tokenizer = GGUFTokenizer(gf)
         weights = load_gguf_weights(gf, cfg)
 
