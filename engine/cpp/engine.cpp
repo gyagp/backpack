@@ -15,6 +15,39 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+/// Resolve model path: accepts GGUF file or directory containing GGUF
+static std::string resolveModelPath(const std::string& path) {
+    // Direct GGUF file
+    if (path.size() > 5 && path.substr(path.size() - 5) == ".gguf") {
+        if (fs::exists(path)) return path;
+    }
+
+    // Directory: search for GGUF files inside
+    if (fs::is_directory(path)) {
+        std::string bestQ8, bestQ4, first;
+        for (auto& entry : fs::recursive_directory_iterator(path)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                auto name = entry.path().filename().string();
+                if (first.empty()) first = entry.path().string();
+                if (name.find("Q8_0") != std::string::npos)
+                    bestQ8 = entry.path().string();
+                else if (name.find("Q4_K") != std::string::npos)
+                    bestQ4 = entry.path().string();
+            }
+        }
+        if (!bestQ8.empty()) return bestQ8;
+        if (!bestQ4.empty()) return bestQ4;
+        if (!first.empty()) return first;
+
+        fprintf(stderr, "No GGUF file found in: %s\n", path.c_str());
+    }
+
+    return path;  // return as-is, let GGUF loader report the error
+}
 
 int main(int argc, char* argv[]) {
     std::string gguf_path, prompt = "Hello";
@@ -35,12 +68,15 @@ int main(int argc, char* argv[]) {
     if (gguf_path.empty()) {
         fprintf(stderr,
             "Backpack Engine -- WebGPU inference from GGUF models\n\n"
-            "Usage: %s --model <path.gguf>\n"
+            "Usage: %s --model <model.gguf or model-dir/>\n"
             "  [--prompt <text>] [--max-tokens <n>] [--backend vulkan|d3d12]\n"
             "  [--profile]\n",
             argv[0]);
         return 1;
     }
+
+    // Resolve model path (directory -> find GGUF inside)
+    gguf_path = resolveModelPath(gguf_path);
 
     WGPUBackendType backend = WGPUBackendType_Vulkan;
     if (backend_str == "d3d12") backend = WGPUBackendType_D3D12;

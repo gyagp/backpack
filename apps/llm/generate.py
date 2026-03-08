@@ -6,16 +6,18 @@ Shared application code for all LLM architectures (LLaMA, Qwen, Mistral,
 Gemma, Phi, GPT-2, etc.). Uses the model-agnostic GGUF engine for inference.
 
 Usage:
-    python -m apps.llm.generate --model path/to/model.gguf \\
-        --prompt "Hello" --max-tokens 100
+    # Direct GGUF file
+    python -m apps.llm --model path/to/model.gguf --prompt "Hello"
 
-    # With chat template
-    python -m apps.llm.generate --model path/to/model.gguf \\
-        --chat "What is the capital of France?"
+    # Model directory (auto-discovers GGUF inside)
+    python -m apps.llm --model path/to/model-dir/ --prompt "Hello"
+
+    # From central model repo
+    python -m apps.llm --model E:/workspace/project/ai-models/qwen-3-1.7B \\
+        --chat "What is 2+2?"
 
     # With profiling
-    python -m apps.llm.generate --model path/to/model.gguf \\
-        --prompt "Hello" --profile
+    python -m apps.llm --model model.gguf --prompt "Hello" --profile
 """
 
 import argparse
@@ -34,6 +36,57 @@ from engine.python.gguf_engine import (
     GGUFModel, GGUFTokenizer, extract_config, load_gguf_weights,
 )
 from common.gguf_utils import GGUFFile
+
+
+# ─── Model path resolution ───────────────────────────────────────────────────
+
+DEFAULT_MODEL_REPO = os.environ.get(
+    "BACKPACK_MODELS", r"E:\workspace\project\ai-models")
+
+
+def resolve_model_path(path: str) -> str:
+    """Resolve a model path to a GGUF file.
+
+    Accepts:
+      - Direct GGUF file path: model.gguf
+      - Model directory: finds *.gguf inside
+      - Model name: looks up in BACKPACK_MODELS env / default repo
+    """
+    # Direct GGUF file
+    if path.endswith('.gguf') and os.path.isfile(path):
+        return path
+
+    # Model directory or model name
+    search_dirs = []
+    if os.path.isdir(path):
+        search_dirs.append(path)
+    else:
+        repo_path = os.path.join(DEFAULT_MODEL_REPO, path)
+        if os.path.isdir(repo_path):
+            search_dirs.append(repo_path)
+
+    for d in search_dirs:
+        gguf_files = []
+        for root, _, files in os.walk(d):
+            gguf_files.extend(os.path.join(root, f) for f in files
+                              if f.endswith('.gguf'))
+        if gguf_files:
+            # Prefer Q8_0 > Q4_K > any
+            for gf in gguf_files:
+                if 'Q8_0' in gf: return gf
+            for gf in gguf_files:
+                if 'Q4_K' in gf: return gf
+            return gguf_files[0]
+
+        # No GGUF — check for ONNX
+        if any(f.endswith('.onnx') for f in os.listdir(d)):
+            print(f"Note: {os.path.basename(d)} has ONNX model but no GGUF.")
+            print(f"  GGUF support coming soon, or convert manually.")
+
+    raise FileNotFoundError(
+        f"No GGUF model found at: {path}\n"
+        f"  Searched: {search_dirs or [path]}\n"
+        f"  Model repo: {DEFAULT_MODEL_REPO}")
 
 
 # ─── Chat template formatting ────────────────────────────────────────────────
@@ -110,9 +163,11 @@ def generate(model: GGUFModel, tokenizer: GGUFTokenizer,
 def main():
     parser = argparse.ArgumentParser(
         description="LLM text generation (all architectures)")
-    parser.add_argument("--model", required=True, help="Path to GGUF model")
+    parser.add_argument("--model", required=True,
+                        help="GGUF file, model directory, or model name")
     parser.add_argument("--prompt", default=None, help="Text prompt")
-    parser.add_argument("--chat", default=None, help="Chat message (auto-wrapped in template)")
+    parser.add_argument("--chat", default=None,
+                        help="Chat message (auto-wrapped in template)")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--backend", default=None, help="vulkan/d3d12")
@@ -124,10 +179,13 @@ def main():
     if not args.prompt and not args.chat:
         args.prompt = "Hello"
 
+    # Resolve model path (GGUF file, directory, or model name)
+    model_path = resolve_model_path(args.model)
+
     # Load model
     t0 = time.time()
-    print(f"Loading: {args.model}")
-    gf = GGUFFile(args.model)
+    print(f"Loading: {model_path}")
+    gf = GGUFFile(model_path)
     cfg = extract_config(gf)
     tokenizer = GGUFTokenizer(gf)
     weights = load_gguf_weights(gf, cfg)
