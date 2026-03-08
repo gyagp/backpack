@@ -4,7 +4,7 @@ project(backpack_engine LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Dawn paths (relative to engines/cpp/)
+# Dawn paths (relative to runtimes/cpp/)
 set(DAWN_SRC "${CMAKE_SOURCE_DIR}/../../third_party/dawn" CACHE PATH "Dawn source")
 set(DAWN_BUILD "${DAWN_SRC}/build" CACHE PATH "Dawn build (gen headers)")
 set(DAWN_LIB "${CMAKE_SOURCE_DIR}/../../third_party/triton-windows/third_party/webgpu/dawn/build"

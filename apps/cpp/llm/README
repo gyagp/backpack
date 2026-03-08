@@ -1,12 +1,12 @@
 # C++ LLM Application
 #
-# The C++ LLM app is built as part of the C++ engine (engines/cpp/).
-# The entry point is engines/cpp/engine.cpp which contains the
-# prompt→generate loop, streaming output, and profiling.
+# The C++ LLM app is built as part of the C++ runtime (runtimes/cpp/).
+# The entry point is runtimes/cpp/engine.cpp which contains the
+# prompt->generate loop, streaming output, and profiling.
 #
 # Build:
-#   cd gitignore/engines/cpp/build
-#   cmake ../../../../engines/cpp
+#   cd gitignore/runtimes/cpp/build
+#   cmake ../../../../runtimes/cpp
 #   cmake --build . --config Release
 #
 # Run:

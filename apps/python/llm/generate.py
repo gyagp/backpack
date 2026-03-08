@@ -32,7 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.a
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'models'))
 
-from engines.python.gguf_engine import (
+from runtimes.python.gguf_engine import (
     GGUFModel, GGUFTokenizer, extract_config, load_gguf_weights,
 )
 from common.gguf_utils import GGUFFile

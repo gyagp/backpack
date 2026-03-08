@@ -191,7 +191,7 @@ int main(int argc, char* argv[]) {
         auto exeDir = fs::path(argv[0]).parent_path();
         if (exeDir.empty()) exeDir = fs::current_path();
         for (auto p = fs::absolute(exeDir); !p.empty() && p != p.parent_path(); p = p.parent_path()) {
-            if (fs::exists(p / ".gitignore") && fs::exists(p / "engines")) {
+            if (fs::exists(p / ".gitignore") && fs::exists(p / "runtimes")) {
                 repoRoot = p;
                 break;
             }
