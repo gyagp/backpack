@@ -1,3 +1,4 @@
+enable f16;
 enable subgroups;
 
 // Simple batched RoPE + QK-norm + KV cache scatter for prefill.
@@ -14,8 +15,8 @@ enable subgroups;
 
 @group(0) @binding(0) var<storage, read> QKV: array<f32>;
 @group(0) @binding(1) var<storage, read_write> QRot: array<f32>;
-@group(0) @binding(2) var<storage, read_write> K_cache: array<f32>;
-@group(0) @binding(3) var<storage, read_write> V_cache: array<f32>;
+@group(0) @binding(2) var<storage, read_write> K_cache: array<f16>;
+@group(0) @binding(3) var<storage, read_write> V_cache: array<f16>;
 @group(0) @binding(4) var<storage, read> Cos: array<f32>;
 @group(0) @binding(5) var<storage, read> Sin: array<f32>;
 @group(0) @binding(6) var<storage, read> QNormW: array<f32>;
@@ -112,13 +113,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let kj = QKV[k_src + j] * rstd * KNormW[j];
             let c = Cos[pos * half_dim + i];
             let s = Sin[pos * half_dim + i];
-            K_cache[k_dst + i] = ki * c - kj * s;
-            K_cache[k_dst + j] = kj * c + ki * s;
+            K_cache[k_dst + i] = f16(ki * c - kj * s);
+            K_cache[k_dst + j] = f16(kj * c + ki * s);
         }
 
         // V: just copy to cache (no RoPE, no norm)
         for (var i = tid; i < HD; i += 128u) {
-            V_cache[v_dst + i] = QKV[v_src + i];
+            V_cache[v_dst + i] = f16(QKV[v_src + i]);
         }
     }
 }

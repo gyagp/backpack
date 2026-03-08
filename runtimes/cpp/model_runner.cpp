@@ -151,15 +151,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * cfg.intermediateSize * 4);
     gpu->writeBuffer(zeroBiasV,   zeros.data(), cfg.nVocab * 4);
 
-    // KV cache
+    // KV cache (fp16 — halves attention bandwidth)
     kvCache.resize(cfg.nLayer);
-    uint64_t kvSize = (uint64_t)maxSeqLen * cfg.nKvHeads * cfg.headDim * 4;
+    uint64_t kvSize = (uint64_t)maxSeqLen * cfg.nKvHeads * cfg.headDim * 2;  // 2 bytes per f16
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         kvCache[i].K = gpu->createBuffer("kv_K_" + std::to_string(i), kvSize);
         kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
         kvCache[i].len = 0;
     }
-    printf("  KV cache: %.0f MB\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
+    printf("  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
 
     // Helper: load fp32/fp16 norm weight from GGUF tensor
     auto loadNorm = [&](const std::string& ggufName, GPUBuffer& buf) {
@@ -728,8 +728,10 @@ void ModelRunner::initPrefillResources() {
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         pfCache.ropeParams[li] = gpu->createBuffer(
             "pp_rope_L" + std::to_string(li), 32);
+        // Attention params use uniform buffer for WGSL uniformity analysis
         pfCache.attnParams[li] = gpu->createBuffer(
-            "pp_attn_L" + std::to_string(li), 32);
+            "pp_attn_L" + std::to_string(li), 32,
+            BUF_UNIFORM | BUF_COPY_DST);
     }
 
     // Get kernels (triggers pipeline compilation)
@@ -1069,6 +1071,7 @@ int32_t ModelRunner::prefillBatched(
         ap[0] = cfg.nKvHeads * cfg.headDim;
         ap[1] = cfg.nHead / cfg.nKvHeads;
         ap[2] = T_total;  ap[3] = cacheLen;
+        ap[4] = T;  // T_prefill
         float sc = 1.0f / sqrtf((float)cfg.headDim);
         float ni = -1e9f;
         memcpy(&ap[5], &sc, 4);  memcpy(&ap[6], &ni, 4);

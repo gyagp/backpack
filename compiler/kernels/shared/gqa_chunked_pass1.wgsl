@@ -1,8 +1,9 @@
+enable f16;
 enable subgroups;
 
 @group(0) @binding(0) var<storage, read_write> Q: array<f32>;
-@group(0) @binding(1) var<storage, read_write> K_cache: array<f32>;
-@group(0) @binding(2) var<storage, read_write> V_cache: array<f32>;
+@group(0) @binding(1) var<storage, read_write> K_cache: array<f16>;
+@group(0) @binding(2) var<storage, read_write> V_cache: array<f16>;
 @group(0) @binding(3) var<storage, read_write> Partials: array<f32>;
 @group(0) @binding(4) var<storage, read_write> _params_: array<u32>;
 
@@ -48,10 +49,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let valid = t < T_total;
 
         let k_base = select(0u, t * kv_stride + kv_off, valid);
-        let k0 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD], valid);
-        let k1 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 1u], valid);
-        let k2 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 2u], valid);
-        let k3 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 3u], valid);
+        let k0 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD]), valid);
+        let k1 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 1u]), valid);
+        let k2 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 2u]), valid);
+        let k3 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 3u]), valid);
 
         // Full 128-element dot product via 4-element partial + subgroupAdd
         let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
@@ -67,10 +68,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let w = exp_score / max(l_new, 1e-10);
 
         let v_base = select(0u, t * kv_stride + kv_off, valid);
-        let v0 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD], valid);
-        let v1 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 1u], valid);
-        let v2 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 2u], valid);
-        let v3 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 3u], valid);
+        let v0 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD]), valid);
+        let v1 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + 1u]), valid);
+        let v2 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + 2u]), valid);
+        let v3 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + 3u]), valid);
 
         acc0 = acc0 * rescale + v0 * w;
         acc1 = acc1 * rescale + v1 * w;

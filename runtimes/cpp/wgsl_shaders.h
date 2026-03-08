@@ -2434,26 +2434,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // [shared] flash_attn_mma (5 bindings)
 static const char* WGSL_FLASH_ATTN_MMA = R"WGSL(
+enable f16;
 enable subgroups;
 
-// Multi-query causal attention: 4 query positions per workgroup.
-// Each warp independently processes one query position, sharing
-// KV cache reads via L1/L2 cache (same KV positions accessed by
-// adjacent warps at similar times).
+// Multi-query causal attention with fp16 KV cache + early exit.
+// 4 query positions per workgroup. Each warp independently processes
+// one query position. fp16 KV cache halves bandwidth.
+// Uniform params enable data-dependent loop bound for early exit.
 //
 // Grid: (n_head, ceil(T/4), 1)
 // WG: 128 threads (4 warps × 32 threads)
 
 @group(0) @binding(0) var<storage, read_write> Q: array<f32>;
-@group(0) @binding(1) var<storage, read_write> K_cache: array<f32>;
-@group(0) @binding(2) var<storage, read_write> V_cache: array<f32>;
+@group(0) @binding(1) var<storage, read_write> K_cache: array<f16>;
+@group(0) @binding(2) var<storage, read_write> V_cache: array<f16>;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;
-@group(0) @binding(4) var<storage, read_write> _params_: array<u32>;
+
+struct AttnParams {
+    kv_stride: u32,
+    n_rep: u32,
+    T_total: u32,
+    cache_offset: u32,
+    T_prefill: u32,
+    scale_bits: u32,
+    neg_inf_bits: u32,
+    pad1: u32,
+};
+@group(0) @binding(4) var<uniform> params: AttnParams;
 
 const HD: u32 = 128u;
 const HD_PER_THREAD: u32 = 4u;
 const QUERIES_PER_WG: u32 = 4u;
-const MAX_SEQ: u32 = 4096u;
 
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -2464,18 +2475,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let warp_id = tid / 32u;
     let lane = tid % 32u;
 
-    let kv_stride = _params_[0];
-    let n_rep = _params_[1];
-    let T_total = _params_[2];
-    let cache_offset = _params_[3];
-    let scale = bitcast<f32>(_params_[5]);
-    let neg_inf = bitcast<f32>(_params_[6]);
+    let kv_stride = params.kv_stride;
+    let n_rep = params.n_rep;
+    let T_total = params.T_total;
+    let cache_offset = params.cache_offset;
+    let scale = bitcast<f32>(params.scale_bits);
+    let neg_inf = bitcast<f32>(params.neg_inf_bits);
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
     let n_head_total = kv_stride / HD * n_rep;
 
-    // Each warp handles one query position
     let q_idx = q_block * QUERIES_PER_WG + warp_id;
     let q_abs_pos = cache_offset + q_idx;
 
@@ -2490,14 +2500,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var m_prev: f32 = neg_inf;
     var l_prev: f32 = 0.0;
 
-    for (var t = 0u; t < MAX_SEQ; t = t + 1u) {
-        let causal_valid = (t < T_total) && (t <= q_abs_pos);
+    // Early exit: max causal position across all 4 warps in this WG.
+    // Uniform because params is var<uniform> and q_block = wid.y (uniform).
+    let max_causal = min(cache_offset + q_block * QUERIES_PER_WG + QUERIES_PER_WG, T_total);
 
-        let k_base = select(0u, t * kv_stride + kv_off, causal_valid);
-        let k0 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD], causal_valid);
-        let k1 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 1u], causal_valid);
-        let k2 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 2u], causal_valid);
-        let k3 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 3u], causal_valid);
+    for (var t = 0u; t < max_causal; t = t + 1u) {
+        let causal_valid = t <= q_abs_pos;
+
+        let k_base = t * kv_stride + kv_off;
+        let k_off = k_base + lane * HD_PER_THREAD;
+        let k0 = select(0.0, f32(K_cache[k_off]), causal_valid);
+        let k1 = select(0.0, f32(K_cache[k_off + 1u]), causal_valid);
+        let k2 = select(0.0, f32(K_cache[k_off + 2u]), causal_valid);
+        let k3 = select(0.0, f32(K_cache[k_off + 3u]), causal_valid);
 
         let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
         let dot_qk = subgroupAdd(partial);
@@ -2510,11 +2525,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let rescale = l_prev * exp_prev / max(l_new, 1e-10);
         let w = exp_score / max(l_new, 1e-10);
 
-        let v_base = select(0u, t * kv_stride + kv_off, causal_valid);
-        let v0 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD], causal_valid);
-        let v1 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 1u], causal_valid);
-        let v2 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 2u], causal_valid);
-        let v3 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 3u], causal_valid);
+        let v_off = k_base + lane * HD_PER_THREAD;
+        let v0 = select(0.0, f32(V_cache[v_off]), causal_valid);
+        let v1 = select(0.0, f32(V_cache[v_off + 1u]), causal_valid);
+        let v2 = select(0.0, f32(V_cache[v_off + 2u]), causal_valid);
+        let v3 = select(0.0, f32(V_cache[v_off + 3u]), causal_valid);
 
         acc0 = acc0 * rescale + v0 * w;
         acc1 = acc1 * rescale + v1 * w;
@@ -2695,6 +2710,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [shared] fused_qknorm_rope (9 bindings)
 static const char* WGSL_FUSED_QKNORM_ROPE = R"WGSL(
+enable f16;
 enable subgroups;
 
 // Auto-generated by Triton WebGPU Backend
@@ -2705,8 +2721,8 @@ var<workgroup> _smem: array<i32, 4>;
 
 @group(0) @binding(0) var<storage, read> buf0: array<f32>;  // QKV
 @group(0) @binding(1) var<storage, read_write> buf1: array<f32>;  // Q_out
-@group(0) @binding(2) var<storage, read_write> buf2: array<f32>;  // K_cache
-@group(0) @binding(3) var<storage, read_write> buf3: array<f32>;  // V_cache
+@group(0) @binding(2) var<storage, read_write> buf2: array<f16>;  // K_cache
+@group(0) @binding(3) var<storage, read_write> buf3: array<f16>;  // V_cache
 @group(0) @binding(4) var<storage, read> buf4: array<f32>;  // CosTable
 @group(0) @binding(5) var<storage, read> buf5: array<f32>;  // SinTable
 @group(0) @binding(6) var<storage, read> buf6: array<f32>;  // NormQ
@@ -2855,13 +2871,13 @@ fn main(
     let v157: i32 = select(0, 1, v34);
     let v158: bool = v157 == 0;
     let v162: f32 = select(f32(0), v153, v158);
-    if v158 { buf2[u32(((params.cache_offset + v37) + v33))] = v162; }
+    if v158 { buf2[u32(((params.cache_offset + v37) + v33))] = f16(v162); }
     let v163: i32 = params.q_size + params.kv_size;
     let v164: i32 = v163 + v37;
     let v167: f32 = buf0[u32((v164 + v33))];
     let v168: f32 = select(f32(0.0), v167, v158);
     let v172: f32 = select(f32(0), v168, v158);
-    if v158 { buf3[u32(((params.cache_offset + v37) + v33))] = v172; }
+    if v158 { buf3[u32(((params.cache_offset + v37) + v33))] = f16(v172); }
 }
 )WGSL";
 
@@ -3024,11 +3040,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 // [shared] gqa_chunked_pass1 (5 bindings)
 static const char* WGSL_GQA_CHUNKED_PASS1 = R"WGSL(
+enable f16;
 enable subgroups;
 
 @group(0) @binding(0) var<storage, read_write> Q: array<f32>;
-@group(0) @binding(1) var<storage, read_write> K_cache: array<f32>;
-@group(0) @binding(2) var<storage, read_write> V_cache: array<f32>;
+@group(0) @binding(1) var<storage, read_write> K_cache: array<f16>;
+@group(0) @binding(2) var<storage, read_write> V_cache: array<f16>;
 @group(0) @binding(3) var<storage, read_write> Partials: array<f32>;
 @group(0) @binding(4) var<storage, read_write> _params_: array<u32>;
 
@@ -3074,10 +3091,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let valid = t < T_total;
 
         let k_base = select(0u, t * kv_stride + kv_off, valid);
-        let k0 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD], valid);
-        let k1 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 1u], valid);
-        let k2 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 2u], valid);
-        let k3 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 3u], valid);
+        let k0 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD]), valid);
+        let k1 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 1u]), valid);
+        let k2 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 2u]), valid);
+        let k3 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 3u]), valid);
 
         // Full 128-element dot product via 4-element partial + subgroupAdd
         let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
@@ -3093,10 +3110,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let w = exp_score / max(l_new, 1e-10);
 
         let v_base = select(0u, t * kv_stride + kv_off, valid);
-        let v0 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD], valid);
-        let v1 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 1u], valid);
-        let v2 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 2u], valid);
-        let v3 = select(0.0, V_cache[v_base + lane * HD_PER_THREAD + 3u], valid);
+        let v0 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD]), valid);
+        let v1 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + 1u]), valid);
+        let v2 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + 2u]), valid);
+        let v3 = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + 3u]), valid);
 
         acc0 = acc0 * rescale + v0 * w;
         acc1 = acc1 * rescale + v1 * w;
@@ -3435,6 +3452,7 @@ fn main(
 
 // [shared] rope_batched_simple (9 bindings)
 static const char* WGSL_ROPE_BATCHED_SIMPLE = R"WGSL(
+enable f16;
 enable subgroups;
 
 // Simple batched RoPE + QK-norm + KV cache scatter for prefill.
@@ -3451,8 +3469,8 @@ enable subgroups;
 
 @group(0) @binding(0) var<storage, read> QKV: array<f32>;
 @group(0) @binding(1) var<storage, read_write> QRot: array<f32>;
-@group(0) @binding(2) var<storage, read_write> K_cache: array<f32>;
-@group(0) @binding(3) var<storage, read_write> V_cache: array<f32>;
+@group(0) @binding(2) var<storage, read_write> K_cache: array<f16>;
+@group(0) @binding(3) var<storage, read_write> V_cache: array<f16>;
 @group(0) @binding(4) var<storage, read> Cos: array<f32>;
 @group(0) @binding(5) var<storage, read> Sin: array<f32>;
 @group(0) @binding(6) var<storage, read> QNormW: array<f32>;
@@ -3549,13 +3567,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let kj = QKV[k_src + j] * rstd * KNormW[j];
             let c = Cos[pos * half_dim + i];
             let s = Sin[pos * half_dim + i];
-            K_cache[k_dst + i] = ki * c - kj * s;
-            K_cache[k_dst + j] = kj * c + ki * s;
+            K_cache[k_dst + i] = f16(ki * c - kj * s);
+            K_cache[k_dst + j] = f16(kj * c + ki * s);
         }
 
         // V: just copy to cache (no RoPE, no norm)
         for (var i = tid; i < HD; i += 128u) {
-            V_cache[v_dst + i] = QKV[v_src + i];
+            V_cache[v_dst + i] = f16(QKV[v_src + i]);
         }
     }
 }
