@@ -112,6 +112,10 @@ struct GPUContext {
     /// Returns immediately; call waitForQueue() to synchronize.
     void submitDispatches(const std::vector<Dispatch>& dispatches);
 
+    /// Submit dispatches without readback (fire-and-forget).
+    void submitOnly(const std::vector<Dispatch>& dispatches,
+                    bool singlePass = true);
+
     /// Submit dispatches, copy result buffer, and synchronize.
     /// Returns a numpy-like vector of the readback data.
     /// passPerDispatch: if true, each dispatch gets its own compute pass

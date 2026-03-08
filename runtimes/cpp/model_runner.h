@@ -47,8 +47,10 @@ struct ModelRunner {
     // Pre-built decode pipeline
     std::vector<Dispatch> allDecodeDispatches;
 
-    // GPU argmax (appended after LM head)
-    GPUBuffer argmaxResultBuf;  // single i32
+    // GPU argmax + embedding gather (for zero-readback decode)
+    GPUBuffer argmaxResultBuf;
+    GPUBuffer embeddingGpuBuf;     // full embedding table on GPU (fp32)
+    std::vector<Dispatch> autoDecodeDispatches;  // embed_gather + full decode  // single i32
 
     // Embedding (CPU-side)
     std::vector<float> embeddingCPU;
@@ -76,8 +78,12 @@ struct ModelRunner {
     bool load(GPUContext& ctx, const std::string& ggufPath);
     std::string ggufPath;  // stored for profile output location
     std::vector<float> decode(int32_t tokenId, uint32_t posOffset);
-    /// Fast decode: returns just the argmax token ID (no logits readback)
     int32_t decodeArgmax(int32_t tokenId, uint32_t posOffset);
+    /// Zero-readback decode: submit embed_gather + full pipeline + argmax.
+    /// Must call readLastArgmax() to get the result.
+    void decodeAutoregressive(uint32_t posOffset);
+    /// Read back the argmax result from the last decodeAutoregressive call.
+    int32_t readLastArgmax();
     static int32_t argmax(const std::vector<float>& logits);
 
     void enableProfiling();

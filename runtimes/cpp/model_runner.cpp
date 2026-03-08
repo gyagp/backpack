@@ -613,6 +613,39 @@ void ModelRunner::buildDecodePipeline() {
         allDecodeDispatches.push_back({plArgmax.pipeline, bg, 1, 1, 1, "argmax"});
     }
 
+    // GPU embedding gather (reads argmax result, writes embedding to xBuf)
+    // This enables zero-readback autoregressive decode.
+    {
+        auto& plEmbGather = getKernel("embed_gather");
+
+        // Upload full embedding table to GPU
+        uint64_t embBytes = (uint64_t)embeddingCPU.size() * 4;
+        embeddingGpuBuf = gpu->createBuffer("embedding_gpu", embBytes);
+        const uint64_t CHUNK = 128 * 1024 * 1024;
+        for (uint64_t off = 0; off < embBytes; off += CHUNK) {
+            uint64_t sz = std::min(CHUNK, embBytes - off);
+            wgpuQueueWriteBuffer(gpu->queue, embeddingGpuBuf.handle, off,
+                                 (const uint8_t*)embeddingCPU.data() + off, sz);
+        }
+
+        GPUBuffer embedParams;
+        {
+            uint32_t p[4] = {cfg.nEmbd, 0, 0, 0};
+            embedParams = gpu->createBuffer("p_embed", 16);
+            gpu->writeBuffer(embedParams, p, 16);
+        }
+        auto bg = makeBG(plEmbGather, {
+            {0, embeddingGpuBuf}, {1, argmaxResultBuf},
+            {2, xBuf}, {3, embedParams}});
+
+        // autoDecodeDispatches = embed_gather + all decode dispatches
+        autoDecodeDispatches.clear();
+        autoDecodeDispatches.push_back({plEmbGather.pipeline, bg,
+            (cfg.nEmbd + 255) / 256, 1, 1, "embed_gather"});
+        autoDecodeDispatches.insert(autoDecodeDispatches.end(),
+            allDecodeDispatches.begin(), allDecodeDispatches.end());
+    }
+
     printf("  Pre-recorded %zu decode dispatches (%u layers)\n",
            allDecodeDispatches.size(), cfg.nLayer);
 }
@@ -675,6 +708,28 @@ int32_t ModelRunner::decodeArgmax(int32_t tokenId, uint32_t posOffset) {
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len++;
 
+    int32_t token;
+    memcpy(&token, result.data(), 4);
+    return token;
+}
+
+void ModelRunner::decodeAutoregressive(uint32_t posOffset) {
+    // No CPU embedding upload needed — embed_gather reads from argmaxResultBuf
+    uint32_t cacheLen = kvCache[0].len;
+    updateDecodeParams(posOffset, cacheLen);
+
+    // Submit all dispatches: embed_gather + decode + argmax (no readback)
+    gpu->submitOnly(autoDecodeDispatches, true);
+
+    for (uint32_t i = 0; i < cfg.nLayer; i++)
+        kvCache[i].len++;
+}
+
+int32_t ModelRunner::readLastArgmax() {
+    // Wait for GPU to finish, then copy argmax result to a readback buffer
+    gpu->waitForQueue();
+
+    auto result = gpu->readBuffer(argmaxResultBuf, 4);
     int32_t token;
     memcpy(&token, result.data(), 4);
     return token;

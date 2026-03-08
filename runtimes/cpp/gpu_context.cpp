@@ -271,6 +271,40 @@ WGPUBindGroup GPUContext::createBindGroup(
 
 // ─── Dispatch ────────────────────────────────────────────────────────────────
 
+void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
+                            bool singlePass) {
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
+
+    if (singlePass) {
+        WGPUComputePassDescriptor cpD{};
+        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+        for (auto& d : dispatches) {
+            wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+        }
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    } else {
+        for (auto& d : dispatches) {
+            WGPUComputePassDescriptor cpD{};
+            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+            wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+        }
+    }
+
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(queue, 1, &cb);
+    wgpuCommandEncoderRelease(enc);
+    wgpuCommandBufferRelease(cb);
+}
+
 void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);

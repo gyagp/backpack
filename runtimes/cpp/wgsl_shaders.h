@@ -1165,6 +1165,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )";
 
+// ─── GPU Embedding Gather ────────────────────────────────────────────────────
+// Reads token ID from ArgmaxResult[0] and copies the embedding row to X.
+// Eliminates CPU readback during decode — argmax result stays on GPU.
+
+static const char* WGSL_EMBED_GATHER = R"WGSL(
+@group(0) @binding(0) var<storage, read> EmbeddingTable: array<f32>;
+@group(0) @binding(1) var<storage, read> TokenId: array<i32>;
+@group(0) @binding(2) var<storage, read_write> X: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let E = _params_[0];
+    let idx = gid.x;
+    if (idx >= E) { return; }
+    let token = u32(TokenId[0]);
+    X[idx] = EmbeddingTable[token * E + idx];
+}
+)WGSL";
+
 
 inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
     static const std::unordered_map<std::string, ShaderInfo> kernels = {
@@ -1179,6 +1199,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"fp16_gemm", {WGSL_FP16_GEMM, 5}},
         {"fp16_gemm_wide", {WGSL_FP16_GEMM_WIDE, 5}},
         {"argmax", {WGSL_ARGMAX, 3}},
+        {"embed_gather", {WGSL_EMBED_GATHER, 4}},
     };
     return kernels;
 }

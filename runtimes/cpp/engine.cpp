@@ -144,7 +144,10 @@ int main(int argc, char* argv[]) {
         prefill_t1 - prefill_t0).count();
     int32_t firstToken = ModelRunner::argmax(logits);
 
-    // 6. Decode loop with text output
+    // Write first token to GPU argmax buffer for autoregressive chaining
+    gpu.writeBuffer(model.argmaxResultBuf, &firstToken, 4);
+
+    // 8. Decode loop — pipelined: print token N while GPU computes N+1
     printf("\n--- Output ---\n%s", prompt.c_str());
     fflush(stdout);
 
@@ -153,19 +156,20 @@ int main(int argc, char* argv[]) {
     int32_t nextToken = firstToken;
 
     for (int step = 0; step < max_tokens; step++) {
-        // Check for EOS
         if (nextToken == tokenizer.eos_token_id) break;
-
         generated.push_back(nextToken);
 
-        // Print token text immediately (streaming)
+        // Print token text
         std::string text = tokenizer.decode_token(nextToken);
         printf("%s", text.c_str());
         fflush(stdout);
 
-        // Generate next token (GPU argmax — reads back only 4 bytes)
+        // Submit next decode (non-blocking) 
         uint32_t pos = (uint32_t)(promptTokens.size() + step);
-        nextToken = model.decodeArgmax(nextToken, pos);
+        model.decodeAutoregressive(pos);
+
+        // Read back result (blocks, but GPU was working during printf above)
+        nextToken = model.readLastArgmax();
     }
 
     auto decode_t1 = std::chrono::steady_clock::now();
