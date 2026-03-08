@@ -736,7 +736,7 @@ void ModelRunner::initPrefillResources() {
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
     auto& kQ8T     = getKernel("q8_matmul_tiled");
-    auto& kDnSiluB = getKernel("q8_down_silu_add_batched");
+    auto& kDnSiluT = getKernel("q8_down_silu_add_tiled");
     auto& kRopeB   = getKernel("rope_batched_simple");
     auto& kCausal  = getKernel("causal_attn");
 
@@ -777,7 +777,7 @@ void ModelRunner::initPrefillResources() {
             {0, pfCache.pNorm}, {1, lw.guW}, {2, lw.guS},
             {3, zeroBiasGU}, {4, pfCache.pGU}, {5, pfCache.pGuP}});
 
-        bg.downsilu = makeBG(kDnSiluB, {
+        bg.downsilu = makeBG(kDnSiluT, {
             {0, pfCache.pGU}, {1, lw.dnW}, {2, lw.dnS},
             {3, zeroBiasE}, {4, pfCache.pX}, {5, pfCache.pDnP}});
     }
@@ -1079,11 +1079,11 @@ int32_t ModelRunner::prefillBatched(
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
     auto& kQ8T     = getKernel("q8_matmul_tiled");
-    auto& kDnSiluB = getKernel("q8_down_silu_add_batched");
+    auto& kDnSiluT = getKernel("q8_down_silu_add_tiled");
     auto& kRopeB   = getKernel("rope_batched_simple");
     auto& kCausal  = getKernel("causal_attn");
 
-    const uint32_t TILED_N = 32u;  // must match q8_matmul_tiled TILE_N
+    const uint32_t TILED_N = 32u;  // must match q8_matmul_tiled / q8_down_silu_add_tiled TILE_N
 
     std::vector<Dispatch> allPrefill;
     allPrefill.reserve(cfg.nLayer * 8 + 2);
@@ -1102,9 +1102,9 @@ int32_t ModelRunner::prefillBatched(
         allPrefill.push_back({kQ8T.pipeline,     bg.gateup,
             (T + TILE_M - 1) / TILE_M,
             (2 * cfg.intermediateSize + TILED_N - 1) / TILED_N, 1, "pf_gateup"});
-        allPrefill.push_back({kDnSiluB.pipeline, bg.downsilu,
+        allPrefill.push_back({kDnSiluT.pipeline, bg.downsilu,
             (T + TILE_M - 1) / TILE_M,
-            (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_down_silu"});
+            (cfg.nEmbd + TILED_N - 1) / TILED_N, 1, "pf_down_silu"});
     }
     allPrefill.push_back({kRmsB.pipeline, pfCache.finalRmsBG, T, 1, 1, "pf_final_rms"});
 

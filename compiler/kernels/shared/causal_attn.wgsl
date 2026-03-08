@@ -70,20 +70,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var l_prev: f32 = 0.0;
 
     for (var t = 0u; t < MAX_SEQ; t = t + 1u) {
-        let in_range = t < T_total;
-        // Causal mask: skip positions after this query
-        let causal_valid = in_range && (t <= q_abs_pos);
+        let causal_valid = (t < T_total) && (t <= q_abs_pos);
 
-        let k_base = select(0u, t * kv_stride + kv_off, in_range);
+        // Only load K/V when position is valid (skip masked positions)
+        let k_base = select(0u, t * kv_stride + kv_off, causal_valid);
         let k0 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD], causal_valid);
         let k1 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 1u], causal_valid);
         let k2 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 2u], causal_valid);
         let k3 = select(0.0, K_cache[k_base + lane * HD_PER_THREAD + 3u], causal_valid);
 
         let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
-        let dot_qk = subgroupAdd(partial);  // uniform: all threads always reach this
-        let raw_score = dot_qk * scale;
-        let score = select(neg_inf, raw_score, causal_valid);
+        let dot_qk = subgroupAdd(partial);
+        let score = select(neg_inf, dot_qk * scale, causal_valid);
 
         // Online softmax update
         let m_new = max(m_prev, score);
