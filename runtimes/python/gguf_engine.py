@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Model-agnostic GGUF inference engine for WebGPU.
+Model-agnostic GGUF inference runtime for WebGPU.
 
 Reads model architecture, weights, and tokenizer directly from any
 llama.cpp-compatible GGUF file. No model-specific Python code needed.
@@ -44,7 +44,7 @@ from common.model_base import WebGPUModel
 # ─── Model config extraction from GGUF metadata ──────────────────────────────
 
 def extract_config(gf: GGUFFile) -> dict:
-    """Extract model config from GGUF metadata, like the C++ engine."""
+    """Extract model config from GGUF metadata, like the C++ runtime."""
     md = gf.metadata
     arch = md.get("general.architecture", "llama")
     a = arch
@@ -297,8 +297,8 @@ class GGUFTokenizer:
 class GGUFModel(WebGPUModel):
     """Model-agnostic WebGPU inference from any llama-family GGUF.
 
-    Like the C++ engine, reads architecture from GGUF metadata and
-    builds the decode pipeline at runtime. No model-specific code.
+    Like the C++ runtime, reads architecture from GGUF metadata and
+    builds the decode pipeline at load time. No model-specific code.
     """
 
     MAX_SEQ_LEN = 2048
@@ -676,7 +676,7 @@ class GGUFModel(WebGPUModel):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Model-agnostic GGUF inference engine (WebGPU)")
+        description="Model-agnostic GGUF inference runtime (WebGPU)")
     parser.add_argument("--model", required=True,
                         help="Path to GGUF model file")
     parser.add_argument("--prompt", default="Hello",

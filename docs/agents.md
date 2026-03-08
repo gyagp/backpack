@@ -4,7 +4,7 @@ Checklist and conventions for AI coding agents working on this project.
 
 ## Project Overview
 
-- **What**: ML inference engine — Triton kernels compiled to WebGPU (WGSL), executed on Dawn
+- **What**: ML inference runtime — Triton kernels compiled to WebGPU (WGSL), executed on Dawn
 - **Language**: Python (models, kernels), WGSL (hand-tuned shaders), C++ (triton backend)
 - **Goal**: Run real ML models fully on Triton WebGPU — no PyTorch at inference time
 

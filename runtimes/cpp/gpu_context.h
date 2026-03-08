@@ -4,7 +4,7 @@
  *
  * Provides GPU initialization, buffer management, pipeline caching,
  * and dispatch encoding. Model-agnostic: the model-specific decode
- * plan is described in manifest.json and interpreted by the engine.
+ * plan is built from GGUF metadata at load time.
  */
 
 #include <webgpu/webgpu.h>
@@ -136,16 +136,30 @@ struct GPUContext {
 
     /// Submit dispatches + copy src to a staging buffer in ONE command buffer.
     /// Then start async map on the staging buffer (non-blocking).
-    /// Call completeAsyncMap() later to get the result.
-    void submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
-                            GPUBuffer src, uint64_t readSize,
-                            WGPUBuffer stagingBuf);
+    /// Returns the map future; call completeAsyncMapI32() later to get the result.
+    /// passPerDispatch: each dispatch gets its own compute pass (allows Dawn
+    ///   to elide barriers between passes that don't share writable buffers).
+    WGPUFuture submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
+                                  GPUBuffer src, uint64_t readSize,
+                                  WGPUBuffer stagingBuf,
+                                  bool passPerDispatch = false);
 
-    /// Wait for a previously started async map and read the data.
-    int32_t completeAsyncMapI32(WGPUBuffer stagingBuf);
+    /// Wait for a previously started async map and read the i32 data.
+    int32_t completeAsyncMapI32(WGPUBuffer stagingBuf, WGPUFuture future);
 
     /// Block until all submitted GPU work completes.
     void waitForQueue();
+
+    // Detailed timing (nanoseconds) for benchmarking
+    struct {
+        int64_t encode_ns = 0;
+        int64_t submit_ns = 0;
+        int64_t map_start_ns = 0;
+        int64_t wait_ns = 0;
+        int64_t unmap_ns = 0;
+        int64_t write_buf_ns = 0;
+        int count = 0;
+    } timing;
 
 private:
     std::unordered_map<std::string, CompiledPipeline> pipelines_;
@@ -157,6 +171,5 @@ private:
 
     WGPUBuffer getOrCreateReadbackBuf(uint64_t size);
 
-    // Pending async map future (for double-buffered readback)
-    WGPUFuture pendingMapFuture_{};
+
 };

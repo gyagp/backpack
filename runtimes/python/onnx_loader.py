@@ -169,7 +169,7 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
     """Load ONNX model weights for inference.
 
     Extracts Q4 quantized weights from ONNX and converts to our runtime format.
-    Returns weights dict compatible with the GGUF engine's GGUFModel.
+    Returns weights dict compatible with the GGUF runtime's GGUFModel.
     """
     import onnx
     from onnx import numpy_helper

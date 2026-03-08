@@ -1,6 +1,6 @@
 # Backpack
 
-LLM inference engine powered by Triton kernels compiled to WebGPU (WGSL) and executed on Dawn.
+LLM inference runtime powered by Triton kernels compiled to WebGPU (WGSL) and executed on Dawn.
 
 ## Architecture
 

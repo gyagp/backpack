@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 
 // ─── GPUProfiler ─────────────────────────────────────────────────────────────
 
@@ -144,7 +145,7 @@ bool GPUContext::init(WGPUBackendType backend) {
 
     WGPUDeviceDescriptor ddesc{};
     ddesc.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&devT);
-    ddesc.label = {"engine", 6};
+    ddesc.label = {"runtime", 7};
     ddesc.requiredFeatureCount = feats.size();
     ddesc.requiredFeatures = feats.empty() ? nullptr : feats.data();
     ddesc.requiredLimits = &limits;
@@ -197,7 +198,11 @@ GPUBuffer GPUContext::getBuffer(const std::string& name) const {
 
 void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
                              uint64_t offset) {
+    using hrc = std::chrono::high_resolution_clock;
+    auto t0 = hrc::now();
     wgpuQueueWriteBuffer(queue, buf.handle, offset, data, size);
+    auto t1 = hrc::now();
+    timing.write_buf_ns += (t1 - t0).count();
 }
 
 // ─── Pipelines ───────────────────────────────────────────────────────────────
@@ -490,28 +495,52 @@ std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
     return out;
 }
 
-void GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
-                                     GPUBuffer src, uint64_t readSize,
-                                     WGPUBuffer stagingBuf) {
+WGPUFuture GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
+                                           GPUBuffer src, uint64_t readSize,
+                                           WGPUBuffer stagingBuf,
+                                           bool passPerDispatch) {
+    using hrc = std::chrono::high_resolution_clock;
+    auto t0 = hrc::now();
+
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
-    WGPUComputePassDescriptor cpD{};
-    auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-    for (auto& d : dispatches) {
-        wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+    if (passPerDispatch) {
+        for (auto& d : dispatches) {
+            WGPUComputePassDescriptor cpD{};
+            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+            wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+        }
+    } else {
+        WGPUComputePassDescriptor cpD{};
+        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+        for (auto& d : dispatches) {
+            wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+        }
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
     }
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
 
     wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, 0,
                                           stagingBuf, 0, readSize);
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+
+    auto t1 = hrc::now();
+    timing.encode_ns += (t1 - t0).count();
+
     wgpuQueueSubmit(queue, 1, &cb);
+
+    auto t2 = hrc::now();
+    timing.submit_ns += (t2 - t1).count();
+
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -519,18 +548,34 @@ void GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatches,
     WGPUBufferMapCallbackInfo mcb{};
     mcb.mode = WGPUCallbackMode_WaitAnyOnly;
     mcb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void*, void*) {};
-    pendingMapFuture_ = wgpuBufferMapAsync(stagingBuf, 1, 0, readSize, mcb);
+    auto future = wgpuBufferMapAsync(stagingBuf, 1, 0, readSize, mcb);
+
+    auto t3 = hrc::now();
+    timing.map_start_ns += (t3 - t2).count();
+    timing.count++;
+
+    return future;
 }
 
-int32_t GPUContext::completeAsyncMapI32(WGPUBuffer stagingBuf) {
+int32_t GPUContext::completeAsyncMapI32(WGPUBuffer stagingBuf, WGPUFuture future) {
+    using hrc = std::chrono::high_resolution_clock;
+    auto t0 = hrc::now();
+
     // Wait for the pending map to complete
-    WGPUFutureWaitInfo fw{pendingMapFuture_, 0};
+    WGPUFutureWaitInfo fw{future, 0};
     wgpuInstanceWaitAny(instance, 1, &fw, UINT64_MAX);
+
+    auto t1 = hrc::now();
+    timing.wait_ns += (t1 - t0).count();
 
     int32_t val = 0;
     auto ptr = wgpuBufferGetConstMappedRange(stagingBuf, 0, 4);
     if (ptr) memcpy(&val, ptr, 4);
     wgpuBufferUnmap(stagingBuf);
+
+    auto t2 = hrc::now();
+    timing.unmap_ns += (t2 - t1).count();
+
     return val;
 }
 

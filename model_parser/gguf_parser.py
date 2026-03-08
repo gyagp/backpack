@@ -27,7 +27,7 @@ from common.gguf_utils import (
 def extract_gguf_config(gf: GGUFFile) -> dict:
     """Extract model config from GGUF metadata.
 
-    Returns a dict with standardized keys matching the C++ engine's
+    Returns a dict with standardized keys matching the C++ runtime's
     extractModelConfig().
     """
     md = gf.metadata

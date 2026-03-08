@@ -3,7 +3,7 @@
 LLM text generation application.
 
 Shared application code for all LLM architectures (LLaMA, Qwen, Mistral,
-Gemma, Phi, GPT-2, etc.). Uses the model-agnostic GGUF engine for inference.
+Gemma, Phi, GPT-2, etc.). Uses the model-agnostic GGUF runtime for inference.
 
 Usage:
     # Direct GGUF file

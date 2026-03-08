@@ -147,7 +147,7 @@ void generateProfileHTML(
     // Template with placeholders
     std::string html = R"TMPL(<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
-<title>Backpack Engine GPU Profile</title>
+<title>Backpack GPU Profile</title>
 <style>
 :root{--bg:#1a1b26;--bg2:#1f2335;--bg3:#292e42;--fg:#c0caf5;--fg2:#a9b1d6;--fg3:#565f89;--blue:#7aa2f7;--purple:#bb9af7;--green:#9ece6a;--orange:#ff9e64;--red:#f7768e;--cyan:#7dcfff;--yellow:#e0af68;--teal:#73daca}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -175,7 +175,7 @@ canvas{display:block}
 .step-card{background:var(--bg2);border:1px solid var(--bg3);border-radius:6px;padding:8px 12px;min-width:90px;text-align:center}
 .step-card .label{font-size:10px;color:var(--fg3)} .step-card .value{font-size:16px;font-weight:600;color:var(--green)} .step-card .unit{font-size:10px;color:var(--fg3)}
 </style></head><body>
-<header><h1>Backpack Engine GPU Profile</h1><span class="chip">{{TIMESTAMP}}</span><span class="chip">{{BACKEND}}</span></header>
+<header><h1>Backpack GPU Profile</h1><span class="chip">{{TIMESTAMP}}</span><span class="chip">{{BACKEND}}</span></header>
 <div class="step-cards">
 <div class="step-card"><div class="label">Decode</div><div class="value">{{TPS}}</div><div class="unit">tok/s</div></div>
 <div class="step-card"><div class="label">Prefill</div><div class="value">{{PREFILL_MS}}</div><div class="unit">ms</div></div>

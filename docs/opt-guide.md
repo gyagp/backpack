@@ -942,6 +942,57 @@ valid for identifying bottlenecks — the relative proportions are stable.
 **Rule**: Always report the **non-profiled** number as the model's
 throughput.  Profiling numbers are for internal optimization only.
 
+### 3.12 Benchmark Results (March 2026)
+
+Qwen3-1.7B Q8_0, RTX 5080, Vulkan backend. Gen=128 tokens (decode
+measured after prefill, at the corresponding context length).
+
+#### Backpack C++ Runtime
+
+Our prefill is sequential T=1 decode (no batched matmul), so prefill
+throughput equals decode throughput. The first-token latency (TTFT)
+scales linearly with prompt length.
+
+| Prompt tokens | Prefill ms | Prefill tok/s | Decode tok/s | TTFT |
+|--------------|-----------|--------------|-------------|------|
+| 3 | 28 | 107 | 193.1 | 28ms |
+| 128 | 732 | 175 | 182.2 | 732ms |
+| 531 | 3175 | 167 | 186.4 | 3.2s |
+| 1061 | 6407 | 166 | 183.3 | 6.4s |
+
+#### llama.cpp Vulkan
+
+llama.cpp uses batched matmul for prefill (cooperative matrix /
+tensor cores when T≥8), giving massive prefill speedup. Decode
+performance is similar across context lengths.
+
+| Prompt tokens | Prefill tok/s | Decode tok/s |
+|--------------|--------------|-------------|
+| 1 | 330 | ~327 |
+| 128 | **14,967** | 327 |
+| 256 | **18,909** | — |
+| 512 | **23,285** | — |
+| 1024 | **22,460** | — |
+| 2048 | **20,191** | — |
+
+#### Gap Analysis
+
+| Metric | Backpack | llama.cpp | Gap |
+|--------|---------|-----------|-----|
+| **Decode tok/s** | 186 | 327 | **1.8×** |
+| **Prefill tok/s (128)** | 175 | 14,967 | **85×** |
+| **Prefill tok/s (512)** | 167 | 23,285 | **140×** |
+| **TTFT (128 tok prompt)** | 732ms | ~9ms | **81×** |
+
+**Decode gap** (1.8×): Dawn internal barrier overhead per dispatch
+(~5µs × 255 dispatches ≈ 1.3ms/token).
+
+**Prefill gap** (85–140×): Our prefill processes tokens one-at-a-time
+(T=1 matvec, 5ms each). llama.cpp batches all prompt tokens into
+single matmul dispatches (T×E × E×N), utilizing tensor cores. This
+is the **#1 performance priority** — implementing batched prefill
+would reduce TTFT from 732ms to <10ms for 128-token prompts.
+
 ---
 
 ## 4. Buffer Management
@@ -1083,7 +1134,7 @@ Remove-Item models/<name>/weights/*.safetensors
 # Delete intermediate fp32 npz after quantization
 Remove-Item models/<name>/weights/weights.npz
 
-# Delete ONNX files (not used by our engine)
+# Delete ONNX files (not used by our runtime)
 Get-ChildItem models -Recurse -Include *.onnx,*.onnx_data | Remove-Item
 ```
 
@@ -1374,21 +1425,68 @@ dispatch savings compound: saving 1 dispatch × 24 layers × 10 tokens
 |--------|-------|---------------|
 | Q+K+V → QKV | 2 dispatches/layer | Concatenated weight matrix |
 | Gate+Up → GateUp | 1 dispatch/layer | Concatenated weight matrix |
-| RoPE Q + RoPE K + KV scatter | 1 dispatch/layer | `fused_rope_qkv_kernel` |
-| Attention (Q·K + softmax + V) | 2 dispatches | Single `gqa_decode_attn_kernel` |
-| Residual + RMSNorm | 1 dispatch/layer | `add_rms_norm_loop_kernel` |
-| SiLU·Gate (GPT-OSS) | 1 dispatch | `gptoss_gate_kernel` |
+| RoPE Q + RoPE K + KV scatter | 1 dispatch/layer | `fused_qknorm_rope` kernel |
+| Attention (Q·K + softmax + V) | 2 dispatches | Single chunked attention kernel |
+| Residual + RMSNorm | 1 dispatch/layer | `add_rms_norm` kernel |
+| SiLU·mul + down proj + residual add | 2 dispatches/layer | `q8_down_silu_add` kernel |
 
-### 6.3 Fusion Opportunities
+### 6.3 Fusion Experiment Results (March 2026)
 
-| Fusion | Expected saving | Complexity |
-|--------|----------------|-----------|
-| RMSNorm + QKV linear | 1 dispatch (norm becomes prologue of matmul) | Medium |
-| O-proj + residual add | 1 dispatch (add bias + residual in epilogue) | Low |
-| Down-proj + residual add | 1 dispatch (same pattern) | Low |
-| RoPE + QKV layout reshape | 1 dispatch (apply RoPE and reshape Q/K/V layout in one pass) | Medium |
+Tested on Qwen3-1.7B Q8_0, RTX 5080 Vulkan, 200-token decode.
 
-### 6.4 Batch-Level Fusion via Command Batching
+#### ✅ SiLU·mul + Down Projection (Implemented)
+
+Fuses `silu_mul` into the down projection matmul epilogue.  The kernel
+reads `gateUpBuf` (2×IM elements), applies `silu(gate) × up` on-the-fly
+while loading the activation vector into shared memory, then multiplies
+by W_down and adds to the residual.
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Dispatches | 283 | **255** | −28 (−10%) |
+| silu_mul | 3.6µs × 28 = 101µs | **0** | eliminated |
+| down_add | 22.1µs × 28 = 619µs | — | replaced |
+| down_silu_add | — | 22.6µs × 28 = 633µs | silu hidden by BW |
+| **Submit time** | 499µs | **398µs** | −20% |
+
+The SiLU computation adds negligible overhead because the kernel is
+memory-bandwidth-bound (reading W_down weights).  The activation
+vector transform is hidden behind the weight read latency.
+
+#### ❌ RMSNorm + QKV Matmul (Reverted — Regression)
+
+Created `q8_matmul_norm` kernel: two-pass approach where each WG
+independently reads X twice — once for sum-of-squares reduction and
+once for the normalized matmul.
+
+| Kernel | Before fusion | After fusion | Delta |
+|--------|-------------|-------------|-------|
+| q8_qkv + rms_norm | 19.0 + 10.5 = 29.5µs | 39.1µs | **+33%** |
+| lm_head + final_rms | 379 + 10.5 = 389.5µs | **1024µs** | **+163%** |
+
+**Why it failed**: Each of N/8 workgroups independently reads the full
+X vector (8KB) twice plus the norm weight vector.  For QKV (512 WGs)
+this adds ~512 × 16KB = 8MB of redundant reads.  For the LM head
+(19K WGs × 16KB = 300MB) it's catastrophic.  The ~5µs barrier savings
+per eliminated dispatch don't compensate.
+
+**Lesson**: Norm fusion only works when the norm can be computed by a
+small number of WGs (1-2) that broadcast the result.  Distributing
+the global reduction across thousands of matmul WGs multiplies memory
+traffic proportional to WG count.  llama.cpp avoids this by using
+a separate norm dispatch that writes to a scalar buffer — the overhead
+is the dispatch itself, not the compute.
+
+### 6.4 Fusion Opportunities (Remaining)
+
+| Fusion | Expected saving | Status |
+|--------|----------------|--------|
+| O-proj + residual add | 1 dispatch/layer | ✅ Already done (`q8_matmul_add`) |
+| Down-proj + silu + residual | 2 dispatches/layer | ✅ Implemented (`q8_down_silu_add`) |
+| RMSNorm + matmul | 1 dispatch/layer | ❌ Regression (per-WG redundant norm) |
+| attn_p2 → attn_p1 | 1 dispatch/layer for single-chunk | Medium (chunk count is dynamic) |
+
+### 6.5 Batch-Level Fusion via Command Batching
 
 Rather than fusing at the kernel level, batch multiple dispatches into
 a single command encoder submission.  This eliminates per-submit overhead
@@ -1409,7 +1507,7 @@ runner.end_batch()
 
 This reduced dispatch overhead from 1760ms → 337ms (5.2× speedup).
 
-### 6.5 Fast Decode: Pre-Compiled Pipeline
+### 6.6 Fast Decode: Pre-Compiled Pipeline
 
 The highest-performance decode path eliminates **all per-token Python
 overhead** by pre-compiling everything at init time:

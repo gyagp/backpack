@@ -214,7 +214,7 @@ def compile_all_kernels(output_dir, has_subgroups=True):
 def build_decode_plan(model_config):
     """Build the per-layer dispatch plan for fast decode.
 
-    Returns a list of dispatch descriptors that the C++ engine can execute
+    Returns a list of dispatch descriptors that the C++ runtime can execute
     without any Python-side logic.
     """
     E = model_config["n_embd"]
