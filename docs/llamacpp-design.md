@@ -76,11 +76,18 @@ for Q·K dot products. No cooperative matrix support in WGSL yet.
 Attention takes ~588µs/token vs estimated ~200µs with coopmat.
 
 **Blocker**: Dawn supports `chromium_experimental_subgroup_matrix` with
-i8×i8→i32 MMA tiles (M=8, N=8, K=32). Confirmed working on RTX 5080.
-However, Q8_0's per-block scales (varying scale per 32-element K-block)
-prevent simple MMA accumulation — each K-block needs rescaling,
-requiring store/load round-trips that negate tensor core benefits.
-Subgroup matrix is most useful for fp16 matmul or Q8 with uniform scales.
+i8×i8→i32 MMA tiles (M=16, N=16, K=32) and fp16×fp16→f32 (M=16, N=16,
+K=16). Both confirmed working on RTX 5080.
+
+**i8 MMA tested and slower**: Q8_0 weights can be loaded directly as
+packed i8 (zero dequant), but activation quantization (fp32→i8 per
+32-element block) and per-element post-MMA scale correction add more
+overhead than the fp16 dequant they replace. At 64×64 tile:
+i8 MMA = 2,902 tok/s vs fp16 MMA = 6,510 tok/s (2.2× slower).
+
+**fp16 MMA is optimal**: Inline weight dequant (extractBits + scale +
+f16 cast) is more pipeline-friendly than i8 MMA’s serial activation
+quantization + global-memory scale correction.
 
 ---
 
@@ -334,7 +341,8 @@ All submitted in a single `submitOnly` call.
 
 The remaining **3.4× gap** vs llama.cpp is primarily:
 - **Q8→fp16 dequant staging**: Per-element extractBits+scale in smem
-  before MMA (~4× slower than llama.cpp’s native SPIR-V pipeline).
+  before MMA. i8 MMA tested but 2.2× slower due to activation
+  quantization + post-MMA scale correction overhead.
 - **Dawn barrier overhead**: ~225 barriers × ~3-5µs per submit.
 - **SiLU activation cost**: exp(-gate) in tile_A staging path for
   down_silu kernel adds significant compute overhead.
