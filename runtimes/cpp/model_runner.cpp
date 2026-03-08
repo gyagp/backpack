@@ -710,10 +710,11 @@ void ModelRunner::initPrefillResources() {
     pfCache.pRstd = gpu->createBuffer("pf_rstd", T * 4);
 
     // Global param buffers (written per-call with actual T)
-    pfCache.pQkvP = gpu->createBuffer("pp_qkv", 16);
-    pfCache.pOpP  = gpu->createBuffer("pp_op",  16);
-    pfCache.pGuP  = gpu->createBuffer("pp_gu",  16);
-    pfCache.pDnP  = gpu->createBuffer("pp_dn",  16);
+    // MMA kernels use var<uniform>; attention params already uniform
+    pfCache.pQkvP = gpu->createBuffer("pp_qkv", 16, BUF_UNIFORM | BUF_COPY_DST);
+    pfCache.pOpP  = gpu->createBuffer("pp_op",  16, BUF_UNIFORM | BUF_COPY_DST);
+    pfCache.pGuP  = gpu->createBuffer("pp_gu",  16, BUF_UNIFORM | BUF_COPY_DST);
+    pfCache.pDnP  = gpu->createBuffer("pp_dn",  16, BUF_UNIFORM | BUF_COPY_DST);
     pfCache.pLmP  = gpu->createBuffer("pp_lm",  16);
     {
         uint32_t d[4] = {cfg.nEmbd, cfg.nEmbd, 0, 0};
