@@ -373,6 +373,26 @@ void ModelRunner::buildDecodePipeline() {
     auto& plRmsNorm    = getKernel("rms_norm");
     auto& plAddRmsNorm = getKernel("add_rms_norm");
     auto& plQ8Matmul   = getKernel("q8_matmul");
+
+    // Check subgroup matrix support
+    {
+        auto& kernels = getEmbeddedKernels();
+        auto it = kernels.find("test_subgroup_matrix");
+        if (it != kernels.end()) {
+            WGPUShaderSourceWGSL src{};
+            src.chain.sType = WGPUSType_ShaderSourceWGSL;
+            src.code = {it->second.source, strlen(it->second.source)};
+            WGPUShaderModuleDescriptor smD{};
+            smD.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&src);
+            auto sm = wgpuDeviceCreateShaderModule(gpu->device, &smD);
+            if (sm) {
+                printf("  Subgroup matrix: available (i8×i8→i32 MMA)\n");
+                wgpuShaderModuleRelease(sm);
+            } else {
+                printf("  Subgroup matrix: not available\n");
+            }
+        }
+    }
     auto& plQ8MatAdd   = getKernel("q8_matmul_add");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
     auto& plQ8AddFast  = getKernel("q8_matmul_add_fast");
@@ -934,41 +954,39 @@ std::vector<float> ModelRunner::prefillBatched(
 
     uint32_t cacheLen = kvCache[0].len;
 
-    // ── Per-layer processing ─────────────────────────────────────────
+    // ── Build ALL prefill dispatches into a single list ──────────────
+    // Then submit once — minimizes Dawn submit overhead.
+    std::vector<Dispatch> allPrefill;
+    allPrefill.reserve(cfg.nLayer * 8 + 2);
+
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         auto& lw = layerWeights[li];
 
-        // 1. Batched RMSNorm: pX[T×E] → pNorm[T×E]
+        // 1. Batched RMSNorm
         {
             auto bg = makeBG(kRmsB, {
                 {0, pX}, {1, pNorm}, {2, lw.inputNorm},
                 {3, pRstd}, {4, pRmsP}});
-            std::vector<Dispatch> d = {{kRmsB.pipeline, bg, T, 1, 1, "pf_rms"}};
-            gpu->submitOnly(d, true);
+            allPrefill.push_back({kRmsB.pipeline, bg, T, 1, 1, "pf_rms"});
         }
 
-        // 2. Batched QKV matmul: pNorm[T×E] × W → pQkv[T×QKV]
+        // 2. Batched QKV matmul
         {
             auto bg = makeBG(kQ8B, {
                 {0, pNorm}, {1, lw.qkvW}, {2, lw.qkvS},
                 {3, zeroBiasQKV}, {4, pQkv}, {5, pQkvP}});
-            std::vector<Dispatch> d = {{kQ8B.pipeline, bg,
+            allPrefill.push_back({kQ8B.pipeline, bg,
                 (T + TILE_M - 1) / TILE_M,
-                (qkvOutL + Q8_TILE - 1) / Q8_TILE, 1, "pf_qkv"}};
-            gpu->submitOnly(d, true);
+                (qkvOutL + Q8_TILE - 1) / Q8_TILE, 1, "pf_qkv"});
         }
 
-        // 3. Batched RoPE + KV scatter (single dispatch for all T tokens)
+        // 3. Batched RoPE + KV scatter
         {
             uint32_t ropeP[8] = {};
-            ropeP[0] = cfg.nHead;
-            ropeP[1] = qDimL;
-            ropeP[2] = kvDimL;
-            ropeP[3] = posOffset;
-            ropeP[4] = cfg.headDim / 2;
+            ropeP[0] = cfg.nHead;  ropeP[1] = qDimL;  ropeP[2] = kvDimL;
+            ropeP[3] = posOffset;  ropeP[4] = cfg.headDim / 2;
             ropeP[5] = cacheLen;
-            float eps_f = cfg.rmsNormEps;
-            memcpy(&ropeP[6], &eps_f, 4);
+            float eps_f = cfg.rmsNormEps; memcpy(&ropeP[6], &eps_f, 4);
             ropeP[7] = cfg.nKvHeads;
             auto pRP = gpu->createBuffer("pp_rope_L" + std::to_string(li), 32);
             gpu->writeBuffer(pRP, ropeP, 32);
@@ -980,23 +998,20 @@ std::vector<float> ModelRunner::prefillBatched(
                 {4, ropeCosBuf}, {5, ropeSinBuf},
                 {6, lw.qNorm}, {7, lw.kNorm},
                 {8, pRP}});
-            std::vector<Dispatch> d = {{kRopeB.pipeline, bg,
-                cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"}};
-            gpu->submitOnly(d, true);
+            allPrefill.push_back({kRopeB.pipeline, bg,
+                cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"});
         }
 
-        // 3b. Batched causal attention (all T queries at once)
+        // 4. Batched causal attention
         {
             uint32_t T_total = cacheLen + T;
             uint32_t ap[8] = {};
-            ap[0] = cfg.nKvHeads * cfg.headDim;   // kv_stride
-            ap[1] = cfg.nHead / cfg.nKvHeads;     // n_rep
-            ap[2] = T_total;
-            ap[3] = cacheLen;                      // cache_offset
+            ap[0] = cfg.nKvHeads * cfg.headDim;
+            ap[1] = cfg.nHead / cfg.nKvHeads;
+            ap[2] = T_total;  ap[3] = cacheLen;
             float sc = 1.0f / sqrtf((float)cfg.headDim);
             float ni = -1e9f;
-            memcpy(&ap[5], &sc, 4);
-            memcpy(&ap[6], &ni, 4);
+            memcpy(&ap[5], &sc, 4);  memcpy(&ap[6], &ni, 4);
             auto pAP = gpu->createBuffer("pp_attn_L" + std::to_string(li), 32);
             gpu->writeBuffer(pAP, ap, 32);
 
@@ -1004,51 +1019,46 @@ std::vector<float> ModelRunner::prefillBatched(
             auto bg = makeBG(kCausal, {
                 {0, pQRot}, {1, kvCache[li].K}, {2, kvCache[li].V},
                 {3, pAttn}, {4, pAP}});
-            std::vector<Dispatch> d = {{kCausal.pipeline, bg,
-                cfg.nHead, T, 1, "pf_attn"}};
-            gpu->submitOnly(d, true);
+            allPrefill.push_back({kCausal.pipeline, bg,
+                cfg.nHead, T, 1, "pf_attn"});
         }
 
-        // 4. Batched O projection: pAttn[T×qD] × W → pProj[T×E]
+        // 5. Batched O projection
         {
             auto bg = makeBG(kQ8B, {
                 {0, pAttn}, {1, lw.oW}, {2, lw.oS},
                 {3, zeroBiasE}, {4, pProj}, {5, pOpP}});
-            std::vector<Dispatch> d = {{kQ8B.pipeline, bg,
+            allPrefill.push_back({kQ8B.pipeline, bg,
                 (T + TILE_M - 1) / TILE_M,
-                (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_oproj"}};
-            gpu->submitOnly(d, true);
+                (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_oproj"});
         }
 
-        // 5. Batched add + RMSNorm: pX += pProj, then norm → pNorm
+        // 6. Batched add + RMSNorm
         {
             auto bg = makeBG(kAddRmsB, {
                 {0, pX}, {1, pProj}, {2, pNorm},
                 {3, lw.postAttnNorm}, {4, pRstd}, {5, pRmsP}});
-            std::vector<Dispatch> d = {{kAddRmsB.pipeline, bg, T, 1, 1, "pf_add_rms"}};
-            gpu->submitOnly(d, true);
+            allPrefill.push_back({kAddRmsB.pipeline, bg, T, 1, 1, "pf_add_rms"});
         }
 
-        // 6. Batched Gate+Up: pNorm[T×E] × W → pGU[T×2IM]
+        // 7. Batched Gate+Up
         {
             auto bg = makeBG(kQ8B, {
                 {0, pNorm}, {1, lw.guW}, {2, lw.guS},
                 {3, zeroBiasGU}, {4, pGU}, {5, pGuP}});
-            std::vector<Dispatch> d = {{kQ8B.pipeline, bg,
+            allPrefill.push_back({kQ8B.pipeline, bg,
                 (T + TILE_M - 1) / TILE_M,
-                (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, "pf_gateup"}};
-            gpu->submitOnly(d, true);
+                (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, "pf_gateup"});
         }
 
-        // 7. Batched fused SiLU + Down + residual add: pGU → pX +=
+        // 8. Batched fused SiLU + Down + residual add
         {
             auto bg = makeBG(kDnSiluB, {
                 {0, pGU}, {1, lw.dnW}, {2, lw.dnS},
                 {3, zeroBiasE}, {4, pX}, {5, pDnP}});
-            std::vector<Dispatch> d = {{kDnSiluB.pipeline, bg,
+            allPrefill.push_back({kDnSiluB.pipeline, bg,
                 (T + TILE_M - 1) / TILE_M,
-                (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_down_silu"}};
-            gpu->submitOnly(d, true);
+                (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_down_silu"});
         }
     }
 
@@ -1057,10 +1067,11 @@ std::vector<float> ModelRunner::prefillBatched(
         auto bg = makeBG(kRmsB, {
             {0, pX}, {1, pNorm}, {2, finalNormW},
             {3, pRstd}, {4, pRmsP}});
-        std::vector<Dispatch> d = {{kRmsB.pipeline, bg, T, 1, 1, "pf_final_rms"}};
-        gpu->submitOnly(d, true);
+        allPrefill.push_back({kRmsB.pipeline, bg, T, 1, 1, "pf_final_rms"});
     }
 
+    // Submit ALL prefill dispatches in one shot
+    gpu->submitOnly(allPrefill, true);
     // LM head: only compute last token
     // Copy last row of pNorm → normOutBuf
     {
