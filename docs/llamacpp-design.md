@@ -4,10 +4,10 @@ Analysis of llama.cpp's Vulkan backend architecture and the design
 patterns that give it a performance advantage over our WebGPU (Dawn)
 runtime on the same hardware.
 
-**Hardware**: RTX 5080, Qwen3-1.7B Q8_0  
-**Decode**: llama.cpp 330 tok/s — Backpack 192 tok/s (**1.7× gap**)  
-**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 350 tok/s (**43× gap**)  
-**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 433 tok/s (**52× gap**)
+**Hardware**: RTX 5080, Qwen3-1.7B Q8_0
+**Decode**: llama.cpp 330 tok/s — Backpack 192 tok/s (**1.7× gap**)
+**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 517 tok/s (**29× gap**)
+**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 652 tok/s (**34× gap**)
 
 ---
 
@@ -238,16 +238,17 @@ return zeros). Straightforward to implement.
 
 ---
 
-## 10. Prefill Architecture (43× gap, was 77×)
+## 10. Prefill Architecture (29× gap, was 43×)
 
 **Status (March 2026)**: Batched prefill implemented. Matmuls read
 weights once for all T tokens. Batched RoPE and causal attention
 process all T tokens in single dispatches. All 225 dispatches submitted
 in a single `submitOnly` call.
 
-**Remaining gap** (43× vs llama.cpp at pl=128): Our batched matmul
-kernel (`q8_matmul_batched`) uses scalar dot products. llama.cpp uses
-cooperative matrix tiled GEMM with shared memory double-buffering.
+**Remaining gap** (29× vs llama.cpp at pl=128): Our batched matmul
+kernel (`q8_matmul_tiled`) uses shared-memory-cached X rows with
+scalar dot products. llama.cpp uses cooperative matrix tiled GEMM
+with shared memory double-buffering for both X and W.
 Our causal attention uses scalar online softmax (subgroupAdd).
 llama.cpp uses flash attention with cooperative matrix tiles.
 
@@ -296,21 +297,23 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Serial tok/s | Batched tok/s | llama.cpp tok/s |
 |--------|-------------|--------------|----------------|
-| 128 | 192 | **350** | 14,967 |
-| 512 | 184 | **422** | 23,285 |
-| 1024 | 183 | **433** | 22,460 |
-| 4096 | 176 | **431** | 20,191 |
+| 128 | 192 | **517** | 14,967 |
+| 512 | 184 | **628** | 23,285 |
+| 1024 | 183 | **652** | 22,460 |
+| 4096 | 176 | **648** | 20,191 |
 
 ### 10.3 Remaining Prefill Gaps
 
 | Component | Status | Remaining gap |
 |-----------|--------|--------------|
 | T×E intermediate buffers | ✅ Done | — |
-| Batched Q8 matmul kernel | ✅ Done (scalar) | No cooperative matrix |
+| Batched Q8 matmul kernel | ✅ Done (tiled smem) | No cooperative matrix |
 | Batched RoPE + KV scatter | ✅ Done | — |
 | Batched causal attention | ✅ Done (scalar) | No cooperative matrix flash attn |
 | Batched add/norm | ✅ Done | — |
 | Single-submit all dispatches | ✅ Done | — |
+| Pre-allocated prefill resources | ✅ Done | Zero alloc on hot path |
+| GPU-side argmax (4B readback) | ✅ Done | Was 593KB logits readback |
 | Cooperative matrix matmul | ⚠️ Available but blocked | Q8_0 per-block scales prevent simple MMA |
 | Shared memory tiled GEMM | ❌ Not yet | Would improve compute utilization |
 | Flash attention (coopmat) | ❌ Not yet | Needs cooperative matrix for tiles |
@@ -319,17 +322,17 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Original | Current batched | llama.cpp |
 |--------|---------|----------------|-----------|
-| 128 tok | 660ms (192 tok/s) | 366ms (**350 tok/s**) | ~9ms (14,967 tok/s) |
-| 512 tok | 2760ms (184 tok/s) | 1214ms (**422 tok/s**) | ~22ms (23,285 tok/s) |
-| 1024 tok | 5576ms (183 tok/s) | 2366ms (**433 tok/s**) | ~46ms (22,460 tok/s) |
-| 4096 tok | 23312ms (176 tok/s) | 9510ms (**431 tok/s**) | ~203ms (20,191 tok/s) |
+| 128 tok | 660ms (192 tok/s) | 247ms (**517 tok/s**) | ~9ms (14,967 tok/s) |
+| 512 tok | 2760ms (184 tok/s) | 815ms (**628 tok/s**) | ~22ms (23,285 tok/s) |
+| 1024 tok | 5576ms (183 tok/s) | 1570ms (**652 tok/s**) | ~46ms (22,460 tok/s) |
+| 4096 tok | 23312ms (176 tok/s) | 6325ms (**648 tok/s**) | ~203ms (20,191 tok/s) |
 
-The remaining **43× gap** vs llama.cpp is primarily:
+The remaining **29× gap** vs llama.cpp is primarily:
 - **No cooperative matrix**: Our matmuls use scalar dot products (1 FMA/cycle)
   vs tensor cores (multiple FMAs/cycle). This is ~8-16× for compute-bound prefill.
 - **Dawn barrier overhead**: ~225 barriers × ~5µs = 1.1ms per submit.
-- **No shared memory tiling**: Our batched matmul reads X rows per-warp
-  from global memory, not from shared memory tiles.
+- **Shared memory tiling (partial)**: X rows cached in smem; weights still
+  read from global memory per-warp (coalesced but not shared).
 
 ---
 

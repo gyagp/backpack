@@ -113,8 +113,9 @@ struct ModelRunner {
     /// Finish prefill: submit last token and read back logits.
     std::vector<float> prefillFinish(int32_t tokenId, uint32_t posOffset);
     /// Batched prefill: process all T tokens in parallel (one weight read).
-    std::vector<float> prefillBatched(const int32_t* tokenIds, uint32_t T,
-                                       uint32_t posOffset);
+    /// Returns argmax token ID (computed on GPU, only 4 bytes readback).
+    int32_t prefillBatched(const int32_t* tokenIds, uint32_t T,
+                           uint32_t posOffset);
     static int32_t argmax(const std::vector<float>& logits);
 
     void enableProfiling();
@@ -131,8 +132,27 @@ private:
     void loadWeights(const GGUFFile& gguf, const std::vector<uint8_t>& fileData);
     void buildDecodePipeline();
     void computeRopeTables();
+    void initPrefillResources();
 
     const CompiledPipeline& getKernel(const std::string& name);
     WGPUBindGroup makeBG(const CompiledPipeline& pl,
                          const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
+
+    // --- Pre-allocated prefill resources (sized to maxSeqLen) ---
+    struct PrefillCache {
+        bool ready = false;
+        GPUBuffer pX, pNorm, pQkv, pQRot, pAttn, pProj, pGU, pRstd;
+        GPUBuffer pQkvP, pOpP, pGuP, pDnP, pRmsP, pLmP;
+        std::vector<GPUBuffer> ropeParams;   // one per layer
+        std::vector<GPUBuffer> attnParams;   // one per layer
+        // Cached bind groups (stable since buffer handles don't change)
+        struct LayerBGs {
+            WGPUBindGroup rms, qkv, rope, attn, oproj, addrms, gateup, downsilu;
+        };
+        std::vector<LayerBGs> layerBGs;
+        WGPUBindGroup finalRmsBG = nullptr;
+        WGPUBindGroup lmBG = nullptr;
+        WGPUBindGroup argmaxBG = nullptr;
+    };
+    PrefillCache pfCache;
 };

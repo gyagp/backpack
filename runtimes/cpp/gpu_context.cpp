@@ -310,6 +310,34 @@ void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
     wgpuCommandBufferRelease(cb);
 }
 
+void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
+                                     GPUProfiler& profiler) {
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
+
+    for (auto& d : dispatches) {
+        auto [bIdx, eIdx] = profiler.allocate(d.name);
+        auto tw = profiler.makeTimestampWrites(bIdx, eIdx);
+        WGPUComputePassDescriptor cpD{};
+        cpD.timestampWrites = &tw;
+        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+        wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    }
+
+    // Resolve timestamps in same command buffer
+    profiler.resolveAndReport(enc);
+
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(queue, 1, &cb);
+    wgpuCommandEncoderRelease(enc);
+    wgpuCommandBufferRelease(cb);
+}
+
 void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);

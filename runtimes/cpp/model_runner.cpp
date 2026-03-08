@@ -685,6 +685,122 @@ void ModelRunner::buildDecodePipeline() {
         refillCBPool(s);
     }
     printf("  Pool: %d slots × %d pre-recorded CBs\n", POOL_DEPTH, CB_POOL_BATCH);
+
+    // Pre-allocate prefill resources (buffers + bind groups at maxSeqLen)
+    initPrefillResources();
+}
+
+// ─── Pre-allocate prefill resources ──────────────────────────────────────────
+
+void ModelRunner::initPrefillResources() {
+    uint32_t T = maxSeqLen;
+    uint32_t qDimL  = cfg.nHead * cfg.headDim;
+    uint32_t kvDimL = cfg.nKvHeads * cfg.headDim;
+    uint32_t qkvOutL = qDimL + 2 * kvDimL;
+    uint32_t Q8_TILE = 8;
+
+    // Intermediate buffers sized to maxSeqLen
+    pfCache.pX    = gpu->createBuffer("pf_x",    T * cfg.nEmbd * 4);
+    pfCache.pNorm = gpu->createBuffer("pf_norm", T * cfg.nEmbd * 4);
+    pfCache.pQkv  = gpu->createBuffer("pf_qkv",  T * qkvOutL * 4);
+    pfCache.pQRot = gpu->createBuffer("pf_qrot", T * qDimL * 4);
+    pfCache.pAttn = gpu->createBuffer("pf_attn", T * qDimL * 4);
+    pfCache.pProj = gpu->createBuffer("pf_proj", T * cfg.nEmbd * 4);
+    pfCache.pGU   = gpu->createBuffer("pf_gu",   T * 2 * cfg.intermediateSize * 4);
+    pfCache.pRstd = gpu->createBuffer("pf_rstd", T * 4);
+
+    // Global param buffers (written per-call with actual T)
+    pfCache.pQkvP = gpu->createBuffer("pp_qkv", 16);
+    pfCache.pOpP  = gpu->createBuffer("pp_op",  16);
+    pfCache.pGuP  = gpu->createBuffer("pp_gu",  16);
+    pfCache.pDnP  = gpu->createBuffer("pp_dn",  16);
+    pfCache.pLmP  = gpu->createBuffer("pp_lm",  16);
+    {
+        uint32_t d[4] = {cfg.nEmbd, cfg.nEmbd, 0, 0};
+        float eps = cfg.rmsNormEps; memcpy(&d[2], &eps, 4);
+        pfCache.pRmsP = gpu->createBuffer("pp_rms", 16);
+        gpu->writeBuffer(pfCache.pRmsP, d, 16);
+    }
+
+    // Per-layer param buffers
+    pfCache.ropeParams.resize(cfg.nLayer);
+    pfCache.attnParams.resize(cfg.nLayer);
+    for (uint32_t li = 0; li < cfg.nLayer; li++) {
+        pfCache.ropeParams[li] = gpu->createBuffer(
+            "pp_rope_L" + std::to_string(li), 32);
+        pfCache.attnParams[li] = gpu->createBuffer(
+            "pp_attn_L" + std::to_string(li), 32);
+    }
+
+    // Get kernels (triggers pipeline compilation)
+    auto& kRmsB    = getKernel("rms_norm_batched");
+    auto& kAddRmsB = getKernel("add_rms_norm_batched");
+    auto& kQ8T     = getKernel("q8_matmul_tiled");
+    auto& kDnSiluB = getKernel("q8_down_silu_add_batched");
+    auto& kRopeB   = getKernel("rope_batched_simple");
+    auto& kCausal  = getKernel("causal_attn");
+
+    // Build bind groups (stable — buffer handles don't change)
+    pfCache.layerBGs.resize(cfg.nLayer);
+    for (uint32_t li = 0; li < cfg.nLayer; li++) {
+        auto& lw = layerWeights[li];
+        auto& bg = pfCache.layerBGs[li];
+
+        bg.rms = makeBG(kRmsB, {
+            {0, pfCache.pX}, {1, pfCache.pNorm}, {2, lw.inputNorm},
+            {3, pfCache.pRstd}, {4, pfCache.pRmsP}});
+
+        bg.qkv = makeBG(kQ8T, {
+            {0, pfCache.pNorm}, {1, lw.qkvW}, {2, lw.qkvS},
+            {3, zeroBiasQKV}, {4, pfCache.pQkv}, {5, pfCache.pQkvP}});
+
+        bg.rope = makeBG(kRopeB, {
+            {0, pfCache.pQkv}, {1, pfCache.pQRot},
+            {2, kvCache[li].K}, {3, kvCache[li].V},
+            {4, ropeCosBuf}, {5, ropeSinBuf},
+            {6, lw.qNorm}, {7, lw.kNorm},
+            {8, pfCache.ropeParams[li]}});
+
+        bg.attn = makeBG(kCausal, {
+            {0, pfCache.pQRot}, {1, kvCache[li].K}, {2, kvCache[li].V},
+            {3, pfCache.pAttn}, {4, pfCache.attnParams[li]}});
+
+        bg.oproj = makeBG(kQ8T, {
+            {0, pfCache.pAttn}, {1, lw.oW}, {2, lw.oS},
+            {3, zeroBiasE}, {4, pfCache.pProj}, {5, pfCache.pOpP}});
+
+        bg.addrms = makeBG(kAddRmsB, {
+            {0, pfCache.pX}, {1, pfCache.pProj}, {2, pfCache.pNorm},
+            {3, lw.postAttnNorm}, {4, pfCache.pRstd}, {5, pfCache.pRmsP}});
+
+        bg.gateup = makeBG(kQ8T, {
+            {0, pfCache.pNorm}, {1, lw.guW}, {2, lw.guS},
+            {3, zeroBiasGU}, {4, pfCache.pGU}, {5, pfCache.pGuP}});
+
+        bg.downsilu = makeBG(kDnSiluB, {
+            {0, pfCache.pGU}, {1, lw.dnW}, {2, lw.dnS},
+            {3, zeroBiasE}, {4, pfCache.pX}, {5, pfCache.pDnP}});
+    }
+
+    pfCache.finalRmsBG = makeBG(kRmsB, {
+        {0, pfCache.pX}, {1, pfCache.pNorm}, {2, finalNormW},
+        {3, pfCache.pRstd}, {4, pfCache.pRmsP}});
+
+    // LM head bind group
+    if (lmHeadIsQ8) {
+        pfCache.lmBG = makeBG(getKernel("q8_matmul"), {
+            {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
+            {3, zeroBiasV}, {4, logitsBuf}, {5, pfCache.pLmP}});
+    }
+
+    // Argmax bind group (reuses existing argmax kernel + result buffer)
+    {
+        auto argmaxParams = gpu->getBuffer("p_argmax");
+        pfCache.argmaxBG = makeBG(getKernel("argmax"), {
+            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxParams}});
+    }
+
+    pfCache.ready = true;
 }
 
 // ─── Pre-record command buffer pool ──────────────────────────────────────────
@@ -888,35 +1004,30 @@ std::vector<float> ModelRunner::prefillFinish(int32_t tokenId, uint32_t posOffse
     return logits;
 }
 
-std::vector<float> ModelRunner::prefillBatched(
+int32_t ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
-    // For small T, serial path is faster (avoids buffer allocation overhead)
+    // For small T, serial path is faster
     if (T <= 16) {
-        if (T == 1) return decode(tokenIds[0], posOffset);
+        if (T == 1) {
+            auto logits = decode(tokenIds[0], posOffset);
+            return argmax(logits);
+        }
         for (uint32_t t = 0; t + 1 < T; t++)
             prefillStep(tokenIds[t], posOffset + t);
-        return prefillFinish(tokenIds[T - 1], posOffset + T - 1);
+        auto logits = prefillFinish(tokenIds[T - 1], posOffset + T - 1);
+        return argmax(logits);
     }
 
-    // ── True batched prefill for T>1 ─────────────────────────────────
-    // Matmuls read each weight matrix ONCE for all T tokens.
-    // RoPE, KV scatter, and attention still per-token (serial).
-    uint32_t qDimL = cfg.nHead * cfg.headDim;
+    // ── True batched prefill using pre-allocated resources ───────────
+    using hrc = std::chrono::high_resolution_clock;
+    auto t_start = hrc::now();
+
+    uint32_t qDimL  = cfg.nHead * cfg.headDim;
     uint32_t kvDimL = cfg.nKvHeads * cfg.headDim;
     uint32_t qkvOutL = qDimL + 2 * kvDimL;
     uint32_t Q8_TILE = 8, TILE_M = 8;
 
-    // Allocate T-row intermediate buffers
-    auto pX    = gpu->createBuffer("pf_x", T * cfg.nEmbd * 4);
-    auto pNorm = gpu->createBuffer("pf_norm", T * cfg.nEmbd * 4);
-    auto pQkv  = gpu->createBuffer("pf_qkv", T * qkvOutL * 4);
-    auto pQRot = gpu->createBuffer("pf_qrot", T * qDimL * 4);
-    auto pAttn = gpu->createBuffer("pf_attn", T * qDimL * 4);
-    auto pProj = gpu->createBuffer("pf_proj", T * cfg.nEmbd * 4);
-    auto pGU   = gpu->createBuffer("pf_gu", T * 2 * cfg.intermediateSize * 4);
-    auto pRstd = gpu->createBuffer("pf_rstd", T * 4);
-
-    // Upload all T embeddings
+    // Upload embeddings into pre-allocated pX
     std::vector<float> embData(T * cfg.nEmbd);
     for (uint32_t t = 0; t < T; t++) {
         int32_t tok = (tokenIds[t] >= 0 && (uint32_t)tokenIds[t] < cfg.nVocab)
@@ -924,161 +1035,93 @@ std::vector<float> ModelRunner::prefillBatched(
         memcpy(embData.data() + t * cfg.nEmbd,
                embeddingCPU.data() + tok * cfg.nEmbd, cfg.nEmbd * 4);
     }
-    gpu->writeBuffer(pX, embData.data(), T * cfg.nEmbd * 4);
+    gpu->writeBuffer(pfCache.pX, embData.data(), T * cfg.nEmbd * 4);
 
-    // Get batched kernels
-    auto& kRmsB    = getKernel("rms_norm_batched");
-    auto& kAddRmsB = getKernel("add_rms_norm_batched");
-    auto& kQ8B     = getKernel("q8_matmul_batched");
-    auto& kDnSiluB = getKernel("q8_down_silu_add_batched");
-
-    // Batched params
-    auto mkP = [&](const std::string& n, uint32_t a, uint32_t b, uint32_t c, uint32_t d = 0) {
-        uint32_t v[4] = {a, b, c, d};
-        auto buf = gpu->createBuffer(n, 16);
-        gpu->writeBuffer(buf, v, 16);
-        return buf;
-    };
-    auto pQkvP = mkP("pp_qkv", cfg.nEmbd, qkvOutL, T);
-    auto pOpP  = mkP("pp_op",  qDimL, cfg.nEmbd, T);
-    auto pGuP  = mkP("pp_gu",  cfg.nEmbd, 2 * cfg.intermediateSize, T);
-    auto pDnP  = mkP("pp_dn",  cfg.intermediateSize, cfg.nEmbd, cfg.intermediateSize, T);
-
-    GPUBuffer pRmsP;
+    // Write T-dependent params into pre-allocated param buffers
     {
-        uint32_t d[4] = {cfg.nEmbd, cfg.nEmbd, 0, 0};
-        float eps = cfg.rmsNormEps; memcpy(&d[2], &eps, 4);
-        pRmsP = gpu->createBuffer("pp_rms", 16);
-        gpu->writeBuffer(pRmsP, d, 16);
+        uint32_t v[4];
+        v[0] = cfg.nEmbd; v[1] = qkvOutL; v[2] = T; v[3] = 0;
+        gpu->writeBuffer(pfCache.pQkvP, v, 16);
+        v[0] = qDimL; v[1] = cfg.nEmbd; v[2] = T;
+        gpu->writeBuffer(pfCache.pOpP, v, 16);
+        v[0] = cfg.nEmbd; v[1] = 2 * cfg.intermediateSize; v[2] = T;
+        gpu->writeBuffer(pfCache.pGuP, v, 16);
+        v[0] = cfg.intermediateSize; v[1] = cfg.nEmbd; v[2] = cfg.intermediateSize; v[3] = T;
+        gpu->writeBuffer(pfCache.pDnP, v, 16);
     }
 
     uint32_t cacheLen = kvCache[0].len;
 
-    // ── Build ALL prefill dispatches into a single list ──────────────
-    // Then submit once — minimizes Dawn submit overhead.
+    // Write per-layer RoPE + attention params
+    for (uint32_t li = 0; li < cfg.nLayer; li++) {
+        uint32_t ropeP[8] = {};
+        ropeP[0] = cfg.nHead;  ropeP[1] = qDimL;  ropeP[2] = kvDimL;
+        ropeP[3] = posOffset;  ropeP[4] = cfg.headDim / 2;
+        ropeP[5] = cacheLen;
+        float eps_f = cfg.rmsNormEps; memcpy(&ropeP[6], &eps_f, 4);
+        ropeP[7] = cfg.nKvHeads;
+        gpu->writeBuffer(pfCache.ropeParams[li], ropeP, 32);
+
+        uint32_t T_total = cacheLen + T;
+        uint32_t ap[8] = {};
+        ap[0] = cfg.nKvHeads * cfg.headDim;
+        ap[1] = cfg.nHead / cfg.nKvHeads;
+        ap[2] = T_total;  ap[3] = cacheLen;
+        float sc = 1.0f / sqrtf((float)cfg.headDim);
+        float ni = -1e9f;
+        memcpy(&ap[5], &sc, 4);  memcpy(&ap[6], &ni, 4);
+        gpu->writeBuffer(pfCache.attnParams[li], ap, 32);
+    }
+
+    auto t_params = hrc::now();
+
+    // Build dispatch list from cached bind groups (only grid sizes vary)
+    auto& kRmsB    = getKernel("rms_norm_batched");
+    auto& kAddRmsB = getKernel("add_rms_norm_batched");
+    auto& kQ8T     = getKernel("q8_matmul_tiled");
+    auto& kDnSiluB = getKernel("q8_down_silu_add_batched");
+    auto& kRopeB   = getKernel("rope_batched_simple");
+    auto& kCausal  = getKernel("causal_attn");
+
+    const uint32_t TILED_N = 32u;  // must match q8_matmul_tiled TILE_N
+
     std::vector<Dispatch> allPrefill;
     allPrefill.reserve(cfg.nLayer * 8 + 2);
 
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
-        auto& lw = layerWeights[li];
+        auto& bg = pfCache.layerBGs[li];
+        allPrefill.push_back({kRmsB.pipeline,    bg.rms,      T, 1, 1, "pf_rms"});
+        allPrefill.push_back({kQ8T.pipeline,     bg.qkv,
+            (T + TILE_M - 1) / TILE_M, (qkvOutL + TILED_N - 1) / TILED_N, 1, "pf_qkv"});
+        allPrefill.push_back({kRopeB.pipeline,   bg.rope,
+            cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"});
+        allPrefill.push_back({kCausal.pipeline,  bg.attn,     cfg.nHead, T, 1, "pf_attn"});
+        allPrefill.push_back({kQ8T.pipeline,     bg.oproj,
+            (T + TILE_M - 1) / TILE_M, (cfg.nEmbd + TILED_N - 1) / TILED_N, 1, "pf_oproj"});
+        allPrefill.push_back({kAddRmsB.pipeline, bg.addrms,   T, 1, 1, "pf_add_rms"});
+        allPrefill.push_back({kQ8T.pipeline,     bg.gateup,
+            (T + TILE_M - 1) / TILE_M,
+            (2 * cfg.intermediateSize + TILED_N - 1) / TILED_N, 1, "pf_gateup"});
+        allPrefill.push_back({kDnSiluB.pipeline, bg.downsilu,
+            (T + TILE_M - 1) / TILE_M,
+            (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_down_silu"});
+    }
+    allPrefill.push_back({kRmsB.pipeline, pfCache.finalRmsBG, T, 1, 1, "pf_final_rms"});
 
-        // 1. Batched RMSNorm
-        {
-            auto bg = makeBG(kRmsB, {
-                {0, pX}, {1, pNorm}, {2, lw.inputNorm},
-                {3, pRstd}, {4, pRmsP}});
-            allPrefill.push_back({kRmsB.pipeline, bg, T, 1, 1, "pf_rms"});
-        }
-
-        // 2. Batched QKV matmul
-        {
-            auto bg = makeBG(kQ8B, {
-                {0, pNorm}, {1, lw.qkvW}, {2, lw.qkvS},
-                {3, zeroBiasQKV}, {4, pQkv}, {5, pQkvP}});
-            allPrefill.push_back({kQ8B.pipeline, bg,
-                (T + TILE_M - 1) / TILE_M,
-                (qkvOutL + Q8_TILE - 1) / Q8_TILE, 1, "pf_qkv"});
-        }
-
-        // 3. Batched RoPE + KV scatter
-        {
-            uint32_t ropeP[8] = {};
-            ropeP[0] = cfg.nHead;  ropeP[1] = qDimL;  ropeP[2] = kvDimL;
-            ropeP[3] = posOffset;  ropeP[4] = cfg.headDim / 2;
-            ropeP[5] = cacheLen;
-            float eps_f = cfg.rmsNormEps; memcpy(&ropeP[6], &eps_f, 4);
-            ropeP[7] = cfg.nKvHeads;
-            auto pRP = gpu->createBuffer("pp_rope_L" + std::to_string(li), 32);
-            gpu->writeBuffer(pRP, ropeP, 32);
-
-            auto& kRopeB = getKernel("rope_batched_simple");
-            auto bg = makeBG(kRopeB, {
-                {0, pQkv}, {1, pQRot},
-                {2, kvCache[li].K}, {3, kvCache[li].V},
-                {4, ropeCosBuf}, {5, ropeSinBuf},
-                {6, lw.qNorm}, {7, lw.kNorm},
-                {8, pRP}});
-            allPrefill.push_back({kRopeB.pipeline, bg,
-                cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"});
-        }
-
-        // 4. Batched causal attention
-        {
-            uint32_t T_total = cacheLen + T;
-            uint32_t ap[8] = {};
-            ap[0] = cfg.nKvHeads * cfg.headDim;
-            ap[1] = cfg.nHead / cfg.nKvHeads;
-            ap[2] = T_total;  ap[3] = cacheLen;
-            float sc = 1.0f / sqrtf((float)cfg.headDim);
-            float ni = -1e9f;
-            memcpy(&ap[5], &sc, 4);  memcpy(&ap[6], &ni, 4);
-            auto pAP = gpu->createBuffer("pp_attn_L" + std::to_string(li), 32);
-            gpu->writeBuffer(pAP, ap, 32);
-
-            auto& kCausal = getKernel("causal_attn");
-            auto bg = makeBG(kCausal, {
-                {0, pQRot}, {1, kvCache[li].K}, {2, kvCache[li].V},
-                {3, pAttn}, {4, pAP}});
-            allPrefill.push_back({kCausal.pipeline, bg,
-                cfg.nHead, T, 1, "pf_attn"});
-        }
-
-        // 5. Batched O projection
-        {
-            auto bg = makeBG(kQ8B, {
-                {0, pAttn}, {1, lw.oW}, {2, lw.oS},
-                {3, zeroBiasE}, {4, pProj}, {5, pOpP}});
-            allPrefill.push_back({kQ8B.pipeline, bg,
-                (T + TILE_M - 1) / TILE_M,
-                (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_oproj"});
-        }
-
-        // 6. Batched add + RMSNorm
-        {
-            auto bg = makeBG(kAddRmsB, {
-                {0, pX}, {1, pProj}, {2, pNorm},
-                {3, lw.postAttnNorm}, {4, pRstd}, {5, pRmsP}});
-            allPrefill.push_back({kAddRmsB.pipeline, bg, T, 1, 1, "pf_add_rms"});
-        }
-
-        // 7. Batched Gate+Up
-        {
-            auto bg = makeBG(kQ8B, {
-                {0, pNorm}, {1, lw.guW}, {2, lw.guS},
-                {3, zeroBiasGU}, {4, pGU}, {5, pGuP}});
-            allPrefill.push_back({kQ8B.pipeline, bg,
-                (T + TILE_M - 1) / TILE_M,
-                (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, "pf_gateup"});
-        }
-
-        // 8. Batched fused SiLU + Down + residual add
-        {
-            auto bg = makeBG(kDnSiluB, {
-                {0, pGU}, {1, lw.dnW}, {2, lw.dnS},
-                {3, zeroBiasE}, {4, pX}, {5, pDnP}});
-            allPrefill.push_back({kDnSiluB.pipeline, bg,
-                (T + TILE_M - 1) / TILE_M,
-                (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, "pf_down_silu"});
-        }
+    // Submit all prefill dispatches in one shot
+    auto t_dispatches = hrc::now();
+    if (profiler && profiler->enabled()) {
+        gpu->submitOnlyProfiled(allPrefill, *profiler);
+    } else {
+        gpu->submitOnly(allPrefill, true);
     }
 
-    // Final RMSNorm (batched)
-    {
-        auto bg = makeBG(kRmsB, {
-            {0, pX}, {1, pNorm}, {2, finalNormW},
-            {3, pRstd}, {4, pRmsP}});
-        allPrefill.push_back({kRmsB.pipeline, bg, T, 1, 1, "pf_final_rms"});
-    }
-
-    // Submit ALL prefill dispatches in one shot
-    gpu->submitOnly(allPrefill, true);
-    // LM head: only compute last token
-    // Copy last row of pNorm → normOutBuf
+    // Copy last token's norm output → normOutBuf for LM head
     {
         WGPUCommandEncoderDescriptor enD{};
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
         wgpuCommandEncoderCopyBufferToBuffer(enc,
-            pNorm.handle, (uint64_t)(T - 1) * cfg.nEmbd * 4,
+            pfCache.pNorm.handle, (uint64_t)(T - 1) * cfg.nEmbd * 4,
             normOutBuf.handle, 0, cfg.nEmbd * 4);
         WGPUCommandBufferDescriptor cbD{};
         auto cb = wgpuCommandEncoderFinish(enc, &cbD);
@@ -1087,20 +1130,34 @@ std::vector<float> ModelRunner::prefillBatched(
         wgpuCommandBufferRelease(cb);
     }
 
-    // Use T=1 LM head from allDecodeDispatches
-    // Find LM head + argmax dispatches (last 2 in allDecodeDispatches)
-    // Actually, just build a minimal dispatch for LM head
-    auto lmP = mkP("pp_lm", cfg.nEmbd, cfg.nVocab, 1);
-    std::vector<Dispatch> lmDisp;
+    // LM head + argmax on GPU, read back 4 bytes instead of 593KB
+    {
+        uint32_t v[4] = {cfg.nEmbd, cfg.nVocab, 1, 0};
+        gpu->writeBuffer(pfCache.pLmP, v, 16);
+    }
+    std::vector<Dispatch> lmArgmax;
     if (lmHeadIsQ8) {
-        auto bg = makeBG(getKernel("q8_matmul"), {
-            {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
-            {3, zeroBiasV}, {4, logitsBuf}, {5, lmP}});
-        lmDisp.push_back({getKernel("q8_matmul").pipeline, bg,
+        lmArgmax.push_back({getKernel("q8_matmul").pipeline, pfCache.lmBG,
             1, (cfg.nVocab + Q8_TILE - 1) / Q8_TILE, 1, "pf_lm"});
     }
-    auto result = gpu->submitAndReadback(lmDisp, logitsBuf,
-                                          cfg.nVocab * 4, passPerDispatch);
+    lmArgmax.push_back({getKernel("argmax").pipeline, pfCache.argmaxBG,
+        1, 1, 1, "pf_argmax"});
+    std::vector<uint8_t> result;
+    if (profiler && profiler->enabled()) {
+        result = gpu->submitAndReadbackProfiled(lmArgmax, argmaxResultBuf, 4,
+                                                 *profiler);
+    } else {
+        result = gpu->submitAndReadback(lmArgmax, argmaxResultBuf, 4,
+                                          passPerDispatch);
+    }
+    auto t_submit = hrc::now();
+
+    // Print prefill timing breakdown
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    printf("  [prefill T=%u] params=%.1fms build=%.1fms gpu+readback=%.1fms total=%.1fms (%zu dispatches)\n",
+           T, ms(t_start, t_params), ms(t_params, t_dispatches),
+           ms(t_dispatches, t_submit),
+           ms(t_start, t_submit), allPrefill.size());
 
     // Update KV cache lengths
     for (uint32_t i = 0; i < cfg.nLayer; i++)
@@ -1111,7 +1168,7 @@ std::vector<float> ModelRunner::prefillBatched(
         WGPUCommandEncoderDescriptor enD{};
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
         wgpuCommandEncoderCopyBufferToBuffer(enc,
-            pX.handle, (uint64_t)(T - 1) * cfg.nEmbd * 4,
+            pfCache.pX.handle, (uint64_t)(T - 1) * cfg.nEmbd * 4,
             xBuf.handle, 0, cfg.nEmbd * 4);
         WGPUCommandBufferDescriptor cbD{};
         auto cb = wgpuCommandEncoderFinish(enc, &cbD);
@@ -1120,9 +1177,9 @@ std::vector<float> ModelRunner::prefillBatched(
         wgpuCommandBufferRelease(cb);
     }
 
-    std::vector<float> logits(cfg.nVocab);
-    memcpy(logits.data(), result.data(), cfg.nVocab * 4);
-    return logits;
+    int32_t tokId;
+    memcpy(&tokId, result.data(), 4);
+    return tokId;
 }
 int32_t ModelRunner::argmax(const std::vector<float>& logits) {
     return (int32_t)std::distance(logits.begin(),

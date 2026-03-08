@@ -116,6 +116,12 @@ struct GPUContext {
     void submitOnly(const std::vector<Dispatch>& dispatches,
                     bool singlePass = true);
 
+    /// Submit dispatches with per-dispatch timestamp profiling (fire-and-forget).
+    /// Each dispatch gets its own compute pass with timestamp writes.
+    /// Call profiler.resolveAndReport() separately after all submits.
+    void submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
+                            GPUProfiler& profiler);
+
     /// Submit dispatches, copy result buffer, and synchronize.
     /// Returns a numpy-like vector of the readback data.
     /// passPerDispatch: if true, each dispatch gets its own compute pass
