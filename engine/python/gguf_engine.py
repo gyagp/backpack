@@ -14,7 +14,7 @@ Supports:
   - Streaming text output
 
 Usage:
-    python -m models.gguf_engine --model path/to/model.gguf \\
+    python -m engine.python.gguf_engine --model path/to/model.gguf \\
         --prompt "Hello" --max-tokens 50 [--profile]
 """
 
@@ -27,9 +27,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Add models/ to path for imports
+# Add models/ to path for shared WebGPU runtime imports
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'models'))
 
 from common.gguf_utils import (
     GGUFFile, dequantize_q8_0, repack_q8_0_for_gpu,
