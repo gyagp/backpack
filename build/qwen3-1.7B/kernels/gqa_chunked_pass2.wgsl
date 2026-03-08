@@ -16,9 +16,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     let n_chunks = _params_[4];
     let neg_inf = bitcast<f32>(_params_[6]);
+    let max_chunks = _params_[7];
 
     let partial_stride = HD + 2u;
-    let head_base = head * n_chunks * partial_stride;
+    let head_base = head * max_chunks * partial_stride;
 
     var acc0: f32 = 0.0; var acc1: f32 = 0.0;
     var acc2: f32 = 0.0; var acc3: f32 = 0.0;

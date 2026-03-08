@@ -1207,7 +1207,7 @@ class Qwen3WebGPU(WebGPUModel):
                          float(np.float32(-1e9)))
 
         # Chunked attention params: [kv_stride, n_rep, T_total, chunk_size,
-        #   n_chunks, scale_bits, neg_inf_bits] = 7 u32s = 28 bytes → pad to 32
+        #   n_chunks, scale_bits, neg_inf_bits, max_chunks] = 8 u32s = 32 bytes
         self._fd_chunked_attn_buf = bytearray(32)
         struct.pack_into('<II', self._fd_chunked_attn_buf, 0,
                          n_kv * HD, n_rep)
@@ -1221,6 +1221,9 @@ class Qwen3WebGPU(WebGPUModel):
         struct.pack_into('<i', self._fd_chunked_attn_buf, 24,
                          struct.unpack('<i', struct.pack('<f',
                              float(np.float32(-1e9))))[0])
+        max_n_chunks = (self.MAX_SEQ_LEN + GQA_CHUNK_SIZE - 1) // GQA_CHUNK_SIZE
+        struct.pack_into('<I', self._fd_chunked_attn_buf, 28,
+                         max_n_chunks)
 
         self._fast_decode_ready = True
         print(f"  Fast decode initialized "

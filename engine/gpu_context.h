@@ -30,11 +30,12 @@ struct CompiledPipeline {
     uint32_t            numBindings  = 0;
 };
 
-/// A single dispatch operation: pipeline + bind group + grid.
+/// A single dispatch operation: pipeline + bind group + grid + name.
 struct Dispatch {
     WGPUComputePipeline pipeline  = nullptr;
     WGPUBindGroup       bindGroup = nullptr;
     uint32_t gx = 1, gy = 1, gz = 1;
+    std::string name;  // for profiling
 };
 
 /// GPU buffer with metadata.
@@ -43,12 +44,45 @@ struct GPUBuffer {
     uint64_t   size   = 0;
 };
 
+/// GPU profiler using WebGPU timestamp queries.
+struct GPUProfiler {
+    WGPUDevice   device   = nullptr;
+    WGPUInstance instance = nullptr;
+    WGPUQueue    queue    = nullptr;
+    WGPUQuerySet querySet = nullptr;
+    WGPUBuffer   resolveBuf = nullptr;
+    WGPUBuffer   readbackBuf = nullptr;
+    uint32_t     nextIndex = 0;
+    static constexpr uint32_t MAX_TIMESTAMPS = 16384;
+
+    struct Entry {
+        std::string name;
+        uint32_t beginIdx, endIdx;
+    };
+    std::vector<Entry> entries;
+
+    bool init(WGPUDevice dev, WGPUInstance inst, WGPUQueue q);
+    void destroy();
+
+    /// Allocate a timestamp pair. Returns (beginIdx, endIdx).
+    std::pair<uint32_t, uint32_t> allocate(const std::string& name);
+
+    /// Fill a WGPUPassTimestampWrites struct for a dispatch.
+    WGPUPassTimestampWrites makeTimestampWrites(uint32_t beginIdx, uint32_t endIdx);
+
+    /// Resolve timestamps after GPU work, read back, and print report.
+    void resolveAndReport(WGPUCommandEncoder enc);
+
+    bool enabled() const { return querySet != nullptr; }
+};
+
 /// Model-agnostic WebGPU context.
 struct GPUContext {
     WGPUInstance instance = nullptr;
     WGPUAdapter  adapter  = nullptr;
     WGPUDevice   device   = nullptr;
     WGPUQueue    queue    = nullptr;
+    WGPUBackendType backendType = WGPUBackendType_Vulkan;
 
     // --- Lifecycle ---
     bool init(WGPUBackendType backend = WGPUBackendType_Vulkan);
@@ -80,9 +114,21 @@ struct GPUContext {
 
     /// Submit dispatches, copy result buffer, and synchronize.
     /// Returns a numpy-like vector of the readback data.
+    /// passPerDispatch: if true, each dispatch gets its own compute pass
+    ///                  (needed for correctness on some backends).
     std::vector<uint8_t> submitAndReadback(
         const std::vector<Dispatch>& dispatches,
-        GPUBuffer src, uint64_t readSize);
+        GPUBuffer src, uint64_t readSize,
+        bool passPerDispatch = true);
+
+    /// Read back buffer contents (no dispatches, just copy + map).
+    std::vector<uint8_t> readBuffer(GPUBuffer src, uint64_t readSize);
+
+    /// Submit dispatches with profiling: each gets its own timestamped pass.
+    std::vector<uint8_t> submitAndReadbackProfiled(
+        const std::vector<Dispatch>& dispatches,
+        GPUBuffer src, uint64_t readSize,
+        GPUProfiler& profiler);
 
     /// Block until all submitted GPU work completes.
     void waitForQueue();

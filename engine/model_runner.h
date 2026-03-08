@@ -1,116 +1,95 @@
 #pragma once
 /**
- * model_runner.h — Manifest-driven model inference engine.
+ * model_runner.h — GGUF-driven model inference engine.
  *
- * Model-agnostic: reads the decode plan from manifest.json and
- * executes it as a sequence of GPU dispatches. No model-specific
- * C++ code is needed — all model structure is captured in the manifest.
+ * Reads model architecture directly from GGUF metadata.
+ * Loads WGSL kernels from embedded shader constants.
+ * No manifest.json or external kernel files needed.
  *
- * Supports any model that compile_model.py can export.
+ * Supports any llama.cpp-compatible GGUF model with Q8_0 quantization.
  */
 
 #include "gpu_context.h"
-#include "json_parser.h"
 #include "gguf_loader.h"
 
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-/// Per-layer pre-built dispatch sequence for fast decode.
-struct LayerDispatches {
-    std::vector<Dispatch> dispatches;
-};
-
-/// Complete model loaded and ready for inference.
 struct ModelRunner {
     GPUContext* gpu = nullptr;
-    JsonValue   manifest;
-    std::string bundleDir;
-
-    // Model config (from manifest)
-    uint32_t nLayer = 0, nHead = 0, nKvHeads = 0, nEmbd = 0;
-    uint32_t intermediateSize = 0, nVocab = 0, headDim = 0;
-    bool tieWordEmbeddings = true;
-    float rmsNormEps = 1e-6f;
-    float ropeTheta = 1e6f;
+    ModelConfig cfg;
+    GGUFFile gguf;  // retained for tokenizer access
 
     // Intermediate buffers
     GPUBuffer xBuf, normOutBuf, qkvBuf, qRotBuf, attnOutBuf;
     GPUBuffer projOutBuf, gateUpBuf, siluOutBuf, rstdBuf, logitsBuf;
     GPUBuffer attnPartialsBuf;
 
-    // KV cache: [layer] → (K_buf, V_buf, cached_len)
+    // KV cache
     struct KVEntry { GPUBuffer K, V; uint32_t len = 0; };
     std::vector<KVEntry> kvCache;
 
     // Per-layer weight buffers
     struct LayerWeights {
-        GPUBuffer qkvW, qkvS;       // QKV projection Q8 weights + scales
-        GPUBuffer oW, oS;           // O projection
-        GPUBuffer guW, guS;         // Gate+Up projection
-        GPUBuffer dnW, dnS;         // Down projection
-        GPUBuffer inputNorm;        // Input layernorm weight
-        GPUBuffer postAttnNorm;     // Post-attention layernorm weight
-        GPUBuffer qNorm, kNorm;     // QK norm weights
+        GPUBuffer qkvW, qkvS;
+        GPUBuffer oW, oS;
+        GPUBuffer guW, guS;
+        GPUBuffer dnW, dnS;
+        GPUBuffer inputNorm, postAttnNorm;
+        GPUBuffer qNorm, kNorm;
     };
     std::vector<LayerWeights> layerWeights;
     GPUBuffer finalNormW;
-    GPUBuffer lmHeadW;              // fp16 LM head weight
-    GPUBuffer embeddingW;           // fp32 embedding weight
+    GPUBuffer lmHeadW;
     GPUBuffer zeroBiasE, zeroBiasQKV, zeroBiasGU, zeroBiasV;
 
-    // Params buffers (static per-shape)
-    std::unordered_map<std::string, GPUBuffer> paramsBufs;
-
-    // Pre-built decode pipeline: all dispatches for one token
+    // Pre-built decode pipeline
     std::vector<Dispatch> allDecodeDispatches;
-    // Logits readback (persistently mapped if possible)
-    GPUBuffer readbackBuf;
-    void*     readbackPtr = nullptr;  // mapped pointer or nullptr
 
-    // Embedding table (CPU-side for token lookup)
+    // GPU argmax (appended after LM head)
+    GPUBuffer argmaxResultBuf;  // single i32
+
+    // Embedding (CPU-side)
     std::vector<float> embeddingCPU;
 
     // RoPE tables
     GPUBuffer ropeCosBuf, ropeSinBuf;
 
-    // Dynamic params buffers (written per-token via writeBuffer)
-    GPUBuffer fusedRopeParamsBuf;
-    GPUBuffer chunkedAttnParamsBuf;
-
-    // Static param layout for fused rope
-    std::vector<uint8_t> ropeParamData;
-    std::vector<uint8_t> chunkedAttnParamData;
+    // Dynamic params
+    GPUBuffer fusedRopeParamsBuf, chunkedAttnParamsBuf;
+    std::vector<uint8_t> ropeParamData, chunkedAttnParamData;
 
     // Derived dimensions
     uint32_t qDim = 0, kvDim = 0, qkvOut = 0;
     uint32_t maxSeqLen = 2048;
     uint32_t gqaChunkSize = 64;
 
+    // Pass mode: false = single compute pass (faster on D3D12)
+    bool passPerDispatch = true;
+
+    // Profiling
+    GPUProfiler* profiler = nullptr;
+
     // --- API ---
-    bool load(GPUContext& ctx, const std::string& bundleDir,
-              const std::string& ggufPath);
-
-    /// Run one decode step. Updates KV cache, returns logits.
+    bool load(GPUContext& ctx, const std::string& ggufPath);
     std::vector<float> decode(int32_t tokenId, uint32_t posOffset);
-
-    /// Greedy decode: return the argmax token from logits.
+    /// Fast decode: returns just the argmax token ID (no logits readback)
+    int32_t decodeArgmax(int32_t tokenId, uint32_t posOffset);
     static int32_t argmax(const std::vector<float>& logits);
 
-    /// Get embedding for a token (CPU lookup + GPU upload)
-    void uploadEmbedding(int32_t tokenId);
+    void enableProfiling();
+    void printProfileReport();
 
-    /// Update dynamic params for this decode step
+    void uploadEmbedding(int32_t tokenId);
     void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
 
 private:
-    void loadWeights(const std::string& ggufPath);
+    void loadWeights(const GGUFFile& gguf, const std::vector<uint8_t>& fileData);
     void buildDecodePipeline();
     void computeRopeTables();
 
-    const CompiledPipeline& loadKernel(const std::string& name);
+    const CompiledPipeline& getKernel(const std::string& name);
     WGPUBindGroup makeBG(const CompiledPipeline& pl,
                          const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
-    std::unordered_map<std::string, const CompiledPipeline*> kernelCache_;
 };

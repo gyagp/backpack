@@ -131,6 +131,39 @@ class GGUFFile:
             return pos
         raise ValueError(f"Unknown GGUF KV value type: {vtype}")
 
+    def _read_kv_value(self, vtype: int, pos: int):
+        """Read a metadata value and return (value, new_pos)."""
+        if vtype == 0:   return self._mm[pos], pos + 1                   # UINT8
+        if vtype == 1:   return struct.unpack_from('<b', self._mm, pos)[0], pos + 1  # INT8
+        if vtype == 2:   return struct.unpack_from('<H', self._mm, pos)[0], pos + 2  # UINT16
+        if vtype == 3:   return struct.unpack_from('<h', self._mm, pos)[0], pos + 2  # INT16
+        if vtype == 4:   return struct.unpack_from('<I', self._mm, pos)[0], pos + 4  # UINT32
+        if vtype == 5:   return struct.unpack_from('<i', self._mm, pos)[0], pos + 4  # INT32
+        if vtype == 6:   return struct.unpack_from('<f', self._mm, pos)[0], pos + 4  # FLOAT32
+        if vtype == 7:   return bool(self._mm[pos]), pos + 1                         # BOOL
+        if vtype == 8:   return self._read_string(pos)                               # STRING
+        if vtype == 10:  return struct.unpack_from('<Q', self._mm, pos)[0], pos + 8  # UINT64
+        if vtype == 11:  return struct.unpack_from('<q', self._mm, pos)[0], pos + 8  # INT64
+        if vtype == 12:  return struct.unpack_from('<d', self._mm, pos)[0], pos + 8  # FLOAT64
+        if vtype == 9:   # ARRAY
+            elem_type, pos = self._read_u32(pos)
+            count, pos = self._read_u64(pos)
+            if elem_type == 8:  # string array
+                arr = []
+                for _ in range(count):
+                    s, pos = self._read_string(pos)
+                    arr.append(s)
+                return arr, pos
+            if elem_type in _KV_FIXED_SIZES:
+                sz = _KV_FIXED_SIZES[elem_type]
+                # Skip fixed-size arrays efficiently
+                pos_end = pos + count * sz
+                return None, pos_end  # don't materialize large int arrays
+            for _ in range(count):
+                _, pos = self._read_kv_value(elem_type, pos)
+            return None, pos
+        raise ValueError(f"Unknown GGUF KV value type: {vtype}")
+
     def _parse(self):
         mm = self._mm
         # Header
@@ -143,11 +176,14 @@ class GGUFFile:
         n_tensors, pos = self._read_u64(pos)
         n_kv, pos = self._read_u64(pos)
 
-        # Skip metadata KV pairs (we don't need them for inference)
+        # Parse metadata KV pairs
+        self.metadata: Dict[str, any] = {}
         for _ in range(n_kv):
-            _, pos = self._read_string(pos)   # key
-            vtype, pos = self._read_u32(pos)  # value type
-            pos = self._skip_kv_value(vtype, pos)  # value data
+            key, pos = self._read_string(pos)
+            vtype, pos = self._read_u32(pos)
+            val, pos = self._read_kv_value(vtype, pos)
+            if val is not None:
+                self.metadata[key] = val
 
         # Parse tensor info entries
         self.tensors: Dict[str, GGUFTensorInfo] = {}

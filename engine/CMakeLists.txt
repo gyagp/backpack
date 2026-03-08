@@ -13,9 +13,9 @@ set(DAWN_LIB "${CMAKE_SOURCE_DIR}/../third_party/triton-windows/third_party/webg
 add_executable(backpack_engine
     engine.cpp
     gpu_context.cpp
-    json_parser.cpp
     model_runner.cpp
     gguf_loader.cpp
+    tokenizer.cpp
 )
 
 target_include_directories(backpack_engine PRIVATE

@@ -2,6 +2,67 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+
+// ─── GPUProfiler ─────────────────────────────────────────────────────────────
+
+bool GPUProfiler::init(WGPUDevice dev, WGPUInstance inst, WGPUQueue q) {
+    device = dev; instance = inst; queue = q;
+    nextIndex = 0;
+    entries.clear();
+
+    WGPUQuerySetDescriptor qsd{};
+    qsd.type = WGPUQueryType_Timestamp;
+    qsd.count = MAX_TIMESTAMPS;
+    querySet = wgpuDeviceCreateQuerySet(device, &qsd);
+    if (!querySet) return false;
+
+    uint64_t bufSize = MAX_TIMESTAMPS * 8;
+    WGPUBufferDescriptor bd{};
+    bd.usage = BUF_COPY_SRC | BUF_COPY_DST | BUF_STORAGE;
+    bd.size = bufSize;
+    resolveBuf = wgpuDeviceCreateBuffer(device, &bd);
+
+    WGPUBufferDescriptor rbd{};
+    rbd.usage = BUF_MAP_READ | BUF_COPY_DST;
+    rbd.size = bufSize;
+    readbackBuf = wgpuDeviceCreateBuffer(device, &rbd);
+
+    return true;
+}
+
+void GPUProfiler::destroy() {
+    if (querySet)    wgpuQuerySetRelease(querySet);
+    if (resolveBuf)  wgpuBufferRelease(resolveBuf);
+    if (readbackBuf) wgpuBufferRelease(readbackBuf);
+    querySet = nullptr; resolveBuf = nullptr; readbackBuf = nullptr;
+}
+
+std::pair<uint32_t, uint32_t> GPUProfiler::allocate(const std::string& name) {
+    if (nextIndex + 2 > MAX_TIMESTAMPS) return {0, 0};
+    uint32_t b = nextIndex, e = nextIndex + 1;
+    nextIndex += 2;
+    entries.push_back({name, b, e});
+    return {b, e};
+}
+
+WGPUPassTimestampWrites GPUProfiler::makeTimestampWrites(
+        uint32_t beginIdx, uint32_t endIdx) {
+    WGPUPassTimestampWrites tw{};
+    tw.querySet = querySet;
+    tw.beginningOfPassWriteIndex = beginIdx;
+    tw.endOfPassWriteIndex = endIdx;
+    return tw;
+}
+
+void GPUProfiler::resolveAndReport(WGPUCommandEncoder enc) {
+    if (nextIndex == 0) return;
+
+    wgpuCommandEncoderResolveQuerySet(enc, querySet, 0, nextIndex,
+                                       resolveBuf, 0);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, resolveBuf, 0,
+                                          readbackBuf, 0, nextIndex * 8);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -12,6 +73,7 @@ static std::string sv_str(WGPUStringView sv) {
 // ─── GPUContext::init ────────────────────────────────────────────────────────
 
 bool GPUContext::init(WGPUBackendType backend) {
+    backendType = backend;
     // Instance with TimedWaitAny
     WGPUInstanceFeatureName instFeat[] = {
         static_cast<WGPUInstanceFeatureName>(0x01) };
@@ -213,17 +275,15 @@ void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
-    WGPUComputePassDescriptor cpD{};
-    auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-
     for (auto& d : dispatches) {
+        WGPUComputePassDescriptor cpD{};
+        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
         wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
     }
-
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
@@ -246,21 +306,36 @@ WGPUBuffer GPUContext::getOrCreateReadbackBuf(uint64_t size) {
 
 std::vector<uint8_t> GPUContext::submitAndReadback(
         const std::vector<Dispatch>& dispatches,
-        GPUBuffer src, uint64_t readSize) {
+        GPUBuffer src, uint64_t readSize,
+        bool passPerDispatch) {
     auto rb = getOrCreateReadbackBuf(readSize);
 
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
-    WGPUComputePassDescriptor cpD{};
-    auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-    for (auto& d : dispatches) {
-        wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+    if (passPerDispatch) {
+        // Each dispatch gets its own compute pass (Vulkan correctness)
+        for (auto& d : dispatches) {
+            WGPUComputePassDescriptor cpD{};
+            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+            wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+        }
+    } else {
+        // Single compute pass — Dawn inserts barriers automatically (D3D12)
+        WGPUComputePassDescriptor cpD{};
+        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+        for (auto& d : dispatches) {
+            wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+        }
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
     }
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
 
     wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, 0, rb, 0, readSize);
 
@@ -285,6 +360,95 @@ std::vector<uint8_t> GPUContext::submitAndReadback(
 
     std::vector<uint8_t> out(readSize);
     if (ms.status == 1 /*Success*/) {
+        auto ptr = wgpuBufferGetConstMappedRange(rb, 0, readSize);
+        memcpy(out.data(), ptr, readSize);
+        wgpuBufferUnmap(rb);
+    }
+    return out;
+}
+
+std::vector<uint8_t> GPUContext::readBuffer(GPUBuffer src, uint64_t readSize) {
+    auto rb = getOrCreateReadbackBuf(readSize);
+
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, 0, rb, 0, readSize);
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(queue, 1, &cb);
+    wgpuCommandEncoderRelease(enc);
+    wgpuCommandBufferRelease(cb);
+
+    struct { bool done; uint32_t status; } ms{false, 0};
+    WGPUBufferMapCallbackInfo mcb{};
+    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
+    mcb.callback = [](WGPUMapAsyncStatus s, WGPUStringView, void* u, void*) {
+        auto* p = static_cast<decltype(&ms)>(u);
+        p->done = true; p->status = s;
+    };
+    mcb.userdata1 = &ms;
+    auto mf = wgpuBufferMapAsync(rb, 1, 0, readSize, mcb);
+    WGPUFutureWaitInfo mw{mf, 0};
+    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
+
+    std::vector<uint8_t> out(readSize);
+    if (ms.status == 1) {
+        auto ptr = wgpuBufferGetConstMappedRange(rb, 0, readSize);
+        memcpy(out.data(), ptr, readSize);
+        wgpuBufferUnmap(rb);
+    }
+    return out;
+}
+
+std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
+        const std::vector<Dispatch>& dispatches,
+        GPUBuffer src, uint64_t readSize,
+        GPUProfiler& profiler) {
+    auto rb = getOrCreateReadbackBuf(readSize);
+
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
+
+    // Each dispatch gets its own compute pass with timestamp writes
+    for (auto& d : dispatches) {
+        auto [bIdx, eIdx] = profiler.allocate(d.name);
+        auto tw = profiler.makeTimestampWrites(bIdx, eIdx);
+        WGPUComputePassDescriptor cpD{};
+        cpD.timestampWrites = &tw;
+        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+        wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    }
+
+    wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, 0, rb, 0, readSize);
+
+    // Resolve timestamps into the same command buffer
+    profiler.resolveAndReport(enc);
+
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(queue, 1, &cb);
+    wgpuCommandEncoderRelease(enc);
+    wgpuCommandBufferRelease(cb);
+
+    // Map result buffer
+    struct { bool done; uint32_t status; } ms{false, 0};
+    WGPUBufferMapCallbackInfo mcb{};
+    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
+    mcb.callback = [](WGPUMapAsyncStatus s, WGPUStringView, void* u, void*) {
+        auto* p = static_cast<decltype(&ms)>(u);
+        p->done = true; p->status = s;
+    };
+    mcb.userdata1 = &ms;
+    auto mf = wgpuBufferMapAsync(rb, 1, 0, readSize, mcb);
+    WGPUFutureWaitInfo mw{mf, 0};
+    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
+
+    std::vector<uint8_t> out(readSize);
+    if (ms.status == 1) {
         auto ptr = wgpuBufferGetConstMappedRange(rb, 0, readSize);
         memcpy(out.data(), ptr, readSize);
         wgpuBufferUnmap(rb);

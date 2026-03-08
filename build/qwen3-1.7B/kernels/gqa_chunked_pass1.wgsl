@@ -25,6 +25,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_chunks = _params_[4];
     let scale = bitcast<f32>(_params_[5]);
     let neg_inf = bitcast<f32>(_params_[6]);
+    let max_chunks = _params_[7];
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
@@ -81,14 +82,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         l_prev = l_new;
     }
 
+    // Use max_chunks for the stride to prevent overlapping writes
+    // across heads. Only write if this chunk is within n_chunks.
     let partial_stride = HD + 2u;
-    let base = head * n_chunks * partial_stride + chunk_id * partial_stride;
-    if (lane == 0u) {
-        Partials[base] = m_prev;
-        Partials[base + 1u] = l_prev;
+    let base = head * max_chunks * partial_stride + chunk_id * partial_stride;
+    if (chunk_id < n_chunks) {
+        if (lane == 0u) {
+            Partials[base] = m_prev;
+            Partials[base + 1u] = l_prev;
+        }
+        Partials[base + 2u + lane * HD_PER_THREAD] = acc0;
+        Partials[base + 2u + lane * HD_PER_THREAD + 1u] = acc1;
+        Partials[base + 2u + lane * HD_PER_THREAD + 2u] = acc2;
+        Partials[base + 2u + lane * HD_PER_THREAD + 3u] = acc3;
     }
-    Partials[base + 2u + lane * HD_PER_THREAD] = acc0;
-    Partials[base + 2u + lane * HD_PER_THREAD + 1u] = acc1;
-    Partials[base + 2u + lane * HD_PER_THREAD + 2u] = acc2;
-    Partials[base + 2u + lane * HD_PER_THREAD + 3u] = acc3;
 }
