@@ -171,9 +171,14 @@ int main(int argc, char* argv[]) {
            nDecode, (long long)decodeMs, tps);
 
     // Print GPU profile report if profiling was enabled
-    if (profile)
+    if (profile) {
+        // Place profile.html next to the GGUF file
+        auto profileDir = fs::path(gguf_path).parent_path();
+        auto profilePath = (profileDir / "profile.html").string();
         model.printProfileReport(nDecode, (int)promptTokens.size(),
-                                 (double)prefillMs, (double)decodeMs);
+                                 (double)prefillMs, (double)decodeMs,
+                                 profilePath);
+    }
 
     gpu.destroy();
     return 0;

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -80,8 +81,9 @@ static void uploadQ8Weight(GPUContext& gpu, const std::string& name,
 
 // ─── Load model ──────────────────────────────────────────────────────────────
 
-bool ModelRunner::load(GPUContext& ctx, const std::string& ggufPath) {
+bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     gpu = &ctx;
+    ggufPath = path;
 
     // Parse GGUF (metadata + tensor index)
     if (!gguf.open(ggufPath)) {
@@ -706,7 +708,8 @@ void ModelRunner::enableProfiling() {
 }
 
 void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
-                                     double prefillMs, double decodeMs) {
+                                     double prefillMs, double decodeMs,
+                                     const std::string& profileOutputPath) {
     if (!profiler || !profiler->enabled() || profiler->nextIndex == 0)
         return;
 
@@ -787,9 +790,15 @@ void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
     printf("%-20s %10.2f\n", "TOTAL", totalGpuUs / 1000.0);
 
     // Generate HTML timeline report
+    std::string htmlPath = profileOutputPath;
+    if (htmlPath.empty()) {
+        // Default: place profile.html next to the GGUF file
+        auto dir = std::filesystem::path(ggufPath).parent_path();
+        htmlPath = (dir / "profile.html").string();
+    }
     generateProfileHTML(*gpu, *profiler, calibration, ptr,
                         nDecodeTokens, nPrefillTokens,
-                        prefillMs, decodeMs);
+                        prefillMs, decodeMs, htmlPath);
 
     wgpuBufferUnmap(profiler->readbackBuf);
 

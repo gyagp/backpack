@@ -74,6 +74,7 @@ struct ModelRunner {
 
     // --- API ---
     bool load(GPUContext& ctx, const std::string& ggufPath);
+    std::string ggufPath;  // stored for profile output location
     std::vector<float> decode(int32_t tokenId, uint32_t posOffset);
     /// Fast decode: returns just the argmax token ID (no logits readback)
     int32_t decodeArgmax(int32_t tokenId, uint32_t posOffset);
@@ -81,7 +82,8 @@ struct ModelRunner {
 
     void enableProfiling();
     void printProfileReport(int nDecodeTokens = 0, int nPrefillTokens = 0,
-                            double prefillMs = 0, double decodeMs = 0);
+                            double prefillMs = 0, double decodeMs = 0,
+                            const std::string& profileOutputPath = "");
 
     void uploadEmbedding(int32_t tokenId);
     void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
