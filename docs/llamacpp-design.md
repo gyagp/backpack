@@ -6,8 +6,8 @@ runtime on the same hardware.
 
 **Hardware**: RTX 5080, Qwen3-1.7B Q8_0
 **Decode**: llama.cpp 330 tok/s — Backpack 192 tok/s (**1.7× gap**)
-**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 3,682 tok/s (**4.1× gap**)
-**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 5,102 tok/s (**4.4× gap**)
+**Prefill (128 tok)**: llama.cpp 14,967 tok/s — Backpack 3,890 tok/s (**3.8× gap**)
+**Prefill (1024 tok)**: llama.cpp 22,460 tok/s — Backpack 6,510 tok/s (**3.4× gap**)
 
 ---
 
@@ -239,22 +239,23 @@ data-dependent early exit.
 
 ---
 
-## 10. Prefill Architecture (4.4× gap, was 7.5×)
+## 10. Prefill Architecture (3.4× gap, was 4.4×)
 
 **Status (March 2026)**: Batched prefill implemented. Matmuls read
 weights once for all T tokens. Batched RoPE and causal attention
 process all T tokens in single dispatches. All 225 dispatches submitted
 in a single `submitOnly` call.
 
-**Remaining gap** (4.4× vs llama.cpp at pl=1024): All matmuls use
-double-buffered subgroup matrix MMA (64×32 output tile, 8 subgroups,
-256 threads, TILE_K=32 with 2 MMA calls per K-block). KV cache is
-fp16. Attention uses multi-query (4 warps/WG) with fp16 KV and
-uniform-param early exit.
+**Remaining gap** (3.4× vs llama.cpp at pl=1024): All matmuls use
+double-buffered subgroup matrix MMA (64×64 output tile, 16 subgroups,
+512 threads, TILE_K=32 with 2 MMA calls per K-block). KV cache is
+fp16. Attention uses MMA flash attention (BQ=16, MMA for Q·K^T and
+P·V) with fp16 KV and uniform-param early exit.
 
-GPU profile at T=1024 (186ms): gateup 34%, down_silu 24%, attn 20%,
-qkv 13%, oproj 7%. Remaining gap is Q8→fp16 dequant staging overhead
-and Dawn barrier overhead.
+GPU profile at T=1024 (152ms): gateup 34%, down_silu 28%, attn 17%,
+qkv 12%, oproj 7%. Remaining gap is Q8→fp16 dequant staging overhead
+(~4× slower than llama.cpp’s native SPIR-V pipeline) and Dawn barrier
+overhead (225 barriers per submit).
 
 ### 10.1 llama.cpp Prefill Pipeline
 
@@ -301,10 +302,10 @@ All submitted in a single `submitOnly` call.
 
 | Prompt | Serial tok/s | Batched tok/s | llama.cpp tok/s |
 |--------|-------------|--------------|----------------|
-| 128 | 192 | **3,682** | 14,967 |
-| 512 | 184 | **5,316** | 23,285 |
-| 1024 | 183 | **5,102** | 22,460 |
-| 4096 | 176 | **3,676** | 20,191 |
+| 128 | 192 | **3,890** | 14,967 |
+| 512 | 184 | **6,174** | 23,285 |
+| 1024 | 183 | **6,510** | 22,460 |
+| 4096 | 176 | **5,307** | 20,191 |
 
 ### 10.3 Remaining Prefill Gaps
 
@@ -313,30 +314,30 @@ All submitted in a single `submitOnly` call.
 | T×E intermediate buffers | ✅ Done | — |
 | Batched Q8 matmul kernel | ✅ Done (MMA) | Subgroup matrix 16×16×16 fp16→f32 |
 | Batched RoPE + KV scatter | ✅ Done | — |
-| Batched causal attention | ✅ Done (fp16 KV + early exit) | Multi-query 4 warps/WG, uniform params |
+| Batched causal attention | ✅ Done (MMA flash attn) | BQ=16, MMA Q·K^T + P·V, fp16 KV, early exit |
 | Batched add/norm | ✅ Done | — |
 | Single-submit all dispatches | ✅ Done | — |
 | Pre-allocated prefill resources | ✅ Done | Zero alloc on hot path |
 | GPU-side argmax (4B readback) | ✅ Done | Was 593KB logits readback |
 | Subgroup matrix matmul | ✅ Done | Q8→fp16 dequant in smem before MMA |
 | fp16 KV cache | ✅ Done | Halves KV bandwidth (448 MB) |
-| Uniform param early exit | ✅ Done | Loop terminates at causal length |
+| MMA flash attention | ✅ Done | BQ=16 queries, MMA for Q·K^T and P·V |
 
 ### 10.4 Performance Achieved vs Projected
 
 | Prompt | Original | Current batched | llama.cpp |
 |--------|---------|----------------|-----------|
-| 128 tok | 660ms (192 tok/s) | 35ms (**3,682 tok/s**) | ~9ms (14,967 tok/s) |
-| 512 tok | 2760ms (184 tok/s) | 96ms (**5,316 tok/s**) | ~22ms (23,285 tok/s) |
-| 1024 tok | 5576ms (183 tok/s) | 201ms (**5,102 tok/s**) | ~46ms (22,460 tok/s) |
-| 4096 tok | 23312ms (176 tok/s) | 1114ms (**3,676 tok/s**) | ~203ms (20,191 tok/s) |
+| 128 tok | 660ms (192 tok/s) | 33ms (**3,890 tok/s**) | ~9ms (14,967 tok/s) |
+| 512 tok | 2760ms (184 tok/s) | 83ms (**6,174 tok/s**) | ~22ms (23,285 tok/s) |
+| 1024 tok | 5576ms (183 tok/s) | 157ms (**6,510 tok/s**) | ~46ms (22,460 tok/s) |
+| 4096 tok | 23312ms (176 tok/s) | 772ms (**5,307 tok/s**) | ~203ms (20,191 tok/s) |
 
-The remaining **4.4× gap** vs llama.cpp is primarily:
+The remaining **3.4× gap** vs llama.cpp is primarily:
 - **Q8→fp16 dequant staging**: Per-element extractBits+scale in smem
-  before MMA. llama.cpp uses SPIR-V with more efficient data paths.
-- **Dawn barrier overhead**: ~225 barriers × ~5µs = 1.1ms per submit.
-- **Attention still scalar**: 20% of GPU time, uses subgroupAdd dot
-  products. Flash attention with MMA would cut this further.
+  before MMA (~4× slower than llama.cpp’s native SPIR-V pipeline).
+- **Dawn barrier overhead**: ~225 barriers × ~3-5µs per submit.
+- **SiLU activation cost**: exp(-gate) in tile_A staging path for
+  down_silu kernel adds significant compute overhead.
 
 ---
 
