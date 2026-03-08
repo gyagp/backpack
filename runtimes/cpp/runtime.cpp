@@ -157,7 +157,7 @@ int main(int argc, char* argv[]) {
                "----------", "----------", "--------", "---------", "--------");
 
         int genTokens = 128;
-        int promptLens[] = {5, 128, 256, 512, 1024};
+        int promptLens[] = {5, 128, 256, 512, 1024, 2048, 4096};
 
         for (int pl : promptLens) {
             model.resetKVCache();
