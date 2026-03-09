@@ -1800,16 +1800,29 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let gr = rb + r;
         tA[0][i] = select(0.0h, f16(X[gr * K + c]), gr < M);
     }
-    for (var i = lx; i < AB_B; i += WG) {
-        let r = i / TK;  let c = i % TK;
-        let gc = cb + r;
+    // Vectorized weight dequant: load 1 u32 (4 packed i8), write 4 f16
+    // AB_B=2048 f16 = 512 u32 weights. 512 threads → 1 u32 per thread.
+    {
+        let wi = lx;  // 0..511 → one u32 per thread
+        let row = wi / (TK / 4u);  // which of 64 weight rows
+        let col4 = wi % (TK / 4u);  // which group of 4 i8 [0..7]
+        let gc = cb + row;
+        let base_k = col4 * 4u;
         if (gc < N) {
-            let pk = W_Q8[gc * ws + c / 4u];
-            let q = f32(extractBits(i32(pk), (c & 3u) * 8u, 8u));
-            let si = gc * (K / SB) + c / SB;
+            let pk = W_Q8[gc * ws + col4];
+            let si = gc * (K / SB) + base_k / SB;
             let sp = unpack2x16float(Scales[si / 2u]);
-            tB[0][i] = f16(q * select(sp.x, sp.y, (si & 1u) != 0u));
-        } else { tB[0][i] = 0.0h; }
+            let scale = select(sp.x, sp.y, (si & 1u) != 0u);
+            let smem_base = row * TK + base_k;
+            tB[0][smem_base]      = f16(f32(extractBits(i32(pk), 0u, 8u)) * scale);
+            tB[0][smem_base + 1u] = f16(f32(extractBits(i32(pk), 8u, 8u)) * scale);
+            tB[0][smem_base + 2u] = f16(f32(extractBits(i32(pk), 16u, 8u)) * scale);
+            tB[0][smem_base + 3u] = f16(f32(extractBits(i32(pk), 24u, 8u)) * scale);
+        } else {
+            let smem_base = row * TK + base_k;
+            tB[0][smem_base] = 0.0h; tB[0][smem_base + 1u] = 0.0h;
+            tB[0][smem_base + 2u] = 0.0h; tB[0][smem_base + 3u] = 0.0h;
+        }
     }
     workgroupBarrier();
 
@@ -1826,16 +1839,28 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let gr = rb + r;
                 tA[nxt][i] = select(0.0h, f16(X[gr * K + kn + c]), gr < M);
             }
-            for (var i = lx; i < AB_B; i += WG) {
-                let r = i / TK;  let c = i % TK;
-                let gc = cb + r;  let gk = kn + c;
-                if (gc < N) {
-                    let pk = W_Q8[gc * ws + gk / 4u];
-                    let q = f32(extractBits(i32(pk), (gk & 3u) * 8u, 8u));
-                    let si = gc * (K / SB) + gk / SB;
+            // Vectorized weight dequant for next tile
+            {
+                let wi = lx;
+                let row = wi / (TK / 4u);
+                let col4 = wi % (TK / 4u);
+                let gc = cb + row;
+                let base_k = kn + col4 * 4u;
+                if (gc < N && base_k < K) {
+                    let pk = W_Q8[gc * ws + base_k / 4u];
+                    let si = gc * (K / SB) + base_k / SB;
                     let sp = unpack2x16float(Scales[si / 2u]);
-                    tB[nxt][i] = f16(q * select(sp.x, sp.y, (si & 1u) != 0u));
-                } else { tB[nxt][i] = 0.0h; }
+                    let scale = select(sp.x, sp.y, (si & 1u) != 0u);
+                    let smem_base = row * TK + col4 * 4u;
+                    tB[nxt][smem_base]      = f16(f32(extractBits(i32(pk), 0u, 8u)) * scale);
+                    tB[nxt][smem_base + 1u] = f16(f32(extractBits(i32(pk), 8u, 8u)) * scale);
+                    tB[nxt][smem_base + 2u] = f16(f32(extractBits(i32(pk), 16u, 8u)) * scale);
+                    tB[nxt][smem_base + 3u] = f16(f32(extractBits(i32(pk), 24u, 8u)) * scale);
+                } else {
+                    let smem_base = row * TK + col4 * 4u;
+                    tB[nxt][smem_base] = 0.0h; tB[nxt][smem_base + 1u] = 0.0h;
+                    tB[nxt][smem_base + 2u] = 0.0h; tB[nxt][smem_base + 3u] = 0.0h;
+                }
             }
         }
 
