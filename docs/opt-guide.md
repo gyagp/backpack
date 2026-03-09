@@ -1492,6 +1492,98 @@ Rather than fusing at the kernel level, batch multiple dispatches into
 a single command encoder submission.  This eliminates per-submit overhead
 while keeping individual kernel simplicity:
 
+---
+
+## 7. Prefill Optimization Results (March 2026)
+
+Comprehensive prefill optimization session on Qwen3-1.7B Q8_0,
+RTX 5080, Dawn/Vulkan backend.
+
+### 7.1 Performance Progression
+
+| Step | T=1024 tok/s | Cumulative |
+|------|-------------|------------|
+| Baseline (serial decode path) | 433 | 1.0× |
+| + Shared memory tiled GEMM (TILE_N=32) | 652 | 1.5× |
+| + Tiled fused SiLU+down (smem SiLU cache) | 1,099 | 2.5× |
+| + Subgroup matrix MMA (fp16→f32 16×16×16) | 1,604 | 3.7× |
+| + Multi-query attention (4 warps/WG) | 1,654 | 3.8× |
+| + fp16 KV cache + uniform params early exit | 2,984 | 6.9× |
+| + Double-buffered MMA + TILE_K=32 | 4,203 | 9.7× |
+| + 64×32 output tile (8 subgroups, 256 threads) | 4,933 | 11.4× |
+| + MMA flash attention (BQ=16, Q·K^T + P·V) | 5,790 | 13.4× |
+| + 64×64 tile (16 subgroups, 512 threads) | **6,510** | **15.0×** |
+
+### 7.2 What Worked
+
+| Optimization | Impact | Key Insight |
+|-------------|--------|-------------|
+| Shared memory X caching | 1.5× | Eliminates redundant X reads across output columns |
+| Fused SiLU in smem | 4.3× per-kernel | Compute SiLU once, reuse across TILE_N output columns |
+| Subgroup matrix MMA | 1.4× | Tensor core fp16×fp16→f32 via `chromium_experimental_subgroup_matrix` |
+| fp16 KV cache | 1.8× | Halves attention bandwidth; `array<f16>` in all kernels |
+| Uniform params early exit | included above | `var<uniform>` makes loop bound legal for `subgroupAdd` |
+| Double-buffered MMA tiles | 1.4× | Overlap next tile load with current MMA compute |
+| 64×64 output tile (512 threads) | 1.13× | RTX 5080 supports 1024 threads/WG; 16 subgroups |
+| MMA flash attention | 1.3× at T=4096 | MMA for Q·K^T and P·V with per-row online softmax |
+
+### 7.3 What Didn't Work
+
+| Attempt | Result | Why |
+|---------|--------|-----|
+| TILE_M=16 (larger row tile) | Regression | 64 accumulators per thread killed register occupancy |
+| TILE_K=64 (larger K tile) | Regression | 48KB smem = max occupancy of 1 WG/SM |
+| i8×i8→i32 MMA for Q8_0 | 2.2× slower | Activation quantization + per-element scale correction overhead |
+| Split-K attention | Blocked | WGSL uniformity analysis prevents data-dependent loop + subgroupAdd |
+| RMSNorm + matmul fusion | Regression | Per-WG redundant norm computation cancels barrier savings |
+
+### 7.4 GPU Profile (T=1024, 152ms total)
+
+| Kernel | Time (ms) | % | Notes |
+|--------|----------|---|-------|
+| pf_gateup | 51.4 | 33.7% | 2048→12288 Q8 MMA GEMM |
+| pf_down_silu | 42.5 | 27.9% | 6144→2048 fused SiLU+down MMA |
+| pf_attn | 26.4 | 17.3% | MMA flash attention (fp16 KV) |
+| pf_qkv | 18.5 | 12.1% | 2048→3072 Q8 MMA GEMM |
+| pf_oproj | 10.5 | 6.9% | 2048→2048 Q8 MMA GEMM |
+| Other (norm, rope) | 3 | 2.0% | Negligible |
+
+### 7.5 Remaining 3.4× Gap vs llama.cpp
+
+| Factor | Estimated impact |
+|--------|-----------------|
+| Q8→fp16 dequant staging | ~3× (per-element extractBits+scale in smem before MMA) |
+| Dawn barrier overhead | ~225 barriers × 3-5µs ≈ 1ms per submit |
+| SiLU exp() cost | Extra compute in down_silu tile_A staging |
+
+### 7.6 Hardware Limits (RTX 5080)
+
+| Limit | Value | How Used |
+|-------|-------|----------|
+| maxComputeInvocationsPerWorkgroup | 1024 | Using 512 (16 subgroups) |
+| maxComputeWorkgroupStorageSize | 49,152 (48KB) | Using 32KB (TILE_K=32 sweet spot) |
+| maxComputeWorkgroupSizeX | 1024 | 512 threads |
+| maxStorageBufferBindingSize | 2047 MB | No constraint |
+| Subgroup matrix configs | f16→f32 16×16×16, i8→i32 16×16×32 | Using f16 MMA (i8 slower) |
+
+### 7.7 Triton Migration Assessment
+
+| Category | Can Migrate | Blocker |
+|----------|------------|---------|
+| rms_norm, add_rms_norm, silu_mul, argmax | Yes (compiles) | Binding format (struct vs array) |
+| causal_attn_multihead | Yes (compiles) | No fp16 KV or MMA support |
+| All Q8 matmul kernels | No | No `extractBits`/`unpack2x16float` in Triton IR |
+| MMA kernels (matmul, attention) | No | No `subgroupMatrix*` in Triton IR |
+| fp16 KV kernels (rope, attention) | No | No `enable f16` / `array<f16>` |
+| Batched norm/RoPE | No | Need new `@triton.jit` implementations |
+
+**Required Triton WebGPU backend extensions:**
+1. `extractBits` intrinsic (Q8_0 weight dequant)
+2. `unpack2x16float` intrinsic (fp16 packed scales)
+3. Subgroup matrix (MMA) support in Triton IR
+4. `f16` type support in shared memory and buffers
+5. Param binding format alignment (struct vs array)
+
 ```python
 runner.begin_batch()
 # 8 dispatches, 1 submission
