@@ -19,6 +19,7 @@ constexpr uint64_t BUF_COPY_SRC  = 0x0004;
 constexpr uint64_t BUF_COPY_DST  = 0x0008;
 constexpr uint64_t BUF_MAP_READ  = 0x0001;
 constexpr uint64_t BUF_UNIFORM   = 0x0040;
+constexpr uint64_t BUF_INDIRECT  = 0x0100;
 constexpr uint64_t BUF_DEFAULT   = BUF_STORAGE | BUF_COPY_SRC | BUF_COPY_DST;
 
 /// Compiled compute pipeline with associated layouts.
@@ -83,6 +84,14 @@ struct GPUContext {
     WGPUDevice   device   = nullptr;
     WGPUQueue    queue    = nullptr;
     WGPUBackendType backendType = WGPUBackendType_Vulkan;
+    std::string adapterName;
+    std::string adapterDescription;
+    WGPULimits adapterLimits{};
+    WGPULimits deviceLimits{};
+    bool supportsShaderF16 = false;
+    bool supportsSubgroups = false;
+    bool supportsSubgroupMatrix = false;
+    bool supportsTimestampQuery = false;
 
     // --- Lifecycle ---
     bool init(WGPUBackendType backend = WGPUBackendType_Vulkan);
@@ -167,6 +176,9 @@ struct GPUContext {
         int count = 0;
     } timing;
 
+    /// Get or create a MAP_READ staging buffer of at least 'size' bytes.
+    WGPUBuffer getOrCreateReadbackBuf(uint64_t size);
+
 private:
     std::unordered_map<std::string, CompiledPipeline> pipelines_;
     std::unordered_map<std::string, GPUBuffer>        buffers_;
@@ -174,8 +186,6 @@ private:
     // Readback buffer (reused across calls)
     WGPUBuffer readbackBuf_     = nullptr;
     uint64_t   readbackBufSize_ = 0;
-
-    WGPUBuffer getOrCreateReadbackBuf(uint64_t size);
 
 
 };

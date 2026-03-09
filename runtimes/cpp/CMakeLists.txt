@@ -36,7 +36,10 @@ if(WIN32)
         d3d12.lib dxgi.lib)
     add_custom_command(TARGET backpack_runtime POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${DAWN_LIB}/webgpu_dawn.dll $<TARGET_FILE_DIR:backpack_runtime>)
+        ${DAWN_LIB}/webgpu_dawn.dll
+        ${DAWN_LIB}/dxcompiler.dll
+        ${DAWN_LIB}/dxil.dll
+        $<TARGET_FILE_DIR:backpack_runtime>)
 else()
     target_link_libraries(backpack_runtime PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
 endif()

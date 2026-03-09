@@ -12,6 +12,7 @@
 #include "gpu_context.h"
 #include "gguf_loader.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,8 +44,6 @@ struct ModelRunner {
     // Each pool slot has its own staging buffer + pre-recorded CBs.
     // The decode loop cycles through slots round-robin, allowing
     // N tokens to be in-flight simultaneously.
-    static constexpr int POOL_DEPTH = 3;
-    static constexpr int CB_POOL_BATCH = 128;
     struct PoolSlot {
         WGPUBuffer stagingBuf = nullptr;
         WGPUFuture pendingFuture{};
@@ -53,8 +52,11 @@ struct ModelRunner {
         std::vector<WGPUCommandBuffer> cbPool;
         int cbIdx = 0;  // index of next token's first CB
     };
-    PoolSlot pool[POOL_DEPTH];
+    std::vector<PoolSlot> pool;
     int nGroups = 1;  // number of CB groups per token (1 = single submit)
+    int decodePoolCapacity = 3;
+    int decodePoolDepth = 3;
+    int decodeCbPoolBatch = 128;
 
     // Dynamic param templates (CPU-side, modified per step)
     std::vector<uint8_t> ropeParamData, chunkedAttnParamData;
@@ -93,7 +95,40 @@ struct ModelRunner {
 
     // Pass mode: false = single compute pass (faster on D3D12)
     bool passPerDispatch = true;
-    bool useMMA = false;  // true on Vulkan with subgroup_matrix support
+    bool useMMA = false;   // true on Vulkan with subgroup_matrix support
+    bool useDP4A = false;  // true when dot4I8Packed is available (D3D12)
+    struct KernelTuning {
+        bool decodeUseFastQkv = false;
+        bool decodeUseFastOproj = false;
+        bool decodeUseFastGateup = false;
+        bool decodeUseWideFp16 = false;
+        bool prefillUseWidePrequant = false;
+        bool prefillUseWidePrequantAdd = false;
+        uint32_t prefillMatM = 8;
+        uint32_t prefillMatN = 32;
+        uint32_t prefillWideMatM = 8;
+        uint32_t prefillWideMatN = 32;
+        uint32_t prefillDnM = 8;
+        uint32_t prefillDnN = 32;
+        uint32_t prefillAttnBlockQ = 4;
+    } tuning;
+
+    struct DecodeDispatchIndices {
+        int qkv = -1;
+        int oproj = -1;
+        int gateup = -1;
+    };
+    struct DecodeVariantBindGroups {
+        WGPUBindGroup qkvBase = nullptr;
+        WGPUBindGroup qkvFast = nullptr;
+        WGPUBindGroup oprojBase = nullptr;
+        WGPUBindGroup oprojFast = nullptr;
+        WGPUBindGroup gateupBase = nullptr;
+        WGPUBindGroup gateupFast = nullptr;
+    };
+    std::vector<DecodeDispatchIndices> decodeDispatchIndices;
+    std::vector<DecodeVariantBindGroups> decodeVariantBGs;
+    bool decodeFastVariantsAvailable = false;
 
     // Profiling
     GPUProfiler* profiler = nullptr;
@@ -128,6 +163,12 @@ struct ModelRunner {
     void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
     void resetKVCache();
     void refillCBPool(int slot);
+    void autotuneDecodeDepth();
+    void autotuneDecodeKernels();
+    bool loadDecodeAutotuneCache();
+    void saveDecodeAutotuneCache() const;
+    void printActiveDecodeTuning(const char* prefix = "  Active decode tuning") const;
+    void destroy();
 
 private:
     void loadWeights(const GGUFFile& gguf, const std::vector<uint8_t>& fileData);
@@ -138,22 +179,40 @@ private:
     const CompiledPipeline& getKernel(const std::string& name);
     WGPUBindGroup makeBG(const CompiledPipeline& pl,
                          const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
+    void applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
+                                    bool useFastGateup);
+    double benchmarkDecodeConfig(int depth, int nTokens, int repeats = 1);
+    std::string decodeAutotuneCachePath() const;
+    std::string decodeAutotuneCacheKey() const;
 
     // --- Pre-allocated prefill resources (sized to maxSeqLen) ---
     struct PrefillCache {
         bool ready = false;
         GPUBuffer pX, pNorm, pQkv, pQRot, pAttn, pProj, pGU, pRstd;
+        GPUBuffer pNormQ, pNormQS, pAttnQ, pAttnQS, pGUQ, pGUQS;
         GPUBuffer pQkvP, pOpP, pGuP, pDnP, pRmsP, pLmP;
+        GPUBuffer pNormQP, pAttnQP, pGUQP;
         std::vector<GPUBuffer> ropeParams;   // one per layer
         std::vector<GPUBuffer> attnParams;   // one per layer
         // Cached bind groups (stable since buffer handles don't change)
         struct LayerBGs {
-            WGPUBindGroup rms, qkv, rope, attn, oproj, addrms, gateup, downsilu;
+            WGPUBindGroup rms, qnorm, qkv, rope, attn, attnq, oproj;
+            WGPUBindGroup addrms, gateup, siluq, downsilu;
         };
         std::vector<LayerBGs> layerBGs;
         WGPUBindGroup finalRmsBG = nullptr;
         WGPUBindGroup lmBG = nullptr;
         WGPUBindGroup argmaxBG = nullptr;
+
+        // Pre-recorded indirect dispatch table (static pipeline + bind group)
+        struct IndirectEntry {
+            WGPUComputePipeline pipeline;
+            WGPUBindGroup       bindGroup;
+            uint64_t            indirectOffset;  // byte offset into indirectBuf
+            std::string         name;
+        };
+        std::vector<IndirectEntry> indirectTable;
+        GPUBuffer indirectBuf;  // [gx, gy, gz] × N dispatches
     };
     PrefillCache pfCache;
 };

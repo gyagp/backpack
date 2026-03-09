@@ -19,6 +19,16 @@
 
 namespace fs = std::filesystem;
 
+static void shutdownRuntime(ModelRunner& model, GPUContext& gpu) {
+#if defined(_WIN32)
+    (void)model;
+    (void)gpu;
+#else
+    model.destroy();
+    gpu.destroy();
+#endif
+}
+
 /// Resolve model path: accepts GGUF file or directory containing GGUF
 static std::string resolveModelPath(const std::string& path) {
     // Direct GGUF file
@@ -57,6 +67,8 @@ int main(int argc, char* argv[]) {
     bool benchDetail = false;
     bool usePassPerDispatch = false;
     bool benchmarkMode = false;
+    int benchPromptLen = 0;
+    int benchGenTokens = 128;
     int submitGroups = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -68,6 +80,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--backend" && i+1 < argc) backend_str = argv[++i];
         else if (arg == "--profile") profile = true;
         else if (arg == "--bench-detail") benchDetail = true;
+        else if (arg == "--bench-prompt-len" && i+1 < argc) benchPromptLen = atoi(argv[++i]);
+        else if (arg == "--bench-gen-tokens" && i+1 < argc) benchGenTokens = atoi(argv[++i]);
         else if (arg == "--pass-per-dispatch") usePassPerDispatch = true;
         else if (arg == "--submit-groups" && i+1 < argc) submitGroups = atoi(argv[++i]);
         else if (arg == "--benchmark") benchmarkMode = true;
@@ -78,7 +92,8 @@ int main(int argc, char* argv[]) {
             "Backpack Runtime -- WebGPU inference from GGUF models\n\n"
             "Usage: %s --model <model.gguf or model-dir/>\n"
             "  [--prompt <text>] [--max-tokens <n>] [--backend vulkan|d3d12]\n"
-            "  [--profile] [--benchmark] [--bench-detail]\n",
+            "  [--profile] [--benchmark] [--bench-detail]\n"
+            "  [--bench-prompt-len <n>] [--bench-gen-tokens <n>]\n",
             argv[0]);
         return 1;
     }
@@ -113,7 +128,7 @@ int main(int argc, char* argv[]) {
     if (submitGroups > 1) {
         model.nGroups = submitGroups;
         // Rebuild pool with new group count
-        for (int s = 0; s < ModelRunner::POOL_DEPTH; s++)
+        for (int s = 0; s < model.decodePoolDepth; s++)
             model.refillCBPool(s);
         printf("  Submit groups: %d (%zu dispatches / %d = %zu per group)\n",
                submitGroups, model.autoDecodeDispatches.size(), submitGroups,
@@ -148,6 +163,18 @@ int main(int argc, char* argv[]) {
         printf("Warmup: %lldms (shader compilation)\n", (long long)warmupMs);
     }
 
+    if (!model.loadDecodeAutotuneCache()) {
+        model.autotuneDecodeDepth();
+        model.autotuneDecodeKernels();
+        model.saveDecodeAutotuneCache();
+    }
+    model.printActiveDecodeTuning();
+
+    if (profile && model.profiler) {
+        model.profiler->nextIndex = 0;
+        model.profiler->entries.clear();
+    }
+
     // ─── Benchmark mode ──────────────────────────────────────────────────
     if (benchmarkMode) {
         printf("\n=== Benchmark: %s ===\n", model.cfg.arch.c_str());
@@ -156,8 +183,18 @@ int main(int argc, char* argv[]) {
         printf("%-12s %10s %10s %10s %10s\n",
                "----------", "----------", "--------", "---------", "--------");
 
-        int genTokens = 128;
-        int promptLens[] = {5, 128, 256, 512, 1024};
+        if (profile && benchPromptLen == 0)
+            benchPromptLen = 1024;
+
+        int genTokens = benchGenTokens;
+        std::vector<int> promptLens;
+        if (benchPromptLen > 0)
+            promptLens.push_back(benchPromptLen);
+        else
+            promptLens = {5, 128, 256, 512, 1024, 2048, 4096};
+
+        double lastPfMs = 0.0, lastDcMs = 0.0;
+        int lastPromptLen = 0;
 
         for (int pl : promptLens) {
             model.resetKVCache();
@@ -177,7 +214,7 @@ int main(int argc, char* argv[]) {
             // Decode: generate genTokens tokens
             auto dc_t0 = std::chrono::steady_clock::now();
             int generated = 0;
-            const int DEPTH = ModelRunner::POOL_DEPTH;
+            const int DEPTH = model.decodePoolDepth;
             int submitted = 0, completed = 0;
 
             int primeCount = std::min(DEPTH, genTokens);
@@ -201,10 +238,44 @@ int main(int argc, char* argv[]) {
 
             printf("%-12d %10.1f %10.1f %10.1f %10.1f\n",
                    pl, pfMs, pfTps, dcMs, dcTps);
+
+            lastPfMs = pfMs;
+            lastDcMs = dcMs;
+            lastPromptLen = pl;
         }
 
         printf("\n");
-        gpu.destroy();
+
+        if (profile) {
+            auto modelPath = fs::path(gguf_path);
+            auto modelDir = modelPath.parent_path();
+            auto modelName = modelDir.filename().string();
+            if (modelName == "weights")
+                modelName = modelDir.parent_path().filename().string();
+            fs::path repoRoot;
+            auto exeDir = fs::path(argv[0]).parent_path();
+            if (exeDir.empty()) exeDir = fs::current_path();
+            for (auto p = fs::absolute(exeDir); !p.empty() && p != p.parent_path(); p = p.parent_path()) {
+                if (fs::exists(p / ".gitignore") && fs::exists(p / "runtimes")) {
+                    repoRoot = p;
+                    break;
+                }
+            }
+
+            std::string profilePath;
+            if (!repoRoot.empty()) {
+                auto profileDir = repoRoot / "gitignore" / "models" / modelName;
+                fs::create_directories(profileDir);
+                profilePath = (profileDir / "profile.html").string();
+            } else {
+                profilePath = "profile.html";
+            }
+
+            model.printProfileReport(genTokens, lastPromptLen, lastPfMs,
+                                     lastDcMs, profilePath);
+        }
+
+        shutdownRuntime(model, gpu);
         return 0;
     }
 
@@ -230,8 +301,8 @@ int main(int argc, char* argv[]) {
     // Write first token to shared GPU argmax buffer for autoregressive chaining
     gpu.writeBuffer(model.argmaxResultBuf, &firstToken, 4);
 
-    // 8. Decode loop — pipelined with POOL_DEPTH staging slots.
-    //    Submit up to POOL_DEPTH tokens ahead, then read oldest + submit next.
+    // 8. Decode loop — pipelined with decodePoolDepth staging slots.
+    //    Submit up to decodePoolDepth tokens ahead, then read oldest + submit next.
     //    Buffers are shared (GPU executes in order); only staging differs per slot.
     printf("\n--- Output ---\n%s", prompt.c_str());
     fflush(stdout);
@@ -253,7 +324,7 @@ int main(int argc, char* argv[]) {
         printf("%s", tokenizer.decode_token(nextToken).c_str());
         fflush(stdout);
 
-        const int DEPTH = ModelRunner::POOL_DEPTH;
+        const int DEPTH = model.decodePoolDepth;
         int submitted = 0;  // total tokens submitted to GPU
         int completed = 0;  // total tokens read back
 
@@ -352,7 +423,11 @@ int main(int argc, char* argv[]) {
     // Print GPU profile report if profiling was enabled
     if (profile) {
         // Derive model name from GGUF path (parent directory name)
-        auto modelName = fs::path(gguf_path).parent_path().filename().string();
+        auto modelPath = fs::path(gguf_path);
+        auto modelDir = modelPath.parent_path();
+        auto modelName = modelDir.filename().string();
+        if (modelName == "weights")
+            modelName = modelDir.parent_path().filename().string();
 
         // Place profile.html under gitignore/models/<model_name>/ in this repo
         // Find repo root: walk up from executable looking for .gitignore
@@ -381,6 +456,6 @@ int main(int argc, char* argv[]) {
                                  profilePath);
     }
 
-    gpu.destroy();
+    shutdownRuntime(model, gpu);
     return 0;
 }

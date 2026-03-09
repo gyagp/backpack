@@ -75,6 +75,15 @@ static std::string sv_str(WGPUStringView sv) {
 
 bool GPUContext::init(WGPUBackendType backend) {
     backendType = backend;
+    adapterName.clear();
+    adapterDescription.clear();
+    adapterLimits = {};
+    deviceLimits = {};
+    supportsShaderF16 = false;
+    supportsSubgroups = false;
+    supportsSubgroupMatrix = false;
+    supportsTimestampQuery = false;
+
     // Instance with TimedWaitAny
     WGPUInstanceFeatureName instFeat[] = {
         static_cast<WGPUInstanceFeatureName>(0x01) };
@@ -116,33 +125,42 @@ bool GPUContext::init(WGPUBackendType backend) {
 
     WGPUAdapterInfo info{};
     wgpuAdapterGetInfo(adapter, &info);
+    adapterName = sv_str(info.device);
+    adapterDescription = sv_str(info.description);
     printf("GPU: %s (%s)\n", sv_str(info.device).c_str(),
            sv_str(info.description).c_str());
 
-    WGPULimits limits{};
-    wgpuAdapterGetLimits(adapter, &limits);
+    if (wgpuAdapterGetLimits(adapter, &adapterLimits) != WGPUStatus_Success) {
+        fprintf(stderr, "FATAL: wgpuAdapterGetLimits failed; refusing to fall back to WebGPU default limits.\n");
+        return false;
+    }
     printf("  maxComputeInvocationsPerWorkgroup: %u\n",
-           (unsigned)limits.maxComputeInvocationsPerWorkgroup);
+            (unsigned)adapterLimits.maxComputeInvocationsPerWorkgroup);
     printf("  maxComputeWorkgroupSizeX: %u\n",
-           (unsigned)limits.maxComputeWorkgroupSizeX);
+            (unsigned)adapterLimits.maxComputeWorkgroupSizeX);
     printf("  maxComputeWorkgroupStorageSize: %u bytes\n",
-           (unsigned)limits.maxComputeWorkgroupStorageSize);
+            (unsigned)adapterLimits.maxComputeWorkgroupStorageSize);
     printf("  maxStorageBufferBindingSize: %llu MB\n",
-           (unsigned long long)limits.maxStorageBufferBindingSize / 1048576);
+            (unsigned long long)adapterLimits.maxStorageBufferBindingSize / 1048576);
     printf("  maxBufferSize: %llu MB\n",
-           (unsigned long long)limits.maxBufferSize / 1048576);
+            (unsigned long long)adapterLimits.maxBufferSize / 1048576);
 
     // Device features
     std::vector<WGPUFeatureName> feats;
-    auto tryFeat = [&](std::initializer_list<uint32_t> ids) {
-        for (auto id : ids)
-            if (wgpuAdapterHasFeature(adapter, (WGPUFeatureName)id))
-                { feats.push_back((WGPUFeatureName)id); return; }
+    auto tryFeat = [&](bool& supported, std::initializer_list<uint32_t> ids) {
+        supported = false;
+        for (auto id : ids) {
+            if (wgpuAdapterHasFeature(adapter, (WGPUFeatureName)id)) {
+                feats.push_back((WGPUFeatureName)id);
+                supported = true;
+                return;
+            }
+        }
     };
-    tryFeat({0x0B, 0x0A});  // ShaderF16
-    tryFeat({0x12, 0x11});  // Subgroups
-    tryFeat({0x00050034});  // SubgroupMatrix
-    tryFeat({0x09});        // TimestampQuery
+    tryFeat(supportsShaderF16, {0x0B, 0x0A});
+    tryFeat(supportsSubgroups, {0x12, 0x11});
+    tryFeat(supportsSubgroupMatrix, {0x00050034});
+    tryFeat(supportsTimestampQuery, {0x09});
 
     const char* devE[] = {"skip_validation", "disable_robustness",
                           "d3d_disable_ieee_strictness"};
@@ -158,7 +176,9 @@ bool GPUContext::init(WGPUBackendType backend) {
     ddesc.label = {"runtime", 7};
     ddesc.requiredFeatureCount = feats.size();
     ddesc.requiredFeatures = feats.empty() ? nullptr : feats.data();
-    ddesc.requiredLimits = &limits;
+    // Request the adapter's actual supported limits instead of a zeroed
+    // WGPULimits struct, which would only ask for WebGPU defaults.
+    ddesc.requiredLimits = &adapterLimits;
     ddesc.uncapturedErrorCallbackInfo.callback =
         [](WGPUDevice const*, WGPUErrorType t, WGPUStringView m, void*, void*) {
             const char* n[] = {"OK","Val","OOM","Int","Unk","Lost"};
@@ -168,7 +188,38 @@ bool GPUContext::init(WGPUBackendType backend) {
 
     device = wgpuAdapterCreateDevice(adapter, &ddesc);
     if (!device) return false;
+
+    if (wgpuDeviceGetLimits(device, &deviceLimits) != WGPUStatus_Success) {
+        fprintf(stderr, "FATAL: wgpuDeviceGetLimits failed after device creation.\n");
+        return false;
+    }
+
+    if (deviceLimits.maxStorageBufferBindingSize != adapterLimits.maxStorageBufferBindingSize ||
+        deviceLimits.maxBufferSize != adapterLimits.maxBufferSize ||
+        deviceLimits.maxComputeWorkgroupStorageSize != adapterLimits.maxComputeWorkgroupStorageSize ||
+        deviceLimits.maxComputeInvocationsPerWorkgroup != adapterLimits.maxComputeInvocationsPerWorkgroup) {
+        fprintf(stderr,
+                "WARNING: device limits differ from adapter limits; device may not be using full hardware limits.\n");
+        fprintf(stderr,
+                "  adapter: maxStorageBufferBindingSize=%llu maxBufferSize=%llu maxComputeWorkgroupStorageSize=%u maxComputeInvocationsPerWorkgroup=%u\n",
+                (unsigned long long)adapterLimits.maxStorageBufferBindingSize,
+                (unsigned long long)adapterLimits.maxBufferSize,
+                (unsigned)adapterLimits.maxComputeWorkgroupStorageSize,
+                (unsigned)adapterLimits.maxComputeInvocationsPerWorkgroup);
+        fprintf(stderr,
+                "  device : maxStorageBufferBindingSize=%llu maxBufferSize=%llu maxComputeWorkgroupStorageSize=%u maxComputeInvocationsPerWorkgroup=%u\n",
+                (unsigned long long)deviceLimits.maxStorageBufferBindingSize,
+                (unsigned long long)deviceLimits.maxBufferSize,
+                (unsigned)deviceLimits.maxComputeWorkgroupStorageSize,
+                (unsigned)deviceLimits.maxComputeInvocationsPerWorkgroup);
+    }
+
     queue = wgpuDeviceGetQueue(device);
+    printf("  Features: f16=%s subgroups=%s subgroup_matrix=%s timestamps=%s\n",
+           supportsShaderF16 ? "yes" : "no",
+           supportsSubgroups ? "yes" : "no",
+           supportsSubgroupMatrix ? "yes" : "no",
+           supportsTimestampQuery ? "yes" : "no");
     return true;
 }
 

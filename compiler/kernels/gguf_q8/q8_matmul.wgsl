@@ -25,14 +25,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    // K_PER_ITER=8: each lane processes 8 elements per 256-element stride
-    // (32 lanes × 8 elem/lane = 256 elements = 8 Q8_0 blocks per stride)
+    // K_PER_ITER=8: each lane processes 8 elements per 256-element stride     
+    // (32 lanes × 8 elem/lane = 256 elements = 8 Q8_0 blocks per stride)      
     let n_strides = K / 256u;
     let stride_w = K / 4u;  // u32 per weight row
 
     var acc: f32 = 0.0;
 
-    if (col < N) {
+    let col_valid = col < N;
+
+    if (col_valid) {
         let w_base = col * stride_w;
         let n_blocks = K / 32u;
         let s_base = col * n_blocks;
@@ -65,28 +67,30 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                                 f32(extractBits(i32(pw1), 24u, 8u)));
 
             // Per-block scales: 2 blocks per 8 elements
-            // block_idx = (g * 256 + lane * 8) / 32
-            let bi = g * 8u + lane / 4u;
-            let si0 = s_base + bi;
-            let si1 = si0 + 1u;
-            // Correction: lane * 8 spans TWO 32-element blocks when lane >= 4
-            // Block for first 4 elements: (g*256 + lane*8) / 32 = g*8 + lane/4
-            // Block for second 4 elements: (g*256 + lane*8 + 4) / 32
+            // Correction: lane * 8 spans TWO 32-element blocks when lane >= 4 
             let block0 = g * 8u + (lane * 8u) / 32u;
             let block1 = g * 8u + (lane * 8u + 4u) / 32u;
             let sp0 = unpack2x16float(Scales[(s_base + block0) / 2u]);
-            let scale0 = select(sp0.x, sp0.y, ((s_base + block0) & 1u) != 0u);
+            let scale0 = select(sp0.x, sp0.y, ((s_base + block0) & 1u) != 0u); 
             let sp1 = unpack2x16float(Scales[(s_base + block1) / 2u]);
-            let scale1 = select(sp1.x, sp1.y, ((s_base + block1) & 1u) != 0u);
+            let scale1 = select(sp1.x, sp1.y, ((s_base + block1) & 1u) != 0u); 
 
             // vec4 dot products with per-block scaling
             acc += dot(xv0, wv0) * scale0 + dot(xv1, wv1) * scale1;
         }
     }
 
-    let warp_sum = subgroupAdd(acc);
+    acc = select(0.0, acc, col_valid);
+    
+    // subgroupAdd requires subgroup uniform control flow
+    var warp_sum = acc;
+    warp_sum += subgroupShuffleXor(warp_sum, 16u);
+    warp_sum += subgroupShuffleXor(warp_sum, 8u);
+    warp_sum += subgroupShuffleXor(warp_sum, 4u);
+    warp_sum += subgroupShuffleXor(warp_sum, 2u);
+    warp_sum += subgroupShuffleXor(warp_sum, 1u);
 
-    if (lane == 0u && col < N) {
+    if (lane == 0u && col_valid) {
         Y[row * N + col] = warp_sum + Bias[col];
     }
 }

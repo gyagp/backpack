@@ -97,7 +97,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let wq1 = W_Q8[w_off + 1u];
                 let wq2 = W_Q8[w_off + 2u];
                 let wq3 = W_Q8[w_off + 3u];
-                
+
                 let block = g * 8u + x_block;
                 let sp = unpack2x16float(Scales[(s_bases[c] + block) / 2u]);
                 let w_scale = select(sp.x, sp.y, ((s_bases[c] + block) & 1u) != 0u);
@@ -108,14 +108,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                     let xq1 = smem_xq[xm_base + 1u];
                     let xq2 = smem_xq[xm_base + 2u];
                     let xq3 = smem_xq[xm_base + 3u];
-                    
+
                     let xsc = smem_xs[m * 8u + x_block];
-                    
-                    let idot = dot4I8Packed(xq0, wq0) + 
-                               dot4I8Packed(xq1, wq1) + 
-                               dot4I8Packed(xq2, wq2) + 
+
+                    let idot = dot4I8Packed(xq0, wq0) +
+                               dot4I8Packed(xq1, wq1) +
+                               dot4I8Packed(xq2, wq2) +
                                dot4I8Packed(xq3, wq3);
-                               
+
                     acc[m][c] += f32(idot) * w_scale * xsc;
                 }
             }
@@ -131,7 +131,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             val += subgroupShuffleXor(val, 4u);
             val += subgroupShuffleXor(val, 2u);
             val += subgroupShuffleXor(val, 1u);
-            
+
             let out_row = tile_row * TILE_M + m;
             if (lane_k == 0u && col_valid[c] && out_row < M) {
                 Y[out_row * N + cols[c]] = val + Bias[cols[c]];

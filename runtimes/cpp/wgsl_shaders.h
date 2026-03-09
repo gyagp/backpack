@@ -861,8 +861,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 static const char* WGSL_Q8_MATMUL = R"WGSL(
 enable subgroups;
 
-@group(0) @binding(0) var<storage, read_write> X_v4: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read_write> W_Q8_v4: array<vec4<u32>>;
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> W_Q8: array<u32>;
 @group(0) @binding(2) var<storage, read_write> Scales: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Bias: array<f32>;
 @group(0) @binding(4) var<storage, read_write> Y: array<f32>;
@@ -879,77 +879,80 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     let K = _params_[0];
     let N = _params_[1];
-    let x_base_v4 = row * (K / 4u);
+    let x_base = row * K;
 
     // 8 warps × 32 threads: each warp computes one output
     let warp_id = tid / 32u;
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    // K_PER_ITER = 16: each lane processes 16 elements per 512-element stride (1 vec4<u32>)
-    // 32 lanes × 16 elem/lane = 512 elements = 16 Q8_0 blocks per stride
-    let n_strides = K / 512u;
-    let stride_w_v4 = K / 16u;  // vec4<u32> per weight row
+    // K_PER_ITER=8: each lane processes 8 elements per 256-element stride     
+    // (32 lanes × 8 elem/lane = 256 elements = 8 Q8_0 blocks per stride)      
+    let n_strides = K / 256u;
+    let stride_w = K / 4u;  // u32 per weight row
 
     var acc: f32 = 0.0;
 
-    let w_base_v4 = col * stride_w_v4;
+    let col_valid = col < N;
+
+    if (col_valid) {
+        let w_base = col * stride_w;
         let n_blocks = K / 32u;
         let s_base = col * n_blocks;
 
         for (var g = 0u; g < n_strides; g = g + 1u) {
-            // Read 16 fp32 activations (four vec4 loads)
-            let k_v4_base = g * 128u + lane * 4u;
-            let xv0 = X_v4[x_base_v4 + k_v4_base];
-            let xv1 = X_v4[x_base_v4 + k_v4_base + 1u];
-            let xv2 = X_v4[x_base_v4 + k_v4_base + 2u];
-            let xv3 = X_v4[x_base_v4 + k_v4_base + 3u];
+            // Read 8 fp32 activations (two vec4 loads)
+            let k_base = g * 256u + lane * 8u;
+            let xv0 = vec4<f32>(X[x_base + k_base],
+                                X[x_base + k_base + 1u],
+                                X[x_base + k_base + 2u],
+                                X[x_base + k_base + 3u]);
+            let xv1 = vec4<f32>(X[x_base + k_base + 4u],
+                                X[x_base + k_base + 5u],
+                                X[x_base + k_base + 6u],
+                                X[x_base + k_base + 7u]);
 
-            // Read 1 vec4<u32> weight (16 int8 values)
-            let wv = W_Q8_v4[w_base_v4 + g * 32u + lane];
+            // Read 2 packed u32 weights (8 int8 values)
+            let w_off = w_base + g * 64u + lane * 2u;
+            let pw0 = W_Q8[w_off];
+            let pw1 = W_Q8[w_off + 1u];
 
-            // Weight block scale. 
-            // 512 elements per stride = 16 blocks per stride.
-            // Lane processes 16 elements. 2 lanes process 1 block (32 elements).
-            // So block index is g * 16 + lane / 2.
-            let b_idx = g * 16u + (lane / 2u);
-            let s_elem = s_base + b_idx;
-            
-            let sp = unpack2x16float(Scales[s_elem / 2u]);
-            let w_scale = select(sp.x, sp.y, (s_elem & 1u) != 0u);
+            // Extract int8 → f32 and form vec4 for dot product
+            let wv0 = vec4<f32>(f32(extractBits(i32(pw0), 0u, 8u)),
+                                f32(extractBits(i32(pw0), 8u, 8u)),
+                                f32(extractBits(i32(pw0), 16u, 8u)),
+                                f32(extractBits(i32(pw0), 24u, 8u)));
+            let wv1 = vec4<f32>(f32(extractBits(i32(pw1), 0u, 8u)),
+                                f32(extractBits(i32(pw1), 8u, 8u)),
+                                f32(extractBits(i32(pw1), 16u, 8u)),
+                                f32(extractBits(i32(pw1), 24u, 8u)));
 
-            // Extract int8 → f32
-            let wv0 = vec4<f32>(f32(extractBits(i32(wv.x), 0u, 8u)),
-                                f32(extractBits(i32(wv.x), 8u, 8u)),
-                                f32(extractBits(i32(wv.x), 16u, 8u)),
-                                f32(extractBits(i32(wv.x), 24u, 8u)));
-            let wv1 = vec4<f32>(f32(extractBits(i32(wv.y), 0u, 8u)),
-                                f32(extractBits(i32(wv.y), 8u, 8u)),
-                                f32(extractBits(i32(wv.y), 16u, 8u)),
-                                f32(extractBits(i32(wv.y), 24u, 8u)));
-            let wv2 = vec4<f32>(f32(extractBits(i32(wv.z), 0u, 8u)),
-                                f32(extractBits(i32(wv.z), 8u, 8u)),
-                                f32(extractBits(i32(wv.z), 16u, 8u)),
-                                f32(extractBits(i32(wv.z), 24u, 8u)));
-            let wv3 = vec4<f32>(f32(extractBits(i32(wv.w), 0u, 8u)),
-                                f32(extractBits(i32(wv.w), 8u, 8u)),
-                                f32(extractBits(i32(wv.w), 16u, 8u)),
-                                f32(extractBits(i32(wv.w), 24u, 8u)));
+            // Per-block scales: 2 blocks per 8 elements
+            // Correction: lane * 8 spans TWO 32-element blocks when lane >= 4 
+            let block0 = g * 8u + (lane * 8u) / 32u;
+            let block1 = g * 8u + (lane * 8u + 4u) / 32u;
+            let sp0 = unpack2x16float(Scales[(s_base + block0) / 2u]);
+            let scale0 = select(sp0.x, sp0.y, ((s_base + block0) & 1u) != 0u); 
+            let sp1 = unpack2x16float(Scales[(s_base + block1) / 2u]);
+            let scale1 = select(sp1.x, sp1.y, ((s_base + block1) & 1u) != 0u); 
 
-            acc += dot(xv0, wv0) * w_scale +
-                   dot(xv1, wv1) * w_scale +
-                   dot(xv2, wv2) * w_scale +
-                   dot(xv3, wv3) * w_scale;
-        // Subgroup reduce within warp
-        acc += subgroupShuffleXor(acc, 16u);
-        acc += subgroupShuffleXor(acc, 8u);
-        acc += subgroupShuffleXor(acc, 4u);
-        acc += subgroupShuffleXor(acc, 2u);
-        acc += subgroupShuffleXor(acc, 1u);
-
-        if (lane == 0u && col < N) {
-            Y[row * N + col] = acc + Bias[col];
+            // vec4 dot products with per-block scaling
+            acc += dot(xv0, wv0) * scale0 + dot(xv1, wv1) * scale1;
         }
+    }
+
+    acc = select(0.0, acc, col_valid);
+    
+    // subgroupAdd requires subgroup uniform control flow
+    var warp_sum = acc;
+    warp_sum += subgroupShuffleXor(warp_sum, 16u);
+    warp_sum += subgroupShuffleXor(warp_sum, 8u);
+    warp_sum += subgroupShuffleXor(warp_sum, 4u);
+    warp_sum += subgroupShuffleXor(warp_sum, 2u);
+    warp_sum += subgroupShuffleXor(warp_sum, 1u);
+
+    if (lane == 0u && col_valid) {
+        Y[row * N + col] = warp_sum + Bias[col];
     }
 }
 )WGSL";
@@ -2179,29 +2182,36 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let row = wid.x;
     let tile_col = wid.y;
     let tid = lid.x;
+
     let K = _params_[0];
     let N = _params_[1];
     let x_base = row * K;
+
     let warp_id = tid / 32u;
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
+
     let n_strides = K / 512u;
     let stride_w = K / 4u;
     var acc: f32 = 0.0;
-    if (col < N) {
+    
+    let col_valid = col < N;
+
+    if (col_valid) {
         let w_base = col * stride_w;
         let n_blocks = K / 32u;
         let s_base = col * n_blocks;
         for (var g = 0u; g < n_strides; g = g + 1u) {
             let k_base = g * 512u + lane * 16u;
             let xv0 = vec4<f32>(X[x_base+k_base], X[x_base+k_base+1u],
-                                X[x_base+k_base+2u], X[x_base+k_base+3u]);
-            let xv1 = vec4<f32>(X[x_base+k_base+4u], X[x_base+k_base+5u],
-                                X[x_base+k_base+6u], X[x_base+k_base+7u]);
-            let xv2 = vec4<f32>(X[x_base+k_base+8u], X[x_base+k_base+9u],
-                                X[x_base+k_base+10u], X[x_base+k_base+11u]);
-            let xv3 = vec4<f32>(X[x_base+k_base+12u], X[x_base+k_base+13u],
-                                X[x_base+k_base+14u], X[x_base+k_base+15u]);
+                                X[x_base+k_base+2u], X[x_base+k_base+3u]);      
+            let xv1 = vec4<f32>(X[x_base+k_base+4u], X[x_base+k_base+5u],       
+                                X[x_base+k_base+6u], X[x_base+k_base+7u]);      
+            let xv2 = vec4<f32>(X[x_base+k_base+8u], X[x_base+k_base+9u],       
+                                X[x_base+k_base+10u], X[x_base+k_base+11u]);    
+            let xv3 = vec4<f32>(X[x_base+k_base+12u], X[x_base+k_base+13u],     
+                                X[x_base+k_base+14u], X[x_base+k_base+15u]);    
+
             let w_off = w_base + g * 128u + lane * 4u;
             let pw0 = W_Q8[w_off]; let pw1 = W_Q8[w_off+1u];
             let pw2 = W_Q8[w_off+2u]; let pw3 = W_Q8[w_off+3u];
@@ -2213,6 +2223,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                                 f32(extractBits(i32(pw2),16u,8u)),f32(extractBits(i32(pw2),24u,8u)));
             let wv3 = vec4<f32>(f32(extractBits(i32(pw3),0u,8u)),f32(extractBits(i32(pw3),8u,8u)),
                                 f32(extractBits(i32(pw3),16u,8u)),f32(extractBits(i32(pw3),24u,8u)));
+
             let block0 = g*16u + (lane*16u)/32u;
             let block1 = g*16u + (lane*16u+4u)/32u;
             let block2 = g*16u + (lane*16u+8u)/32u;
@@ -2229,8 +2240,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                  + dot(xv2,wv2)*sc2 + dot(xv3,wv3)*sc3;
         }
     }
-    let warp_sum = subgroupAdd(acc);
-    if (lane==0u && col<N) { Y[row*N+col] = warp_sum + Bias[col]; }
+
+    acc = select(0.0, acc, col_valid);
+    var warp_sum = acc;
+    warp_sum += subgroupShuffleXor(warp_sum, 16u);
+    warp_sum += subgroupShuffleXor(warp_sum, 8u);
+    warp_sum += subgroupShuffleXor(warp_sum, 4u);
+    warp_sum += subgroupShuffleXor(warp_sum, 2u);
+    warp_sum += subgroupShuffleXor(warp_sum, 1u);
+
+    if (lane==0u && col_valid) { 
+        Y[row*N+col] = warp_sum + Bias[col]; 
+    }
 }
 )WGSL";
 
@@ -2947,7 +2968,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let wq1 = W_Q8[w_off + 1u];
                 let wq2 = W_Q8[w_off + 2u];
                 let wq3 = W_Q8[w_off + 3u];
-                
+
                 let block = g * 8u + x_block;
                 let sp = unpack2x16float(Scales[(s_bases[c] + block) / 2u]);
                 let w_scale = select(sp.x, sp.y, ((s_bases[c] + block) & 1u) != 0u);
@@ -2958,14 +2979,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                     let xq1 = smem_xq[xm_base + 1u];
                     let xq2 = smem_xq[xm_base + 2u];
                     let xq3 = smem_xq[xm_base + 3u];
-                    
+
                     let xsc = smem_xs[m * 8u + x_block];
-                    
-                    let idot = dot4I8Packed(xq0, wq0) + 
-                               dot4I8Packed(xq1, wq1) + 
-                               dot4I8Packed(xq2, wq2) + 
+
+                    let idot = dot4I8Packed(xq0, wq0) +
+                               dot4I8Packed(xq1, wq1) +
+                               dot4I8Packed(xq2, wq2) +
                                dot4I8Packed(xq3, wq3);
-                               
+
                     acc[m][c] += f32(idot) * w_scale * xsc;
                 }
             }
@@ -2981,7 +3002,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             val += subgroupShuffleXor(val, 4u);
             val += subgroupShuffleXor(val, 2u);
             val += subgroupShuffleXor(val, 1u);
-            
+
             let out_row = tile_row * TILE_M + m;
             if (lane_k == 0u && col_valid[c] && out_row < M) {
                 Y[out_row * N + cols[c]] = val + Bias[cols[c]];

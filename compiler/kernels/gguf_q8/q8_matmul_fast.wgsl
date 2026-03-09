@@ -15,29 +15,36 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let row = wid.x;
     let tile_col = wid.y;
     let tid = lid.x;
+
     let K = _params_[0];
     let N = _params_[1];
     let x_base = row * K;
+
     let warp_id = tid / 32u;
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
+
     let n_strides = K / 512u;
     let stride_w = K / 4u;
     var acc: f32 = 0.0;
-    if (col < N) {
+    
+    let col_valid = col < N;
+
+    if (col_valid) {
         let w_base = col * stride_w;
         let n_blocks = K / 32u;
         let s_base = col * n_blocks;
         for (var g = 0u; g < n_strides; g = g + 1u) {
             let k_base = g * 512u + lane * 16u;
             let xv0 = vec4<f32>(X[x_base+k_base], X[x_base+k_base+1u],
-                                X[x_base+k_base+2u], X[x_base+k_base+3u]);
-            let xv1 = vec4<f32>(X[x_base+k_base+4u], X[x_base+k_base+5u],
-                                X[x_base+k_base+6u], X[x_base+k_base+7u]);
-            let xv2 = vec4<f32>(X[x_base+k_base+8u], X[x_base+k_base+9u],
-                                X[x_base+k_base+10u], X[x_base+k_base+11u]);
-            let xv3 = vec4<f32>(X[x_base+k_base+12u], X[x_base+k_base+13u],
-                                X[x_base+k_base+14u], X[x_base+k_base+15u]);
+                                X[x_base+k_base+2u], X[x_base+k_base+3u]);      
+            let xv1 = vec4<f32>(X[x_base+k_base+4u], X[x_base+k_base+5u],       
+                                X[x_base+k_base+6u], X[x_base+k_base+7u]);      
+            let xv2 = vec4<f32>(X[x_base+k_base+8u], X[x_base+k_base+9u],       
+                                X[x_base+k_base+10u], X[x_base+k_base+11u]);    
+            let xv3 = vec4<f32>(X[x_base+k_base+12u], X[x_base+k_base+13u],     
+                                X[x_base+k_base+14u], X[x_base+k_base+15u]);    
+
             let w_off = w_base + g * 128u + lane * 4u;
             let pw0 = W_Q8[w_off]; let pw1 = W_Q8[w_off+1u];
             let pw2 = W_Q8[w_off+2u]; let pw3 = W_Q8[w_off+3u];
@@ -49,6 +56,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                                 f32(extractBits(i32(pw2),16u,8u)),f32(extractBits(i32(pw2),24u,8u)));
             let wv3 = vec4<f32>(f32(extractBits(i32(pw3),0u,8u)),f32(extractBits(i32(pw3),8u,8u)),
                                 f32(extractBits(i32(pw3),16u,8u)),f32(extractBits(i32(pw3),24u,8u)));
+
             let block0 = g*16u + (lane*16u)/32u;
             let block1 = g*16u + (lane*16u+4u)/32u;
             let block2 = g*16u + (lane*16u+8u)/32u;
@@ -65,6 +73,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                  + dot(xv2,wv2)*sc2 + dot(xv3,wv3)*sc3;
         }
     }
-    let warp_sum = subgroupAdd(acc);
-    if (lane==0u && col<N) { Y[row*N+col] = warp_sum + Bias[col]; }
+
+    acc = select(0.0, acc, col_valid);
+    var warp_sum = acc;
+    warp_sum += subgroupShuffleXor(warp_sum, 16u);
+    warp_sum += subgroupShuffleXor(warp_sum, 8u);
+    warp_sum += subgroupShuffleXor(warp_sum, 4u);
+    warp_sum += subgroupShuffleXor(warp_sum, 2u);
+    warp_sum += subgroupShuffleXor(warp_sum, 1u);
+
+    if (lane==0u && col_valid) { 
+        Y[row*N+col] = warp_sum + Bias[col]; 
+    }
 }
