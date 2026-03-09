@@ -731,10 +731,10 @@ void ModelRunner::initPrefillResources() {
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         pfCache.ropeParams[li] = gpu->createBuffer(
             "pp_rope_L" + std::to_string(li), 32);
-        // Attention params: uniform on Vulkan (MMA), storage on D3D12
+        // Attention params always uniform (enables early exit on both backends)
         pfCache.attnParams[li] = gpu->createBuffer(
             "pp_attn_L" + std::to_string(li), 32,
-            isVulkan ? (BUF_UNIFORM | BUF_COPY_DST) : BUF_DEFAULT);
+            BUF_UNIFORM | BUF_COPY_DST);
     }
 
     // Get kernels — MMA on Vulkan, tiled scalar on D3D12
@@ -1106,8 +1106,8 @@ int32_t ModelRunner::prefillBatched(
     const uint32_t MAT_N = useMMA ? 64u : 32u;
     const uint32_t DS_M  = useMMA ? 64u : 8u;
     const uint32_t DS_N  = useMMA ? 64u : 32u;
-    // Attention: MMA BQ=16, causal_attn = per-query (grid.y = T)
-    const uint32_t ATTN_BQ = useMMA ? 16u : 1u;
+    // Attention: MMA BQ=16, causal_attn BQ=4 (multi-query)
+    const uint32_t ATTN_BQ = useMMA ? 16u : 4u;
 
     std::vector<Dispatch> allPrefill;
     allPrefill.reserve(cfg.nLayer * 8 + 2);
