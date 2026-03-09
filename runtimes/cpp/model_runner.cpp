@@ -744,8 +744,8 @@ void ModelRunner::initPrefillResources() {
 
     // Select matmul + attention kernels based on backend capability
     useMMA = (gpu->backendType != WGPUBackendType_D3D12);
-    const char* matKernel = useMMA ? "q8_matmul_mma" : "q8_matmul_tiled";
-    const char* dnSiluKernel = useMMA ? "q8_down_silu_add_mma" : "q8_down_silu_add_tiled";
+    const char* matKernel = useMMA ? "q8_matmul_mma" : "q8_matmul_d3d12";
+    const char* dnSiluKernel = useMMA ? "q8_down_silu_add_mma" : "q8_down_silu_add_d3d12";
     const char* attnKernel = useMMA ? "flash_attn_mma" : "causal_attn";
     auto& kMat     = getKernel(matKernel);
     auto& kDnSilu  = getKernel(dnSiluKernel);
@@ -1092,8 +1092,8 @@ int32_t ModelRunner::prefillBatched(
     // Build dispatch list from cached bind groups (only grid sizes vary)
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
-    const char* matK = useMMA ? "q8_matmul_mma" : "q8_matmul_tiled";
-    const char* dsK  = useMMA ? "q8_down_silu_add_mma" : "q8_down_silu_add_tiled";
+    const char* matK = useMMA ? "q8_matmul_mma" : "q8_matmul_d3d12";
+    const char* dsK  = useMMA ? "q8_down_silu_add_mma" : "q8_down_silu_add_d3d12";
     const char* atK  = useMMA ? "flash_attn_mma" : "causal_attn";
     auto& kMat     = getKernel(matK);
     auto& kDnSilu  = getKernel(dsK);
