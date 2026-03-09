@@ -10,9 +10,10 @@
 struct ShaderInfo {
     const char* source;
     uint32_t numBindings;
+    bool isTritonGenerated;  // true = Triton-compiled, false = hand-written WGSL
 };
 
-// [gguf_q8] q8_down_silu_add (6 bindings)
+// [gguf_q8] q8_down_silu_add (6 bindings, hand)
 static const char* WGSL_Q8_DOWN_SILU_ADD = R"WGSL(
 enable subgroups;
 
@@ -116,7 +117,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_down_silu_add_batched (6 bindings)
+// [gguf_q8] q8_down_silu_add_batched (6 bindings, hand)
 static const char* WGSL_Q8_DOWN_SILU_ADD_BATCHED = R"WGSL(
 enable subgroups;
 
@@ -228,7 +229,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_down_silu_add_mma (6 bindings)
+// [gguf_q8] q8_down_silu_add_mma (6 bindings, hand)
 static const char* WGSL_Q8_DOWN_SILU_ADD_MMA = R"WGSL(
 enable f16;
 enable subgroups;
@@ -357,7 +358,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_down_silu_add_tiled (6 bindings)
+// [gguf_q8] q8_down_silu_add_tiled (6 bindings, hand)
 static const char* WGSL_Q8_DOWN_SILU_ADD_TILED = R"WGSL(
 enable subgroups;
 
@@ -514,7 +515,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul (6 bindings)
+// [gguf_q8] q8_matmul (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL = R"WGSL(
 enable subgroups;
 
@@ -610,7 +611,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_add (6 bindings)
+// [gguf_q8] q8_matmul_add (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_ADD = R"WGSL(
 enable subgroups;
 
@@ -706,7 +707,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_add_batched (6 bindings)
+// [gguf_q8] q8_matmul_add_batched (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_ADD_BATCHED = R"WGSL(
 enable subgroups;
 
@@ -808,7 +809,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_add_fast (6 bindings)
+// [gguf_q8] q8_matmul_add_fast (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_ADD_FAST = R"WGSL(
 enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
@@ -855,7 +856,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_add_lite (6 bindings)
+// [gguf_q8] q8_matmul_add_lite (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_ADD_LITE = R"WGSL(
 enable subgroups;
 
@@ -934,7 +935,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_add_smem (6 bindings)
+// [gguf_q8] q8_matmul_add_smem (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_ADD_SMEM = R"WGSL(
 enable subgroups;
 
@@ -1016,7 +1017,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_batched (6 bindings)
+// [gguf_q8] q8_matmul_batched (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_BATCHED = R"WGSL(
 enable subgroups;
 
@@ -1136,7 +1137,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_dp4a (6 bindings)
+// [gguf_q8] q8_matmul_dp4a (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_DP4A = R"WGSL(
 requires packed_4x8_integer_dot_product;
 enable subgroups;
@@ -1274,7 +1275,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_fast (6 bindings)
+// [gguf_q8] q8_matmul_fast (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_FAST = R"WGSL(
 enable subgroups;
 
@@ -1348,7 +1349,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_lite (6 bindings)
+// [gguf_q8] q8_matmul_lite (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_LITE = R"WGSL(
 enable subgroups;
 
@@ -1432,7 +1433,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_mma (6 bindings)
+// [gguf_q8] q8_matmul_mma (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_MMA = R"WGSL(
 enable f16;
 enable subgroups;
@@ -1564,7 +1565,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_norm (7 bindings)
+// [gguf_q8] q8_matmul_norm (7 bindings, hand)
 static const char* WGSL_Q8_MATMUL_NORM = R"WGSL(
 enable subgroups;
 
@@ -1694,7 +1695,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_smem (6 bindings)
+// [gguf_q8] q8_matmul_smem (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_SMEM = R"WGSL(
 enable subgroups;
 
@@ -1779,7 +1780,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_tiled (6 bindings)
+// [gguf_q8] q8_matmul_tiled (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_TILED = R"WGSL(
 enable subgroups;
 
@@ -1934,7 +1935,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [gguf_q8] q8_matmul_vec4 (6 bindings)
+// [gguf_q8] q8_matmul_vec4 (6 bindings, hand)
 static const char* WGSL_Q8_MATMUL_VEC4 = R"WGSL(
 enable subgroups;
 
@@ -2020,7 +2021,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] add_rms_norm (6 bindings)
+// [shared] add_rms_norm (6 bindings, triton)
 static const char* WGSL_ADD_RMS_NORM = R"WGSL(
 enable subgroups;
 
@@ -2195,7 +2196,7 @@ fn main(
 }
 )WGSL";
 
-// [shared] add_rms_norm_batched (6 bindings)
+// [shared] add_rms_norm_batched (6 bindings, hand)
 static const char* WGSL_ADD_RMS_NORM_BATCHED = R"WGSL(
 enable subgroups;
 
@@ -2274,7 +2275,7 @@ fn main(
 }
 )WGSL";
 
-// [shared] argmax (3 bindings)
+// [shared] argmax (3 bindings, hand)
 static const char* WGSL_ARGMAX = R"WGSL(
 enable subgroups;
 
@@ -2338,7 +2339,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] causal_attn (5 bindings)
+// [shared] causal_attn (5 bindings, hand)
 static const char* WGSL_CAUSAL_ATTN = R"WGSL(
 enable subgroups;
 
@@ -2433,7 +2434,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] embed_gather (4 bindings)
+// [shared] embed_gather (4 bindings, hand)
 static const char* WGSL_EMBED_GATHER = R"WGSL(
 @group(0) @binding(0) var<storage, read> EmbeddingTable: array<f32>;
 @group(0) @binding(1) var<storage, read> TokenId: array<i32>;
@@ -2450,7 +2451,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
-// [shared] flash_attn_mma (5 bindings)
+// [shared] flash_attn_mma (5 bindings, hand)
 static const char* WGSL_FLASH_ATTN_MMA = R"WGSL(
 enable f16;
 enable subgroups;
@@ -2684,7 +2685,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] fp16_gemm (5 bindings)
+// [shared] fp16_gemm (5 bindings, hand)
 static const char* WGSL_FP16_GEMM = R"WGSL(
 enable subgroups;
 
@@ -2752,7 +2753,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] fp16_gemm_wide (5 bindings)
+// [shared] fp16_gemm_wide (5 bindings, hand)
 static const char* WGSL_FP16_GEMM_WIDE = R"WGSL(
 enable subgroups;
 
@@ -2844,7 +2845,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] fused_qknorm_rope (9 bindings)
+// [shared] fused_qknorm_rope (9 bindings, triton)
 static const char* WGSL_FUSED_QKNORM_ROPE = R"WGSL(
 enable f16;
 enable subgroups;
@@ -3017,7 +3018,7 @@ fn main(
 }
 )WGSL";
 
-// [shared] fused_qknorm_rope_batched (9 bindings)
+// [shared] fused_qknorm_rope_batched (9 bindings, hand)
 static const char* WGSL_FUSED_QKNORM_ROPE_BATCHED = R"WGSL(
 enable subgroups;
 
@@ -3174,7 +3175,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] gqa_chunked_pass1 (5 bindings)
+// [shared] gqa_chunked_pass1 (5 bindings, hand)
 static const char* WGSL_GQA_CHUNKED_PASS1 = R"WGSL(
 enable f16;
 enable subgroups;
@@ -3277,7 +3278,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] gqa_chunked_pass2 (3 bindings)
+// [shared] gqa_chunked_pass2 (3 bindings, hand)
 static const char* WGSL_GQA_CHUNKED_PASS2 = R"WGSL(
 enable subgroups;
 
@@ -3340,7 +3341,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] gqa_fused_attn (5 bindings)
+// [shared] gqa_fused_attn (5 bindings, hand)
 static const char* WGSL_GQA_FUSED_ATTN = R"WGSL(
 enable f16;
 enable subgroups;
@@ -3428,7 +3429,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] rms_norm (5 bindings)
+// [shared] rms_norm (5 bindings, triton)
 static const char* WGSL_RMS_NORM = R"WGSL(
 enable subgroups;
 
@@ -3597,7 +3598,7 @@ fn main(
 }
 )WGSL";
 
-// [shared] rms_norm_batched (5 bindings)
+// [shared] rms_norm_batched (5 bindings, hand)
 static const char* WGSL_RMS_NORM_BATCHED = R"WGSL(
 enable subgroups;
 
@@ -3674,7 +3675,7 @@ fn main(
 }
 )WGSL";
 
-// [shared] rope_batched_simple (9 bindings)
+// [shared] rope_batched_simple (9 bindings, hand)
 static const char* WGSL_ROPE_BATCHED_SIMPLE = R"WGSL(
 enable f16;
 enable subgroups;
@@ -3803,7 +3804,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 )WGSL";
 
-// [shared] silu_mul_fused (3 bindings)
+// [shared] silu_mul_fused (3 bindings, triton)
 static const char* WGSL_SILU_MUL_FUSED = R"WGSL(
 // Auto-generated by Triton WebGPU Backend
 // Kernel: silu_mul_fused_kernel
@@ -3859,42 +3860,42 @@ fn main(
 
 inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
     static const std::unordered_map<std::string, ShaderInfo> kernels = {
-        {"q8_down_silu_add", {WGSL_Q8_DOWN_SILU_ADD, 6}},
-        {"q8_down_silu_add_batched", {WGSL_Q8_DOWN_SILU_ADD_BATCHED, 6}},
-        {"q8_down_silu_add_mma", {WGSL_Q8_DOWN_SILU_ADD_MMA, 6}},
-        {"q8_down_silu_add_tiled", {WGSL_Q8_DOWN_SILU_ADD_TILED, 6}},
-        {"q8_matmul", {WGSL_Q8_MATMUL, 6}},
-        {"q8_matmul_add", {WGSL_Q8_MATMUL_ADD, 6}},
-        {"q8_matmul_add_batched", {WGSL_Q8_MATMUL_ADD_BATCHED, 6}},
-        {"q8_matmul_add_fast", {WGSL_Q8_MATMUL_ADD_FAST, 6}},
-        {"q8_matmul_add_lite", {WGSL_Q8_MATMUL_ADD_LITE, 6}},
-        {"q8_matmul_add_smem", {WGSL_Q8_MATMUL_ADD_SMEM, 6}},
-        {"q8_matmul_batched", {WGSL_Q8_MATMUL_BATCHED, 6}},
-        {"q8_matmul_dp4a", {WGSL_Q8_MATMUL_DP4A, 6}},
-        {"q8_matmul_fast", {WGSL_Q8_MATMUL_FAST, 6}},
-        {"q8_matmul_lite", {WGSL_Q8_MATMUL_LITE, 6}},
-        {"q8_matmul_mma", {WGSL_Q8_MATMUL_MMA, 6}},
-        {"q8_matmul_norm", {WGSL_Q8_MATMUL_NORM, 7}},
-        {"q8_matmul_smem", {WGSL_Q8_MATMUL_SMEM, 6}},
-        {"q8_matmul_tiled", {WGSL_Q8_MATMUL_TILED, 6}},
-        {"q8_matmul_vec4", {WGSL_Q8_MATMUL_VEC4, 6}},
-        {"add_rms_norm", {WGSL_ADD_RMS_NORM, 6}},
-        {"add_rms_norm_batched", {WGSL_ADD_RMS_NORM_BATCHED, 6}},
-        {"argmax", {WGSL_ARGMAX, 3}},
-        {"causal_attn", {WGSL_CAUSAL_ATTN, 5}},
-        {"embed_gather", {WGSL_EMBED_GATHER, 4}},
-        {"flash_attn_mma", {WGSL_FLASH_ATTN_MMA, 5}},
-        {"fp16_gemm", {WGSL_FP16_GEMM, 5}},
-        {"fp16_gemm_wide", {WGSL_FP16_GEMM_WIDE, 5}},
-        {"fused_qknorm_rope", {WGSL_FUSED_QKNORM_ROPE, 9}},
-        {"fused_qknorm_rope_batched", {WGSL_FUSED_QKNORM_ROPE_BATCHED, 9}},
-        {"gqa_chunked_pass1", {WGSL_GQA_CHUNKED_PASS1, 5}},
-        {"gqa_chunked_pass2", {WGSL_GQA_CHUNKED_PASS2, 3}},
-        {"gqa_fused_attn", {WGSL_GQA_FUSED_ATTN, 5}},
-        {"rms_norm", {WGSL_RMS_NORM, 5}},
-        {"rms_norm_batched", {WGSL_RMS_NORM_BATCHED, 5}},
-        {"rope_batched_simple", {WGSL_ROPE_BATCHED_SIMPLE, 9}},
-        {"silu_mul_fused", {WGSL_SILU_MUL_FUSED, 3}},
+        {"q8_down_silu_add", {WGSL_Q8_DOWN_SILU_ADD, 6, false}},
+        {"q8_down_silu_add_batched", {WGSL_Q8_DOWN_SILU_ADD_BATCHED, 6, false}},
+        {"q8_down_silu_add_mma", {WGSL_Q8_DOWN_SILU_ADD_MMA, 6, false}},
+        {"q8_down_silu_add_tiled", {WGSL_Q8_DOWN_SILU_ADD_TILED, 6, false}},
+        {"q8_matmul", {WGSL_Q8_MATMUL, 6, false}},
+        {"q8_matmul_add", {WGSL_Q8_MATMUL_ADD, 6, false}},
+        {"q8_matmul_add_batched", {WGSL_Q8_MATMUL_ADD_BATCHED, 6, false}},
+        {"q8_matmul_add_fast", {WGSL_Q8_MATMUL_ADD_FAST, 6, false}},
+        {"q8_matmul_add_lite", {WGSL_Q8_MATMUL_ADD_LITE, 6, false}},
+        {"q8_matmul_add_smem", {WGSL_Q8_MATMUL_ADD_SMEM, 6, false}},
+        {"q8_matmul_batched", {WGSL_Q8_MATMUL_BATCHED, 6, false}},
+        {"q8_matmul_dp4a", {WGSL_Q8_MATMUL_DP4A, 6, false}},
+        {"q8_matmul_fast", {WGSL_Q8_MATMUL_FAST, 6, false}},
+        {"q8_matmul_lite", {WGSL_Q8_MATMUL_LITE, 6, false}},
+        {"q8_matmul_mma", {WGSL_Q8_MATMUL_MMA, 6, false}},
+        {"q8_matmul_norm", {WGSL_Q8_MATMUL_NORM, 7, false}},
+        {"q8_matmul_smem", {WGSL_Q8_MATMUL_SMEM, 6, false}},
+        {"q8_matmul_tiled", {WGSL_Q8_MATMUL_TILED, 6, false}},
+        {"q8_matmul_vec4", {WGSL_Q8_MATMUL_VEC4, 6, false}},
+        {"add_rms_norm", {WGSL_ADD_RMS_NORM, 6, true}},
+        {"add_rms_norm_batched", {WGSL_ADD_RMS_NORM_BATCHED, 6, false}},
+        {"argmax", {WGSL_ARGMAX, 3, false}},
+        {"causal_attn", {WGSL_CAUSAL_ATTN, 5, false}},
+        {"embed_gather", {WGSL_EMBED_GATHER, 4, false}},
+        {"flash_attn_mma", {WGSL_FLASH_ATTN_MMA, 5, false}},
+        {"fp16_gemm", {WGSL_FP16_GEMM, 5, false}},
+        {"fp16_gemm_wide", {WGSL_FP16_GEMM_WIDE, 5, false}},
+        {"fused_qknorm_rope", {WGSL_FUSED_QKNORM_ROPE, 9, true}},
+        {"fused_qknorm_rope_batched", {WGSL_FUSED_QKNORM_ROPE_BATCHED, 9, false}},
+        {"gqa_chunked_pass1", {WGSL_GQA_CHUNKED_PASS1, 5, false}},
+        {"gqa_chunked_pass2", {WGSL_GQA_CHUNKED_PASS2, 3, false}},
+        {"gqa_fused_attn", {WGSL_GQA_FUSED_ATTN, 5, false}},
+        {"rms_norm", {WGSL_RMS_NORM, 5, true}},
+        {"rms_norm_batched", {WGSL_RMS_NORM_BATCHED, 5, false}},
+        {"rope_batched_simple", {WGSL_ROPE_BATCHED_SIMPLE, 9, false}},
+        {"silu_mul_fused", {WGSL_SILU_MUL_FUSED, 3, true}},
     };
     return kernels;
 }
