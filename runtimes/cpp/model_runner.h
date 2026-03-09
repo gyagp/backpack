@@ -93,6 +93,7 @@ struct ModelRunner {
 
     // Pass mode: false = single compute pass (faster on D3D12)
     bool passPerDispatch = true;
+    bool useMMA = false;  // true on Vulkan with subgroup_matrix support
 
     // Profiling
     GPUProfiler* profiler = nullptr;

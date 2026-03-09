@@ -710,11 +710,13 @@ void ModelRunner::initPrefillResources() {
     pfCache.pRstd = gpu->createBuffer("pf_rstd", T * 4);
 
     // Global param buffers (written per-call with actual T)
-    // MMA kernels use var<uniform>; attention params already uniform
-    pfCache.pQkvP = gpu->createBuffer("pp_qkv", 16, BUF_UNIFORM | BUF_COPY_DST);
-    pfCache.pOpP  = gpu->createBuffer("pp_op",  16, BUF_UNIFORM | BUF_COPY_DST);
-    pfCache.pGuP  = gpu->createBuffer("pp_gu",  16, BUF_UNIFORM | BUF_COPY_DST);
-    pfCache.pDnP  = gpu->createBuffer("pp_dn",  16, BUF_UNIFORM | BUF_COPY_DST);
+    // MMA kernels use var<uniform>; tiled kernels use var<storage>
+    bool isVulkan = (gpu->backendType != WGPUBackendType_D3D12);
+    uint64_t paramUsage = isVulkan ? (BUF_UNIFORM | BUF_COPY_DST) : BUF_DEFAULT;
+    pfCache.pQkvP = gpu->createBuffer("pp_qkv", 16, paramUsage);
+    pfCache.pOpP  = gpu->createBuffer("pp_op",  16, paramUsage);
+    pfCache.pGuP  = gpu->createBuffer("pp_gu",  16, paramUsage);
+    pfCache.pDnP  = gpu->createBuffer("pp_dn",  16, paramUsage);
     pfCache.pLmP  = gpu->createBuffer("pp_lm",  16);
     {
         uint32_t d[4] = {cfg.nEmbd, cfg.nEmbd, 0, 0};
@@ -729,19 +731,25 @@ void ModelRunner::initPrefillResources() {
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         pfCache.ropeParams[li] = gpu->createBuffer(
             "pp_rope_L" + std::to_string(li), 32);
-        // Attention params use uniform buffer for WGSL uniformity analysis
+        // Attention params: uniform on Vulkan (MMA), storage on D3D12
         pfCache.attnParams[li] = gpu->createBuffer(
             "pp_attn_L" + std::to_string(li), 32,
-            BUF_UNIFORM | BUF_COPY_DST);
+            isVulkan ? (BUF_UNIFORM | BUF_COPY_DST) : BUF_DEFAULT);
     }
 
-    // Get kernels (triggers pipeline compilation)
+    // Get kernels — MMA on Vulkan, tiled scalar on D3D12
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
-    auto& kQ8M     = getKernel("q8_matmul_mma");
-    auto& kDnSiluM = getKernel("q8_down_silu_add_mma");
     auto& kRopeB   = getKernel("rope_batched_simple");
-    auto& kAttnMQ  = getKernel("flash_attn_mma");
+
+    // Select matmul + attention kernels based on backend capability
+    useMMA = (gpu->backendType != WGPUBackendType_D3D12);
+    const char* matKernel = useMMA ? "q8_matmul_mma" : "q8_matmul_tiled";
+    const char* dnSiluKernel = useMMA ? "q8_down_silu_add_mma" : "q8_down_silu_add_tiled";
+    const char* attnKernel = useMMA ? "flash_attn_mma" : "causal_attn";
+    auto& kMat     = getKernel(matKernel);
+    auto& kDnSilu  = getKernel(dnSiluKernel);
+    auto& kAttn    = getKernel(attnKernel);
 
     // Build bind groups (stable — buffer handles don't change)
     pfCache.layerBGs.resize(cfg.nLayer);
@@ -753,7 +761,7 @@ void ModelRunner::initPrefillResources() {
             {0, pfCache.pX}, {1, pfCache.pNorm}, {2, lw.inputNorm},
             {3, pfCache.pRstd}, {4, pfCache.pRmsP}});
 
-        bg.qkv = makeBG(kQ8M, {
+        bg.qkv = makeBG(kMat, {
             {0, pfCache.pNorm}, {1, lw.qkvW}, {2, lw.qkvS},
             {3, zeroBiasQKV}, {4, pfCache.pQkv}, {5, pfCache.pQkvP}});
 
@@ -764,11 +772,11 @@ void ModelRunner::initPrefillResources() {
             {6, lw.qNorm}, {7, lw.kNorm},
             {8, pfCache.ropeParams[li]}});
 
-        bg.attn = makeBG(kAttnMQ, {
+        bg.attn = makeBG(kAttn, {
             {0, pfCache.pQRot}, {1, kvCache[li].K}, {2, kvCache[li].V},
             {3, pfCache.pAttn}, {4, pfCache.attnParams[li]}});
 
-        bg.oproj = makeBG(kQ8M, {
+        bg.oproj = makeBG(kMat, {
             {0, pfCache.pAttn}, {1, lw.oW}, {2, lw.oS},
             {3, zeroBiasE}, {4, pfCache.pProj}, {5, pfCache.pOpP}});
 
@@ -776,11 +784,11 @@ void ModelRunner::initPrefillResources() {
             {0, pfCache.pX}, {1, pfCache.pProj}, {2, pfCache.pNorm},
             {3, lw.postAttnNorm}, {4, pfCache.pRstd}, {5, pfCache.pRmsP}});
 
-        bg.gateup = makeBG(kQ8M, {
+        bg.gateup = makeBG(kMat, {
             {0, pfCache.pNorm}, {1, lw.guW}, {2, lw.guS},
             {3, zeroBiasGU}, {4, pfCache.pGU}, {5, pfCache.pGuP}});
 
-        bg.downsilu = makeBG(kDnSiluM, {
+        bg.downsilu = makeBG(kDnSilu, {
             {0, pfCache.pGU}, {1, lw.dnW}, {2, lw.dnS},
             {3, zeroBiasE}, {4, pfCache.pX}, {5, pfCache.pDnP}});
     }
@@ -1084,14 +1092,22 @@ int32_t ModelRunner::prefillBatched(
     // Build dispatch list from cached bind groups (only grid sizes vary)
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
-    auto& kQ8M     = getKernel("q8_matmul_mma");
-    auto& kDnSiluM = getKernel("q8_down_silu_add_mma");
+    const char* matK = useMMA ? "q8_matmul_mma" : "q8_matmul_tiled";
+    const char* dsK  = useMMA ? "q8_down_silu_add_mma" : "q8_down_silu_add_tiled";
+    const char* atK  = useMMA ? "flash_attn_mma" : "causal_attn";
+    auto& kMat     = getKernel(matK);
+    auto& kDnSilu  = getKernel(dsK);
+    auto& kAttn    = getKernel(atK);
     auto& kRopeB   = getKernel("rope_batched_simple");
-    auto& kAttnMQ  = getKernel("flash_attn_mma");
 
-    // MMA grid: both matmul and down_silu use TM=64, TN=64
-    const uint32_t MMA_N = 64u;
-    const uint32_t MMA_M = 64u;
+    // Grid sizes depend on kernel tile dimensions
+    // MMA: TM=TN=64; Tiled: TM=8, TN=32 (matmul), TN=32 (down_silu)
+    const uint32_t MAT_M = useMMA ? 64u : 8u;
+    const uint32_t MAT_N = useMMA ? 64u : 32u;
+    const uint32_t DS_M  = useMMA ? 64u : 8u;
+    const uint32_t DS_N  = useMMA ? 64u : 32u;
+    // Attention: MMA BQ=16, causal_attn = per-query (grid.y = T)
+    const uint32_t ATTN_BQ = useMMA ? 16u : 1u;
 
     std::vector<Dispatch> allPrefill;
     allPrefill.reserve(cfg.nLayer * 8 + 2);
@@ -1099,20 +1115,21 @@ int32_t ModelRunner::prefillBatched(
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         auto& bg = pfCache.layerBGs[li];
         allPrefill.push_back({kRmsB.pipeline,    bg.rms,      T, 1, 1, "pf_rms"});
-        allPrefill.push_back({kQ8M.pipeline,     bg.qkv,
-            (qkvOutL + MMA_N - 1) / MMA_N, (T + MMA_M - 1) / MMA_M, 1, "pf_qkv"});
+        allPrefill.push_back({kMat.pipeline,     bg.qkv,
+            (qkvOutL + MAT_N - 1) / MAT_N, (T + MAT_M - 1) / MAT_M, 1, "pf_qkv"});
         allPrefill.push_back({kRopeB.pipeline,   bg.rope,
             cfg.nHead + cfg.nKvHeads, T, 1, "pf_rope"});
-        allPrefill.push_back({kAttnMQ.pipeline,  bg.attn,     cfg.nHead, (T + 15u) / 16u, 1, "pf_attn"});
-        allPrefill.push_back({kQ8M.pipeline,     bg.oproj,
-            (cfg.nEmbd + MMA_N - 1) / MMA_N, (T + MMA_M - 1) / MMA_M, 1, "pf_oproj"});
+        allPrefill.push_back({kAttn.pipeline,    bg.attn,
+            cfg.nHead, (T + ATTN_BQ - 1u) / ATTN_BQ, 1, "pf_attn"});
+        allPrefill.push_back({kMat.pipeline,     bg.oproj,
+            (cfg.nEmbd + MAT_N - 1) / MAT_N, (T + MAT_M - 1) / MAT_M, 1, "pf_oproj"});
         allPrefill.push_back({kAddRmsB.pipeline, bg.addrms,   T, 1, 1, "pf_add_rms"});
-        allPrefill.push_back({kQ8M.pipeline,     bg.gateup,
-            (2 * cfg.intermediateSize + MMA_N - 1) / MMA_N,
-            (T + MMA_M - 1) / MMA_M, 1, "pf_gateup"});
-        allPrefill.push_back({kDnSiluM.pipeline, bg.downsilu,
-            (cfg.nEmbd + MMA_N - 1) / MMA_N,
-            (T + MMA_M - 1) / MMA_M, 1, "pf_down_silu"});
+        allPrefill.push_back({kMat.pipeline,     bg.gateup,
+            (2 * cfg.intermediateSize + MAT_N - 1) / MAT_N,
+            (T + MAT_M - 1) / MAT_M, 1, "pf_gateup"});
+        allPrefill.push_back({kDnSilu.pipeline,  bg.downsilu,
+            (cfg.nEmbd + DS_N - 1) / DS_N,
+            (T + DS_M - 1) / DS_M, 1, "pf_down_silu"});
     }
     allPrefill.push_back({kRmsB.pipeline, pfCache.finalRmsBG, T, 1, 1, "pf_final_rms"});
 
