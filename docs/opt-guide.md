@@ -1512,7 +1512,8 @@ RTX 5080, Dawn/Vulkan backend.
 | + Double-buffered MMA + TILE_K=32 | 4,203 | 9.7× |
 | + 64×32 output tile (8 subgroups, 256 threads) | 4,933 | 11.4× |
 | + MMA flash attention (BQ=16, Q·K^T + P·V) | 5,790 | 13.4× |
-| + 64×64 tile (16 subgroups, 512 threads) | **6,510** | **15.0×** |
+| + 64×64 tile (16 subgroups, 512 threads) | 6,510 | 15.0× |
+| + Vectorized Q8 weight dequant (4-at-a-time) | **7,537** | **17.4×** |
 
 ### 7.2 What Worked
 
@@ -1526,6 +1527,7 @@ RTX 5080, Dawn/Vulkan backend.
 | Double-buffered MMA tiles | 1.4× | Overlap next tile load with current MMA compute |
 | 64×64 output tile (512 threads) | 1.13× | RTX 5080 supports 1024 threads/WG; 16 subgroups |
 | MMA flash attention | 1.3× at T=4096 | MMA for Q·K^T and P·V with per-row online softmax |
+| Vectorized Q8 weight dequant | 1.15-1.23× | Load 1 u32 (4 packed i8), share scale across all 4, write 4 f16. Eliminates 3 redundant W_Q8 loads + 3 scale lookups per 4 elements |
 
 ### 7.3 What Didn't Work
 
