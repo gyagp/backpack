@@ -22,6 +22,12 @@ struct OnnxTokenizer {
     // merge_rank[pair_string] -> priority (lower = merge first)
     std::unordered_map<std::string, int32_t> merge_rank;
 
+    // Added/special tokens: exact string -> token_id
+    // These are matched before BPE encoding (e.g. <|im_start|>, <think>)
+    std::unordered_map<std::string, int32_t> added_tokens;
+    // Sorted by length (longest first) for greedy matching
+    std::vector<std::string> added_tokens_sorted;
+
     // Special token IDs
     int32_t eos_token_id = -1;
     int32_t bos_token_id = -1;
@@ -44,4 +50,7 @@ private:
     // GPT-2 byte-level encoding tables
     std::unordered_map<uint32_t, uint8_t> unicode_to_byte_;
     uint32_t byte_to_unicode_[256]{};
+
+    // BPE encode a text segment (no added token handling)
+    std::vector<int32_t> encodeBpe(const std::string& text) const;
 };

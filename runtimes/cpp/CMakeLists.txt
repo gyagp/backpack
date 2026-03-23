@@ -38,20 +38,18 @@ target_include_directories(backpack_core PUBLIC
 )
 set_target_properties(backpack_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# ─── Public shared library (backpack.dll / libbackpack.so) ───────────────────
+# ─── Public library ──────────────────────────────────────────────────────────
 
 add_library(backpack SHARED backpack.cpp $<TARGET_OBJECTS:backpack_core>)
-target_compile_definitions(backpack PRIVATE BACKPACK_EXPORTS)
+target_compile_definitions(backpack PRIVATE BACKPACK_BUILDING)
+set_target_properties(backpack PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+)
 target_include_directories(backpack PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${DAWN_SRC}/include
     ${DAWN_BUILD}/gen/include
     ${DAWN_SRC}/include/dawn/native
-)
-
-# Put DLL in the same output dir as executables
-set_target_properties(backpack PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
 )
 
 # ─── Internal CLI (links object files directly for internal access) ──────────
@@ -64,12 +62,18 @@ target_include_directories(backpack_runtime PRIVATE
     ${DAWN_SRC}/include/dawn/native
 )
 
-# ─── LLM application (links shared library — public API only) ───────────────
+# ─── LLM application (uses runtime API + internal LLM logic) ─────────────────
 
 set(BACKPACK_LLM_APP "${CMAKE_SOURCE_DIR}/../../apps/cpp/llm/main.cpp")
 if(EXISTS ${BACKPACK_LLM_APP})
-    add_executable(backpack_llm ${BACKPACK_LLM_APP})
+    add_executable(backpack_llm ${BACKPACK_LLM_APP} $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_llm PRIVATE backpack)
+    target_include_directories(backpack_llm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${DAWN_SRC}/include
+        ${DAWN_BUILD}/gen/include
+        ${DAWN_SRC}/include/dawn/native
+    )
 endif()
 
 # ─── Link Dawn ───────────────────────────────────────────────────────────────
@@ -82,6 +86,10 @@ if(WIN32)
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     target_link_libraries(backpack_runtime PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    if(TARGET backpack_llm)
+        target_link_libraries(backpack_llm PRIVATE
+            ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    endif()
     # Copy DLLs next to executables
     foreach(_target backpack_runtime backpack_llm)
         if(TARGET ${_target})
@@ -96,4 +104,7 @@ if(WIN32)
 else()
     target_link_libraries(backpack PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     target_link_libraries(backpack_runtime PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    if(TARGET backpack_llm)
+        target_link_libraries(backpack_llm PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    endif()
 endif()

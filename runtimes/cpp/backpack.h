@@ -2,180 +2,163 @@
 /**
  * backpack.h — Public C++ API for the Backpack inference runtime.
  *
- * Minimal surface, opaque internals, format-agnostic (GGUF + ONNX).
- * WebGPU-accelerated LLM inference with pipelined decode.
+ * General-purpose ONNX execution engine on WebGPU.
+ * Model-agnostic: the runtime knows inputs, outputs, and tensors —
+ * not "LLM" or "image generation". Those are application concerns.
  *
- * Linked as a shared library (backpack.dll / libbackpack.so).
+ * Naming follows Dawn/WebGPU C++ style: bp::Object::Verb (PascalCase).
  *
  * Quick start:
- *   auto* model = bp_model_load("path/to/model");
- *   auto* ctx   = bp_context_create(model);
- *   bp_generate(ctx, "Hello", {.maxTokens = 50},
- *       [](const std::string& t) { printf("%s", t.c_str()); return true; });
- *   bp_context_free(ctx);
- *   bp_model_free(model);
+ *   auto device  = bp::Device::Create();
+ *   auto model   = bp::Model::Load(device, "model.onnx");
+ *   auto session = bp::Session::Create(model);
+ *   session.SetInput("x", inputTensor);
+ *   session.Run();
  */
 
 #include <cstdint>
-#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
-// ─── DLL export/import ──────────────────────────────────────────────────────
-
+// DLL export for shared library builds.
 #if defined(_WIN32)
-#  if defined(BACKPACK_EXPORTS)
-#    define BP_API __declspec(dllexport)
+#  if defined(BACKPACK_BUILDING)
+#    define BP_EXPORT __declspec(dllexport)
 #  else
-#    define BP_API __declspec(dllimport)
+#    define BP_EXPORT __declspec(dllimport)
 #  endif
 #else
-#  if defined(BACKPACK_EXPORTS)
-#    define BP_API __attribute__((visibility("default")))
-#  else
-#    define BP_API
-#  endif
+#  define BP_EXPORT __attribute__((visibility("default")))
 #endif
 
-// ─── Forward declarations (opaque) ──────────────────────────────────────────
-
-struct BpModel;
-struct BpContext;
-struct BpTokenizer;
+namespace bp {
 
 // ─── Enums ──────────────────────────────────────────────────────────────────
 
-enum class BpBackend { Vulkan, D3D12, Metal, Default };
+enum class Backend { Vulkan, D3D12, Metal, Default };
 
-// ─── Configuration ──────────────────────────────────────────────────────────
+enum class DataType { Float32, Float16, Int32, Int64, UInt8, Int8, Bool };
 
-/// Parameters for model loading (GPU init + weight upload).
-struct BpModelParams {
-    BpBackend backend     = BpBackend::Default;  // GPU backend selection
-    uint32_t  maxSeqLen   = 4096;                // Maximum sequence length
-};
+// ─── Device ─────────────────────────────────────────────────────────────────
+/// GPU device. One per physical GPU. Shared by all models.
 
-/// Parameters for context creation (KV cache + pipeline tuning).
-struct BpContextParams {
-    bool autoWarmup   = true;   // Warmup shader compilation on create
-    bool autoAutotune = true;   // Auto-tune decode kernel selection
-};
+class BP_EXPORT Device {
+public:
+    struct Impl;
 
-/// Parameters for text generation.
-struct BpGenerateParams {
-    int   maxTokens   = 100;    // Maximum tokens to generate
-    float temperature = 0.0f;   // 0 = greedy (argmax)
-};
+    static Device Create(Backend backend = Backend::Default);
 
-// ─── Model info ─────────────────────────────────────────────────────────────
+    std::string GetName() const;
+    std::string GetBackendName() const;
+    void Release();
 
-/// Read-only metadata about a loaded model.
-struct BpModelInfo {
-    std::string arch;           // e.g. "phi3", "qwen3", "llama"
-    std::string format;         // "gguf" or "onnx"
-    uint32_t nLayer;
-    uint32_t nHead;
-    uint32_t nKvHeads;
-    uint32_t nEmbd;
-    uint32_t headDim;
-    uint32_t nVocab;
-    uint32_t intermediateSize;
-    float    ropeTheta;
-    std::string gpuName;        // GPU adapter name
-    std::string backendName;    // "vulkan", "d3d12", "metal"
+    Device() = default;
+    ~Device();
+    Device(Device&& o) noexcept;
+    Device& operator=(Device&& o) noexcept;
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+
+    Impl* GetImpl() const { return impl_.get(); }
+    bool IsValid() const { return impl_ != nullptr; }
+
+    /// Access the underlying GPUContext (for apps needing internal access).
+    void* GetGPUContext() const;
+
+private:
+    std::unique_ptr<Impl> impl_;
 };
 
 // ─── Model ──────────────────────────────────────────────────────────────────
-//
-// Immutable after creation. Owns GPU device, compiled pipelines, and weights.
-// Auto-detects model format (GGUF file, GGUF directory, or ONNX directory).
+/// A compiled ONNX graph: weights uploaded, shaders compiled.
+/// Immutable after creation.
 
-/// Load a model from a path. Accepts:
-///   - GGUF file path       ("model.gguf")
-///   - Directory with GGUF  ("models/qwen-3/")
-///   - ONNX model dir       ("models/phi-4/")  (must contain model.onnx)
-/// Returns nullptr on failure.
-BP_API BpModel*     bp_model_load(const std::string& path,
-                                   const BpModelParams& params = {});
-BP_API void         bp_model_free(BpModel* model);
-BP_API BpModelInfo  bp_model_info(const BpModel* model);
+class BP_EXPORT Model {
+public:
+    struct Impl;
 
-// ─── Tokenizer ──────────────────────────────────────────────────────────────
-//
-// Loaded with the model. Supports GGUF metadata and HuggingFace tokenizer.json.
+    static Model Load(Device& device, const std::string& path);
 
-/// Get the tokenizer (borrowed pointer — lifetime tied to model, do not free).
-BP_API BpTokenizer*          bp_tokenizer(const BpModel* model);
-BP_API std::vector<int32_t>  bp_tokenize(const BpTokenizer* tok,
-                                          const std::string& text);
-BP_API std::string           bp_token_to_text(const BpTokenizer* tok,
-                                               int32_t token);
-BP_API std::string           bp_detokenize(const BpTokenizer* tok,
-                                            const std::vector<int32_t>& tokens);
-BP_API int32_t               bp_token_eos(const BpTokenizer* tok);
-BP_API int32_t               bp_token_bos(const BpTokenizer* tok);
+    int GetInputCount() const;
+    int GetOutputCount() const;
+    std::string GetInputName(int index) const;
+    std::string GetOutputName(int index) const;
 
-// ─── Context ────────────────────────────────────────────────────────────────
-//
-// Mutable inference state: KV cache + pipelined decode pipeline.
+    void Release();
 
-BP_API BpContext*  bp_context_create(BpModel* model,
-                                      const BpContextParams& params = {});
-BP_API void        bp_context_free(BpContext* ctx);
+    Model() = default;
+    ~Model();
+    Model(Model&& o) noexcept;
+    Model& operator=(Model&& o) noexcept;
+    Model(const Model&) = delete;
+    Model& operator=(const Model&) = delete;
 
-/// Clear KV cache and reset sequence position to 0.
-BP_API void        bp_context_reset(BpContext* ctx);
+    Impl* GetImpl() const { return impl_.get(); }
+    bool IsValid() const { return impl_ != nullptr; }
 
-/// Current sequence length (number of tokens in KV cache).
-BP_API uint32_t    bp_context_pos(const BpContext* ctx);
-
-// ─── Low-level inference ────────────────────────────────────────────────────
-//
-// Caller controls the decode loop. Maximum flexibility.
-
-/// Prefill: process prompt tokens in parallel (batched matmul).
-/// Populates KV cache for positions [0, nTokens).
-/// Returns the argmax token ID for the next position.
-BP_API int32_t  bp_prefill(BpContext* ctx, const int32_t* tokens,
-                            uint32_t nTokens);
-
-/// Decode: generate one token using pipelined GPU execution.
-/// Reads the previous argmax result and submits the next decode step.
-/// Returns the next token ID (argmax).
-BP_API int32_t  bp_decode(BpContext* ctx);
-
-// ─── High-level generation ──────────────────────────────────────────────────
-//
-// Simple generate call with optional streaming. Good for applications.
-
-/// Streaming callback: receives each decoded text piece.
-/// Return true to continue, false to stop generation early.
-using BpStreamCallback = std::function<bool(const std::string& text)>;
-
-/// Generate text from a prompt. Handles tokenization, prefill, and decode.
-/// Returns the full generated text (excluding the prompt).
-/// If onToken is provided, each token is streamed to the callback.
-BP_API std::string  bp_generate(BpContext* ctx,
-                                 const std::string& prompt,
-                                 const BpGenerateParams& params = {},
-                                 BpStreamCallback onToken = nullptr);
-
-// ─── Profiling ──────────────────────────────────────────────────────────────
-
-BP_API void  bp_enable_profiling(BpContext* ctx);
-BP_API void  bp_print_profile(BpContext* ctx,
-                               const std::string& outputPath = "");
-
-/// Benchmark result for a single prompt length.
-struct BpBenchResult {
-    double prefillMs;
-    double prefillTps;
-    double decodeMs;
-    double decodeTps;
-    int    nPrefillTokens;
-    int    nDecodeTokens;
+private:
+    std::unique_ptr<Impl> impl_;
 };
 
-/// Run a benchmark: prefill + decode at the given prompt length.
-BP_API BpBenchResult bp_benchmark(BpContext* ctx, int promptLen = 1024,
-                                   int genTokens = 128);
+// ─── Tensor ─────────────────────────────────────────────────────────────────
+/// A shaped, typed buffer (GPU or CPU).
+/// Flows between sessions: output of one model becomes input of another.
+
+class BP_EXPORT Tensor {
+public:
+    struct Impl;
+
+    static Tensor Create(Device& device, DataType dtype,
+                          const std::vector<int64_t>& shape);
+
+    void SetData(const void* data, size_t bytes);
+    void GetData(void* data, size_t bytes) const;
+
+    DataType GetDtype() const;
+    std::vector<int64_t> GetShape() const;
+    int64_t GetElementCount() const;
+
+    void Release();
+
+    Tensor() = default;
+    ~Tensor();
+    Tensor(Tensor&& o) noexcept;
+    Tensor& operator=(Tensor&& o) noexcept;
+    Tensor(const Tensor&) = delete;
+    Tensor& operator=(const Tensor&) = delete;
+
+    Impl* GetImpl() const { return impl_.get(); }
+    bool IsValid() const { return impl_ != nullptr; }
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+// ─── Session ────────────────────────────────────────────────────────────────
+/// Bind inputs, run a model, read outputs. Stateless per run.
+
+class BP_EXPORT Session {
+public:
+    struct Impl;
+
+    static Session Create(Model& model);
+
+    void SetInput(const std::string& name, Tensor& tensor);
+    void SetOutput(const std::string& name, Tensor& tensor);
+    void Run();
+
+    void Release();
+
+    Session() = default;
+    ~Session();
+    Session(Session&& o) noexcept;
+    Session& operator=(Session&& o) noexcept;
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace bp

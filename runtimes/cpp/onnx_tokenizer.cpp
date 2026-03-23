@@ -332,6 +332,59 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
         }
     }
 
+    // Find "added_tokens": [ {"id": N, "content": "...", ...}, ... ]
+    {
+        const char* addedKey = strstr(p, "\"added_tokens\"");
+        if (addedKey) {
+            const char* ap = addedKey + 14;
+            ap = skipWs(ap, end);
+            if (ap < end && *ap == ':') ap++;
+            ap = skipWs(ap, end);
+            if (ap < end && *ap == '[') {
+                ap++; // past '['
+                // Each entry is a JSON object { "id": N, "content": "..." , ... }
+                while (ap < end) {
+                    ap = skipWs(ap, end);
+                    if (ap >= end || *ap == ']') break;
+                    if (*ap == ',') { ap++; continue; }
+                    if (*ap != '{') break;
+                    ap++; // past '{'
+                    int32_t id = -1;
+                    std::string content;
+                    while (ap < end) {
+                        ap = skipWs(ap, end);
+                        if (ap >= end || *ap == '}') { if (ap < end) ap++; break; }
+                        if (*ap == ',') { ap++; continue; }
+                        if (*ap != '"') { ap = skipJsonValue(ap, end); continue; }
+                        std::string key;
+                        ap = parseJsonString(ap, end, key);
+                        ap = skipWs(ap, end);
+                        if (ap < end && *ap == ':') ap++;
+                        ap = skipWs(ap, end);
+                        if (key == "id") {
+                            id = (int32_t)strtol(ap, (char**)&ap, 10);
+                        } else if (key == "content") {
+                            ap = parseJsonString(ap, end, content);
+                        } else {
+                            ap = skipJsonValue(ap, end);
+                        }
+                    }
+                    if (id >= 0 && !content.empty()) {
+                        added_tokens[content] = id;
+                    }
+                }
+            }
+        }
+        // Sort added tokens by length (longest first) for greedy matching
+        for (auto& [tok, id] : added_tokens) {
+            added_tokens_sorted.push_back(tok);
+        }
+        std::sort(added_tokens_sorted.begin(), added_tokens_sorted.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return a.size() > b.size();
+                  });
+    }
+
     // 2. Parse genai_config.json for special tokens
     std::string cfgPath = (fs::path(modelDir) / "genai_config.json").string();
     std::ifstream cfgFile(cfgPath);
@@ -353,8 +406,8 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
             bos_token_id = model["bos_token_id"].as_int();
     }
 
-    printf("  Tokenizer: %zu tokens, %zu merges, EOS=%d\n",
-           vocab.size(), merge_rank.size(), eos_token_id);
+    printf("  Tokenizer: %zu tokens, %zu merges, %zu added, EOS=%d\n",
+           vocab.size(), merge_rank.size(), added_tokens.size(), eos_token_id);
 
     return true;
 }
@@ -380,6 +433,55 @@ std::string OnnxTokenizer::decode(const std::vector<int32_t>& token_ids) const {
 // ─── Encode ──────────────────────────────────────────────────────────────────
 
 std::vector<int32_t> OnnxTokenizer::encode(const std::string& text) const {
+    if (text.empty()) return {};
+
+    // 0. Split text on added tokens (special tokens like <|im_start|>, <think>)
+    //    These must be matched as exact strings before BPE encoding.
+    if (!added_tokens_sorted.empty()) {
+        // Split text into segments: alternating [regular_text, special_token, ...]
+        struct Segment { std::string text; int32_t tokenId; bool isSpecial; };
+        std::vector<Segment> segments;
+
+        size_t pos = 0;
+        while (pos < text.size()) {
+            // Try to match any added token at current position (longest first)
+            bool matched = false;
+            for (auto& tok : added_tokens_sorted) {
+                if (pos + tok.size() <= text.size() &&
+                    text.compare(pos, tok.size(), tok) == 0) {
+                    segments.push_back({tok, added_tokens.at(tok), true});
+                    pos += tok.size();
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                // Accumulate regular text
+                if (segments.empty() || segments.back().isSpecial)
+                    segments.push_back({"", -1, false});
+                segments.back().text += text[pos];
+                pos++;
+            }
+        }
+
+        // Encode each segment
+        std::vector<int32_t> ids;
+        for (auto& seg : segments) {
+            if (seg.isSpecial) {
+                ids.push_back(seg.tokenId);
+            } else if (!seg.text.empty()) {
+                auto subIds = encodeBpe(seg.text);
+                ids.insert(ids.end(), subIds.begin(), subIds.end());
+            }
+        }
+        return ids;
+    }
+
+    // No added tokens — just BPE encode the whole string
+    return encodeBpe(text);
+}
+
+std::vector<int32_t> OnnxTokenizer::encodeBpe(const std::string& text) const {
     if (text.empty()) return {};
 
     // 1. Convert bytes to BPE string representation
