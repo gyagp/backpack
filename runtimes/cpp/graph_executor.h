@@ -153,6 +153,10 @@ public:
     /// Submit dispatches (fire and forget, no sync).
     void SubmitAsync(const std::vector<Dispatch>& dispatches);
 
+    /// Queue a GPU buffer copy (batched with dispatches).
+    void QueueCopy(GPUBuffer src, uint64_t srcOffset,
+                    GPUBuffer dst, uint64_t dstOffset, uint64_t size);
+
     /// Wait for all GPU work to complete.
     void Sync();
 
@@ -178,6 +182,8 @@ private:
 public:
     // Batched dispatches for the current execution (public for op access)
     std::vector<Dispatch> pendingDispatches_;
+    struct PendingCopy { GPUBuffer src; uint64_t srcOff; GPUBuffer dst; uint64_t dstOff; uint64_t size; };
+    std::vector<PendingCopy> pendingCopies_;
 
 private:
 

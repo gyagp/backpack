@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -493,9 +494,13 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
 }
 
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
-    // Batch into pending — submitted all at once at end of Execute()
     pendingDispatches_.insert(pendingDispatches_.end(),
                               dispatches.begin(), dispatches.end());
+}
+
+void GraphExecutor::QueueCopy(GPUBuffer src, uint64_t srcOffset,
+                               GPUBuffer dst, uint64_t dstOffset, uint64_t size) {
+    pendingCopies_.push_back({src, srcOffset, dst, dstOffset, size});
 }
 
 void GraphExecutor::Sync() {
@@ -519,8 +524,66 @@ void GraphExecutor::Execute(
     // Clear dispatch batch
     pendingDispatches_.clear();
 
-    // Execute nodes in order (ONNX guarantees topological order)
-    for (size_t ni = 0; ni < graph_.nodes.size(); ni++) {
+    // Topological sort using Kahn's algorithm (O(N+E), not O(N²))
+    std::vector<size_t> execOrder;
+    {
+        auto sortT0 = std::chrono::steady_clock::now();
+        size_t N = graph_.nodes.size();
+        std::unordered_set<std::string> available;
+        for (auto& [name, _] : inputs) available.insert(name);
+        for (auto& [name, _] : tensorStore_) available.insert(name);
+
+        // Build dependency counts
+        std::vector<int> depCount(N, 0);
+        // Map: tensor name → list of node indices that need it
+        std::unordered_map<std::string, std::vector<size_t>> consumers;
+
+        for (size_t ni = 0; ni < N; ni++) {
+            auto& node = graph_.nodes[ni];
+            for (auto& inName : node.inputs) {
+                if (inName.empty() || available.count(inName)) continue;
+                depCount[ni]++;
+                consumers[inName].push_back(ni);
+            }
+        }
+
+        // Start with nodes that have 0 dependencies
+        std::vector<size_t> ready;
+        for (size_t ni = 0; ni < N; ni++)
+            if (depCount[ni] == 0) ready.push_back(ni);
+
+        while (!ready.empty()) {
+            size_t ni = ready.back(); ready.pop_back();
+            execOrder.push_back(ni);
+            auto& node = graph_.nodes[ni];
+            for (auto& outName : node.outputs) {
+                if (outName.empty()) continue;
+                available.insert(outName);
+                auto it = consumers.find(outName);
+                if (it != consumers.end()) {
+                    for (auto ci : it->second) {
+                        depCount[ci]--;
+                        if (depCount[ci] == 0) ready.push_back(ci);
+                    }
+                }
+            }
+        }
+
+        // Add remaining unresolved nodes
+        if (execOrder.size() < N)
+            for (size_t ni = 0; ni < N; ni++)
+                if (depCount[ni] > 0) execOrder.push_back(ni);
+
+        auto sortT1 = std::chrono::steady_clock::now();
+        auto sortMs = std::chrono::duration_cast<std::chrono::milliseconds>(sortT1 - sortT0).count();
+        fprintf(stderr, "  [exec] topo sort: %zu/%zu nodes in %lldms\n",
+                execOrder.size(), N, (long long)sortMs);
+        fflush(stderr);
+    }
+
+    // Execute nodes in topological order
+    for (size_t ei = 0; ei < execOrder.size(); ei++) {
+        size_t ni = execOrder[ei];
         auto& node = graph_.nodes[ni];
 
         if (ni < 15 || ni % 100 == 0) {
@@ -573,6 +636,27 @@ void GraphExecutor::Execute(
         if (opIt != registry.end()) {
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
+
+            // Submit pending work periodically (no sync — fire and forget)
+            if (pendingDispatches_.size() + pendingCopies_.size() >= 100) {
+                // Build one command buffer with compute + copies
+                if (!pendingDispatches_.empty())
+                    gpu->submitOnly(pendingDispatches_, false);
+                if (!pendingCopies_.empty()) {
+                    WGPUCommandEncoderDescriptor enD{};
+                    auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+                    for (auto& c : pendingCopies_)
+                        wgpuCommandEncoderCopyBufferToBuffer(enc,
+                            c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+                    WGPUCommandBufferDescriptor cbD{};
+                    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+                    wgpuQueueSubmit(gpu->queue, 1, &cb);
+                    wgpuCommandBufferRelease(cb);
+                    wgpuCommandEncoderRelease(enc);
+                }
+                pendingDispatches_.clear();
+                pendingCopies_.clear();
+            }
         } else {
             if (skipped < 5)
                 fprintf(stderr, "  [exec] UNIMPL op: %s (%s)\n",
@@ -592,10 +676,23 @@ void GraphExecutor::Execute(
     fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %zu dispatches\n",
             executed, graph_.nodes.size(), skipped, pendingDispatches_.size());
 
-    // Submit ALL batched GPU dispatches in one command buffer
+    // Submit all remaining batched GPU work
     if (!pendingDispatches_.empty()) {
         gpu->submitOnly(pendingDispatches_, false);
-        gpu->waitForQueue();
         pendingDispatches_.clear();
     }
+    if (!pendingCopies_.empty()) {
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+        for (auto& c : pendingCopies_)
+            wgpuCommandEncoderCopyBufferToBuffer(enc,
+                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+        WGPUCommandBufferDescriptor cbD{};
+        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        wgpuCommandBufferRelease(cb);
+        wgpuCommandEncoderRelease(enc);
+        pendingCopies_.clear();
+    }
+    gpu->waitForQueue();
 }
