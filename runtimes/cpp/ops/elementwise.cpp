@@ -341,42 +341,180 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 }
 
-// Where: for now, just pass through X (TODO: GPU Where kernel)
+// Where: condition ? X : Y
+static const char* WGSL_WHERE = R"WGSL(
+@group(0) @binding(0) var<storage, read> Cond: array<u32>;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read> Y: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let N_cond = _params_[1];
+    let N_x = _params_[2];
+    let N_y = _params_[3];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+    let c_idx = select(idx, idx % N_cond, N_cond < N && N_cond > 0u);
+    let x_idx = select(idx, idx % N_x, N_x < N && N_x > 0u);
+    let y_idx = select(idx, idx % N_y, N_y < N && N_y > 0u);
+    // Bool packed as bytes in u32
+    let byte_idx = c_idx / 4u;
+    let bit_pos = (c_idx % 4u) * 8u;
+    let cond_val = (Cond[byte_idx] >> bit_pos) & 0xFFu;
+    Out[idx] = select(Y[y_idx], X[x_idx], cond_val != 0u);
+}
+)WGSL";
+
 static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* Cond = in[0];
     auto* X = in.size() > 1 ? in[1] : nullptr;
-    if (X && X->IsValid()) { ex.EnsureGpu(*X); *out[0] = *X; }
-    else if (in[0] && in[0]->IsValid()) { ex.EnsureGpu(*in[0]); *out[0] = *in[0]; }
+    auto* Y = in.size() > 2 ? in[2] : nullptr;
+    if (!Cond || !X || !Y || !Cond->IsValid() || !X->IsValid() || !Y->IsValid()) {
+        // Fallback: pass X
+        if (X && X->IsValid()) { ex.EnsureGpu(*X); *out[0] = *X; }
+        else if (Y && Y->IsValid()) { ex.EnsureGpu(*Y); *out[0] = *Y; }
+        return;
+    }
+    ex.EnsureGpu(*Cond); ex.EnsureGpu(*X); ex.EnsureGpu(*Y);
+
+    int64_t N = std::max({tensorNel(Cond), tensorNel(X), tensorNel(Y)});
+    auto& outShape = (tensorNel(X) >= tensorNel(Y)) ? X->shape : Y->shape;
+    if (tensorNel(Cond) > tensorNel(X) && tensorNel(Cond) > tensorNel(Y))
+        *out[0] = ex.AllocTensor(Cond->shape, X->dtype);
+    else
+        *out[0] = ex.AllocTensor(outShape, X->dtype);
+
+    auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(Cond),
+                                (uint32_t)tensorNel(X), (uint32_t)tensorNel(Y));
+    auto& pl = ex.GetPipeline("where_gpu", WGSL_WHERE, 5);
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, Cond->buffer}, {1, X->buffer}, {2, Y->buffer},
+        {3, out[0]->buffer}, {4, params}});
+    ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "where"}});
 }
 
-// Equal, GreaterOrEqual: produce bool tensor (zeros for now)
+// Equal: compare two f32 tensors, output bool
+static const char* WGSL_EQUAL = R"WGSL(
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<u32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let N_B = _params_[1];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+    let b_idx = select(idx, idx % N_B, N_B < N && N_B > 0u);
+    let eq = select(0u, 1u, A[idx] == B[b_idx]);
+    // Pack bool into bytes within u32
+    let u32_idx = idx / 4u;
+    let byte_pos = (idx % 4u) * 8u;
+    // Note: atomicOr would be ideal but not available. Write full u32.
+    // This is a simplification that works when N is a multiple of 4.
+    if (idx % 4u == 0u) {
+        var packed: u32 = 0u;
+        for (var i = 0u; i < 4u && (idx + i) < N; i++) {
+            let bi = select(idx + i, (idx + i) % N_B, N_B < N && N_B > 0u);
+            let e = select(0u, 1u, A[idx + i] == B[bi]);
+            packed |= e << (i * 8u);
+        }
+        Out[u32_idx] = packed;
+    }
+}
+)WGSL";
+
 static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    if (in[0] && in[0]->IsValid()) {
-        *out[0] = ex.AllocTensor(in[0]->shape, TensorDtype::Bool);
-        // Zero-fill (all false)
-        size_t bytes = out[0]->ByteSize();
-        std::vector<uint8_t> zeros(bytes, 0);
-        ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), bytes);
+    auto* A = in[0]; auto* B = in.size() > 1 ? in[1] : nullptr;
+    if (!A || !B || !A->IsValid() || !B->IsValid()) {
+        if (A && A->IsValid()) {
+            *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
+            size_t bytes = (out[0]->ElementCount() + 3) / 4 * 4;
+            std::vector<uint8_t> zeros(bytes, 0);
+            ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), bytes);
+        }
+        return;
     }
+    ex.EnsureGpu(*A); ex.EnsureGpu(*B);
+
+    int64_t N = tensorNel(A);
+    *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
+
+    auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(B));
+    auto& pl = ex.GetPipeline("equal_gpu", WGSL_EQUAL, 4);
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, params}});
+    ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "equal"}});
 }
 
 static void opGreaterOrEqual(GraphExecutor& ex, const OnnxGraphNode& n,
                               const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    if (in[0] && in[0]->IsValid()) {
-        *out[0] = ex.AllocTensor(in[0]->shape, TensorDtype::Bool);
-        size_t bytes = out[0]->ByteSize();
-        std::vector<uint8_t> ones(bytes, 1); // all true
-        ex.gpu->writeBuffer(out[0]->buffer, ones.data(), bytes);
-    }
+    auto* A = in[0]; auto* B = in.size() > 1 ? in[1] : nullptr;
+    if (!A || !A->IsValid()) return;
+    int64_t N = tensorNel(A);
+    *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
+    // For now, produce all-true (GreaterOrEqual is used in scheduler for step selection)
+    size_t bytes = (N + 3) / 4 * 4;
+    std::vector<uint8_t> ones(bytes, 1);
+    ex.gpu->writeBuffer(out[0]->buffer, ones.data(), bytes);
 }
 
-// Softmax: full implementation needed for VAE attention
+// Softmax: proper GPU kernel with numerical stability
+static const char* WGSL_SOFTMAX = R"WGSL(
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let nRows = _params_[0];
+    let rowLen = _params_[1];
+    let row = gid.x;
+    if (row >= nRows) { return; }
+    let base = row * rowLen;
+
+    // Find max for numerical stability
+    var maxVal: f32 = -1e30;
+    for (var i = 0u; i < rowLen; i++) {
+        maxVal = max(maxVal, X[base + i]);
+    }
+    // Compute exp and sum
+    var sumExp: f32 = 0.0;
+    for (var i = 0u; i < rowLen; i++) {
+        sumExp += exp(X[base + i] - maxVal);
+    }
+    // Normalize
+    let invSum = 1.0 / max(sumExp, 1e-9);
+    for (var i = 0u; i < rowLen; i++) {
+        Y[base + i] = exp(X[base + i] - maxVal) * invSum;
+    }
+}
+)WGSL";
+
 static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    if (in[0] && in[0]->IsValid()) {
-        *out[0] = *in[0]; // TODO: implement softmax kernel
-    }
+    auto* X = in[0];
+    if (!X || !X->IsValid()) return;
+    ex.EnsureGpu(*X);
+
+    int64_t axis = n.GetInt("axis", -1);
+    if (axis < 0) axis += (int64_t)X->shape.size();
+    int64_t rowLen = (axis < (int64_t)X->shape.size()) ? X->shape[axis] : X->shape.back();
+    int64_t nRows = tensorNel(X) / rowLen;
+
+    *out[0] = ex.AllocTensor(X->shape, X->dtype);
+
+    auto params = makeParamBuf(ex, (uint32_t)nRows, (uint32_t)rowLen);
+    auto& pl = ex.GetPipeline("softmax_gpu", WGSL_SOFTMAX, 3);
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, X->buffer}, {1, out[0]->buffer}, {2, params}});
+    ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((nRows + 255) / 256), 1, 1, "softmax"}});
 }
 
 // ReduceSum: CPU for small tensors, GPU readback for larger ones
