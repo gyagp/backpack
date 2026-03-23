@@ -125,30 +125,6 @@ int main(int argc, char* argv[]) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    printf("Loading text encoder...\n"); fflush(stdout);
-    auto textEnc = bp::Model::Load(device,
-        (fs::path(modelDir) / "text_encoder_model_q4f16.onnx").string());
-
-    printf("Loading transformer (DiT)...\n"); fflush(stdout);
-    auto dit = bp::Model::Load(device,
-        (fs::path(modelDir) / "transformer_model_q4f16.onnx").string());
-
-    printf("Loading VAE decoder...\n"); fflush(stdout);
-    auto vae = bp::Model::Load(device,
-        (fs::path(modelDir) / "vae_decoder_model_f16.onnx").string());
-
-    printf("Loading scheduler...\n"); fflush(stdout);
-    auto scheduler = bp::Model::Load(device,
-        (fs::path(modelDir) / "scheduler_step_model_f16.onnx").string());
-
-    printf("Loading VAE preprocess...\n"); fflush(stdout);
-    auto vaePre = bp::Model::Load(device,
-        (fs::path(modelDir) / "vae_pre_process_model_f16.onnx").string());
-
-    auto t1 = std::chrono::steady_clock::now();
-    auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    printf("Models loaded in %lldms\n\n", (long long)loadMs);
-
     // ─── 3. Tokenize prompt ──────────────────────────────────────────────
 
     OnnxTokenizer tokenizer;
@@ -172,6 +148,9 @@ int main(int argc, char* argv[]) {
     printf("\n--- Text Encoder ---\n"); fflush(stdout);
     auto tEnc0 = std::chrono::steady_clock::now();
 
+    auto textEnc = bp::Model::Load(device,
+        (fs::path(modelDir) / "text_encoder_model_q4f16.onnx").string());
+
     auto inputIdsTensor = bp::Tensor::Create(device, bp::DataType::Int64,
                                               {1, (int64_t)maxSeqLen});
     inputIdsTensor.SetData(inputIds64.data(), maxSeqLen * sizeof(int64_t));
@@ -181,13 +160,19 @@ int main(int argc, char* argv[]) {
     attMaskTensor.SetData(attentionMask.data(), maxSeqLen * sizeof(int64_t));
 
     auto hiddenTensor = bp::Tensor::Create(device, bp::DataType::Float32,
-                                            {1, (int64_t)maxSeqLen, 2560});
+                                           {1, (int64_t)maxSeqLen, 2560});
 
     auto encSession = bp::Session::Create(textEnc);
     encSession.SetInput("input_ids", inputIdsTensor);
     encSession.SetInput("attention_mask", attMaskTensor);
     encSession.SetOutput("encoder_hidden_state", hiddenTensor);
     encSession.Run();
+
+    // Free text encoder to save VRAM (~1.5 GB)
+    encSession.Release();
+    textEnc.Release();
+    inputIdsTensor.Release();
+    attMaskTensor.Release();
 
     auto tEnc1 = std::chrono::steady_clock::now();
     auto encMs = std::chrono::duration<double,std::milli>(tEnc1 - tEnc0).count();
@@ -207,9 +192,18 @@ int main(int argc, char* argv[]) {
     latentsTensor.SetData(latentsData.data(), latentSize * sizeof(float));
 
     // ─── 6. Diffusion loop ───────────────────────────────────────────────
+    // Load DiT and scheduler for the diffusion steps
 
     printf("\n--- Diffusion (%d steps) ---\n", numSteps);
     auto schedule = computeSchedule(numSteps);
+
+    printf("Loading transformer (DiT)...\n"); fflush(stdout);
+    auto dit = bp::Model::Load(device,
+        (fs::path(modelDir) / "transformer_model_q4f16.onnx").string());
+
+    printf("Loading scheduler...\n"); fflush(stdout);
+    auto scheduler = bp::Model::Load(device,
+        (fs::path(modelDir) / "scheduler_step_model_f16.onnx").string());
 
     for (int step = 0; step < numSteps; step++) {
         auto tStep0 = std::chrono::steady_clock::now();
@@ -252,10 +246,24 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
 
+    // Free DiT and scheduler
+    dit.Release();
+    scheduler.Release();
+    hiddenTensor.Release();
+
     // ─── 7. VAE decode ───────────────────────────────────────────────────
 
     printf("\n--- VAE Decode ---\n"); fflush(stdout);
     auto tVae0 = std::chrono::steady_clock::now();
+
+    auto imageTensor = bp::Tensor::Create(device, bp::DataType::Float32,
+        {1, 3, (int64_t)height, (int64_t)width});
+
+    printf("Loading VAE...\n"); fflush(stdout);
+    auto vaePre = bp::Model::Load(device,
+        (fs::path(modelDir) / "vae_pre_process_model_f16.onnx").string());
+    auto vae = bp::Model::Load(device,
+        (fs::path(modelDir) / "vae_decoder_model_f16.onnx").string());
 
     // Preprocess: [1,16,1,H,W] → [1,16,H,W]
     auto scaledTensor = bp::Tensor::Create(device, bp::DataType::Float32,
@@ -267,9 +275,6 @@ int main(int argc, char* argv[]) {
     preSession.Run();
 
     // VAE decode: [1,16,H,W] → [1,3,H*8,W*8]
-    auto imageTensor = bp::Tensor::Create(device, bp::DataType::Float32,
-        {1, 3, (int64_t)height, (int64_t)width});
-
     auto vaeSession = bp::Session::Create(vae);
     vaeSession.SetInput("latent_sample", scaledTensor);
     vaeSession.SetOutput("sample", imageTensor);
@@ -293,7 +298,6 @@ int main(int argc, char* argv[]) {
     auto totalMs = std::chrono::duration<double,std::milli>(tEnd - t0).count();
     printf("\n--- Performance ---\n");
     printf("  Total:    %.0fms\n", totalMs);
-    printf("  Load:     %lldms\n", (long long)loadMs);
     printf("  Encode:   %.0fms\n", encMs);
     printf("  Diffusion: %d steps\n", numSteps);
     printf("  VAE:      %.0fms\n", vaeMs);
