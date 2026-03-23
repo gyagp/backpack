@@ -224,8 +224,10 @@ bp::Tensor& bp::Tensor::operator=(Tensor&& o) noexcept = default;
 
 struct bp::Session::Impl {
     Model* model = nullptr;
-    std::unordered_map<std::string, GpuTensor*> boundInputs;
-    std::unordered_map<std::string, GpuTensor*> boundOutputs;
+    std::vector<GpuTensor> ownedInputs;
+    std::vector<GpuTensor> ownedOutputs;
+    std::vector<std::string> inputNames;
+    std::vector<std::string> outputNames;
 };
 
 bp::Session bp::Session::Create(Model& model) {
@@ -238,30 +240,39 @@ bp::Session bp::Session::Create(Model& model) {
 void bp::Session::SetInput(const std::string& name, Tensor& tensor) {
     if (!impl_ || !tensor.GetImpl()) return;
     auto* ti = tensor.GetImpl();
-    static thread_local std::vector<GpuTensor> tempTensors;
     GpuTensor gt;
     gt.buffer = ti->gpuBuf;
     gt.shape = ti->shape;
     gt.dtype = ti->geDtype;
-    tempTensors.push_back(gt);
-    impl_->boundInputs[name] = &tempTensors.back();
+    impl_->ownedInputs.push_back(gt);
+    // Don't store pointer yet — will resolve after all SetInput calls
+    impl_->inputNames.push_back(name);
 }
 
 void bp::Session::SetOutput(const std::string& name, Tensor& tensor) {
     if (!impl_ || !tensor.GetImpl()) return;
     auto* ti = tensor.GetImpl();
-    static thread_local std::vector<GpuTensor> tempTensors;
     GpuTensor gt;
     gt.buffer = ti->gpuBuf;
     gt.shape = ti->shape;
     gt.dtype = ti->geDtype;
-    tempTensors.push_back(gt);
-    impl_->boundOutputs[name] = &tempTensors.back();
+    impl_->ownedOutputs.push_back(gt);
+    impl_->outputNames.push_back(name);
 }
 
 void bp::Session::Run() {
     if (!impl_ || !impl_->model || !impl_->model->GetImpl()) return;
-    impl_->model->GetImpl()->executor.Execute(impl_->boundInputs, impl_->boundOutputs);
+
+    // Build input/output maps from owned vectors (pointers stable after all push_backs)
+    std::unordered_map<std::string, GpuTensor*> inputs;
+    for (size_t i = 0; i < impl_->inputNames.size(); i++)
+        inputs[impl_->inputNames[i]] = &impl_->ownedInputs[i];
+
+    std::unordered_map<std::string, GpuTensor*> outputs;
+    for (size_t i = 0; i < impl_->outputNames.size(); i++)
+        outputs[impl_->outputNames[i]] = &impl_->ownedOutputs[i];
+
+    impl_->model->GetImpl()->executor.Execute(inputs, outputs);
 }
 
 void bp::Session::Release() { impl_.reset(); }

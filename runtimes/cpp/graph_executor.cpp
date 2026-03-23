@@ -198,18 +198,18 @@ static PBAttribute parseAttr(PBReader& r) {
         auto [f, w] = r.readTag();
         switch (f) {
             case 1: a.name = r.readString(); break;
-            case 4: a.type = (int)r.readVarint(); break;
-            case 5: { uint32_t bits = r.readFixed32(); memcpy(&a.f, &bits, 4); break; }
-            case 6: a.i = (int64_t)r.readVarint(); break;
-            case 7: a.s = r.readString(); break;
+            case 2: { uint32_t bits = r.readFixed32(); memcpy(&a.f, &bits, 4); break; } // f (float)
+            case 3: a.i = (int64_t)r.readVarint(); break; // i (int64)
+            case 4: a.s = r.readString(); break; // s (bytes)
+            case 7: // floats (repeated)
+                if (w == 2) { auto sub = r.readLengthDelimited(); while (!sub.eof()) { uint32_t bits = sub.readFixed32(); float fv; memcpy(&fv, &bits, 4); a.floats.push_back(fv); } }
+                else { uint32_t bits = r.readFixed32(); float fv; memcpy(&fv, &bits, 4); a.floats.push_back(fv); }
+                break;
             case 8: // ints (repeated)
                 if (w == 2) { auto sub = r.readLengthDelimited(); while (!sub.eof()) a.ints.push_back((int64_t)sub.readVarint()); }
                 else a.ints.push_back((int64_t)r.readVarint());
                 break;
-            case 9: // floats (repeated)
-                if (w == 2) { auto sub = r.readLengthDelimited(); while (!sub.eof()) { uint32_t bits = sub.readFixed32(); float fv; memcpy(&fv, &bits, 4); a.floats.push_back(fv); } }
-                else { uint32_t bits = r.readFixed32(); float fv; memcpy(&fv, &bits, 4); a.floats.push_back(fv); }
-                break;
+            case 20: a.type = (int)r.readVarint(); break; // type (AttributeType)
             default: r.skip(w); break;
         }
     }
@@ -752,7 +752,7 @@ void GraphExecutor::Execute(
             }
         }
 
-        if (ei < 30 || ei % 50 == 0 || (ei > 0 && (std::chrono::steady_clock::now() - execT0) > std::chrono::seconds(5))) {
+        if (ei < 50 || ei % 20 == 0 || (ei > 0 && (std::chrono::steady_clock::now() - execT0) > std::chrono::seconds(5))) {
             auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - execT0).count();
             int validCount = 0, invalidCount = 0;
@@ -760,9 +760,10 @@ void GraphExecutor::Execute(
                 auto* t = inTensors[ti];
                 if (t && t->IsValid()) validCount++; else if (t) invalidCount++;
             }
-            fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (valid=%d invalid=%d, %lldms)\n",
+            fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (valid=%d invalid=%d, %lldms) pending=%zu\n",
                     ei, ni, graph_.nodes.size(), node.opType.c_str(),
-                    validCount, invalidCount, (long long)nowMs);
+                    validCount, invalidCount, (long long)nowMs,
+                    pendingDispatches_.size());
             fflush(stderr);
         }
 
@@ -782,18 +783,15 @@ void GraphExecutor::Execute(
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
-            // Release input buffers that are no longer needed
-            for (auto& inName : node.inputs) {
-                if (inName.empty()) continue;
-                auto rc = --tensorRefCount[inName];
-                if (rc <= 0) {
-                    auto it = tensorStore_.find(inName);
-                    if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
-                        gpu->releaseBuffer(it->second.buffer);
-                        it->second.buffer = {nullptr, 0};
-                    }
-                }
+            if (ei < 50) {
+                fprintf(stderr, "  [post-op] ei=%zu done, pending=%zu\n", ei, pendingDispatches_.size());
+                fflush(stderr);
             }
+
+            // Note: buffer release disabled during execution because zero-copy ops
+            // (Reshape, Squeeze, Unsqueeze, Flatten) alias input buffers in outputs.
+            // Releasing would invalidate downstream consumers.
+            // Buffers are freed when the graph executor is destroyed.
 
             // Submit pending work periodically (with sync to prevent TDR)
             if (pendingDispatches_.size() + pendingCopies_.size() >= 8) {

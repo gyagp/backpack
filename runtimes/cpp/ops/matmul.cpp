@@ -131,6 +131,11 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto outShape = X->shape;
     outShape.back() = N;
+    fprintf(stderr, "    [mmn] M=%lld N=%u K=%u X.shape=[", (long long)M, N, K);
+    for (size_t i = 0; i < X->shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)X->shape[i]);
+    fprintf(stderr, "] out=[");
+    for (size_t i = 0; i < outShape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)outShape[i]);
+    fprintf(stderr, "]\n"); fflush(stderr);
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
 
     uint32_t params[4] = {(uint32_t)M, N, K, 0};
@@ -332,7 +337,21 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t nIdx = 1;
     for (auto d : Indices->shape) nIdx *= d;
 
-    int64_t bits = n.GetInt("bits", 8);
+    int64_t bits = n.GetInt("bits", 0);
+    // If bits not specified, detect from weight data type
+    // ONNX type 22 = UINT4, type 2 = UINT8
+    if (bits == 0) {
+        // Check weight buffer size vs element count to infer bits
+        int64_t totalElements = 1;
+        for (auto d : W->shape) totalElements *= d;
+        int64_t rawBytes = W->buffer.size;
+        if (totalElements > 0 && rawBytes > 0) {
+            double bitsPerElem = (double)rawBytes * 8.0 / totalElements;
+            bits = (bitsPerElem < 6) ? 4 : 8;
+        } else {
+            bits = 8;
+        }
+    }
     int64_t block_size_attr = n.GetInt("block_size", 32);
     uint32_t n_groups, bs, K;
 
@@ -354,6 +373,11 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto outShape = Indices->shape;
     outShape.push_back(K);
+    fprintf(stderr, "    [gbq] nIdx=%lld K=%u bits=%lld outShape=[", (long long)nIdx, K, bits);
+    for (size_t i = 0; i < outShape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)outShape[i]);
+    fprintf(stderr, "] idxShape=[");
+    for (size_t i = 0; i < Indices->shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)Indices->shape[i]);
+    fprintf(stderr, "]\n"); fflush(stderr);
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
 
     if (!Scales || !Scales->IsValid()) return;

@@ -57,12 +57,23 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t hiddenDim = X->shape.back();
     int64_t nRows = tensorNel(X) / hiddenDim;
 
+    fprintf(stderr, "    [sln] H=%lld nRows=%lld shape=[", (long long)hiddenDim, (long long)nRows);
+    for (size_t i = 0; i < X->shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)X->shape[i]);
+    fprintf(stderr, "] W=%p\n", (void*)(W ? W : nullptr));
+    fflush(stderr);
+
     *out[0] = ex.AllocTensor(X->shape, X->dtype);
     // Additional outputs (inv_std_dev) are optional
     for (size_t i = 1; i < out.size(); i++)
         if (out[i]) *out[i] = ex.AllocTensor({nRows}, X->dtype);
 
-    if (!W || !W->IsValid()) return;
+    if (!W || !W->IsValid()) {
+        fprintf(stderr, "    [sln] W not valid, returning\n"); fflush(stderr);
+        return;
+    }
+
+    fprintf(stderr, "    [sln] W valid, buffer=%p size=%zu\n", (void*)W->buffer.handle, W->buffer.size);
+    fflush(stderr);
 
     uint32_t eps_u32;
     memcpy(&eps_u32, &eps, 4);
@@ -70,12 +81,16 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("rmsn_p", 16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
+    fprintf(stderr, "    [sln] getting pipeline...\n"); fflush(stderr);
     auto& pl = ex.GetPipeline("rmsnorm", WGSL_RMSNORM, 4);
+    fprintf(stderr, "    [sln] pipeline ok, making bind group...\n"); fflush(stderr);
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
+    fprintf(stderr, "    [sln] dispatching...\n"); fflush(stderr);
 
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
         (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm"});
+    fprintf(stderr, "    [sln] done\n"); fflush(stderr);
 }
 
 // ─── SkipSimplifiedLayerNorm (residual add + RMSNorm) ────────────────────────
