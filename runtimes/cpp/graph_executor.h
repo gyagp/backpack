@@ -148,6 +148,19 @@ public:
 private:
     OnnxGraph graph_;
 
+public:
+    /// Access initializer data on CPU (avoids GPU readback for metadata ops).
+    const OnnxGraph::InitData* GetInitData(const std::string& name) const {
+        auto it = graph_.initializers.find(name);
+        return (it != graph_.initializers.end()) ? &it->second : nullptr;
+    }
+
+    /// Check if a tensor name is an initializer (constant weight).
+    bool IsInitializer(const std::string& name) const {
+        return graph_.initializers.count(name) > 0;
+    }
+
+private:
     // Tensor store: all intermediate and initializer tensors by name
     std::unordered_map<std::string, GpuTensor> tensorStore_;
 

@@ -7,6 +7,7 @@
  */
 
 #include "../graph_executor.h"
+#include <webgpu/webgpu.h>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -35,13 +36,31 @@ static void opReshape(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.pendingDispatches_.clear();
     }
 
-    // Read shape from the shape tensor (on GPU) or from initializer
+    // Read shape from initializer (CPU) if possible, else from GPU
     std::vector<int64_t> newShape;
     if (shape && shape->IsValid()) {
         int64_t nel = tensorNel(shape);
         newShape.resize(nel);
-        auto readback = ex.gpu->readBuffer(shape->buffer, nel * sizeof(int64_t));
-        memcpy(newShape.data(), readback.data(), nel * sizeof(int64_t));
+
+        // Try CPU initializer first (no GPU sync needed)
+        bool fromCPU = false;
+        if (n.inputs.size() > 1) {
+            auto* initData = ex.GetInitData(n.inputs[1]);
+            if (initData && initData->data) {
+                memcpy(newShape.data(), initData->data, nel * sizeof(int64_t));
+                fromCPU = true;
+            }
+        }
+        if (!fromCPU) {
+            // Flush before reading shape from GPU
+            if (!ex.pendingDispatches_.empty()) {
+                ex.gpu->submitOnly(ex.pendingDispatches_, false);
+                ex.gpu->waitForQueue();
+                ex.pendingDispatches_.clear();
+            }
+            auto readback = ex.gpu->readBuffer(shape->buffer, nel * sizeof(int64_t));
+            memcpy(newShape.data(), readback.data(), nel * sizeof(int64_t));
+        }
     }
 
     // Handle -1 (infer) and 0 (keep) dimensions
@@ -186,8 +205,16 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* indices = in[1];
     if (!data || !indices || !data->IsValid() || !indices->IsValid()) return;
 
-    // Flush pending GPU work before CPU readback
-    if (!ex.pendingDispatches_.empty()) {
+    // Flush pending GPU work before CPU readback (only if needed)
+    bool needsFlush = true;
+
+    // Try reading indices from CPU initializer (no GPU sync)
+    auto* idxInit = (n.inputs.size() > 1) ? ex.GetInitData(n.inputs[1]) : nullptr;
+    if (idxInit && idxInit->data) needsFlush = false;
+    auto* dataInit = ex.GetInitData(n.inputs[0]);
+    if (dataInit && dataInit->data) needsFlush = false;
+
+    if (needsFlush && !ex.pendingDispatches_.empty()) {
         ex.gpu->submitOnly(ex.pendingDispatches_, false);
         ex.gpu->waitForQueue();
         ex.pendingDispatches_.clear();
@@ -242,33 +269,56 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
 
 static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // Simplified concat along axis
     int64_t axis = n.GetInt("axis", 0);
 
+    // Collect valid inputs
+    std::vector<GpuTensor*> validIn;
+    for (auto* t : in) if (t && t->IsValid()) validIn.push_back(t);
+    if (validIn.empty()) return;
+
+    // Normalize axis
+    int ndim = (int)validIn[0]->shape.size();
+    if (axis < 0) axis += ndim;
+
     // Compute output shape
-    std::vector<int64_t> outShape;
+    auto outShape = validIn[0]->shape;
     int64_t totalOnAxis = 0;
-    for (auto* t : in) {
-        if (!t || !t->IsValid()) continue;
-        if (outShape.empty()) outShape = t->shape;
-        if (axis >= 0 && axis < (int64_t)t->shape.size())
+    for (auto* t : validIn) {
+        if (axis < (int64_t)t->shape.size())
             totalOnAxis += t->shape[axis];
     }
-    if (!outShape.empty() && axis >= 0 && axis < (int64_t)outShape.size())
+    if (axis < (int64_t)outShape.size())
         outShape[axis] = totalOnAxis;
 
-    *out[0] = ex.AllocTensor(outShape, in[0]->dtype);
+    // Flush pending before GPU copy
+    if (!ex.pendingDispatches_.empty()) {
+        ex.gpu->submitOnly(ex.pendingDispatches_, false);
+        ex.gpu->waitForQueue();
+        ex.pendingDispatches_.clear();
+    }
 
-    // Copy each input's data sequentially (simplified: assumes concat on last/outer axis)
+    *out[0] = ex.AllocTensor(outShape, validIn[0]->dtype);
+
+    // GPU-to-GPU copy: use CopyBufferToBuffer for each input
+    // For simple concat on outer axis, data is contiguous
     size_t offset = 0;
-    for (auto* t : in) {
-        if (!t || !t->IsValid()) continue;
+    for (auto* t : validIn) {
         size_t bytes = t->ByteSize();
-        auto rb = ex.gpu->readBuffer(t->buffer, bytes);
-        // Write at offset in output buffer
-        ex.gpu->writeBuffer(out[0]->buffer, rb.data(), bytes, offset);
+        if (bytes > 0 && t->buffer.handle && out[0]->buffer.handle) {
+            // Use WebGPU buffer copy (GPU-side, no CPU readback)
+            WGPUCommandEncoderDescriptor enD{};
+            auto enc = wgpuDeviceCreateCommandEncoder(ex.gpu->device, &enD);
+            wgpuCommandEncoderCopyBufferToBuffer(enc, t->buffer.handle, 0,
+                out[0]->buffer.handle, offset, bytes);
+            WGPUCommandBufferDescriptor cbD{};
+            auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+            wgpuQueueSubmit(ex.gpu->queue, 1, &cb);
+            wgpuCommandBufferRelease(cb);
+            wgpuCommandEncoderRelease(enc);
+        }
         offset += bytes;
     }
+    ex.gpu->waitForQueue();
 }
 
 static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
