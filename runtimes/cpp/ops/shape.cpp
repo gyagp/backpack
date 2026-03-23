@@ -40,9 +40,33 @@ static void opReshape(GraphExecutor& ex, const OnnxGraphNode& n,
             int64_t nel = tensorNel(shape);
             newShape.resize(nel);
             memcpy(newShape.data(), shape->cpuData.data(), nel * 8);
+        } else if (!shape->cpuData.empty()) {
+            int64_t nel = tensorNel(shape);
+            newShape.resize(nel);
+            memcpy(newShape.data(), shape->cpuData.data(), nel * 8);
         }
     }
-    if (newShape.empty()) { *out[0] = *data; return; }
+    if (newShape.empty() && shape) {
+        fprintf(stderr, "    [reshape] EMPTY: shape->isCpu=%d cpuData=%zu shape=[",
+                shape->isCpuOnly, shape->cpuData.size());
+        for (size_t i = 0; i < shape->shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)shape->shape[i]);
+        fprintf(stderr, "] buf=%p\n", (void*)shape->buffer.handle);
+        fflush(stderr);
+    }
+    if (newShape.empty()) {
+        fprintf(stderr, "    [reshape] empty shape! data=[");
+        for (size_t i = 0; i < data->shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)data->shape[i]);
+        fprintf(stderr, "] shape_input=%s isCpu=%d cpuData=%zu\n",
+                (shape ? "valid" : "null"), (shape ? shape->isCpuOnly : 0),
+                (shape ? shape->cpuData.size() : 0));
+        if (n.inputs.size() > 1) {
+            auto* init = ex.GetInitData(n.inputs[1]);
+            fprintf(stderr, "    [reshape] init=%p name='%s'\n",
+                    (void*)init, n.inputs[1].c_str());
+        }
+        fflush(stderr);
+        *out[0] = *data; return;
+    }
 
     int64_t totalIn = tensorNel(data);
     int64_t known = 1; int inferIdx = -1;
@@ -51,6 +75,12 @@ static void opReshape(GraphExecutor& ex, const OnnxGraphNode& n,
         if (newShape[i] == -1) inferIdx = i; else known *= newShape[i];
     }
     if (inferIdx >= 0 && known > 0) newShape[inferIdx] = totalIn / known;
+    fprintf(stderr, "    [reshape] in=[");
+    for (size_t i = 0; i < data->shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)data->shape[i]);
+    fprintf(stderr, "] -> out=[");
+    for (size_t i = 0; i < newShape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)newShape[i]);
+    fprintf(stderr, "] total=%lld\n", (long long)totalIn);
+    fflush(stderr);
     *out[0] = *data;
     out[0]->shape = newShape;
 }
@@ -114,6 +144,9 @@ static void opShape(GraphExecutor& ex, const OnnxGraphNode& n,
 
 static void opConstant(GraphExecutor& ex, const OnnxGraphNode& n,
                         const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    // Check if output was already pre-stored (tensor-valued 'value' attribute)
+    if (out[0] && out[0]->IsValid()) return;
+
     if (n.attrIntLists.count("value_ints")) {
         auto& v = n.attrIntLists.at("value_ints");
         *out[0] = ex.AllocCpuTensor({(int64_t)v.size()}, TensorDtype::Int64, v.data(), v.size()*8);

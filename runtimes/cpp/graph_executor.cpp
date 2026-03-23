@@ -190,6 +190,9 @@ struct PBAttribute {
     std::string s;
     std::vector<int64_t> ints;
     std::vector<float> floats;
+    // Tensor-valued attribute (for Constant node's 'value')
+    PBTensor tensor;
+    bool hasTensor = false;
 };
 
 static PBAttribute parseAttr(PBReader& r) {
@@ -201,6 +204,12 @@ static PBAttribute parseAttr(PBReader& r) {
             case 2: { uint32_t bits = r.readFixed32(); memcpy(&a.f, &bits, 4); break; } // f (float)
             case 3: a.i = (int64_t)r.readVarint(); break; // i (int64)
             case 4: a.s = r.readString(); break; // s (bytes)
+            case 5: { // t (TensorProto) — tensor-valued attribute
+                auto sub = r.readLengthDelimited();
+                a.tensor = parseTensor(sub);
+                a.hasTensor = true;
+                break;
+            }
             case 7: // floats (repeated)
                 if (w == 2) { auto sub = r.readLengthDelimited(); while (!sub.eof()) { uint32_t bits = sub.readFixed32(); float fv; memcpy(&fv, &bits, 4); a.floats.push_back(fv); } }
                 else { uint32_t bits = r.readFixed32(); float fv; memcpy(&fv, &bits, 4); a.floats.push_back(fv); }
@@ -416,6 +425,41 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             else if (a.type == 1) node.attrFloats[a.name] = a.f; // FLOAT
             else if (a.type == 3) node.attrStrings[a.name] = a.s; // STRING
             else if (a.type == 7) node.attrIntLists[a.name] = a.ints; // INTS
+
+            // Handle tensor-valued 'value' attribute (Constant nodes)
+            if (a.hasTensor && a.name == "value" && node.opType == "Constant" && !node.outputs.empty()) {
+                auto& t = a.tensor;
+                auto dtype = fromOnnxDtype(t.dataType);
+                const uint8_t* rawPtr = t.rawData;
+                size_t rawLen = t.rawSize;
+                std::vector<uint8_t> inlineBuf;
+                if (!rawPtr && !t.int64Data.empty()) {
+                    inlineBuf.resize(t.int64Data.size() * 8);
+                    memcpy(inlineBuf.data(), t.int64Data.data(), inlineBuf.size());
+                    rawPtr = inlineBuf.data(); rawLen = inlineBuf.size();
+                } else if (!rawPtr && !t.floatData.empty()) {
+                    inlineBuf.resize(t.floatData.size() * 4);
+                    memcpy(inlineBuf.data(), t.floatData.data(), inlineBuf.size());
+                    rawPtr = inlineBuf.data(); rawLen = inlineBuf.size();
+                }
+                if (rawPtr && rawLen > 0) {
+                    GpuTensor gt;
+                    gt.shape = t.dims;
+                    gt.dtype = dtype;
+                    gt.isCpuOnly = true;
+                    gt.cpuData.resize(rawLen);
+                    memcpy(gt.cpuData.data(), rawPtr, rawLen);
+                    // Pre-store in tensor store so the Constant op finds it
+                    tensorStore_[node.outputs[0]] = std::move(gt);
+                    if (node.outputs[0].find("INT64") != std::string::npos) {
+                        auto& stored = tensorStore_[node.outputs[0]];
+                        fprintf(stderr, "  [pre-store] '%s' shape=[", node.outputs[0].c_str());
+                        for (size_t i = 0; i < stored.shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)stored.shape[i]);
+                        fprintf(stderr, "] cpuData=%zu isCpu=%d\n", stored.cpuData.size(), stored.isCpuOnly);
+                        fflush(stderr);
+                    }
+                }
+            }
         }
         graph_.nodes.push_back(std::move(node));
     }
@@ -769,10 +813,12 @@ void GraphExecutor::Execute(
 
         // Prepare output tensor pointers
         std::vector<GpuTensor*> outTensors(node.outputs.size(), nullptr);
-        // Pre-allocate slots in the store
+        // Pre-allocate slots in the store (but don't overwrite existing pre-stored tensors)
         for (size_t oi = 0; oi < node.outputs.size(); oi++) {
             if (!node.outputs[oi].empty()) {
-                tensorStore_[node.outputs[oi]] = {};
+                auto it = tensorStore_.find(node.outputs[oi]);
+                if (it == tensorStore_.end() || !it->second.IsValid())
+                    tensorStore_[node.outputs[oi]] = {};
                 outTensors[oi] = &tensorStore_[node.outputs[oi]];
             }
         }
