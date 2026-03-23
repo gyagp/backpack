@@ -122,35 +122,18 @@ static PBTensor parseTensor(PBReader& r) {
                 break;
             case 2: t.dataType = (int)r.readVarint(); break;
             case 8: t.name = r.readString(); break;
-            case 15: dataLoc = (int)r.readVarint(); break;
-            case 13: { // raw_data or misplaced external_data
+            case 14: // data_location
+                if (w == 0) { dataLoc = (int)r.readVarint(); }
+                else { r.skip(w); }
+                break;
+            case 9: { // raw_data (bytes) — field 9 in ONNX TensorProto
                 uint64_t len = r.readVarint();
-                const uint8_t* start = r.data;
-                // Check if this is a StringStringEntryProto (external_data encoded as field 13)
-                if (len > 4 && len < 200 && start[0] == 0x0A) {
-                    PBReader sub(start, (size_t)len);
-                    std::string key, value;
-                    bool isEntry = true;
-                    while (!sub.eof()) {
-                        auto [f2, w2] = sub.readTag();
-                        if (f2 == 1 && w2 == 2) key = sub.readString();
-                        else if (f2 == 2 && w2 == 2) value = sub.readString();
-                        else { isEntry = false; break; }
-                    }
-                    if (isEntry && !key.empty()) {
-                        if (key == "location") t.extLocation = value;
-                        else if (key == "offset") t.extOffset = std::stoll(value);
-                        else if (key == "length") t.extLength = std::stoll(value);
-                        r.data += len;
-                        break;
-                    }
-                }
-                t.rawData = start;
+                t.rawData = r.data;
                 t.rawSize = (size_t)len;
                 r.data += len;
                 break;
             }
-            case 14: // external_data or data_location
+            case 13: // external_data (StringStringEntryProto, repeated) or data_location
                 if (w == 0) { dataLoc = (int)r.readVarint(); }
                 else {
                     auto sub = r.readLengthDelimited();
@@ -415,9 +398,16 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     }
 
     // Upload initializers to GPU
-    int uploaded = 0;
+    int uploaded = 0, nodata = 0;
     for (auto& t : initTensors) {
-        if (!t.rawData || t.rawSize == 0) continue;
+        if (!t.rawData || t.rawSize == 0) {
+            nodata++;
+            if (nodata <= 3)
+                fprintf(stderr, "    [nodata] '%s' dims=%zu rawSize=%zu extLoc='%s' extOff=%lld\n",
+                        t.name.c_str(), t.dims.size(), t.rawSize,
+                        t.extLocation.c_str(), (long long)t.extOffset);
+            continue;
+        }
         auto dtype = fromOnnxDtype(t.dataType);
         GpuTensor gt;
         gt.shape = t.dims;
@@ -433,7 +423,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    printf("  %d initializers uploaded, %lldms\n", uploaded, (long long)ms);
+    printf("  %d initializers uploaded, %d no-data, %lldms\n", uploaded, nodata, (long long)ms);
 
     return true;
 }

@@ -98,7 +98,7 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
         {3, out[0]->buffer}, {4, paramBuf}});
 
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        N, (uint32_t)M, 1, "matmul_q4"});
+        (N + 255) / 256, (uint32_t)M, 1, "matmul_q4"});
 }
 
 // ─── MatMul: fp32 matrix multiply ────────────────────────────────────────────
@@ -268,10 +268,24 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t nIdx = 1;
     for (auto d : Indices->shape) nIdx *= d;
 
-    // Compute K from weight dims
-    uint32_t n_groups = (W->shape.size() >= 2) ? (uint32_t)W->shape[1] : 1;
-    uint32_t bs = (W->shape.size() >= 3) ? (uint32_t)W->shape[2] : 32;
-    uint32_t K = n_groups * bs;
+    // Compute K from node attributes and weight dims
+    int64_t bits = n.GetInt("bits", 8);
+    int64_t block_size_attr = n.GetInt("block_size", 32);
+    // For Q8 embedding: weight is [V, n_groups, block_size] raw uint8
+    // K = n_groups * block_size = hidden_dim
+    uint32_t n_groups, bs, K;
+    if (W->shape.size() >= 3) {
+        n_groups = (uint32_t)W->shape[1];
+        bs = (uint32_t)W->shape[2];
+        K = n_groups * bs;
+    } else if (W->shape.size() == 2) {
+        // Weight was reshaped to [V, hidden_dim]
+        K = (uint32_t)W->shape[1];
+        bs = (uint32_t)block_size_attr;
+        n_groups = K / bs;
+    } else {
+        K = 1; bs = 1; n_groups = 1;
+    }
 
     auto outShape = Indices->shape;
     outShape.push_back(K);

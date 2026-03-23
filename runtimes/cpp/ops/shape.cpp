@@ -273,15 +273,34 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
     }
     if (axis < (int64_t)outShape.size()) outShape[axis] = totalOnAxis;
 
-    // CPU path for metadata
-    if (allCpu) {
-        size_t totalBytes = 0;
-        for (auto* t : validIn) totalBytes += t->cpuData.size();
+    // CPU path for small metadata (even if some inputs are on GPU)
+    size_t totalBytes = 0;
+    for (auto* t : validIn) totalBytes += (t->isCpuOnly) ? t->cpuData.size() : t->ByteSize();
+
+    if (allCpu || totalBytes <= 512) {
+        // Small concat — do on CPU
+        if (!allCpu) {
+            fprintf(stderr, "    [concat] small non-cpu: %zu bytes, %zu inputs, syncing...\n", totalBytes, validIn.size());
+            fflush(stderr);
+        }
+        if (!allCpu && !ex.pendingDispatches_.empty()) {
+            ex.gpu->submitOnly(ex.pendingDispatches_, false);
+            ex.gpu->waitForQueue();
+            ex.pendingDispatches_.clear();
+        }
         std::vector<uint8_t> outData(totalBytes);
         size_t offset = 0;
         for (auto* t : validIn) {
-            memcpy(outData.data() + offset, t->cpuData.data(), t->cpuData.size());
-            offset += t->cpuData.size();
+            size_t bytes;
+            if (t->isCpuOnly) {
+                bytes = t->cpuData.size();
+                memcpy(outData.data() + offset, t->cpuData.data(), bytes);
+            } else {
+                bytes = t->ByteSize();
+                auto rb = ex.gpu->readBuffer(t->buffer, bytes);
+                memcpy(outData.data() + offset, rb.data(), bytes);
+            }
+            offset += bytes;
         }
         *out[0] = ex.AllocCpuTensor(outShape, validIn[0]->dtype, outData.data(), totalBytes);
         return;
