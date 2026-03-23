@@ -11,6 +11,7 @@
 #include "gpu_context.h"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -177,7 +178,8 @@ public:
 
 private:
     // Tensor store: all intermediate and initializer tensors by name
-    std::unordered_map<std::string, GpuTensor> tensorStore_;
+    // Using std::map for pointer stability (unordered_map rehashes invalidate references)
+    std::map<std::string, GpuTensor> tensorStore_;
 
 public:
     // Batched dispatches for the current execution (public for op access)

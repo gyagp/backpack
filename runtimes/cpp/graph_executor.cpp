@@ -781,11 +781,26 @@ void GraphExecutor::Execute(
         size_t ni = execOrder[ei];
         auto& node = graph_.nodes[ni];
 
-        // Resolve input tensors
+        // Resolve input tensor NAMES (not pointers — map may rehash during output allocation)
+        std::vector<std::string> inNames;
+        for (auto& inName : node.inputs) inNames.push_back(inName);
+
+        // Prepare output tensor slots
+        std::vector<std::string> outNames;
+        for (size_t oi = 0; oi < node.outputs.size(); oi++) {
+            outNames.push_back(node.outputs[oi]);
+            if (!node.outputs[oi].empty()) {
+                auto it = tensorStore_.find(node.outputs[oi]);
+                if (it == tensorStore_.end() || !it->second.IsValid())
+                    tensorStore_[node.outputs[oi]] = {};
+            }
+        }
+
+        // NOW resolve pointers (map is stable after all insertions)
         std::vector<GpuTensor*> inTensors;
-        for (auto& inName : node.inputs) {
+        for (auto& inName : inNames) {
             if (inName.empty()) {
-                inTensors.push_back(nullptr);  // optional input
+                inTensors.push_back(nullptr);
                 continue;
             }
             auto it = tensorStore_.find(inName);
@@ -796,14 +811,21 @@ void GraphExecutor::Execute(
             }
         }
 
-        if (ei < 50 || ei % 20 == 0 || (ei > 0 && (std::chrono::steady_clock::now() - execT0) > std::chrono::seconds(5))) {
+        std::vector<GpuTensor*> outTensors;
+        for (auto& outName : outNames) {
+            if (outName.empty()) {
+                outTensors.push_back(nullptr);
+            } else {
+                outTensors.push_back(&tensorStore_[outName]);
+            }
+        }
+
+        if (ei < 100 || ei % 50 == 0) {
             auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - execT0).count();
             int validCount = 0, invalidCount = 0;
-            for (size_t ti = 0; ti < inTensors.size(); ti++) {
-                auto* t = inTensors[ti];
+            for (auto* t : inTensors)
                 if (t && t->IsValid()) validCount++; else if (t) invalidCount++;
-            }
             fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (valid=%d invalid=%d, %lldms) pending=%zu\n",
                     ei, ni, graph_.nodes.size(), node.opType.c_str(),
                     validCount, invalidCount, (long long)nowMs,
@@ -811,28 +833,11 @@ void GraphExecutor::Execute(
             fflush(stderr);
         }
 
-        // Prepare output tensor pointers
-        std::vector<GpuTensor*> outTensors(node.outputs.size(), nullptr);
-        // Pre-allocate slots in the store (but don't overwrite existing pre-stored tensors)
-        for (size_t oi = 0; oi < node.outputs.size(); oi++) {
-            if (!node.outputs[oi].empty()) {
-                auto it = tensorStore_.find(node.outputs[oi]);
-                if (it == tensorStore_.end() || !it->second.IsValid())
-                    tensorStore_[node.outputs[oi]] = {};
-                outTensors[oi] = &tensorStore_[node.outputs[oi]];
-            }
-        }
-
         // Dispatch op
         auto opIt = registry.find(node.opType);
         if (opIt != registry.end()) {
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
-
-            if (ei < 50) {
-                fprintf(stderr, "  [post-op] ei=%zu done, pending=%zu\n", ei, pendingDispatches_.size());
-                fflush(stderr);
-            }
 
             // Note: buffer release disabled during execution because zero-copy ops
             // (Reshape, Squeeze, Unsqueeze, Flatten) alias input buffers in outputs.

@@ -280,7 +280,15 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
     if (validIn.empty()) return;
 
     int ndim = (int)validIn[0]->shape.size();
+    if (ndim == 0) {
+        // Scalar tensors: treat as 1D
+        for (auto* t : validIn) if (t->shape.empty()) t->shape = {1};
+        ndim = 1;
+        axis = 0;
+    }
     if (axis < 0) axis += ndim;
+    if (axis < 0) axis = 0;
+    if (axis >= ndim) axis = ndim - 1;
     auto outShape = validIn[0]->shape;
     int64_t totalOnAxis = 0;
     for (auto* t : validIn)
@@ -288,27 +296,48 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
     if (axis < (int64_t)outShape.size()) outShape[axis] = totalOnAxis;
 
     for (auto* t : validIn) ex.EnsureGpu(*t);
-    *out[0] = ex.AllocTensor(outShape, validIn[0]->dtype);
+
+    // Filter out tensors with no GPU buffer after EnsureGpu
+    std::vector<GpuTensor*> gpuIn;
+    for (auto* t : validIn)
+        if (t->buffer.handle) gpuIn.push_back(t);
+
+    fprintf(stderr, "    [concat] axis=%lld ndim=%d validIn=%zu gpuIn=%zu\n",
+            (long long)axis, ndim, validIn.size(), gpuIn.size());
+    for (size_t i = 0; i < validIn.size(); i++) {
+        auto* t = validIn[i];
+        fprintf(stderr, "      [%zu] shape=[", i);
+        for (size_t j = 0; j < t->shape.size(); j++) fprintf(stderr, "%s%lld", j?",":"", (long long)t->shape[j]);
+        fprintf(stderr, "] buf=%p size=%zu isCpu=%d cpuData=%zu\n",
+                (void*)t->buffer.handle, t->buffer.size, t->isCpuOnly, t->cpuData.size());
+    }
+    fflush(stderr);
+
+    if (gpuIn.empty()) return;
+
+    *out[0] = ex.AllocTensor(outShape, gpuIn[0]->dtype);
 
     // For axis=0 or 1D tensors, simple byte concatenation
     if (axis == 0 || ndim <= 1) {
         size_t offset = 0;
-        for (auto* t : validIn) {
+        for (auto* t : gpuIn) {
             size_t bytes = t->ByteSize();
-            if (bytes > 0 && t->buffer.handle)
+            if (bytes == 0) bytes = t->buffer.size;
+            if (bytes > t->buffer.size) bytes = t->buffer.size;
+            if (bytes > 0)
                 ex.QueueCopy(t->buffer, 0, out[0]->buffer, offset, bytes);
             offset += bytes;
         }
     } else {
         // General axis concatenation: copy slabs
-        size_t elemSize = validIn[0]->DtypeSize();
+        size_t elemSize = gpuIn[0]->DtypeSize();
         int64_t innerSize = 1;
         for (int i = (int)axis + 1; i < ndim; i++) innerSize *= outShape[i];
         int64_t outerSize = 1;
         for (int i = 0; i < (int)axis; i++) outerSize *= outShape[i];
 
         int64_t dstAxisOffset = 0;
-        for (auto* t : validIn) {
+        for (auto* t : gpuIn) {
             int64_t srcAxisSize = t->shape[axis];
             for (int64_t o = 0; o < outerSize; o++) {
                 size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
