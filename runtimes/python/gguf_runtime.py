@@ -295,10 +295,13 @@ class GGUFTokenizer:
 # ─── Model-agnostic GGUF Model ───────────────────────────────────────────────
 
 class GGUFModel(WebGPUModel):
-    """Model-agnostic WebGPU inference from any llama-family GGUF.
+    """Model-agnostic WebGPU inference from any llama-family model.
 
-    Like the C++ runtime, reads architecture from GGUF metadata and
-    builds the decode pipeline at load time. No model-specific code.
+    Supports both GGUF and ONNX model formats. Reads architecture from
+    config and builds the decode pipeline at load time. No model-specific code.
+
+    Partial RoPE (Phi-3/Phi-4) is supported via the rotary_dim config key.
+    Pre-computed ONNX cos/sin cache (Su-scaled RoPE) is used when available.
     """
 
     MAX_SEQ_LEN = 2048
@@ -307,6 +310,9 @@ class GGUFModel(WebGPUModel):
         self.tie_word_embeddings = cfg["tie_word_embeddings"]
         self._has_qk_norm = cfg["has_qk_norm"]
         self._decode_mode = 'gpu'
+
+        # Partial RoPE support: rotary_dim may be < head_dim (e.g. Phi models)
+        self.rotary_dim = cfg.get("rotary_dim", cfg["head_dim"])
 
         # Detect quantization mode from available weights
         has_q8 = any(k.endswith('.q8') for k in weights)
@@ -359,14 +365,31 @@ class GGUFModel(WebGPUModel):
     # ─── RoPE ─────────────────────────────────────────────────────────────
 
     def _apply_rope_fast(self, x, positions):
-        """Apply RoPE using pre-computed tables."""
-        half = self.head_dim // 2
+        """Apply RoPE using pre-computed tables.
+
+        Supports partial RoPE: when rotary_dim < head_dim, only the first
+        rotary_dim dimensions get rotated, the rest pass through unchanged.
+        """
+        rot_dim = self.rotary_dim
+        half = rot_dim // 2
         cos_v = self._rope_cos[positions][:, None, :]
         sin_v = self._rope_sin[positions][:, None, :]
-        x1, x2 = x[..., :half], x[..., half:]
-        out = np.empty_like(x)
-        out[..., :half] = x1 * cos_v - x2 * sin_v
-        out[..., half:] = x2 * cos_v + x1 * sin_v
+
+        if rot_dim < self.head_dim:
+            # Partial RoPE: rotate first rotary_dim dims, pass-through the rest
+            x_rot = x[..., :rot_dim]
+            x_pass = x[..., rot_dim:]
+            x1, x2 = x_rot[..., :half], x_rot[..., half:]
+            out = np.empty_like(x)
+            out[..., :half] = x1 * cos_v - x2 * sin_v
+            out[..., half:rot_dim] = x2 * cos_v + x1 * sin_v
+            out[..., rot_dim:] = x_pass
+        else:
+            # Full RoPE: all head_dim dimensions get rotated
+            x1, x2 = x[..., :half], x[..., half:]
+            out = np.empty_like(x)
+            out[..., :half] = x1 * cos_v - x2 * sin_v
+            out[..., half:] = x2 * cos_v + x1 * sin_v
         return out
 
     # ─── Projection helper ────────────────────────────────────────────────
@@ -410,6 +433,23 @@ class GGUFModel(WebGPUModel):
         self._gpu_weights[fp16_key] = runner.upload_to_gpu(
             emb.ravel(), fp16_key)
         self._gpu_weights[fp16_key].shape = emb.shape
+
+        # LM head (if not tied to embedding)
+        if not self.tie_word_embeddings and "lm_head.weight" in self.weights:
+            lm_q8_key = "lm_head.weight.q8"
+            if lm_q8_key in self.weights:
+                q8 = self.weights[lm_q8_key]
+                N = q8.shape[0]
+                K = q8.shape[1] * 4
+                self._upload_q8_weight("lm_head.weight", N, K)
+            else:
+                lm_w = self.weights["lm_head.weight"]
+                if lm_w.dtype != np.float16:
+                    lm_w = lm_w.astype(np.float16)
+                lm_fp16_key = "lm_head.weight.fp16"
+                self._gpu_weights[lm_fp16_key] = runner.upload_to_gpu(
+                    lm_w.ravel(), lm_fp16_key)
+                self._gpu_weights[lm_fp16_key].shape = lm_w.shape
 
         # Final norm
         nw = self.weights["norm.weight"]
@@ -480,15 +520,38 @@ class GGUFModel(WebGPUModel):
     # ─── RoPE tables ──────────────────────────────────────────────────────
 
     def _precompute_rope_tables(self):
-        """Pre-compute cos/sin RoPE tables."""
+        """Pre-compute cos/sin RoPE tables.
+
+        If ONNX-provided cos/sin cache is available in weights (e.g. from
+        phi-4-mini's Su-scaled RoPE), use those directly. Otherwise compute
+        from rope_theta.
+
+        Supports partial RoPE: when rotary_dim < head_dim, only the first
+        rotary_dim dimensions get rotated.
+        """
         HD = self.head_dim
-        half = HD // 2
-        positions = np.arange(self.MAX_SEQ_LEN, dtype=np.float32)
-        freqs = 1.0 / (self.rope_theta ** (
-            np.arange(0, HD, 2, dtype=np.float32) / HD))
-        angles = np.outer(positions, freqs)
-        self._rope_cos = np.cos(angles).astype(np.float32)
-        self._rope_sin = np.sin(angles).astype(np.float32)
+        rot_dim = self.rotary_dim
+        half = rot_dim // 2
+
+        if "_rope_cos" in self.weights and "_rope_sin" in self.weights:
+            # Use pre-computed ONNX cos/sin cache directly
+            # Shape: [max_positions, half_rotary_dim]
+            self._rope_cos = self.weights.pop("_rope_cos")
+            self._rope_sin = self.weights.pop("_rope_sin")
+            # Truncate to MAX_SEQ_LEN if needed
+            if self._rope_cos.shape[0] > self.MAX_SEQ_LEN:
+                self._rope_cos = self._rope_cos[:self.MAX_SEQ_LEN]
+                self._rope_sin = self._rope_sin[:self.MAX_SEQ_LEN]
+            print(f"  Using ONNX RoPE cache: {self._rope_cos.shape} "
+                  f"(rotary_dim={rot_dim})")
+        else:
+            # Compute from rope_theta
+            positions = np.arange(self.MAX_SEQ_LEN, dtype=np.float32)
+            freqs = 1.0 / (self.rope_theta ** (
+                np.arange(0, rot_dim, 2, dtype=np.float32) / rot_dim))
+            angles = np.outer(positions, freqs)
+            self._rope_cos = np.cos(angles).astype(np.float32)
+            self._rope_sin = np.sin(angles).astype(np.float32)
 
         runner = self.cache.runner
         self._gpu_rope_cos = runner.upload_to_gpu(

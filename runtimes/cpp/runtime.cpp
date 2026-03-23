@@ -1,16 +1,18 @@
 /**
- * Backpack Runtime -- WebGPU inference directly from GGUF models.
+ * Backpack Runtime -- WebGPU inference from GGUF and ONNX models.
  *
- * Reads model architecture and tokenizer from GGUF metadata.
+ * Reads model architecture and tokenizer from GGUF metadata or ONNX config.
  * All WGSL compute kernels are embedded in the binary.
  *
  * Usage:
  *   backpack_runtime --model model.gguf [--prompt "Hello"] [--max-tokens 50]
+ *   backpack_runtime --model onnx-model-dir/ [--prompt "Hello"] [--max-tokens 50]
  */
 
 #include "gpu_context.h"
 #include "model_runner.h"
 #include "tokenizer.h"
+#include "onnx_tokenizer.h"
 
 #include <chrono>
 #include <cstdio>
@@ -29,15 +31,37 @@ static void shutdownRuntime(ModelRunner& model, GPUContext& gpu) {
 #endif
 }
 
-/// Resolve model path: accepts GGUF file or directory containing GGUF
-static std::string resolveModelPath(const std::string& path) {
+/// Check if a path is an ONNX model directory
+static bool isOnnxDir(const std::string& path) {
+    return fs::is_directory(path) &&
+           fs::exists(fs::path(path) / "model.onnx") &&
+           fs::exists(fs::path(path) / "genai_config.json");
+}
+
+/// Resolve model path: accepts GGUF file, ONNX dir, or directory containing either
+static std::string resolveModelPath(const std::string& path, std::string& format) {
     // Direct GGUF file
     if (path.size() > 5 && path.substr(path.size() - 5) == ".gguf") {
-        if (fs::exists(path)) return path;
+        if (fs::exists(path)) { format = "gguf"; return path; }
     }
 
-    // Directory: search for GGUF files inside
+    // ONNX directory (contains model.onnx + genai_config.json)
+    if (isOnnxDir(path)) {
+        format = "onnx";
+        return path;
+    }
+
+    // Directory: search for GGUF files or ONNX subdirs
     if (fs::is_directory(path)) {
+        // Check for ONNX in subdirectories
+        for (auto& entry : fs::directory_iterator(path)) {
+            if (entry.is_directory() && isOnnxDir(entry.path().string())) {
+                format = "onnx";
+                return entry.path().string();
+            }
+        }
+
+        // Search for GGUF files
         std::string bestQ8, bestQ4, first;
         for (auto& entry : fs::recursive_directory_iterator(path)) {
             if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
@@ -49,14 +73,15 @@ static std::string resolveModelPath(const std::string& path) {
                     bestQ4 = entry.path().string();
             }
         }
-        if (!bestQ8.empty()) return bestQ8;
-        if (!bestQ4.empty()) return bestQ4;
-        if (!first.empty()) return first;
+        if (!bestQ8.empty()) { format = "gguf"; return bestQ8; }
+        if (!bestQ4.empty()) { format = "gguf"; return bestQ4; }
+        if (!first.empty())  { format = "gguf"; return first; }
 
-        fprintf(stderr, "No GGUF file found in: %s\n", path.c_str());
+        fprintf(stderr, "No GGUF or ONNX model found in: %s\n", path.c_str());
     }
 
-    return path;  // return as-is, let GGUF loader report the error
+    format = "gguf";
+    return path;  // return as-is, let loader report the error
 }
 
 int main(int argc, char* argv[]) {
@@ -89,17 +114,21 @@ int main(int argc, char* argv[]) {
 
     if (gguf_path.empty()) {
         fprintf(stderr,
-            "Backpack Runtime -- WebGPU inference from GGUF models\n\n"
+            "Backpack Runtime -- WebGPU inference from GGUF/ONNX models\n\n"
             "Usage: %s --model <model.gguf or model-dir/>\n"
             "  [--prompt <text>] [--max-tokens <n>] [--backend vulkan|d3d12]\n"
             "  [--profile] [--benchmark] [--bench-detail]\n"
-            "  [--bench-prompt-len <n>] [--bench-gen-tokens <n>]\n",
+            "  [--bench-prompt-len <n>] [--bench-gen-tokens <n>]\n\n"
+            "Supports:\n"
+            "  - GGUF files (Q8_0 quantization)\n"
+            "  - ONNX directories (model.onnx + genai_config.json)\n",
             argv[0]);
         return 1;
     }
 
-    // Resolve model path (directory -> find GGUF inside)
-    gguf_path = resolveModelPath(gguf_path);
+    // Resolve model path and detect format
+    std::string modelFormat;
+    gguf_path = resolveModelPath(gguf_path, modelFormat);
 
     WGPUBackendType backend = WGPUBackendType_Vulkan;
     if (backend_str == "d3d12") backend = WGPUBackendType_D3D12;
@@ -115,7 +144,15 @@ int main(int argc, char* argv[]) {
     // 2. Load model
     ModelRunner model;
     auto t0 = std::chrono::steady_clock::now();
-    if (!model.load(gpu, gguf_path)) {
+    bool loadOk = false;
+    if (modelFormat == "onnx") {
+        printf("Loading ONNX model: %s\n", gguf_path.c_str());
+        loadOk = model.loadOnnx(gpu, gguf_path);
+    } else {
+        printf("Loading GGUF model: %s\n", gguf_path.c_str());
+        loadOk = model.load(gpu, gguf_path);
+    }
+    if (!loadOk) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
@@ -135,11 +172,29 @@ int main(int argc, char* argv[]) {
                model.autoDecodeDispatches.size() / submitGroups);
     }
 
-    // 3. Load tokenizer from same GGUF
-    Tokenizer tokenizer;
-    if (!tokenizer.load(model.gguf)) {
-        fprintf(stderr, "Failed to load tokenizer\n");
-        return 1;
+    // 3. Load tokenizer
+    Tokenizer ggufTokenizer;
+    OnnxTokenizer onnxTokenizer;
+    int32_t eos_token_id;
+    auto encodeFn = [&](const std::string& text) -> std::vector<int32_t> {
+        return (modelFormat == "onnx") ? onnxTokenizer.encode(text) : ggufTokenizer.encode(text);
+    };
+    auto decodeTokenFn = [&](int32_t id) -> std::string {
+        return (modelFormat == "onnx") ? onnxTokenizer.decode_token(id) : ggufTokenizer.decode_token(id);
+    };
+
+    if (modelFormat == "onnx") {
+        if (!onnxTokenizer.load(gguf_path)) {
+            fprintf(stderr, "Failed to load ONNX tokenizer\n");
+            return 1;
+        }
+        eos_token_id = onnxTokenizer.eos_token_id;
+    } else {
+        if (!ggufTokenizer.load(model.gguf)) {
+            fprintf(stderr, "Failed to load tokenizer\n");
+            return 1;
+        }
+        eos_token_id = ggufTokenizer.eos_token_id;
     }
 
     // 4. Enable profiling if requested
@@ -284,7 +339,7 @@ int main(int argc, char* argv[]) {
     }
 
     // 6. Tokenize prompt
-    auto promptTokens = tokenizer.encode(prompt);
+    auto promptTokens = encodeFn(prompt);
 
     printf("Prompt: \"%s\"\n", prompt.c_str());
     printf("Tokens (%zu): ", promptTokens.size());
@@ -323,9 +378,9 @@ int main(int argc, char* argv[]) {
     // Reset GPU timing counters for decode-only measurement
     memset(&gpu.timing, 0, sizeof(gpu.timing));
 
-    if (nextToken != tokenizer.eos_token_id && max_tokens > 0) {
+    if (nextToken != eos_token_id && max_tokens > 0) {
         generated.push_back(nextToken);
-        printf("%s", tokenizer.decode_token(nextToken).c_str());
+        printf("%s", decodeTokenFn(nextToken).c_str());
         fflush(stdout);
 
         const int DEPTH = model.decodePoolDepth;
@@ -355,12 +410,12 @@ int main(int argc, char* argv[]) {
             total_read_ns += (tr1 - tr0).count(); read_count++;
             completed++;
 
-            if (nextToken == tokenizer.eos_token_id) { eos = true; break; }
+            if (nextToken == eos_token_id) { eos = true; break; }
 
             // Print + submit next (reusing the just-freed slot)
             auto tp0 = hrc::now();
             generated.push_back(nextToken);
-            printf("%s", tokenizer.decode_token(nextToken).c_str());
+            printf("%s", decodeTokenFn(nextToken).c_str());
             fflush(stdout);
             auto tp1 = hrc::now();
             total_print_ns += (tp1 - tp0).count();

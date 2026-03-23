@@ -1,15 +1,46 @@
 # C++ LLM Application
 #
-# The C++ LLM app is built as part of the C++ runtime (runtimes/cpp/).
-# The entry point is runtimes/cpp/runtime.cpp which contains the
-# prompt->generate loop, streaming output, and profiling.
+# End-to-end text generation using the Backpack public API (backpack.h).
+# Supports all architectures (Phi-4, Qwen, LLaMA, etc.) in GGUF and ONNX.
 #
-# Build:
+# ─── Build ────────────────────────────────────────────────────────────────
+#
 #   cd gitignore/runtimes/cpp/build
 #   cmake ../../../../runtimes/cpp
 #   cmake --build . --config Release
 #
-# Run:
-#   ./Release/backpack_runtime --model path/to/model.gguf --prompt "Hello"
-#   ./Release/backpack_runtime --model path/to/model.gguf --max-tokens 100
-#   ./Release/backpack_runtime --model path/to/model.gguf --profile
+# This produces:
+#   backpack_llm       - LLM application (this app)
+#   backpack_runtime   - Low-level CLI (advanced profiling/benchmarks)
+#   backpack.lib       - Static library (for custom apps)
+#
+# ─── Usage ────────────────────────────────────────────────────────────────
+#
+# Chat with Phi-4 (ONNX):
+#   ./Release/backpack_llm --model E:/ai-models/phi-4/ --chat "What is 2+2?"
+#
+# Raw prompt:
+#   ./Release/backpack_llm --model models/qwen-3/ --prompt "Once upon a time"
+#
+# Benchmark:
+#   ./Release/backpack_llm --model models/phi-4/ --benchmark
+#
+# All options:
+#   --model <path>       Model path (GGUF file, GGUF dir, or ONNX dir)
+#   --prompt <text>      Raw text prompt
+#   --chat <message>     Chat message (auto-wrapped in ChatML template)
+#   --max-tokens <n>     Max tokens to generate (default: 100)
+#   --backend <name>     GPU backend: vulkan, d3d12, metal
+#   --benchmark          Run prefill+decode benchmark
+#   --profile            Enable GPU timestamp profiling
+#
+# ─── API Quick Start ──────────────────────────────────────────────────────
+#
+#   #include "backpack.h"
+#
+#   auto* model = bp_model_load("models/phi-4/");
+#   auto* ctx   = bp_context_create(model);
+#   bp_generate(ctx, "Hello!", {.maxTokens = 50},
+#       [](const std::string& t) { printf("%s", t.c_str()); return true; });
+#   bp_context_free(ctx);
+#   bp_model_free(model);

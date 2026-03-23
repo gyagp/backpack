@@ -4,10 +4,10 @@ ONNX model loader for the Python runtime.
 
 Loads ONNX GenAI models (like phi-4-mini) directly for inference.
 Extracts model config from genai_config.json, tokenizer from
-tokenizer.json, and Q4 weights from model.onnx + model.onnx.data.
+tokenizer.json, and quantized weights from model.onnx + model.onnx.data.
 
 Supports:
-  - MatMulNBits (4-bit per-group quantized matmul)
+  - MatMulNBits (4-bit and 8-bit per-group quantized matmul)
   - GatherBlockQuantized (quantized embedding)
   - GroupQueryAttention (fused GQA + RoPE)
   - SkipSimplifiedLayerNormalization (fused residual + RMSNorm)
@@ -15,10 +15,7 @@ Supports:
 
 import json
 import os
-import struct
-import sys
-import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -198,7 +195,7 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
     # Extract per-layer weights from the graph
     for node in g.node:
         if node.op_type == "MatMulNBits":
-            # Q4 quantized matmul
+            # Quantized matmul (Q4 or Q8)
             out_name = node.output[0]
             w_name = node.input[1]
             s_name = node.input[2]
@@ -211,8 +208,8 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
             # Convert weight tensor
             w_init = init_map[w_name]
             s_init = init_map[s_name]
-            w_data = numpy_helper.to_array(w_init)  # [N, K/block_size, block_size/2]
-            s_data = numpy_helper.to_array(s_init)  # [N, K/block_size] fp16
+            w_data = numpy_helper.to_array(w_init)
+            s_data = numpy_helper.to_array(s_init)
 
             # Determine the backpack weight name from ONNX naming
             bp_name = _onnx_name_to_backpack(w_name, n_embd, q_dim, kv_dim, qkv_out)
@@ -222,6 +219,7 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
                 out[bp_name + ".q4_K"] = K
                 out[bp_name + ".q4_N"] = N
                 out[bp_name + ".q4_block_size"] = block_size
+                out[bp_name + ".q_bits"] = bits
 
                 # Infer intermediate_size from gate/up projections
                 if "gate_up_proj" in bp_name or "gate_proj" in bp_name:
@@ -300,9 +298,9 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
         n_vocab_actual = raw.shape[0]
         if scales is not None:
             n_groups = raw.shape[1]
-            # INT8 dequant: raw is unsigned uint8, interpret as int8
-            raw_i8 = raw.view(np.int8).astype(np.float32)
-            raw_flat = raw_i8.reshape(n_vocab_actual, -1)  # [V, K]
+            # Unsigned uint8 with zero_point=128 (symmetric around 128)
+            raw_centered = (raw.astype(np.int16) - 128).astype(np.float32)
+            raw_flat = raw_centered.reshape(n_vocab_actual, -1)  # [V, K]
             K = raw_flat.shape[1]
             scales_f32 = scales.astype(np.float32)  # [V, n_groups]
             # Expand scales to match each block
@@ -340,16 +338,12 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
                 k = out.pop(k_key + suffix)
                 v = out.pop(v_key + suffix)
                 out[qkv_key + suffix] = np.concatenate([q, k, v], axis=0)
-            for suffix in [".q4_K", ".q4_N", ".q4_block_size"]:
+            for suffix in [".q4_K", ".q4_N", ".q4_block_size", ".q_bits"]:
                 q_val = out.pop(q_key + suffix, None)
                 out.pop(k_key + suffix, None)
                 out.pop(v_key + suffix, None)
                 if q_val is not None:
                     out[qkv_key + suffix] = q_val
-            # Sum N for K and block_size reuse
-            if qkv_key + ".q4_N" in out:
-                # Recalculate total N
-                pass  # concatenation handles it
 
         # Try fp16 fusion
         elif q_key in out and k_key in out and v_key in out:
@@ -378,34 +372,44 @@ def load_onnx_weights(model_dir: str, cfg: dict) -> Dict[str, np.ndarray]:
             out.pop(up_key + ".q4_K", None)
             out.pop(gate_key + ".q4_block_size", None)
             out.pop(up_key + ".q4_block_size", None)
+            gate_bits = out.pop(gate_key + ".q_bits", 4)
+            out.pop(up_key + ".q_bits", None)
             out[gu_key + ".q4_K"] = K
             out[gu_key + ".q4_N"] = N_gate + N_up
             out[gu_key + ".q4_block_size"] = 32
+            out[gu_key + ".q_bits"] = gate_bits
 
             if cfg["intermediate_size"] == 0:
                 cfg["intermediate_size"] = N_gate
 
-    # Dequantize Q4 weights to fp16 for the runtime
-    # (Q4 GPU kernels can be added later for better perf)
+    # Dequantize quantized weights to fp16 for the runtime
     q4_keys = [k.replace(".q4", "") for k in list(out.keys()) if k.endswith(".q4")]
     for base_key in q4_keys:
-        q4_data = out.pop(base_key + ".q4")       # [N, n_groups, block_size/2] uint8
+        q_data = out.pop(base_key + ".q4")
         scales = out.pop(base_key + ".q4_scales")  # [N, n_groups] fp16
         K = out.pop(base_key + ".q4_K", None)
         N = out.pop(base_key + ".q4_N", None)
         out.pop(base_key + ".q4_block_size", None)
+        bits = out.pop(base_key + ".q_bits", 4)
 
-        # Unpack 4-bit: each byte has 2 nibbles (low nibble = first element)
-        n_rows = q4_data.shape[0]
-        n_groups = q4_data.shape[1]
-        block_half = q4_data.shape[2]  # block_size / 2
+        n_rows = q_data.shape[0]
+        n_groups = q_data.shape[1]
 
-        low = (q4_data & 0x0F).astype(np.int8) - 8   # [-8, 7]
-        high = (q4_data >> 4).astype(np.int8) - 8
-        # Interleave per-byte: byte[i] → [value[2i], value[2i+1]]
-        unpacked = np.empty((n_rows, n_groups, block_half * 2), dtype=np.int8)
-        unpacked[:, :, 0::2] = low
-        unpacked[:, :, 1::2] = high
+        if bits == 8:
+            # Q8: each byte is one unsigned uint8 value with zero_point=128
+            # q_data shape: [N, n_groups, block_size] uint8
+            unpacked = (q_data.astype(np.int16) - 128).reshape(n_rows, n_groups, -1)
+        else:
+            # Q4: each byte has 2 nibbles (interleaved format)
+            # byte[j] stores: element[2j] in low nibble, element[2j+1] in high nibble
+            # Values are unsigned uint4 with zero_point=8: value = nibble - 8
+            # q_data shape: [N, n_groups, block_size/2] uint8
+            block_half = q_data.shape[2]
+            low = (q_data & 0x0F).astype(np.int8) - 8   # [-8, 7]
+            high = (q_data >> 4).astype(np.int8) - 8
+            unpacked = np.empty((n_rows, n_groups, block_half * 2), dtype=np.int8)
+            unpacked[:, :, 0::2] = low
+            unpacked[:, :, 1::2] = high
 
         # Dequantize
         scales_f32 = scales.astype(np.float32)[:, :, None]  # [N, n_groups, 1]
@@ -421,7 +425,9 @@ def _onnx_name_to_backpack(onnx_name: str, n_embd: int, q_dim: int,
                             kv_dim: int, qkv_out: int) -> Optional[str]:
     """Map ONNX weight names to backpack naming convention."""
     # model.layers.0.attn.qkv_proj.MatMul.weight_Q4G32 -> layers.0.self_attn.qkv_proj.weight
-    parts = onnx_name.replace("MatMul.", "").replace(".weight_Q4G32", "").replace(".weight_scale", "")
+    # lm_head.MatMul.weight_Q8G32 -> lm_head.weight
+    parts = onnx_name.replace("MatMul.", "").replace(".weight_Q4G32", "")
+    parts = parts.replace(".weight_Q8G32", "").replace(".weight_scale", "")
     parts = parts.replace("model.", "")
 
     # Map ONNX names to our convention
@@ -457,6 +463,9 @@ def _onnx_name_to_backpack(onnx_name: str, n_embd: int, q_dim: int,
 def _onnx_norm_to_backpack(onnx_name: str) -> Optional[str]:
     """Map ONNX norm weight names to backpack convention."""
     name = onnx_name.replace("model.", "")
+    # Final norm (e.g. model.layers.32.final_norm_layernorm.weight)
+    if "final_norm" in name:
+        return "norm.weight"
     if "input_layernorm" in name:
         parts = name.split('.')
         for i, p in enumerate(parts):

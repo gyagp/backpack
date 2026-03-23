@@ -1,12 +1,14 @@
 #pragma once
 /**
- * model_runner.h — GGUF-driven model inference runtime.
+ * model_runner.h — Model inference runtime (GGUF + ONNX).
  *
- * Reads model architecture directly from GGUF metadata.
+ * Reads model architecture from GGUF metadata or ONNX genai_config.json.
  * Loads WGSL kernels from embedded shader constants.
  * No manifest.json or external kernel files needed.
  *
- * Supports any llama.cpp-compatible GGUF model with Q8_0 quantization.
+ * Supports:
+ *   - Any llama.cpp-compatible GGUF model with Q8_0 quantization
+ *   - ONNX GenAI models (e.g. Phi-4-mini) with Q4/Q8 quantization
  */
 
 #include "gpu_context.h"
@@ -134,8 +136,14 @@ struct ModelRunner {
     GPUProfiler* profiler = nullptr;
     struct ClockCalibration* calibration = nullptr;
 
+    // ONNX-specific: partial RoPE and pre-computed tables
+    uint32_t rotaryDim = 0;         // 0 = full RoPE (rotaryDim == headDim)
+    bool hasPrecomputedRope = false; // true = use ONNX cos/sin cache
+    std::string modelFormat;        // "gguf" or "onnx"
+
     // --- API ---
     bool load(GPUContext& ctx, const std::string& ggufPath);
+    bool loadOnnx(GPUContext& ctx, const std::string& onnxDir);
     std::string ggufPath;  // stored for profile output location
     std::vector<float> decode(int32_t tokenId, uint32_t posOffset);
     int32_t decodeArgmax(int32_t tokenId, uint32_t posOffset);
@@ -177,6 +185,8 @@ private:
     void initPrefillResources();
 
     const CompiledPipeline& getKernel(const std::string& name);
+    const CompiledPipeline& getKernelHD(const std::string& name);
+    std::string patchShaderHD(const char* source) const;
     WGPUBindGroup makeBG(const CompiledPipeline& pl,
                          const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
     void applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,

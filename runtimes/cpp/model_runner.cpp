@@ -1,4 +1,5 @@
 #include "model_runner.h"
+#include "onnx_loader.h"
 #include "wgsl_shaders.h"
 #include "clock_calibration.h"
 #include "profile_html.h"
@@ -102,6 +103,123 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
                                      it->second.numBindings);
 }
 
+// ─── HD-patched kernel loading ───────────────────────────────────────────────
+
+std::string ModelRunner::patchShaderHD(const char* source) const {
+    std::string s(source);
+    uint32_t hd = cfg.headDim;
+    if (hd == 128) return s;  // no patching needed
+
+    // Replace "const HD: u32 = 128u;" with actual value
+    {
+        const char* pat = "const HD: u32 = 128u;";
+        std::string rep = "const HD: u32 = " + std::to_string(hd) + "u;";
+        auto pos = s.find(pat);
+        if (pos != std::string::npos)
+            s.replace(pos, strlen(pat), rep);
+    }
+
+    // HD_PER_THREAD: for 32-thread kernels, HD/32. Must divide evenly.
+    if (hd % 32 == 0) {
+        uint32_t hpt = hd / 32;
+        {
+            const char* pat = "const HD_PER_THREAD: u32 = 4u;";
+            std::string rep = "const HD_PER_THREAD: u32 = " + std::to_string(hpt) + "u;";
+            auto pos = s.find(pat);
+            if (pos != std::string::npos)
+                s.replace(pos, strlen(pat), rep);
+        }
+
+        // For unrolled 4-element load/store patterns, replace with loop.
+        // Pattern: "let q0 = Q[...]; let q1 = Q[... + 1u]; let q2 = Q[... + 2u]; let q3 = Q[... + 3u];"
+        // Replace with HD_PER_THREAD-element loop.
+        // This is complex to do via string replacement, so for HD_PER_THREAD != 4,
+        // we use the generic gqa_fused_attn kernel instead of gqa_chunked.
+    }
+
+    // HD_TILES = HD / 16 (flash_attn_vulkan)
+    {
+        const char* pat = "const HD_TILES: u32 = 8u;";
+        if (hd % 16 == 0) {
+            uint32_t hdt = hd / 16;
+            std::string rep = "const HD_TILES: u32 = " + std::to_string(hdt) + "u;";
+            auto pos = s.find(pat);
+            if (pos != std::string::npos)
+                s.replace(pos, strlen(pat), rep);
+        }
+    }
+
+    // HALF = HD / 2 (rope_batched_simple)
+    {
+        const char* pat = "const HALF: u32 = 64u;";
+        uint32_t half = hd / 2;
+        std::string rep = "const HALF: u32 = " + std::to_string(half) + "u;";
+        auto pos = s.find(pat);
+        if (pos != std::string::npos)
+            s.replace(pos, strlen(pat), rep);
+    }
+
+    // Local variable arrays sized to HD
+    {
+        std::string pat = "array<f32, 128>";
+        std::string rep = "array<f32, " + std::to_string(hd) + ">";
+        size_t pos = 0;
+        while ((pos = s.find(pat, pos)) != std::string::npos) {
+            s.replace(pos, pat.size(), rep);
+            pos += rep.size();
+        }
+    }
+
+    // Shared memory: out_acc for flash_attn (BQ=16 × HD)
+    {
+        const char* pat = "array<f32, 2048>";
+        std::string rep = "array<f32, " + std::to_string(16 * hd) + ">";
+        auto pos = s.find(pat);
+        if (pos != std::string::npos)
+            s.replace(pos, strlen(pat), rep);
+    }
+
+    // Triton-generated kernel: literal "* 128;" and "f32(128.0)"
+    {
+        std::string pat1 = "* 128;";
+        std::string rep1 = "* " + std::to_string(hd) + ";";
+        size_t pos = 0;
+        while ((pos = s.find(pat1, pos)) != std::string::npos) {
+            s.replace(pos, pat1.size(), rep1);
+            pos += rep1.size();
+        }
+    }
+    {
+        std::string pat2 = "f32(128.0)";
+        std::string rep2 = "f32(" + std::to_string(hd) + ".0)";
+        size_t pos = 0;
+        while ((pos = s.find(pat2, pos)) != std::string::npos) {
+            s.replace(pos, pat2.size(), rep2);
+            pos += rep2.size();
+        }
+    }
+
+    return s;
+}
+
+const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
+    if (cfg.headDim == 128) return getKernel(name);
+
+    // Patched pipeline: keyed by name + "_HD" + headDim
+    std::string patchedName = name + "_HD" + std::to_string(cfg.headDim);
+
+    auto& kernels = getEmbeddedKernels();
+    auto it = kernels.find(name);
+    if (it == kernels.end()) {
+        fprintf(stderr, "Kernel not found: %s\n", name.c_str());
+        exit(1);
+    }
+
+    std::string patchedSource = patchShaderHD(it->second.source);
+    return gpu->getOrCreatePipeline(patchedName, patchedSource,
+                                     it->second.numBindings);
+}
+
 // ─── fp16 conversion helpers ─────────────────────────────────────────────────
 
 static float fp16_to_f32(uint16_t h) {
@@ -146,6 +264,7 @@ static void uploadQ8Weight(GPUContext& gpu, const std::string& name,
 bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     gpu = &ctx;
     ggufPath = path;
+    modelFormat = "gguf";
 
     // Parse GGUF (metadata + tensor index)
     if (!gguf.open(ggufPath)) {
@@ -186,6 +305,199 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     // Build decode pipeline
     buildDecodePipeline();
 
+    return true;
+}
+
+// ─── Load ONNX model ─────────────────────────────────────────────────────────
+
+bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
+    gpu = &ctx;
+    ggufPath = onnxDir;
+    modelFormat = "onnx";
+
+    // 1. Load ONNX model (parse protobuf, extract & repack weights)
+    OnnxLoadResult onnx;
+    if (!loadOnnxModel(onnxDir, onnx)) {
+        fprintf(stderr, "Failed to load ONNX model from: %s\n", onnxDir.c_str());
+        return false;
+    }
+
+    cfg = onnx.cfg;
+    rotaryDim = onnx.rotaryDim;
+    hasPrecomputedRope = onnx.hasPrecomputedRope;
+
+    printf("Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u) [ONNX]\n",
+           cfg.arch.c_str(), cfg.nLayer, cfg.nEmbd, cfg.headDim,
+           cfg.nVocab, cfg.nKvHeads);
+    printf("  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
+           cfg.ropeTheta, cfg.rmsNormEps,
+           cfg.hasQkNorm ? "yes" : "no");
+    if (rotaryDim > 0 && rotaryDim != cfg.headDim)
+        printf("  Partial RoPE: rotary_dim=%u (head_dim=%u)\n", rotaryDim, cfg.headDim);
+    if (cfg.headDim != 128 && cfg.headDim % 32 == 0)
+        printf("  Note: head_dim=%u (attention kernels will be HD-patched)\n", cfg.headDim);
+    if (cfg.headDim % 32 != 0) {
+        fprintf(stderr, "Error: head_dim=%u is not a multiple of 32\n", cfg.headDim);
+        return false;
+    }
+
+    passPerDispatch = false;
+    printf("  Backend: %s, single-pass dispatch\n",
+           gpu->backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan");
+
+    // 2. Upload weights to GPU
+    auto t0 = std::chrono::steady_clock::now();
+    printf("  Uploading weights to GPU...\n");
+
+    uint32_t qDimL = cfg.nHead * cfg.headDim;
+    uint32_t kvDimL = cfg.nKvHeads * cfg.headDim;
+    uint32_t qkvOutL = qDimL + 2 * kvDimL;
+
+    // Zero bias buffers
+    uint32_t maxBias = std::max({cfg.nEmbd, qkvOutL,
+                                 2 * cfg.intermediateSize, cfg.nVocab});
+    std::vector<float> zeros(maxBias, 0.0f);
+    zeroBiasE   = gpu->createBuffer("zero_bias_E", cfg.nEmbd * 4);
+    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", qkvOutL * 4);
+    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * cfg.intermediateSize * 4);
+    zeroBiasV   = gpu->createBuffer("zero_bias_V", cfg.nVocab * 4);
+    gpu->writeBuffer(zeroBiasE,   zeros.data(), cfg.nEmbd * 4);
+    gpu->writeBuffer(zeroBiasQKV, zeros.data(), qkvOutL * 4);
+    gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * cfg.intermediateSize * 4);
+    gpu->writeBuffer(zeroBiasV,   zeros.data(), cfg.nVocab * 4);
+
+    // KV cache
+    kvCache.resize(cfg.nLayer);
+    uint64_t kvSize = (uint64_t)maxSeqLen * cfg.nKvHeads * cfg.headDim * 2;
+    for (uint32_t i = 0; i < cfg.nLayer; i++) {
+        kvCache[i].K = gpu->createBuffer("kv_K_" + std::to_string(i), kvSize);
+        kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
+        kvCache[i].len = 0;
+    }
+    printf("  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
+
+    // Per-layer weights
+    layerWeights.resize(cfg.nLayer);
+    for (uint32_t i = 0; i < cfg.nLayer; i++) {
+        auto& lw = layerWeights[i];
+        auto& ld = onnx.layers[i];
+
+        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", ld.qkv, lw.qkvW, lw.qkvS);
+        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
+        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
+        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", ld.down, lw.dnW, lw.dnS);
+
+        // Norm weights
+        if (!ld.inputNorm.empty()) {
+            lw.inputNorm = gpu->createBuffer("L" + std::to_string(i) + ".inorm",
+                                              ld.inputNorm.size() * 4);
+            gpu->writeBuffer(lw.inputNorm, ld.inputNorm.data(), ld.inputNorm.size() * 4);
+        }
+        if (!ld.postAttnNorm.empty()) {
+            lw.postAttnNorm = gpu->createBuffer("L" + std::to_string(i) + ".panorm",
+                                                 ld.postAttnNorm.size() * 4);
+            gpu->writeBuffer(lw.postAttnNorm, ld.postAttnNorm.data(), ld.postAttnNorm.size() * 4);
+        }
+        // QK norm (optional)
+        if (!ld.qNorm.empty()) {
+            lw.qNorm = gpu->createBuffer("L" + std::to_string(i) + ".qnorm",
+                                          ld.qNorm.size() * 4);
+            gpu->writeBuffer(lw.qNorm, ld.qNorm.data(), ld.qNorm.size() * 4);
+        }
+        if (!ld.kNorm.empty()) {
+            lw.kNorm = gpu->createBuffer("L" + std::to_string(i) + ".knorm",
+                                          ld.kNorm.size() * 4);
+            gpu->writeBuffer(lw.kNorm, ld.kNorm.data(), ld.kNorm.size() * 4);
+        }
+
+        if (i % 7 == 6 || i == cfg.nLayer - 1)
+            printf("  uploaded layer %u/%u\n", i + 1, cfg.nLayer);
+    }
+
+    // Final norm
+    if (!onnx.finalNorm.empty()) {
+        finalNormW = gpu->createBuffer("final_norm", onnx.finalNorm.size() * 4);
+        gpu->writeBuffer(finalNormW, onnx.finalNorm.data(), onnx.finalNorm.size() * 4);
+    }
+
+    // Embedding
+    embeddingCPU = std::move(onnx.embeddingCPU);
+    printf("  Embedding: %u × %u (fp32)\n", cfg.nVocab, cfg.nEmbd);
+
+    // LM head
+    if (onnx.hasLmHeadQ8) {
+        uploadQ8Weight(*gpu, "lm_head_q8", onnx.lmHeadQ8, lmHeadQ8W, lmHeadQ8S);
+        lmHeadIsQ8 = true;
+        printf("  LM head: separate (Q8)\n");
+    } else if (cfg.tieWordEmbeddings) {
+        // Build Q8 LM head from embedding table
+        uint32_t nBlocksPerRow = (cfg.nEmbd + 31) / 32;
+        size_t totalBlocks = (size_t)cfg.nVocab * nBlocksPerRow;
+        struct Q8B { uint16_t d; int8_t qs[32]; };
+        std::vector<Q8B> blocks(totalBlocks);
+        for (uint32_t row = 0; row < cfg.nVocab; row++) {
+            for (uint32_t blk = 0; blk < nBlocksPerRow; blk++) {
+                auto& b = blocks[row * nBlocksPerRow + blk];
+                float maxAbs = 0.0f;
+                for (int q = 0; q < 32; q++) {
+                    uint32_t col = blk * 32 + q;
+                    float v = (col < cfg.nEmbd) ? embeddingCPU[row * cfg.nEmbd + col] : 0.0f;
+                    maxAbs = std::max(maxAbs, std::abs(v));
+                }
+                float scale = maxAbs / 127.0f;
+                float inv = (scale > 0) ? 1.0f / scale : 0.0f;
+                uint32_t fb; memcpy(&fb, &scale, 4);
+                uint32_t s16 = (fb >> 16) & 0x8000;
+                int32_t e = ((fb >> 23) & 0xFF) - 112;
+                uint32_t m = (fb >> 13) & 0x3FF;
+                if (e <= 0) b.d = (uint16_t)s16;
+                else if (e > 30) b.d = (uint16_t)(s16 | 0x7C00);
+                else b.d = (uint16_t)(s16 | (e << 10) | m);
+                for (int q = 0; q < 32; q++) {
+                    uint32_t col = blk * 32 + q;
+                    float v = (col < cfg.nEmbd) ? embeddingCPU[row * cfg.nEmbd + col] : 0.0f;
+                    int iv = (int)roundf(v * inv);
+                    iv = std::max(-128, std::min(127, iv));
+                    b.qs[q] = (int8_t)iv;
+                }
+            }
+        }
+        auto rep = repack_q8_0(blocks.data(), cfg.nVocab, nBlocksPerRow * 32);
+        uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
+        lmHeadIsQ8 = true;
+        printf("  LM head: tied embeddings (Q8)\n");
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    printf("  Weights uploaded in %lldms\n", (long long)ms);
+
+    // 3. RoPE tables
+    if (hasPrecomputedRope && !onnx.ropeCos.empty()) {
+        // Upload pre-computed ONNX cos/sin tables
+        uint32_t ropeHalf = onnx.ropeHalfDim;
+        uint32_t maxPos = std::min(onnx.ropeMaxPositions, maxSeqLen);
+        uint64_t ropeBytes = (uint64_t)maxPos * ropeHalf * 4;
+        ropeCosBuf = gpu->createBuffer("rope_cos", ropeBytes);
+        ropeSinBuf = gpu->createBuffer("rope_sin", ropeBytes);
+        // Only upload up to maxSeqLen positions
+        if (onnx.ropeMaxPositions > maxSeqLen) {
+            // Truncate
+            gpu->writeBuffer(ropeCosBuf, onnx.ropeCos.data(), ropeBytes);
+            gpu->writeBuffer(ropeSinBuf, onnx.ropeSin.data(), ropeBytes);
+        } else {
+            gpu->writeBuffer(ropeCosBuf, onnx.ropeCos.data(), ropeBytes);
+            gpu->writeBuffer(ropeSinBuf, onnx.ropeSin.data(), ropeBytes);
+        }
+        printf("  Using ONNX RoPE cache: %u positions × %u half-dim\n",
+               maxPos, ropeHalf);
+    }
+    computeRopeTables();
+
+    // 4. Build decode pipeline (identical to GGUF path from here)
+    buildDecodePipeline();
+
+    fprintf(stderr, "[onnx] loadOnnx complete\n"); fflush(stderr);
     return true;
 }
 
@@ -406,20 +718,23 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 // ─── RoPE tables ─────────────────────────────────────────────────────────────
 
 void ModelRunner::computeRopeTables() {
-    uint32_t half = cfg.headDim / 2;
-    std::vector<float> cosTable(maxSeqLen * half), sinTable(maxSeqLen * half);
+    // For ONNX models with pre-computed RoPE tables, upload directly
+    if (hasPrecomputedRope) return;  // already uploaded in loadOnnx()
+
+    uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
+    std::vector<float> cosTable(maxSeqLen * ropeHalf), sinTable(maxSeqLen * ropeHalf);
     for (uint32_t pos = 0; pos < maxSeqLen; pos++) {
-        for (uint32_t i = 0; i < half; i++) {
-            float freq = 1.0f / powf(cfg.ropeTheta, (float)(2 * i) / cfg.headDim);
+        for (uint32_t i = 0; i < ropeHalf; i++) {
+            float freq = 1.0f / powf(cfg.ropeTheta, (float)(2 * i) / (rotaryDim > 0 ? rotaryDim : cfg.headDim));
             float angle = pos * freq;
-            cosTable[pos * half + i] = cosf(angle);
-            sinTable[pos * half + i] = sinf(angle);
+            cosTable[pos * ropeHalf + i] = cosf(angle);
+            sinTable[pos * ropeHalf + i] = sinf(angle);
         }
     }
-    ropeCosBuf = gpu->createBuffer("rope_cos", maxSeqLen * half * 4);
-    ropeSinBuf = gpu->createBuffer("rope_sin", maxSeqLen * half * 4);
-    gpu->writeBuffer(ropeCosBuf, cosTable.data(), maxSeqLen * half * 4);
-    gpu->writeBuffer(ropeSinBuf, sinTable.data(), maxSeqLen * half * 4);
+    ropeCosBuf = gpu->createBuffer("rope_cos", maxSeqLen * ropeHalf * 4);
+    ropeSinBuf = gpu->createBuffer("rope_sin", maxSeqLen * ropeHalf * 4);
+    gpu->writeBuffer(ropeCosBuf, cosTable.data(), maxSeqLen * ropeHalf * 4);
+    gpu->writeBuffer(ropeSinBuf, sinTable.data(), maxSeqLen * ropeHalf * 4);
 }
 
 // ─── Build decode pipeline ───────────────────────────────────────────────────
@@ -457,9 +772,9 @@ void ModelRunner::buildDecodePipeline() {
     printf("  Subgroup matrix: %s\n",
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
-    auto& plFusedRope  = getKernel("fused_qknorm_rope");
-    auto& plChunkP1    = getKernel("gqa_chunked_pass1");
-    auto& plChunkP2    = getKernel("gqa_chunked_pass2");
+    auto& plFusedRope  = getKernelHD("fused_qknorm_rope");
+    auto& plChunkP1    = getKernelHD("gqa_chunked_pass1");
+    auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
     auto& plFp16Gemm   = getKernel("fp16_gemm");
     auto& plFp16Wide   = getKernel("fp16_gemm_wide");
     auto& plArgmax     = getKernel("argmax");
@@ -554,8 +869,9 @@ void ModelRunner::buildDecodePipeline() {
     ropeParamData.resize(32, 0);
     {
         auto* p = reinterpret_cast<int32_t*>(ropeParamData.data());
+        uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
         p[0] = cfg.nHead;  p[1] = qDim;  p[2] = kvDim;
-        p[3] = 0;  p[4] = cfg.headDim / 2;  p[5] = 0;
+        p[3] = 0;  p[4] = ropeHalf;  p[5] = 0;
         float eps = cfg.rmsNormEps;
         memcpy(&p[6], &eps, 4);
     }
@@ -858,7 +1174,7 @@ void ModelRunner::initPrefillResources() {
     // Get kernels — MMA on Vulkan, prequantized DP4A on D3D12 when available
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
-    auto& kRopeB   = getKernel("rope_batched_simple");
+    auto& kRopeB   = getKernelHD("rope_batched_simple");
 
     const auto& limits = effectiveLimits(*gpu);
     const bool canUse512ThreadKernels =
@@ -919,7 +1235,7 @@ void ModelRunner::initPrefillResources() {
         : nullptr;
     auto& kMat     = getKernel(matKernel);
     auto& kDnSilu  = getKernel(dnSiluKernel);
-    auto& kAttn    = getKernel(attnKernel);
+    auto& kAttn    = getKernelHD(attnKernel);
     printf("  Prefill tuning: mat=%s qkv/gateup=%s down=%s attn=%s tiles=%ux%u wide=%ux%u pool=%d\n",
            matKernel,
            tuning.prefillUseWidePrequant ? wideMatKernel : matKernel,
