@@ -90,8 +90,19 @@ static void opSqueeze(GraphExecutor& ex, const OnnxGraphNode& n,
     if (in.size() > 1 && in[1] && in[1]->IsValid()) {
         int64_t nel = tensorNel(in[1]);
         axes.resize(nel);
-        auto rb = ex.gpu->readBuffer(in[1]->buffer, nel * sizeof(int64_t));
-        memcpy(axes.data(), rb.data(), nel * sizeof(int64_t));
+        // Try CPU initializer first
+        auto* initData = (n.inputs.size() > 1) ? ex.GetInitData(n.inputs[1]) : nullptr;
+        if (initData && initData->data) {
+            memcpy(axes.data(), initData->data, nel * sizeof(int64_t));
+        } else {
+            if (!ex.pendingDispatches_.empty()) {
+                ex.gpu->submitOnly(ex.pendingDispatches_, false);
+                ex.gpu->waitForQueue();
+                ex.pendingDispatches_.clear();
+            }
+            auto rb = ex.gpu->readBuffer(in[1]->buffer, nel * sizeof(int64_t));
+            memcpy(axes.data(), rb.data(), nel * sizeof(int64_t));
+        }
     } else if (n.attrIntLists.count("axes")) {
         axes = n.attrIntLists.at("axes");
     }
@@ -195,8 +206,9 @@ static void opShape(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* data = in[0];
     if (!data) return;
     int ndim = (int)data->shape.size();
-    *out[0] = ex.AllocTensor({ndim}, TensorDtype::Int64);
-    ex.gpu->writeBuffer(out[0]->buffer, data->shape.data(), ndim * sizeof(int64_t));
+    // Shape output is always small — use CPU tensor (no GPU alloc/sync)
+    *out[0] = ex.AllocCpuTensor({ndim}, TensorDtype::Int64,
+                                 data->shape.data(), ndim * sizeof(int64_t));
 }
 
 static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
@@ -280,44 +292,65 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
     int ndim = (int)validIn[0]->shape.size();
     if (axis < 0) axis += ndim;
 
-    // Compute output shape
+    // Compute output shape and total bytes
     auto outShape = validIn[0]->shape;
     int64_t totalOnAxis = 0;
+    int64_t totalBytes = 0;
+    bool allSmall = true;
     for (auto* t : validIn) {
         if (axis < (int64_t)t->shape.size())
             totalOnAxis += t->shape[axis];
+        totalBytes += t->ByteSize();
+        if (t->ByteSize() > 256) allSmall = false;
     }
     if (axis < (int64_t)outShape.size())
         outShape[axis] = totalOnAxis;
 
-    // Flush pending before GPU copy
+    *out[0] = ex.AllocTensor(outShape, validIn[0]->dtype);
+
+    // For small tensors (shape metadata), use CPU concat
+    if (allSmall) {
+        if (!ex.pendingDispatches_.empty()) {
+            ex.gpu->submitOnly(ex.pendingDispatches_, false);
+            ex.gpu->waitForQueue();
+            ex.pendingDispatches_.clear();
+        }
+        std::vector<uint8_t> outData(totalBytes);
+        size_t offset = 0;
+        for (auto* t : validIn) {
+            size_t bytes = t->ByteSize();
+            auto rb = ex.gpu->readBuffer(t->buffer, bytes);
+            memcpy(outData.data() + offset, rb.data(), bytes);
+            offset += bytes;
+        }
+        ex.gpu->writeBuffer(out[0]->buffer, outData.data(), totalBytes);
+        return;
+    }
+
+    // For large tensors, use GPU buffer copy
     if (!ex.pendingDispatches_.empty()) {
         ex.gpu->submitOnly(ex.pendingDispatches_, false);
         ex.gpu->waitForQueue();
         ex.pendingDispatches_.clear();
     }
 
-    *out[0] = ex.AllocTensor(outShape, validIn[0]->dtype);
-
-    // GPU-to-GPU copy: use CopyBufferToBuffer for each input
-    // For simple concat on outer axis, data is contiguous
+    // Batch all copies into one command buffer
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(ex.gpu->device, &enD);
     size_t offset = 0;
     for (auto* t : validIn) {
         size_t bytes = t->ByteSize();
-        if (bytes > 0 && t->buffer.handle && out[0]->buffer.handle) {
-            // Use WebGPU buffer copy (GPU-side, no CPU readback)
-            WGPUCommandEncoderDescriptor enD{};
-            auto enc = wgpuDeviceCreateCommandEncoder(ex.gpu->device, &enD);
+        if (bytes > 0 && t->buffer.handle) {
             wgpuCommandEncoderCopyBufferToBuffer(enc, t->buffer.handle, 0,
                 out[0]->buffer.handle, offset, bytes);
-            WGPUCommandBufferDescriptor cbD{};
-            auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-            wgpuQueueSubmit(ex.gpu->queue, 1, &cb);
-            wgpuCommandBufferRelease(cb);
-            wgpuCommandEncoderRelease(enc);
         }
         offset += bytes;
     }
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(ex.gpu->queue, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(enc);
     ex.gpu->waitForQueue();
 }
 

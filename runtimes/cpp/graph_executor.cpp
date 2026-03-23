@@ -451,6 +451,27 @@ GpuTensor GraphExecutor::AllocTensor(const std::vector<int64_t>& shape,
     return t;
 }
 
+GpuTensor GraphExecutor::AllocCpuTensor(const std::vector<int64_t>& shape,
+                                          TensorDtype dtype,
+                                          const void* data, size_t bytes) {
+    GpuTensor t;
+    t.shape = shape;
+    t.dtype = dtype;
+    t.isCpuOnly = true;
+    t.cpuData.resize(bytes);
+    if (data) memcpy(t.cpuData.data(), data, bytes);
+    return t;
+}
+
+void GraphExecutor::EnsureGpu(GpuTensor& t) {
+    if (t.buffer.handle || !t.isCpuOnly) return;
+    size_t bytes = t.cpuData.size();
+    if (bytes == 0) bytes = 4;
+    t.buffer = gpu->createBuffer("cpu2gpu", bytes);
+    gpu->writeBuffer(t.buffer, t.cpuData.data(), t.cpuData.size());
+    t.isCpuOnly = false;
+}
+
 // ─── Pipeline / Dispatch Helpers ─────────────────────────────────────────────
 
 const CompiledPipeline& GraphExecutor::GetPipeline(const std::string& name,
@@ -512,9 +533,23 @@ void GraphExecutor::Execute(
     for (size_t ni = 0; ni < graph_.nodes.size(); ni++) {
         auto& node = graph_.nodes[ni];
 
-        if (ni < 10 || ni % 100 == 0) {
-            fprintf(stderr, "  [exec] node %zu/%zu: %s\n",
+        if (ni < 15 || ni % 100 == 0) {
+            fprintf(stderr, "  [exec] node %zu/%zu: %s",
                     ni, graph_.nodes.size(), node.opType.c_str());
+            // Print input tensor info for first few nodes
+            if (ni < 15) {
+                for (size_t ii = 0; ii < node.inputs.size() && ii < 2; ii++) {
+                    auto it = tensorStore_.find(node.inputs[ii]);
+                    if (it != tensorStore_.end() && it->second.IsValid()) {
+                        auto& t = it->second;
+                        fprintf(stderr, " in%zu=[", ii);
+                        for (size_t d = 0; d < t.shape.size(); d++)
+                            fprintf(stderr, "%s%lld", d?",":"", (long long)t.shape[d]);
+                        fprintf(stderr, "]dt%d", (int)t.dtype);
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
             fflush(stderr);
         }
 

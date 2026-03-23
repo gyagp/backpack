@@ -25,6 +25,10 @@ struct GpuTensor {
     std::vector<int64_t> shape;
     TensorDtype dtype = TensorDtype::Float32;
 
+    // CPU-side data (for small metadata tensors that don't need GPU)
+    std::vector<uint8_t> cpuData;
+    bool isCpuOnly = false;
+
     int64_t ElementCount() const {
         int64_t n = 1;
         for (auto d : shape) n *= d;
@@ -45,7 +49,7 @@ struct GpuTensor {
         return 4;
     }
 
-    bool IsValid() const { return buffer.handle != nullptr && !shape.empty(); }
+    bool IsValid() const { return (buffer.handle != nullptr || isCpuOnly) && !shape.empty(); }
 };
 
 // ─── ONNX Node ───────────────────────────────────────────────────────────────
@@ -126,6 +130,13 @@ public:
 
     /// Allocate a GPU tensor.
     GpuTensor AllocTensor(const std::vector<int64_t>& shape, TensorDtype dtype);
+
+    /// Create a CPU-only tensor (no GPU buffer). Upload to GPU lazily.
+    GpuTensor AllocCpuTensor(const std::vector<int64_t>& shape, TensorDtype dtype,
+                              const void* data, size_t bytes);
+
+    /// Ensure a tensor has a GPU buffer (uploads CPU data if needed).
+    void EnsureGpu(GpuTensor& t);
 
     /// Get or create a WGSL compute pipeline.
     const CompiledPipeline& GetPipeline(const std::string& name,
