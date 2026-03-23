@@ -49,7 +49,7 @@ struct GpuTensor {
         return 4;
     }
 
-    bool IsValid() const { return (buffer.handle != nullptr || isCpuOnly) && !shape.empty(); }
+    bool IsValid() const { return (buffer.handle != nullptr || isCpuOnly); }
 };
 
 // ─── ONNX Node ───────────────────────────────────────────────────────────────

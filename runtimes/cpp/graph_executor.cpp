@@ -109,6 +109,10 @@ struct PBTensor {
     size_t rawSize = 0;
     std::string extLocation;
     int64_t extOffset = -1, extLength = -1;
+    // Inline typed data (protobuf fields 4/5/7)
+    std::vector<float> floatData;
+    std::vector<int32_t> int32Data;
+    std::vector<int64_t> int64Data;
 };
 
 static PBTensor parseTensor(PBReader& r) {
@@ -126,6 +130,24 @@ static PBTensor parseTensor(PBReader& r) {
             case 14: // data_location
                 if (w == 0) { dataLoc = (int)r.readVarint(); }
                 else { r.skip(w); }
+                break;
+            case 4: // float_data (repeated float, packed)
+                if (w == 2) {
+                    auto sub = r.readLengthDelimited();
+                    while (!sub.eof()) { uint32_t bits = sub.readFixed32(); float fv; memcpy(&fv, &bits, 4); t.floatData.push_back(fv); }
+                } else { uint32_t bits = r.readFixed32(); float fv; memcpy(&fv, &bits, 4); t.floatData.push_back(fv); }
+                break;
+            case 5: // int32_data (repeated int32, packed)
+                if (w == 2) {
+                    auto sub = r.readLengthDelimited();
+                    while (!sub.eof()) t.int32Data.push_back((int32_t)sub.readVarint());
+                } else t.int32Data.push_back((int32_t)r.readVarint());
+                break;
+            case 7: // int64_data (repeated int64, packed)
+                if (w == 2) {
+                    auto sub = r.readLengthDelimited();
+                    while (!sub.eof()) t.int64Data.push_back((int64_t)sub.readVarint());
+                } else t.int64Data.push_back((int64_t)r.readVarint());
                 break;
             case 9: { // raw_data (bytes) — field 9 in ONNX TensorProto
                 uint64_t len = r.readVarint();
@@ -401,6 +423,26 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     // Upload initializers to GPU
     int uploaded = 0, nodata = 0;
     for (auto& t : initTensors) {
+        // Resolve inline typed data if no raw_data
+        std::vector<uint8_t> inlineDataBuf;
+        if (!t.rawData || t.rawSize == 0) {
+            if (!t.int64Data.empty()) {
+                inlineDataBuf.resize(t.int64Data.size() * 8);
+                memcpy(inlineDataBuf.data(), t.int64Data.data(), inlineDataBuf.size());
+                t.rawData = inlineDataBuf.data();
+                t.rawSize = inlineDataBuf.size();
+            } else if (!t.floatData.empty()) {
+                inlineDataBuf.resize(t.floatData.size() * 4);
+                memcpy(inlineDataBuf.data(), t.floatData.data(), inlineDataBuf.size());
+                t.rawData = inlineDataBuf.data();
+                t.rawSize = inlineDataBuf.size();
+            } else if (!t.int32Data.empty()) {
+                inlineDataBuf.resize(t.int32Data.size() * 4);
+                memcpy(inlineDataBuf.data(), t.int32Data.data(), inlineDataBuf.size());
+                t.rawData = inlineDataBuf.data();
+                t.rawSize = inlineDataBuf.size();
+            }
+        }
         if (!t.rawData || t.rawSize == 0) {
             nodata++;
             if (nodata <= 3)
@@ -410,11 +452,77 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             continue;
         }
         auto dtype = fromOnnxDtype(t.dataType);
+
+        // For small tensors, keep as CPU-only (avoid GPU buffer alignment issues)
+        int64_t nel = 1; for (auto d : t.dims) nel *= d;
+        bool isTiny = (nel <= 64 && (dtype == TensorDtype::Int64 || dtype == TensorDtype::Int32));
+
+        if (isTiny) {
+            GpuTensor gt;
+            gt.shape = t.dims;
+            gt.dtype = dtype;
+            gt.isCpuOnly = true;
+            gt.cpuData.resize(t.rawSize);
+            memcpy(gt.cpuData.data(), t.rawData, t.rawSize);
+            tensorStore_[t.name] = std::move(gt);
+            graph_.initializers[t.name] = {t.rawData, t.rawSize, dtype, t.dims};
+            uploaded++;
+            continue;
+        }
+
+        // For fp16 tensors that will be used as f32 in compute shaders:
+        // Convert to fp32 on upload (except large weight/scale buffers which
+        // are read as packed u32 in specialized kernels)
+        bool isLargeWeight = (t.name.find("weight_Q4") != std::string::npos ||
+                              t.name.find("weight_Q8") != std::string::npos ||
+                              t.name.find("_Q4") != std::string::npos ||
+                              t.name.find("_Q8") != std::string::npos);
+        bool isScale = (t.name.find("scale") != std::string::npos ||
+                        t.name.find("Scale") != std::string::npos ||
+                        t.name.find("_scales") != std::string::npos);
+        bool convertToF32 = (dtype == TensorDtype::Float16 && !isLargeWeight && !isScale);
+
+        if (convertToF32) {
+            // Convert fp16 → fp32
+            size_t fp16Count = t.rawSize / 2;
+            std::vector<float> fp32(fp16Count);
+            const uint16_t* src = (const uint16_t*)t.rawData;
+            for (size_t i = 0; i < fp16Count; i++) fp32[i] = fp16_to_f32(src[i]);
+            size_t f32Size = fp16Count * 4;
+            GpuTensor gt;
+            gt.shape = t.dims;
+            gt.dtype = TensorDtype::Float32;
+            gt.buffer = gpu->createBuffer(t.name, f32Size);
+            gpu->writeBuffer(gt.buffer, fp32.data(), f32Size);
+            tensorStore_[t.name] = std::move(gt);
+            graph_.initializers[t.name] = {t.rawData, t.rawSize, TensorDtype::Float16, t.dims};
+            uploaded++;
+            continue;
+        }
+
+        // Pad buffer size to 4-byte alignment for WebGPU
+        size_t bufSize = (t.rawSize + 3) & ~(size_t)3;
         GpuTensor gt;
         gt.shape = t.dims;
         gt.dtype = dtype;
-        gt.buffer = gpu->createBuffer(t.name, t.rawSize);
-        gpu->writeBuffer(gt.buffer, t.rawData, t.rawSize);
+        gt.buffer = gpu->createBuffer(t.name, bufSize);
+        if (t.rawSize < 4) {
+            // Tiny buffer: pad to 4 bytes
+            uint8_t padded[4] = {0};
+            memcpy(padded, t.rawData, t.rawSize);
+            gpu->writeBuffer(gt.buffer, padded, 4);
+        } else {
+            // Write aligned size
+            size_t writeSize = t.rawSize & ~(size_t)3;
+            if (writeSize > 0)
+                gpu->writeBuffer(gt.buffer, t.rawData, writeSize);
+            // Write remaining bytes padded to 4
+            if (t.rawSize > writeSize) {
+                uint8_t padded[4] = {0};
+                memcpy(padded, t.rawData + writeSize, t.rawSize - writeSize);
+                gpu->writeBuffer(gt.buffer, padded, 4, writeSize);
+            }
+        }
         tensorStore_[t.name] = std::move(gt);
 
         // Also record in graph initializers (for metadata)
@@ -458,8 +566,23 @@ void GraphExecutor::EnsureGpu(GpuTensor& t) {
     if (t.buffer.handle || !t.isCpuOnly) return;
     size_t bytes = t.cpuData.size();
     if (bytes == 0) bytes = 4;
-    t.buffer = gpu->createBuffer("cpu2gpu", bytes);
-    gpu->writeBuffer(t.buffer, t.cpuData.data(), t.cpuData.size());
+    // Align to 4 bytes for WebGPU
+    size_t bufSize = (bytes + 3) & ~(size_t)3;
+    t.buffer = gpu->createBuffer("cpu2gpu", bufSize);
+    if (bytes < 4) {
+        uint8_t padded[4] = {0};
+        memcpy(padded, t.cpuData.data(), bytes);
+        gpu->writeBuffer(t.buffer, padded, 4);
+    } else {
+        size_t writeSize = bytes & ~(size_t)3;
+        if (writeSize > 0)
+            gpu->writeBuffer(t.buffer, t.cpuData.data(), writeSize);
+        if (bytes > writeSize) {
+            uint8_t padded[4] = {0};
+            memcpy(padded, t.cpuData.data() + writeSize, bytes - writeSize);
+            gpu->writeBuffer(t.buffer, padded, 4, writeSize);
+        }
+    }
     t.isCpuOnly = false;
 }
 
@@ -516,10 +639,25 @@ void GraphExecutor::Execute(
     // Bind graph inputs into tensor store
     for (auto& [name, tensor] : inputs) {
         tensorStore_[name] = *tensor;
+        // For int64 inputs, also store as CPU data for metadata ops
+        if (tensor->dtype == TensorDtype::Int64 && tensor->buffer.handle && !tensor->isCpuOnly) {
+            int64_t nel = tensor->ElementCount();
+            if (nel <= 1024) {
+                // Readback small int64 tensor for CPU ops (ReduceSum, Sub, etc.)
+                if (!tensor->cpuData.empty()) {
+                    tensorStore_[name].cpuData = tensor->cpuData;
+                } else {
+                    auto rb = gpu->readBuffer(tensor->buffer, nel * 8);
+                    tensorStore_[name].cpuData.resize(nel * 8);
+                    memcpy(tensorStore_[name].cpuData.data(), rb.data(), nel * 8);
+                }
+            }
+        }
     }
 
     auto& registry = GetOpRegistry();
     int executed = 0, skipped = 0;
+    int totalDispatches = 0, totalCopies = 0;
 
     // Clear dispatch batch
     pendingDispatches_.clear();
@@ -599,14 +737,6 @@ void GraphExecutor::Execute(
         size_t ni = execOrder[ei];
         auto& node = graph_.nodes[ni];
 
-        if (ei < 15 || ei % 50 == 0) {
-            auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - execT0).count();
-            fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (%lldms)\n",
-                    ei, ni, graph_.nodes.size(), node.opType.c_str(), (long long)nowMs);
-            fflush(stderr);
-        }
-
         // Resolve input tensors
         std::vector<GpuTensor*> inTensors;
         for (auto& inName : node.inputs) {
@@ -620,6 +750,20 @@ void GraphExecutor::Execute(
             } else {
                 inTensors.push_back(nullptr);
             }
+        }
+
+        if (ei < 30 || ei % 50 == 0 || (ei > 0 && (std::chrono::steady_clock::now() - execT0) > std::chrono::seconds(5))) {
+            auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - execT0).count();
+            int validCount = 0, invalidCount = 0;
+            for (size_t ti = 0; ti < inTensors.size(); ti++) {
+                auto* t = inTensors[ti];
+                if (t && t->IsValid()) validCount++; else if (t) invalidCount++;
+            }
+            fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (valid=%d invalid=%d, %lldms)\n",
+                    ei, ni, graph_.nodes.size(), node.opType.c_str(),
+                    validCount, invalidCount, (long long)nowMs);
+            fflush(stderr);
         }
 
         // Prepare output tensor pointers
@@ -652,7 +796,9 @@ void GraphExecutor::Execute(
             }
 
             // Submit pending work periodically (with sync to prevent TDR)
-            if (pendingDispatches_.size() + pendingCopies_.size() >= 20) {
+            if (pendingDispatches_.size() + pendingCopies_.size() >= 8) {
+                totalDispatches += (int)pendingDispatches_.size();
+                totalCopies += (int)pendingCopies_.size();
                 if (!pendingDispatches_.empty())
                     gpu->submitOnly(pendingDispatches_, false);
                 if (!pendingCopies_.empty()) {
@@ -687,9 +833,10 @@ void GraphExecutor::Execute(
         }
     }
 
-    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %zu dispatches, %zu copies\n",
-            executed, graph_.nodes.size(), skipped,
-            pendingDispatches_.size(), pendingCopies_.size());
+    totalDispatches += (int)pendingDispatches_.size();
+    totalCopies += (int)pendingCopies_.size();
+    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies\n",
+            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies);
 
     // Submit all remaining batched GPU work
     if (!pendingDispatches_.empty()) {

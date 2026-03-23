@@ -109,11 +109,12 @@ static void cpuBinaryInt64(GraphExecutor& ex, const OnnxGraphNode& node,
     auto readInt64 = [&](GpuTensor* t, std::vector<int64_t>& dst, int64_t nel, const std::string& name) {
         if (t->isCpuOnly && !t->cpuData.empty()) {
             memcpy(dst.data(), t->cpuData.data(), nel * 8);
+        } else if (!t->cpuData.empty()) {
+            // GPU tensor with cached CPU data
+            memcpy(dst.data(), t->cpuData.data(), nel * 8);
         } else if (auto* init = ex.GetInitData(name); init && init->data) {
             memcpy(dst.data(), init->data, nel * 8);
         } else {
-            // GPU tensor — can't read without sync. Use zeros.
-            // TODO: add GPU int64 binary kernel
             memset(dst.data(), 0, nel * 8);
         }
     };
@@ -378,7 +379,7 @@ static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 }
 
-// ReduceSum: CPU for small tensors
+// ReduceSum: CPU for small tensors, GPU readback for larger ones
 static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0];
@@ -388,11 +389,31 @@ static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
     // Read from CPU if possible
     const uint8_t* ptr = nullptr;
     if (A->isCpuOnly && !A->cpuData.empty()) ptr = A->cpuData.data();
+    else if (!A->cpuData.empty()) ptr = A->cpuData.data();
     else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) ptr = init->data;
 
-    if (!ptr && A->buffer.handle) {
-        // GPU tensor — can't reduce without sync. Allocate zero result.
-        // TODO: add GPU reduce kernel
+    if (!ptr && A->buffer.handle && N <= 4096) {
+        // Small GPU tensor — readback and reduce on CPU
+        if (!ex.pendingDispatches_.empty()) {
+            ex.gpu->submitOnly(ex.pendingDispatches_, false);
+            ex.gpu->waitForQueue();
+            ex.pendingDispatches_.clear();
+        }
+        auto rb = ex.gpu->readBuffer(A->buffer, A->ByteSize());
+        ptr = rb.data();
+        // Compute on the readback data
+        if (A->dtype == TensorDtype::Int64) {
+            int64_t sum = 0;
+            for (int64_t i = 0; i < N; i++) { int64_t v; memcpy(&v, ptr + i*8, 8); sum += v; }
+            *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &sum, 8);
+        } else {
+            float sum = 0;
+            for (int64_t i = 0; i < N; i++) { float v; memcpy(&v, ptr + i*4, 4); sum += v; }
+            *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &sum, 4);
+        }
+        return;
+    }
+    if (!ptr) {
         if (A->dtype == TensorDtype::Int64) {
             int64_t z = 0;
             *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &z, 8);
@@ -402,7 +423,6 @@ static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
         }
         return;
     }
-    if (!ptr) return;
 
     if (A->dtype == TensorDtype::Int64) {
         int64_t sum = 0;

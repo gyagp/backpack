@@ -269,8 +269,9 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // ─── GatherBlockQuantized ────────────────────────────────────────────────────
+// Supports both Q8 (bits=8, zp=128) and Q4 (bits=4, zp=8)
 
-static const char* WGSL_GATHER_BQ = R"WGSL(
+static const char* WGSL_GATHER_BQ_Q8 = R"WGSL(
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> Scales: array<u32>;
 @group(0) @binding(2) var<storage, read> Indices: array<i32>;
@@ -288,15 +289,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx_i >= nIdx || k >= K) { return; }
     let vocab_idx = u32(Indices[idx_i]);
     let group = k / bs;
-    let elem = k % bs;
     let scale_flat = vocab_idx * n_groups + group;
     let scale_u32 = Scales[scale_flat / 2u];
     let scale_f16 = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
     let scale = unpack2x16float(scale_f16 | (scale_f16 << 16u)).x;
-    let byte_flat = vocab_idx * n_groups * bs + group * bs + elem;
+    let byte_flat = vocab_idx * n_groups * bs + k;
     let byte_u32 = W[byte_flat / 4u];
     let byte_val = (byte_u32 >> ((byte_flat % 4u) * 8u)) & 0xFFu;
     let centered = f32(i32(byte_val) - 128);
+    Y[idx_i * K + k] = centered * scale;
+}
+)WGSL";
+
+static const char* WGSL_GATHER_BQ_Q4 = R"WGSL(
+@group(0) @binding(0) var<storage, read> W: array<u32>;
+@group(0) @binding(1) var<storage, read> Scales: array<u32>;
+@group(0) @binding(2) var<storage, read> Indices: array<i32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let nIdx = _params_[0];
+    let K = _params_[1];       // output elements per row
+    let n_groups = _params_[2]; // K / block_size
+    let bs = _params_[3];      // block_size
+    let idx_i = gid.y;
+    let k = gid.x;
+    if (idx_i >= nIdx || k >= K) { return; }
+    let vocab_idx = u32(Indices[idx_i]);
+    let group = k / bs;
+    let scale_flat = vocab_idx * n_groups + group;
+    let scale_u32 = Scales[scale_flat / 2u];
+    let scale_f16 = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+    let scale = unpack2x16float(scale_f16 | (scale_f16 << 16u)).x;
+    // Q4: 2 elements per byte. Element k is at byte k/2, nibble k%2
+    let byte_flat = vocab_idx * (K / 2u) + k / 2u;
+    let byte_u32 = W[byte_flat / 4u];
+    let byte_val = (byte_u32 >> ((byte_flat % 4u) * 8u)) & 0xFFu;
+    let nibble = select(byte_val & 0x0Fu, (byte_val >> 4u) & 0x0Fu, (k & 1u) != 0u);
+    let centered = f32(i32(nibble)) - 8.0;
     Y[idx_i * K + k] = centered * scale;
 }
 )WGSL";
@@ -314,7 +346,14 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t bits = n.GetInt("bits", 8);
     int64_t block_size_attr = n.GetInt("block_size", 32);
     uint32_t n_groups, bs, K;
-    if (W->shape.size() >= 3) {
+
+    if (bits == 4) {
+        // Q4: weight dims [V, K] where K is the full output dim
+        // Raw bytes = V * K / 2
+        K = (uint32_t)W->shape.back();
+        bs = (uint32_t)block_size_attr;
+        n_groups = K / bs;
+    } else if (W->shape.size() >= 3) {
         n_groups = (uint32_t)W->shape[1];
         bs = (uint32_t)W->shape[2];
         K = n_groups * bs;
@@ -331,13 +370,50 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     if (!Scales || !Scales->IsValid()) return;
     ex.EnsureGpu(*Scales);
 
+    // Handle int64 indices → int32 conversion
+    GPUBuffer idxBuf = Indices->buffer;
+    if (Indices->dtype == TensorDtype::Int64) {
+        // Read from CPU if possible, convert to int32
+        const uint8_t* idxPtr = nullptr;
+        if (Indices->isCpuOnly && !Indices->cpuData.empty())
+            idxPtr = Indices->cpuData.data();
+        else if (auto* init = ex.GetInitData(n.inputs[1]); init && init->data)
+            idxPtr = init->data;
+
+        if (idxPtr) {
+            std::vector<int32_t> i32(nIdx);
+            for (int64_t i = 0; i < nIdx; i++) {
+                int64_t v; memcpy(&v, idxPtr + i * 8, 8);
+                i32[i] = (int32_t)v;
+            }
+            idxBuf = ex.gpu->createBuffer("gbq_idx32", nIdx * 4);
+            ex.gpu->writeBuffer(idxBuf, i32.data(), nIdx * 4);
+        } else {
+            // GPU int64 tensor — need readback or GPU cast kernel
+            // For now, flush and readback
+            if (!ex.pendingDispatches_.empty()) {
+                ex.gpu->submitOnly(ex.pendingDispatches_, false);
+                ex.gpu->waitForQueue();
+                ex.pendingDispatches_.clear();
+            }
+            auto rb = ex.gpu->readBuffer(Indices->buffer, nIdx * 8);
+            std::vector<int32_t> i32(nIdx);
+            const int64_t* src = (const int64_t*)rb.data();
+            for (int64_t i = 0; i < nIdx; i++) i32[i] = (int32_t)src[i];
+            idxBuf = ex.gpu->createBuffer("gbq_idx32", nIdx * 4);
+            ex.gpu->writeBuffer(idxBuf, i32.data(), nIdx * 4);
+        }
+    }
+
     uint32_t params[4] = {(uint32_t)nIdx, K, n_groups, bs};
     auto paramBuf = ex.gpu->createBuffer("gbq_p", 16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
-    auto& pl = ex.GetPipeline("gather_bq", WGSL_GATHER_BQ, 5);
+    const char* kernel = (bits == 4) ? WGSL_GATHER_BQ_Q4 : WGSL_GATHER_BQ_Q8;
+    const char* plName = (bits == 4) ? "gather_bq_q4" : "gather_bq_q8";
+    auto& pl = ex.GetPipeline(plName, kernel, 5);
     auto bg = ex.MakeBindGroup(pl, {
-        {0, W->buffer}, {1, Scales->buffer}, {2, Indices->buffer},
+        {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
         (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq"});
