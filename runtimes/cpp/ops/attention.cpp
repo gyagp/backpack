@@ -13,58 +13,82 @@ static int64_t tensorNel(const GpuTensor* t) {
 }
 
 // ─── GroupQueryAttention ─────────────────────────────────────────────────────
-// Fused Q/K/V attention with optional RoPE.
-// Inputs: Q, K, V, [key_padding_mask], [attn_bias], [past_key], [past_value],
-//         [cos_cache], [sin_cache], [present_key], [present_value]
+// Tiled GQA: each workgroup handles one (head, query_token) pair.
+// Uses shared memory for dot product reduction.
 
-static const char* WGSL_GQA = R"WGSL(
+static const char* WGSL_GQA_TILED = R"WGSL(
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
 @group(0) @binding(2) var<storage, read> V: array<f32>;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let T = _params_[0];        // sequence length
+const WG: u32 = 128u;
+var<workgroup> shared_max: f32;
+var<workgroup> shared_sum: f32;
+var<workgroup> partial: array<f32, WG>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let T = _params_[0];
     let num_heads = _params_[1];
     let head_dim = _params_[2];
     let kv_heads = _params_[3];
-
-    let total = T * num_heads * head_dim;
-    let idx = gid.x;
-    if (idx >= total) { return; }
-
-    let t = idx / (num_heads * head_dim);
-    let h = (idx / head_dim) % num_heads;
-    let d = idx % head_dim;
-    let kv_h = h / (num_heads / kv_heads);
     let scale = bitcast<f32>(_params_[4]);
 
-    // Compute attention: simple dot-product attention
-    // score[t, h, t'] = sum_d Q[t,h,d] * K[t',kv_h,d] * scale
-    var acc: f32 = 0.0;
-    for (var t2 = 0u; t2 < T; t2++) {
-        // Compute score for this t, h, t2
-        var score: f32 = 0.0;
-        for (var dd = 0u; dd < head_dim; dd++) {
-            score += Q[t * num_heads * head_dim + h * head_dim + dd] *
-                     K[t2 * kv_heads * head_dim + kv_h * head_dim + dd];
-        }
-        score *= scale;
-        // Softmax approximation: just use raw weighted sum for now
-        // (proper softmax needs a reduction pass)
-        let w = exp(score);
-        acc += w * V[t2 * kv_heads * head_dim + kv_h * head_dim + d];
-    }
+    let q_tok = wid.x;
+    let head = wid.y;
+    if (q_tok >= T || head >= num_heads) { return; }
+    let kv_head = head / (num_heads / kv_heads);
 
-    Out[idx] = acc;
+    let d = lid.x;
+    if (d >= head_dim) { return; }
+
+    let q_val = Q[q_tok * num_heads * head_dim + head * head_dim + d];
+
+    // Pass 1: max score
+    var local_max: f32 = -1e30;
+    for (var kv = 0u; kv < T; kv++) {
+        let k_val = K[kv * kv_heads * head_dim + kv_head * head_dim + d];
+        partial[d] = q_val * k_val * scale;
+        workgroupBarrier();
+        for (var s = WG/2u; s > 0u; s >>= 1u) {
+            if (d < s && d + s < head_dim) { partial[d] += partial[d + s]; }
+            workgroupBarrier();
+        }
+        if (d == 0u) { local_max = max(local_max, partial[0]); }
+        workgroupBarrier();
+    }
+    if (d == 0u) { shared_max = local_max; }
+    workgroupBarrier();
+    let max_s = shared_max;
+
+    // Pass 2: softmax + weighted V
+    var acc: f32 = 0.0;
+    var local_sum: f32 = 0.0;
+    for (var kv = 0u; kv < T; kv++) {
+        let k_val = K[kv * kv_heads * head_dim + kv_head * head_dim + d];
+        partial[d] = q_val * k_val * scale;
+        workgroupBarrier();
+        for (var s = WG/2u; s > 0u; s >>= 1u) {
+            if (d < s && d + s < head_dim) { partial[d] += partial[d + s]; }
+            workgroupBarrier();
+        }
+        let w = exp(partial[0] - max_s);
+        workgroupBarrier();
+        if (d == 0u) { local_sum += w; }
+        acc += w * V[kv * kv_heads * head_dim + kv_head * head_dim + d];
+    }
+    if (d == 0u) { shared_sum = local_sum; }
+    workgroupBarrier();
+
+    Out[q_tok * num_heads * head_dim + head * head_dim + d] = acc / max(shared_sum, 1e-9);
 }
 )WGSL";
 
 static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // inputs: Q[0], K[1], V[2], ...optional..., cos_cache[7], sin_cache[8]
     auto* Q = in[0];
     auto* K = in.size() > 1 ? in[1] : nullptr;
     auto* V = in.size() > 2 ? in[2] : nullptr;
@@ -74,18 +98,13 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t kv_heads = n.GetInt("kv_num_heads", 8);
     float scale = n.GetFloat("scale", 1.0f / sqrtf(128.0f));
 
-    // Q shape: [batch, seq_len, num_heads * head_dim]
     int64_t T = (Q->shape.size() >= 2) ? Q->shape[Q->shape.size()-2] : 1;
     int64_t qDim = Q->shape.back();
     int64_t head_dim = qDim / num_heads;
 
-    // Output: same shape as Q
     *out[0] = ex.AllocTensor(Q->shape, Q->dtype);
-
-    // Present key/value outputs (optional)
-    for (size_t i = 1; i < out.size(); i++) {
+    for (size_t i = 1; i < out.size(); i++)
         if (out[i]) *out[i] = ex.AllocTensor({1}, Q->dtype);
-    }
 
     uint32_t scale_u32; memcpy(&scale_u32, &scale, 4);
     uint32_t params[8] = {(uint32_t)T, (uint32_t)num_heads, (uint32_t)head_dim,
@@ -93,75 +112,111 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("gqa_p", 32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipeline("gqa", WGSL_GQA, 5);
+    auto& pl = ex.GetPipeline("gqa_tiled", WGSL_GQA_TILED, 5);
     auto bg = ex.MakeBindGroup(pl, {
         {0, Q->buffer}, {1, K->buffer}, {2, V->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
 
-    int64_t total = T * num_heads * head_dim;
+    // Dispatch: (T, num_heads, 1)
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((total + 255) / 256), 1, 1, "gqa"});
+        (uint32_t)T, (uint32_t)num_heads, 1, "gqa"});
 }
 
 // ─── MultiHeadAttention ──────────────────────────────────────────────────────
-// Standard MHA: Q, K, V → softmax(Q·K^T/√d)·V
+// Proper tiled MHA: each workgroup handles one (batch, head, query_token)
+// Uses shared memory for Q row, iterates over KV in tiles.
+// Layout: Q/K/V are [batch, seq_len, num_heads * head_dim] (3D)
+//   or [batch, num_heads, seq_len, head_dim] after reshape (4D)
+// ORT MHA always receives [batch, seq_len, num_heads * head_dim]
 
-static const char* WGSL_MHA = R"WGSL(
+static const char* WGSL_MHA_TILED = R"WGSL(
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
 @group(0) @binding(2) var<storage, read> V: array<f32>;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let T = _params_[0];
+// Each workgroup computes attention for one (head, query_token) pair
+// Workgroup size = head_dim (capped at 128)
+const WG: u32 = 128u;
+var<workgroup> shared_max: f32;
+var<workgroup> shared_sum: f32;
+var<workgroup> partial_sums: array<f32, WG>;
+var<workgroup> partial_maxs: array<f32, WG>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let T_q = _params_[0];
     let num_heads = _params_[1];
     let head_dim = _params_[2];
-    let T_kv = _params_[3]; // K/V sequence length (may differ from Q)
-
-    let idx = gid.x;
-    let total = T * num_heads * head_dim;
-    if (idx >= total) { return; }
-
-    let t = idx / (num_heads * head_dim);
-    let h = (idx / head_dim) % num_heads;
-    let d = idx % head_dim;
+    let T_kv = _params_[3];
     let scale = bitcast<f32>(_params_[4]);
 
-    // Compute attention for this (t, h, d)
-    // First compute all scores for this (t, h)
-    // Then softmax and weighted sum
-    // Simplified: compute weighted sum directly
+    let q_tok = wid.x;
+    let head = wid.y;
+    if (q_tok >= T_q || head >= num_heads) { return; }
 
-    // For numerical stability, find max score first
-    var max_score: f32 = -1e9;
-    for (var t2 = 0u; t2 < T_kv; t2++) {
-        var s: f32 = 0.0;
-        for (var dd = 0u; dd < head_dim; dd++) {
-            s += Q[t * num_heads * head_dim + h * head_dim + dd] *
-                 K[t2 * num_heads * head_dim + h * head_dim + dd];
+    let d = lid.x;
+    if (d >= head_dim) { return; }
+
+    // Load Q[q_tok, head, d]
+    let q_val = Q[q_tok * num_heads * head_dim + head * head_dim + d];
+
+    // Pass 1: Find max score across all KV tokens
+    var local_max: f32 = -1e30;
+    for (var kv = 0u; kv < T_kv; kv++) {
+        let k_val = K[kv * num_heads * head_dim + head * head_dim + d];
+        let partial = q_val * k_val * scale;
+        // Reduce across head_dim using shared memory
+        partial_sums[d] = partial;
+        workgroupBarrier();
+        // Tree reduction
+        for (var stride = WG / 2u; stride > 0u; stride >>= 1u) {
+            if (d < stride && d + stride < head_dim) {
+                partial_sums[d] += partial_sums[d + stride];
+            }
+            workgroupBarrier();
         }
-        s *= scale;
-        max_score = max(max_score, s);
+        if (d == 0u) {
+            local_max = max(local_max, partial_sums[0]);
+        }
+        workgroupBarrier();
     }
+    if (d == 0u) { shared_max = local_max; }
+    workgroupBarrier();
+    let max_score = shared_max;
 
-    // Compute softmax denominator and weighted sum
-    var sum_exp: f32 = 0.0;
+    // Pass 2: Compute softmax weights and weighted V sum
     var acc: f32 = 0.0;
-    for (var t2 = 0u; t2 < T_kv; t2++) {
-        var s: f32 = 0.0;
-        for (var dd = 0u; dd < head_dim; dd++) {
-            s += Q[t * num_heads * head_dim + h * head_dim + dd] *
-                 K[t2 * num_heads * head_dim + h * head_dim + dd];
+    var local_sum: f32 = 0.0;
+
+    for (var kv = 0u; kv < T_kv; kv++) {
+        let k_val = K[kv * num_heads * head_dim + head * head_dim + d];
+        let partial = q_val * k_val * scale;
+        partial_sums[d] = partial;
+        workgroupBarrier();
+        // Reduce
+        for (var stride = WG / 2u; stride > 0u; stride >>= 1u) {
+            if (d < stride && d + stride < head_dim) {
+                partial_sums[d] += partial_sums[d + stride];
+            }
+            workgroupBarrier();
         }
-        s *= scale;
-        let w = exp(s - max_score);
-        sum_exp += w;
-        acc += w * V[t2 * num_heads * head_dim + h * head_dim + d];
+        let score = partial_sums[0];
+        workgroupBarrier();
+
+        let w = exp(score - max_score);
+        if (d == 0u) { local_sum += w; }
+        let v_val = V[kv * num_heads * head_dim + head * head_dim + d];
+        acc += w * v_val;
     }
 
-    Out[idx] = acc / max(sum_exp, 1e-9);
+    if (d == 0u) { shared_sum = local_sum; }
+    workgroupBarrier();
+
+    // Write output
+    Out[q_tok * num_heads * head_dim + head * head_dim + d] = acc / max(shared_sum, 1e-9);
 }
 )WGSL";
 
@@ -189,14 +244,14 @@ static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("mha_p", 32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipeline("mha", WGSL_MHA, 5);
+    auto& pl = ex.GetPipeline("mha_tiled", WGSL_MHA_TILED, 5);
     auto bg = ex.MakeBindGroup(pl, {
         {0, Q->buffer}, {1, K->buffer}, {2, V->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
 
-    int64_t total = T_q * num_heads * head_dim;
+    // Dispatch: (T_q, num_heads, 1) — each workgroup = one (token, head)
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((total + 255) / 256), 1, 1, "mha"});
+        (uint32_t)T_q, (uint32_t)num_heads, 1, "mha"});
 }
 
 // ─── RotaryEmbedding ─────────────────────────────────────────────────────────
