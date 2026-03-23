@@ -25,6 +25,13 @@ set(BACKPACK_CORE_SOURCES
     tokenizer.cpp
     onnx_tokenizer.cpp
     json_parser.cpp
+    graph_executor.cpp
+    ops/elementwise.cpp
+    ops/shape.cpp
+    ops/matmul.cpp
+    ops/norm.cpp
+    ops/attention.cpp
+    ops/conv.cpp
     clock_calibration.cpp
     profile_html.cpp
 )
@@ -76,6 +83,20 @@ if(EXISTS ${BACKPACK_LLM_APP})
     )
 endif()
 
+# ─── Image generation application ────────────────────────────────────────────
+
+set(BACKPACK_IMAGE_APP "${CMAKE_SOURCE_DIR}/../../apps/cpp/image/main.cpp")
+if(EXISTS ${BACKPACK_IMAGE_APP})
+    add_executable(backpack_image ${BACKPACK_IMAGE_APP} $<TARGET_OBJECTS:backpack_core>)
+    target_link_libraries(backpack_image PRIVATE backpack)
+    target_include_directories(backpack_image PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${DAWN_SRC}/include
+        ${DAWN_BUILD}/gen/include
+        ${DAWN_SRC}/include/dawn/native
+    )
+endif()
+
 # ─── Link Dawn ───────────────────────────────────────────────────────────────
 
 if(WIN32)
@@ -90,8 +111,12 @@ if(WIN32)
         target_link_libraries(backpack_llm PRIVATE
             ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     endif()
+    if(TARGET backpack_image)
+        target_link_libraries(backpack_image PRIVATE
+            ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    endif()
     # Copy DLLs next to executables
-    foreach(_target backpack_runtime backpack_llm)
+    foreach(_target backpack_runtime backpack_llm backpack_image)
         if(TARGET ${_target})
             add_custom_command(TARGET ${_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -106,5 +131,8 @@ else()
     target_link_libraries(backpack_runtime PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     if(TARGET backpack_llm)
         target_link_libraries(backpack_llm PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    endif()
+    if(TARGET backpack_image)
+        target_link_libraries(backpack_image PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     endif()
 endif()

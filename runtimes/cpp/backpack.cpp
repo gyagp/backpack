@@ -7,6 +7,7 @@
 
 #include "backpack.h"
 #include "gpu_context.h"
+#include "graph_executor.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -84,15 +85,31 @@ void* bp::Device::GetGPUContext() const {
 
 struct bp::Model::Impl {
     Device* device = nullptr;
+    GraphExecutor executor;
     std::vector<std::string> inputNames;
     std::vector<std::string> outputNames;
 };
 
 bp::Model bp::Model::Load(Device& device, const std::string& path) {
+    if (!device.IsValid()) return {};
     Model m;
     m.impl_ = std::make_unique<Impl>();
     m.impl_->device = &device;
-    // TODO: general ONNX graph loading + compilation
+
+    auto* gpuCtx = static_cast<GPUContext*>(device.GetGPUContext());
+    if (!m.impl_->executor.Load(*gpuCtx, path)) {
+        fprintf(stderr, "bp::Model::Load: failed to load %s\n", path.c_str());
+        m.impl_.reset();
+        return m;
+    }
+
+    // Populate input/output names from parsed graph
+    auto& graph = m.impl_->executor.GetGraph();
+    for (auto& inp : graph.inputs)
+        m.impl_->inputNames.push_back(inp.name);
+    for (auto& out : graph.outputs)
+        m.impl_->outputNames.push_back(out.name);
+
     return m;
 }
 
@@ -125,23 +142,63 @@ struct bp::Tensor::Impl {
     std::vector<int64_t> shape;
     GPUBuffer gpuBuf;
     Device* device = nullptr;
+    TensorDtype geDtype; // graph executor dtype
 };
+
+static TensorDtype toGeDtype(bp::DataType dt) {
+    switch (dt) {
+        case bp::DataType::Float32: return TensorDtype::Float32;
+        case bp::DataType::Float16: return TensorDtype::Float16;
+        case bp::DataType::Int32: return TensorDtype::Int32;
+        case bp::DataType::Int64: return TensorDtype::Int64;
+        case bp::DataType::UInt8: return TensorDtype::UInt8;
+        case bp::DataType::Int8: return TensorDtype::Int8;
+        case bp::DataType::Bool: return TensorDtype::Bool;
+    }
+    return TensorDtype::Float32;
+}
+
+static size_t dtypeSize(bp::DataType dt) {
+    switch (dt) {
+        case bp::DataType::Float32: case bp::DataType::Int32: return 4;
+        case bp::DataType::Float16: return 2;
+        case bp::DataType::Int64: return 8;
+        case bp::DataType::UInt8: case bp::DataType::Int8: case bp::DataType::Bool: return 1;
+    }
+    return 4;
+}
 
 bp::Tensor bp::Tensor::Create(Device& device, DataType dtype,
                                 const std::vector<int64_t>& shape) {
+    if (!device.IsValid()) return {};
     Tensor t;
     t.impl_ = std::make_unique<Impl>();
     t.impl_->dtype = dtype;
     t.impl_->shape = shape;
     t.impl_->device = &device;
+    t.impl_->geDtype = toGeDtype(dtype);
+
+    int64_t nel = 1;
+    for (auto d : shape) nel *= d;
+    size_t bytes = (size_t)nel * dtypeSize(dtype);
+    if (bytes == 0) bytes = 4;
+
+    auto* gpuCtx = static_cast<GPUContext*>(device.GetGPUContext());
+    t.impl_->gpuBuf = gpuCtx->createBuffer("tensor", bytes);
     return t;
 }
 
 void bp::Tensor::SetData(const void* data, size_t bytes) {
-    (void)data; (void)bytes; // TODO
+    if (!impl_ || !impl_->device) return;
+    auto* gpuCtx = static_cast<GPUContext*>(impl_->device->GetGPUContext());
+    gpuCtx->writeBuffer(impl_->gpuBuf, data, bytes);
 }
+
 void bp::Tensor::GetData(void* data, size_t bytes) const {
-    (void)data; (void)bytes; // TODO
+    if (!impl_ || !impl_->device) return;
+    auto* gpuCtx = static_cast<GPUContext*>(impl_->device->GetGPUContext());
+    auto readback = gpuCtx->readBuffer(impl_->gpuBuf, bytes);
+    memcpy(data, readback.data(), std::min(bytes, readback.size()));
 }
 bp::DataType bp::Tensor::GetDtype() const {
     return impl_ ? impl_->dtype : DataType::Float32;
@@ -167,6 +224,8 @@ bp::Tensor& bp::Tensor::operator=(Tensor&& o) noexcept = default;
 
 struct bp::Session::Impl {
     Model* model = nullptr;
+    std::unordered_map<std::string, GpuTensor*> boundInputs;
+    std::unordered_map<std::string, GpuTensor*> boundOutputs;
 };
 
 bp::Session bp::Session::Create(Model& model) {
@@ -177,13 +236,32 @@ bp::Session bp::Session::Create(Model& model) {
 }
 
 void bp::Session::SetInput(const std::string& name, Tensor& tensor) {
-    (void)name; (void)tensor; // TODO
+    if (!impl_ || !tensor.GetImpl()) return;
+    auto* ti = tensor.GetImpl();
+    static thread_local std::vector<GpuTensor> tempTensors;
+    GpuTensor gt;
+    gt.buffer = ti->gpuBuf;
+    gt.shape = ti->shape;
+    gt.dtype = ti->geDtype;
+    tempTensors.push_back(gt);
+    impl_->boundInputs[name] = &tempTensors.back();
 }
+
 void bp::Session::SetOutput(const std::string& name, Tensor& tensor) {
-    (void)name; (void)tensor; // TODO
+    if (!impl_ || !tensor.GetImpl()) return;
+    auto* ti = tensor.GetImpl();
+    static thread_local std::vector<GpuTensor> tempTensors;
+    GpuTensor gt;
+    gt.buffer = ti->gpuBuf;
+    gt.shape = ti->shape;
+    gt.dtype = ti->geDtype;
+    tempTensors.push_back(gt);
+    impl_->boundOutputs[name] = &tempTensors.back();
 }
+
 void bp::Session::Run() {
-    // TODO: execute ONNX graph on GPU
+    if (!impl_ || !impl_->model || !impl_->model->GetImpl()) return;
+    impl_->model->GetImpl()->executor.Execute(impl_->boundInputs, impl_->boundOutputs);
 }
 
 void bp::Session::Release() { impl_.reset(); }
