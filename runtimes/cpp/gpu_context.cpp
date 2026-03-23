@@ -240,8 +240,30 @@ void GPUContext::destroy() {
 
 // ─── Buffers ─────────────────────────────────────────────────────────────────
 
+int GPUContext::poolBucket(uint64_t size) const {
+    if (size <= (1ULL << POOL_MIN_BITS)) return 0;
+    int bits = 0;
+    uint64_t s = size - 1;
+    while (s > 0) { s >>= 1; bits++; }
+    return std::min(std::max(bits - POOL_MIN_BITS, 0), POOL_BUCKETS - 1);
+}
+
 GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
                                    uint64_t usage, bool mappedAtCreation) {
+    // Try pool first (only for default usage, non-mapped)
+    if (bufferPoolEnabled && usage == BUF_DEFAULT && !mappedAtCreation && size > 0) {
+        int bucket = poolBucket(size);
+        if (!pool_[bucket].empty()) {
+            GPUBuffer buf = pool_[bucket].back();
+            pool_[bucket].pop_back();
+            // Buffer might be larger than requested — that's fine
+            return {buf.handle, size};
+        }
+        // Round up to bucket size for new allocation
+        uint64_t bucketSize = 1ULL << (bucket + POOL_MIN_BITS);
+        size = std::max(size, bucketSize);
+    }
+
     WGPUBufferDescriptor d{};
     d.label = {name.c_str(), name.size()};
     d.usage = usage;
@@ -250,6 +272,17 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
     GPUBuffer buf{wgpuDeviceCreateBuffer(device, &d), size};
     buffers_[name] = buf;
     return buf;
+}
+
+void GPUContext::releaseBuffer(GPUBuffer buf) {
+    if (!buf.handle || !bufferPoolEnabled) return;
+    int bucket = poolBucket(buf.size);
+    // Limit pool size per bucket to avoid unbounded memory growth
+    if (pool_[bucket].size() < 256) {
+        pool_[bucket].push_back(buf);
+    } else {
+        wgpuBufferRelease(buf.handle);
+    }
 }
 
 GPUBuffer GPUContext::getBuffer(const std::string& name) const {

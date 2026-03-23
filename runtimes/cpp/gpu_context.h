@@ -104,6 +104,11 @@ struct GPUContext {
     GPUBuffer getBuffer(const std::string& name) const;
     void      writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
                           uint64_t offset = 0);
+    /// Return a buffer to the pool for reuse.
+    void      releaseBuffer(GPUBuffer buf);
+
+    /// Enable/disable buffer pooling. Enabled by default.
+    bool bufferPoolEnabled = true;
 
     // --- Pipelines ---
     const CompiledPipeline& getOrCreatePipeline(
@@ -187,5 +192,11 @@ private:
     WGPUBuffer readbackBuf_     = nullptr;
     uint64_t   readbackBufSize_ = 0;
 
-
+    // Buffer pool: bucketIndex → free list of buffers
+    // Bucket i holds buffers of size 2^(i+4) bytes (bucket 0 = 16B, bucket 1 = 32B, ...)
+    static constexpr int POOL_MIN_BITS = 4;   // 16 bytes min
+    static constexpr int POOL_MAX_BITS = 30;  // 1GB max
+    static constexpr int POOL_BUCKETS = POOL_MAX_BITS - POOL_MIN_BITS + 1;
+    std::vector<GPUBuffer> pool_[POOL_BUCKETS];
+    int poolBucket(uint64_t size) const;
 };

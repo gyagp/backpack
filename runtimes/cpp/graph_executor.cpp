@@ -581,28 +581,29 @@ void GraphExecutor::Execute(
         fflush(stderr);
     }
 
+    // Build tensor reference counts for buffer recycling
+    std::unordered_map<std::string, int> tensorRefCount;
+    for (size_t ni : execOrder) {
+        auto& node = graph_.nodes[ni];
+        for (auto& inName : node.inputs)
+            if (!inName.empty()) tensorRefCount[inName]++;
+    }
+    // Output tensors should not be released
+    for (auto& [name, _] : outputs) tensorRefCount[name] += 1000;
+    // Initializers should not be released
+    for (auto& [name, _] : graph_.initializers) tensorRefCount[name] += 1000;
+
     // Execute nodes in topological order
+    auto execT0 = std::chrono::steady_clock::now();
     for (size_t ei = 0; ei < execOrder.size(); ei++) {
         size_t ni = execOrder[ei];
         auto& node = graph_.nodes[ni];
 
-        if (ni < 15 || ni % 100 == 0) {
-            fprintf(stderr, "  [exec] node %zu/%zu: %s",
-                    ni, graph_.nodes.size(), node.opType.c_str());
-            // Print input tensor info for first few nodes
-            if (ni < 15) {
-                for (size_t ii = 0; ii < node.inputs.size() && ii < 2; ii++) {
-                    auto it = tensorStore_.find(node.inputs[ii]);
-                    if (it != tensorStore_.end() && it->second.IsValid()) {
-                        auto& t = it->second;
-                        fprintf(stderr, " in%zu=[", ii);
-                        for (size_t d = 0; d < t.shape.size(); d++)
-                            fprintf(stderr, "%s%lld", d?",":"", (long long)t.shape[d]);
-                        fprintf(stderr, "]dt%d", (int)t.dtype);
-                    }
-                }
-            }
-            fprintf(stderr, "\n");
+        if (ei < 15 || ei % 50 == 0) {
+            auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - execT0).count();
+            fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (%lldms)\n",
+                    ei, ni, graph_.nodes.size(), node.opType.c_str(), (long long)nowMs);
             fflush(stderr);
         }
 
@@ -637,9 +638,21 @@ void GraphExecutor::Execute(
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
-            // Submit pending work periodically (no sync — fire and forget)
-            if (pendingDispatches_.size() + pendingCopies_.size() >= 100) {
-                // Build one command buffer with compute + copies
+            // Release input buffers that are no longer needed
+            for (auto& inName : node.inputs) {
+                if (inName.empty()) continue;
+                auto rc = --tensorRefCount[inName];
+                if (rc <= 0) {
+                    auto it = tensorStore_.find(inName);
+                    if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
+                        gpu->releaseBuffer(it->second.buffer);
+                        it->second.buffer = {nullptr, 0};
+                    }
+                }
+            }
+
+            // Submit pending work periodically (with sync to prevent TDR)
+            if (pendingDispatches_.size() + pendingCopies_.size() >= 20) {
                 if (!pendingDispatches_.empty())
                     gpu->submitOnly(pendingDispatches_, false);
                 if (!pendingCopies_.empty()) {
@@ -654,6 +667,7 @@ void GraphExecutor::Execute(
                     wgpuCommandBufferRelease(cb);
                     wgpuCommandEncoderRelease(enc);
                 }
+                gpu->waitForQueue();  // Sync to prevent TDR
                 pendingDispatches_.clear();
                 pendingCopies_.clear();
             }
