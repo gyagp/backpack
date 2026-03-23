@@ -687,8 +687,9 @@ void GraphExecutor::Execute(
         }
     }
 
-    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %zu dispatches\n",
-            executed, graph_.nodes.size(), skipped, pendingDispatches_.size());
+    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %zu dispatches, %zu copies\n",
+            executed, graph_.nodes.size(), skipped,
+            pendingDispatches_.size(), pendingCopies_.size());
 
     // Submit all remaining batched GPU work
     if (!pendingDispatches_.empty()) {
