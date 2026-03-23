@@ -103,19 +103,27 @@ static void cpuBinaryInt64(GraphExecutor& ex, const OnnxGraphNode& node,
     int64_t N = std::max(N_A, N_B);
     auto& outShape = (N_A >= N_B) ? A->shape : B->shape;
 
-    // Flush pending GPU work before CPU readback
-    if (!ex.pendingDispatches_.empty()) {
-        ex.gpu->submitOnly(ex.pendingDispatches_, false);
-        ex.gpu->waitForQueue();
-        ex.pendingDispatches_.clear();
-    }
-
-    // Read inputs from GPU
+    // Read from CPU data if available, else GPU readback
     std::vector<int64_t> a(N_A), b(N_B), c(N);
-    auto rbA = ex.gpu->readBuffer(A->buffer, N_A * 8);
-    auto rbB = ex.gpu->readBuffer(B->buffer, N_B * 8);
-    memcpy(a.data(), rbA.data(), N_A * 8);
-    memcpy(b.data(), rbB.data(), N_B * 8);
+
+    auto readInt64 = [&](GpuTensor* t, std::vector<int64_t>& dst, int64_t nel, const std::string& name) {
+        if (t->isCpuOnly && !t->cpuData.empty()) {
+            memcpy(dst.data(), t->cpuData.data(), nel * 8);
+        } else if (auto* init = ex.GetInitData(name); init && init->data) {
+            memcpy(dst.data(), init->data, nel * 8);
+        } else {
+            if (!ex.pendingDispatches_.empty()) {
+                ex.gpu->submitOnly(ex.pendingDispatches_, false);
+                ex.gpu->waitForQueue();
+                ex.pendingDispatches_.clear();
+            }
+            auto rb = ex.gpu->readBuffer(t->buffer, nel * 8);
+            memcpy(dst.data(), rb.data(), nel * 8);
+        }
+    };
+
+    readInt64(A, a, N_A, node.inputs[0]);
+    readInt64(B, b, N_B, node.inputs[1]);
 
     for (int64_t i = 0; i < N; i++) {
         int64_t av = a[i % N_A], bv = b[i % N_B];
@@ -127,8 +135,7 @@ static void cpuBinaryInt64(GraphExecutor& ex, const OnnxGraphNode& node,
         }
     }
 
-    *outputs[0] = ex.AllocTensor(outShape, TensorDtype::Int64);
-    ex.gpu->writeBuffer(outputs[0]->buffer, c.data(), N * 8);
+    *outputs[0] = ex.AllocCpuTensor(outShape, TensorDtype::Int64, c.data(), N * 8);
 }
 
 // ─── Binary elementwise dispatch (dtype-aware) ───────────────────────────────
@@ -147,6 +154,10 @@ static void dispatchBinaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
         cpuBinaryInt64(ex, node, inputs, outputs, (int)opCode);
         return;
     }
+
+    // GPU kernel for fp32 binary ops
+    ex.EnsureGpu(*A);
+    ex.EnsureGpu(*B);
 
     int64_t N_A = tensorNel(A);
     int64_t N_B = tensorNel(B);
@@ -171,6 +182,7 @@ static void dispatchUnaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
     auto* A = inputs[0];
     if (!A || !A->IsValid()) return;
 
+    ex.EnsureGpu(*A);
     int64_t N = tensorNel(A);
     *outputs[0] = ex.AllocTensor(A->shape, A->dtype);
 
@@ -251,25 +263,39 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
 
     int64_t N = tensorNel(A);
 
-    // Flush before CPU readback
-    if (!ex.pendingDispatches_.empty()) {
-        ex.gpu->submitOnly(ex.pendingDispatches_, false);
-        ex.gpu->waitForQueue();
-        ex.pendingDispatches_.clear();
+    // For CPU-only tensors, do type conversion on CPU
+    const uint8_t* srcPtr = nullptr;
+    if (A->isCpuOnly && !A->cpuData.empty()) {
+        srcPtr = A->cpuData.data();
+    } else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) {
+        srcPtr = init->data;
     }
 
-    // CPU type conversion for small tensors and int types
-    auto rb = ex.gpu->readBuffer(A->buffer, A->ByteSize());
+    if (srcPtr) {
+        // CPU type conversion — no GPU sync needed
+    } else {
+        // GPU readback needed
+        if (!ex.pendingDispatches_.empty()) {
+            ex.gpu->submitOnly(ex.pendingDispatches_, false);
+            ex.gpu->waitForQueue();
+            ex.pendingDispatches_.clear();
+        }
+        auto rb = ex.gpu->readBuffer(A->buffer, A->ByteSize());
+        // Use temp storage for srcPtr
+        static thread_local std::vector<uint8_t> castTempBuf;
+        castTempBuf = std::move(rb);
+        srcPtr = castTempBuf.data();
+    }
 
     // Read source as fp64 intermediate
     std::vector<double> vals(N);
     for (int64_t i = 0; i < N; i++) {
         switch (A->dtype) {
-            case TensorDtype::Float32: { float v; memcpy(&v, rb.data() + i*4, 4); vals[i] = v; break; }
-            case TensorDtype::Int64: { int64_t v; memcpy(&v, rb.data() + i*8, 8); vals[i] = (double)v; break; }
-            case TensorDtype::Int32: { int32_t v; memcpy(&v, rb.data() + i*4, 4); vals[i] = (double)v; break; }
+            case TensorDtype::Float32: { float v; memcpy(&v, srcPtr + i*4, 4); vals[i] = v; break; }
+            case TensorDtype::Int64: { int64_t v; memcpy(&v, srcPtr + i*8, 8); vals[i] = (double)v; break; }
+            case TensorDtype::Int32: { int32_t v; memcpy(&v, srcPtr + i*4, 4); vals[i] = (double)v; break; }
             case TensorDtype::Float16: {
-                uint16_t h; memcpy(&h, rb.data() + i*2, 2);
+                uint16_t h; memcpy(&h, srcPtr + i*2, 2);
                 uint32_t sign = (h >> 15) & 1;
                 uint32_t exp = (h >> 10) & 0x1F;
                 uint32_t mant = h & 0x3FF;
@@ -285,8 +311,14 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     // Write target type
-    *out[0] = ex.AllocTensor(A->shape, outDtype);
-    size_t outElemSize = out[0]->DtypeSize();
+    bool isCpuResult = (A->isCpuOnly || N <= 64);
+    size_t outElemSize = 4;
+    switch (outDtype) {
+        case TensorDtype::Float32: case TensorDtype::Int32: outElemSize = 4; break;
+        case TensorDtype::Float16: outElemSize = 2; break;
+        case TensorDtype::Int64: outElemSize = 8; break;
+        case TensorDtype::Bool: case TensorDtype::UInt8: case TensorDtype::Int8: outElemSize = 1; break;
+    }
     std::vector<uint8_t> outBuf(N * outElemSize);
     for (int64_t i = 0; i < N; i++) {
         switch (outDtype) {
@@ -310,7 +342,12 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
             default: break;
         }
     }
-    ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBuf.size());
+    if (isCpuResult) {
+        *out[0] = ex.AllocCpuTensor(A->shape, outDtype, outBuf.data(), outBuf.size());
+    } else {
+        *out[0] = ex.AllocTensor(A->shape, outDtype);
+        ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBuf.size());
+    }
 }
 
 // Where: C = cond ? X : Y (CPU for small, GPU for large)
@@ -424,33 +461,33 @@ static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
     if (!A || !A->IsValid()) return;
     int64_t N = tensorNel(A);
 
-    if (!ex.pendingDispatches_.empty()) {
-        ex.gpu->submitOnly(ex.pendingDispatches_, false);
-        ex.gpu->waitForQueue();
-        ex.pendingDispatches_.clear();
+    // Read from CPU if possible
+    const uint8_t* ptr = nullptr;
+    if (A->isCpuOnly && !A->cpuData.empty()) ptr = A->cpuData.data();
+    else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) ptr = init->data;
+
+    if (!ptr && A->buffer.handle) {
+        if (!ex.pendingDispatches_.empty()) {
+            ex.gpu->submitOnly(ex.pendingDispatches_, false);
+            ex.gpu->waitForQueue();
+            ex.pendingDispatches_.clear();
+        }
+        auto rb = ex.gpu->readBuffer(A->buffer, A->ByteSize());
+        // Use temp copy
+        static thread_local std::vector<uint8_t> tempBuf;
+        tempBuf = std::move(rb);
+        ptr = tempBuf.data();
     }
+    if (!ptr) return;
 
-    // Read data
-    auto rb = ex.gpu->readBuffer(A->buffer, A->ByteSize());
-
-    // Sum along the specified axis (simplified: sum all for now)
-    // TODO: proper axis support
     if (A->dtype == TensorDtype::Int64) {
         int64_t sum = 0;
-        for (int64_t i = 0; i < N; i++) {
-            int64_t v; memcpy(&v, rb.data() + i*8, 8);
-            sum += v;
-        }
-        *out[0] = ex.AllocTensor({1}, TensorDtype::Int64);
-        ex.gpu->writeBuffer(out[0]->buffer, &sum, 8);
+        for (int64_t i = 0; i < N; i++) { int64_t v; memcpy(&v, ptr + i*8, 8); sum += v; }
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &sum, 8);
     } else {
         float sum = 0;
-        for (int64_t i = 0; i < N; i++) {
-            float v; memcpy(&v, rb.data() + i*4, 4);
-            sum += v;
-        }
-        *out[0] = ex.AllocTensor({1}, TensorDtype::Float32);
-        ex.gpu->writeBuffer(out[0]->buffer, &sum, 4);
+        for (int64_t i = 0; i < N; i++) { float v; memcpy(&v, ptr + i*4, 4); sum += v; }
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &sum, 4);
     }
 }
 

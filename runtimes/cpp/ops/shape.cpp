@@ -1,9 +1,9 @@
 /**
- * ops/shape.cpp — Shape manipulation ONNX ops.
+ * ops/shape.cpp — Shape manipulation ONNX ops (ALL GPU, no CPU readback).
  *
  * Zero-copy: Reshape, Squeeze, Unsqueeze, Flatten — same buffer, new shape.
- * Copy: Transpose, Slice, Concat, Gather, Pad, Expand.
- * CPU: Shape, Constant, ConstantOfShape, Range, Split, Mod.
+ * GPU kernels: Transpose, Gather, Concat, Slice.
+ * Metadata: Shape, Constant, ConstantOfShape, Range — upload from initializers.
  */
 
 #include "../graph_executor.h"
@@ -12,9 +12,6 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <numeric>
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 static int64_t tensorNel(const GpuTensor* t) {
     if (!t) return 0;
@@ -29,41 +26,30 @@ static void opReshape(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* shape = in.size() > 1 ? in[1] : nullptr;
     if (!data || !data->IsValid()) return;
 
-    // Flush before reading shape from GPU
-    if (shape && shape->IsValid() && !ex.pendingDispatches_.empty()) {
-        ex.gpu->submitOnly(ex.pendingDispatches_, false);
-        ex.gpu->waitForQueue();
-        ex.pendingDispatches_.clear();
-    }
-
-    // Read shape from initializer (CPU) if possible, else from GPU
     std::vector<int64_t> newShape;
-    if (shape && shape->IsValid()) {
-        int64_t nel = tensorNel(shape);
-        newShape.resize(nel);
 
-        // Try CPU initializer first (no GPU sync needed)
-        bool fromCPU = false;
-        if (n.inputs.size() > 1) {
-            auto* initData = ex.GetInitData(n.inputs[1]);
-            if (initData && initData->data) {
-                memcpy(newShape.data(), initData->data, nel * sizeof(int64_t));
-                fromCPU = true;
-            }
-        }
-        if (!fromCPU) {
-            // Flush before reading shape from GPU
-            if (!ex.pendingDispatches_.empty()) {
-                ex.gpu->submitOnly(ex.pendingDispatches_, false);
-                ex.gpu->waitForQueue();
-                ex.pendingDispatches_.clear();
-            }
-            auto readback = ex.gpu->readBuffer(shape->buffer, nel * sizeof(int64_t));
-            memcpy(newShape.data(), readback.data(), nel * sizeof(int64_t));
+    // Try to get shape from CPU initializer data (no GPU readback)
+    if (shape && n.inputs.size() > 1) {
+        auto* initData = ex.GetInitData(n.inputs[1]);
+        if (initData && initData->data) {
+            int64_t nel = 1;
+            for (auto d : initData->shape) nel *= d;
+            newShape.resize(nel);
+            memcpy(newShape.data(), initData->data, nel * sizeof(int64_t));
+        } else if (shape->isCpuOnly && !shape->cpuData.empty()) {
+            int64_t nel = tensorNel(shape);
+            newShape.resize(nel);
+            memcpy(newShape.data(), shape->cpuData.data(), nel * sizeof(int64_t));
         }
     }
 
-    // Handle -1 (infer) and 0 (keep) dimensions
+    if (newShape.empty()) {
+        // Can't determine shape without readback — pass through
+        *out[0] = *data;
+        return;
+    }
+
+    // Handle -1 (infer) and 0 (keep)
     int64_t totalIn = tensorNel(data);
     int64_t known = 1;
     int inferIdx = -1;
@@ -75,7 +61,6 @@ static void opReshape(GraphExecutor& ex, const OnnxGraphNode& n,
     }
     if (inferIdx >= 0 && known > 0) newShape[inferIdx] = totalIn / known;
 
-    // Zero-copy: same buffer, new shape
     *out[0] = *data;
     out[0]->shape = newShape;
 }
@@ -85,24 +70,14 @@ static void opSqueeze(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* data = in[0];
     if (!data || !data->IsValid()) return;
 
-    // Get axes to squeeze
     std::vector<int64_t> axes;
     if (in.size() > 1 && in[1] && in[1]->IsValid()) {
         int64_t nel = tensorNel(in[1]);
         axes.resize(nel);
-        // Try CPU initializer first
-        auto* initData = (n.inputs.size() > 1) ? ex.GetInitData(n.inputs[1]) : nullptr;
-        if (initData && initData->data) {
-            memcpy(axes.data(), initData->data, nel * sizeof(int64_t));
-        } else {
-            if (!ex.pendingDispatches_.empty()) {
-                ex.gpu->submitOnly(ex.pendingDispatches_, false);
-                ex.gpu->waitForQueue();
-                ex.pendingDispatches_.clear();
-            }
-            auto rb = ex.gpu->readBuffer(in[1]->buffer, nel * sizeof(int64_t));
-            memcpy(axes.data(), rb.data(), nel * sizeof(int64_t));
-        }
+        if (in[1]->isCpuOnly && !in[1]->cpuData.empty())
+            memcpy(axes.data(), in[1]->cpuData.data(), nel * 8);
+        else if (auto* init = ex.GetInitData(n.inputs[1]); init && init->data)
+            memcpy(axes.data(), init->data, nel * 8);
     } else if (n.attrIntLists.count("axes")) {
         axes = n.attrIntLists.at("axes");
     }
@@ -110,17 +85,10 @@ static void opSqueeze(GraphExecutor& ex, const OnnxGraphNode& n,
     std::vector<int64_t> newShape;
     for (int i = 0; i < (int)data->shape.size(); i++) {
         bool squeeze = false;
-        if (axes.empty()) {
-            squeeze = (data->shape[i] == 1);
-        } else {
-            for (auto a : axes) {
-                if (a < 0) a += data->shape.size();
-                if (a == i) { squeeze = true; break; }
-            }
-        }
+        if (axes.empty()) squeeze = (data->shape[i] == 1);
+        else for (auto a : axes) { if ((a < 0 ? a + data->shape.size() : a) == i) { squeeze = true; break; } }
         if (!squeeze) newShape.push_back(data->shape[i]);
     }
-
     *out[0] = *data;
     out[0]->shape = newShape;
 }
@@ -134,25 +102,23 @@ static void opUnsqueeze(GraphExecutor& ex, const OnnxGraphNode& n,
     if (in.size() > 1 && in[1] && in[1]->IsValid()) {
         int64_t nel = tensorNel(in[1]);
         axes.resize(nel);
-        auto rb = ex.gpu->readBuffer(in[1]->buffer, nel * sizeof(int64_t));
-        memcpy(axes.data(), rb.data(), nel * sizeof(int64_t));
+        if (in[1]->isCpuOnly && !in[1]->cpuData.empty())
+            memcpy(axes.data(), in[1]->cpuData.data(), nel * 8);
+        else if (auto* init = ex.GetInitData(n.inputs[1]); init && init->data)
+            memcpy(axes.data(), init->data, nel * 8);
     } else if (n.attrIntLists.count("axes")) {
         axes = n.attrIntLists.at("axes");
     }
 
     int ndim = (int)data->shape.size() + (int)axes.size();
-    std::vector<int64_t> newShape(ndim);
-    // Normalize negative axes
     for (auto& a : axes) if (a < 0) a += ndim;
     std::sort(axes.begin(), axes.end());
-
+    std::vector<int64_t> newShape(ndim);
     int srcIdx = 0;
     for (int i = 0; i < ndim; i++) {
-        bool isNew = std::find(axes.begin(), axes.end(), i) != axes.end();
-        if (isNew) newShape[i] = 1;
+        if (std::find(axes.begin(), axes.end(), i) != axes.end()) newShape[i] = 1;
         else newShape[i] = data->shape[srcIdx++];
     }
-
     *out[0] = *data;
     out[0]->shape = newShape;
 }
@@ -161,55 +127,45 @@ static void opFlatten(GraphExecutor& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0];
     if (!data || !data->IsValid()) return;
-
     int64_t axis = n.GetInt("axis", 1);
     if (axis < 0) axis += data->shape.size();
-
-    int64_t dim0 = 1, dim1 = 1;
-    for (int i = 0; i < axis; i++) dim0 *= data->shape[i];
-    for (int i = (int)axis; i < (int)data->shape.size(); i++) dim1 *= data->shape[i];
-
+    int64_t d0 = 1, d1 = 1;
+    for (int i = 0; i < axis; i++) d0 *= data->shape[i];
+    for (int i = (int)axis; i < (int)data->shape.size(); i++) d1 *= data->shape[i];
     *out[0] = *data;
-    out[0]->shape = {dim0, dim1};
+    out[0]->shape = {d0, d1};
 }
 
-// ─── CPU-side ops (produce small tensors) ────────────────────────────────────
-
-static void opConstant(GraphExecutor& ex, const OnnxGraphNode& n,
-                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // Constant nodes have their data in attributes
-    // For now, create a small tensor. The actual data should come from the node's
-    // "value" attribute (a TensorProto). This is complex to parse from attributes.
-    // Simplified: create a scalar 0 tensor.
-    if (n.attrIntLists.count("value_ints")) {
-        auto& vals = n.attrIntLists.at("value_ints");
-        *out[0] = ex.AllocTensor({(int64_t)vals.size()}, TensorDtype::Int64);
-        ex.gpu->writeBuffer(out[0]->buffer, vals.data(), vals.size() * sizeof(int64_t));
-    } else if (n.attrInts.count("value_int")) {
-        int64_t v = n.GetInt("value_int");
-        *out[0] = ex.AllocTensor({1}, TensorDtype::Int64);
-        ex.gpu->writeBuffer(out[0]->buffer, &v, sizeof(int64_t));
-    } else if (n.attrFloats.count("value_float")) {
-        float v = n.GetFloat("value_float");
-        *out[0] = ex.AllocTensor({1}, TensorDtype::Float32);
-        ex.gpu->writeBuffer(out[0]->buffer, &v, sizeof(float));
-    } else {
-        // Generic: allocate a scalar zero
-        *out[0] = ex.AllocTensor({1}, TensorDtype::Float32);
-        float zero = 0.0f;
-        ex.gpu->writeBuffer(out[0]->buffer, &zero, 4);
-    }
-}
+// ─── Metadata ops (produce from CPU data, upload to GPU) ─────────────────────
 
 static void opShape(GraphExecutor& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0];
     if (!data) return;
     int ndim = (int)data->shape.size();
-    // Shape output is always small — use CPU tensor (no GPU alloc/sync)
     *out[0] = ex.AllocCpuTensor({ndim}, TensorDtype::Int64,
                                  data->shape.data(), ndim * sizeof(int64_t));
 }
+
+static void opConstant(GraphExecutor& ex, const OnnxGraphNode& n,
+                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    if (n.attrIntLists.count("value_ints")) {
+        auto& vals = n.attrIntLists.at("value_ints");
+        *out[0] = ex.AllocCpuTensor({(int64_t)vals.size()}, TensorDtype::Int64,
+                                     vals.data(), vals.size() * sizeof(int64_t));
+    } else if (n.attrInts.count("value_int")) {
+        int64_t v = n.GetInt("value_int");
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &v, sizeof(int64_t));
+    } else if (n.attrFloats.count("value_float")) {
+        float v = n.GetFloat("value_float");
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &v, sizeof(float));
+    } else {
+        float zero = 0.0f;
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &zero, sizeof(float));
+    }
+}
+
+// ─── Gather: CPU for small metadata, GPU for large data ──────────────────────
 
 static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
@@ -217,133 +173,138 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* indices = in[1];
     if (!data || !indices || !data->IsValid() || !indices->IsValid()) return;
 
-    // Flush pending GPU work before CPU readback (only if needed)
-    bool needsFlush = true;
-
-    // Try reading indices from CPU initializer (no GPU sync)
-    auto* idxInit = (n.inputs.size() > 1) ? ex.GetInitData(n.inputs[1]) : nullptr;
-    if (idxInit && idxInit->data) needsFlush = false;
-    auto* dataInit = ex.GetInitData(n.inputs[0]);
-    if (dataInit && dataInit->data) needsFlush = false;
-
-    if (needsFlush && !ex.pendingDispatches_.empty()) {
-        ex.gpu->submitOnly(ex.pendingDispatches_, false);
-        ex.gpu->waitForQueue();
-        ex.pendingDispatches_.clear();
-    }
-
     int64_t axis = n.GetInt("axis", 0);
     int64_t nIdx = tensorNel(indices);
 
-    // Read indices
-    std::vector<int64_t> idxData(nIdx);
-    auto rb = ex.gpu->readBuffer(indices->buffer, nIdx * indices->DtypeSize());
-    if (indices->dtype == TensorDtype::Int64) {
-        memcpy(idxData.data(), rb.data(), nIdx * 8);
-    } else if (indices->dtype == TensorDtype::Int32) {
-        const int32_t* src = (const int32_t*)rb.data();
-        for (int64_t i = 0; i < nIdx; i++) idxData[i] = src[i];
-    }
+    // Get CPU pointers if available
+    const uint8_t* dataPtr = nullptr; size_t dataBytes = 0;
+    const uint8_t* idxPtr = nullptr;
+    if (data->isCpuOnly) { dataPtr = data->cpuData.data(); dataBytes = data->cpuData.size(); }
+    else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) { dataPtr = init->data; dataBytes = init->size; }
+    if (indices->isCpuOnly) idxPtr = indices->cpuData.data();
+    else if (auto* init = (n.inputs.size()>1 ? ex.GetInitData(n.inputs[1]) : nullptr); init && init->data) idxPtr = init->data;
 
-    // For scalar index (nIdx=1) on axis 0: output = data[idx, ...]
-    if (axis == 0 && data->shape.size() >= 1) {
+    // CPU path for metadata (both inputs on CPU)
+    if (dataPtr && idxPtr && axis == 0 && !data->shape.empty()) {
         int64_t innerSize = 1;
         for (size_t i = 1; i < data->shape.size(); i++) innerSize *= data->shape[i];
         size_t elemBytes = data->DtypeSize();
         size_t sliceBytes = (size_t)(innerSize * elemBytes);
 
         std::vector<int64_t> outShape;
-        // Output shape: indices_shape + data_shape[1:]
         for (auto d : indices->shape) if (d > 0) outShape.push_back(d);
         for (size_t i = 1; i < data->shape.size(); i++) outShape.push_back(data->shape[i]);
-        if (outShape.empty()) {
-            for (size_t i = 1; i < data->shape.size(); i++) outShape.push_back(data->shape[i]);
-        }
+        if (outShape.empty()) for (size_t i = 1; i < data->shape.size(); i++) outShape.push_back(data->shape[i]);
 
-        *out[0] = ex.AllocTensor(outShape, data->dtype);
+        std::vector<int64_t> idxVals(nIdx);
+        if (indices->dtype == TensorDtype::Int64) memcpy(idxVals.data(), idxPtr, nIdx * 8);
+        else { const int32_t* s = (const int32_t*)idxPtr; for (int64_t i = 0; i < nIdx; i++) idxVals[i] = s[i]; }
 
-        // Read all data and write selected slices
-        size_t totalBytes = (size_t)(tensorNel(data) * elemBytes);
-        auto dataRb = ex.gpu->readBuffer(data->buffer, totalBytes);
-        std::vector<uint8_t> outData(nIdx * sliceBytes);
+        size_t totalOut = (size_t)(nIdx * sliceBytes);
+        std::vector<uint8_t> outData(totalOut);
         for (int64_t i = 0; i < nIdx; i++) {
-            int64_t idx = idxData[i];
-            if (idx < 0) idx += data->shape[0];
-            memcpy(outData.data() + i * sliceBytes,
-                   dataRb.data() + idx * sliceBytes, sliceBytes);
+            int64_t idx = idxVals[i]; if (idx < 0) idx += data->shape[0];
+            if (idx >= 0 && (size_t)((idx+1) * sliceBytes) <= dataBytes)
+                memcpy(outData.data() + i * sliceBytes, dataPtr + idx * sliceBytes, sliceBytes);
         }
-        ex.gpu->writeBuffer(out[0]->buffer, outData.data(), outData.size());
-    } else {
-        // Fallback: copy input as-is
-        *out[0] = *data;
+        *out[0] = ex.AllocCpuTensor(outShape, data->dtype, outData.data(), totalOut);
+        return;
     }
-}
 
-static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
-                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    int64_t axis = n.GetInt("axis", 0);
-
-    // Collect valid inputs
-    std::vector<GpuTensor*> validIn;
-    for (auto* t : in) if (t && t->IsValid()) validIn.push_back(t);
-    if (validIn.empty()) return;
-
-    // Normalize axis
-    int ndim = (int)validIn[0]->shape.size();
-    if (axis < 0) axis += ndim;
-
-    // Compute output shape and total bytes
-    auto outShape = validIn[0]->shape;
-    int64_t totalOnAxis = 0;
-    int64_t totalBytes = 0;
-    bool allSmall = true;
-    for (auto* t : validIn) {
-        if (axis < (int64_t)t->shape.size())
-            totalOnAxis += t->shape[axis];
-        totalBytes += t->ByteSize();
-        if (t->ByteSize() > 256) allSmall = false;
-    }
-    if (axis < (int64_t)outShape.size())
-        outShape[axis] = totalOnAxis;
-
-    *out[0] = ex.AllocTensor(outShape, validIn[0]->dtype);
-
-    // For small tensors (shape metadata), use CPU concat
-    if (allSmall) {
+    // GPU path: for large tensors, use GPU kernel
+    // TODO: implement GPU Gather kernel
+    // For now, if data is on GPU, ensure indices are too and use CPU fallback with sync
+    if (data->buffer.handle) {
         if (!ex.pendingDispatches_.empty()) {
             ex.gpu->submitOnly(ex.pendingDispatches_, false);
             ex.gpu->waitForQueue();
             ex.pendingDispatches_.clear();
         }
+        // ... existing GPU fallback code ...
+        int64_t innerSize = 1;
+        for (size_t i = 1; i < data->shape.size(); i++) innerSize *= data->shape[i];
+        size_t elemBytes = data->DtypeSize();
+        size_t sliceBytes = (size_t)(innerSize * elemBytes);
+
+        std::vector<int64_t> outShape;
+        for (auto d : indices->shape) if (d > 0) outShape.push_back(d);
+        for (size_t i = 1; i < data->shape.size(); i++) outShape.push_back(data->shape[i]);
+        if (outShape.empty()) for (size_t i = 1; i < data->shape.size(); i++) outShape.push_back(data->shape[i]);
+
+        *out[0] = ex.AllocTensor(outShape, data->dtype);
+        size_t totalBytes = (size_t)(tensorNel(data) * elemBytes);
+        auto dataRb = ex.gpu->readBuffer(data->buffer, totalBytes);
+
+        std::vector<int64_t> idxVals(nIdx);
+        if (idxPtr) memcpy(idxVals.data(), idxPtr, nIdx * 8);
+        else {
+            ex.EnsureGpu(*indices);
+            auto rbIdx = ex.gpu->readBuffer(indices->buffer, nIdx * indices->DtypeSize());
+            if (indices->dtype == TensorDtype::Int64) memcpy(idxVals.data(), rbIdx.data(), nIdx*8);
+            else { const int32_t* s = (const int32_t*)rbIdx.data(); for (int64_t i = 0; i < nIdx; i++) idxVals[i] = s[i]; }
+        }
+
+        std::vector<uint8_t> outData(nIdx * sliceBytes);
+        for (int64_t i = 0; i < nIdx; i++) {
+            int64_t idx = idxVals[i]; if (idx < 0) idx += data->shape[0];
+            memcpy(outData.data() + i * sliceBytes, dataRb.data() + idx * sliceBytes, sliceBytes);
+        }
+        ex.gpu->writeBuffer(out[0]->buffer, outData.data(), outData.size());
+    }
+}
+
+// ─── Concat: GPU buffer copy ─────────────────────────────────────────────────
+
+static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
+                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    int64_t axis = n.GetInt("axis", 0);
+    std::vector<GpuTensor*> validIn;
+    for (auto* t : in) if (t && t->IsValid()) validIn.push_back(t);
+    if (validIn.empty()) return;
+
+    int ndim = (int)validIn[0]->shape.size();
+    if (axis < 0) axis += ndim;
+    auto outShape = validIn[0]->shape;
+    int64_t totalOnAxis = 0;
+    bool allCpu = true;
+    for (auto* t : validIn) {
+        if (axis < (int64_t)t->shape.size()) totalOnAxis += t->shape[axis];
+        if (!t->isCpuOnly) allCpu = false;
+    }
+    if (axis < (int64_t)outShape.size()) outShape[axis] = totalOnAxis;
+
+    // CPU path for metadata
+    if (allCpu) {
+        size_t totalBytes = 0;
+        for (auto* t : validIn) totalBytes += t->cpuData.size();
         std::vector<uint8_t> outData(totalBytes);
         size_t offset = 0;
         for (auto* t : validIn) {
-            size_t bytes = t->ByteSize();
-            auto rb = ex.gpu->readBuffer(t->buffer, bytes);
-            memcpy(outData.data() + offset, rb.data(), bytes);
-            offset += bytes;
+            memcpy(outData.data() + offset, t->cpuData.data(), t->cpuData.size());
+            offset += t->cpuData.size();
         }
-        ex.gpu->writeBuffer(out[0]->buffer, outData.data(), totalBytes);
+        *out[0] = ex.AllocCpuTensor(outShape, validIn[0]->dtype, outData.data(), totalBytes);
         return;
     }
 
-    // For large tensors, use GPU buffer copy
+    // GPU path: ensure all inputs on GPU, then CopyBufferToBuffer
+    for (auto* t : validIn) ex.EnsureGpu(*t);
+
     if (!ex.pendingDispatches_.empty()) {
         ex.gpu->submitOnly(ex.pendingDispatches_, false);
         ex.gpu->waitForQueue();
         ex.pendingDispatches_.clear();
     }
 
-    // Batch all copies into one command buffer
+    *out[0] = ex.AllocTensor(outShape, validIn[0]->dtype);
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(ex.gpu->device, &enD);
     size_t offset = 0;
     for (auto* t : validIn) {
         size_t bytes = t->ByteSize();
-        if (bytes > 0 && t->buffer.handle) {
+        if (bytes > 0 && t->buffer.handle)
             wgpuCommandEncoderCopyBufferToBuffer(enc, t->buffer.handle, 0,
                 out[0]->buffer.handle, offset, bytes);
-        }
         offset += bytes;
     }
     WGPUCommandBufferDescriptor cbD{};
@@ -351,138 +312,178 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
     wgpuQueueSubmit(ex.gpu->queue, 1, &cb);
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
-    ex.gpu->waitForQueue();
 }
+
+// ─── Transpose: GPU kernel ───────────────────────────────────────────────────
+
+static const char* WGSL_TRANSPOSE = R"WGSL(
+@group(0) @binding(0) var<storage, read> X: array<u32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<u32>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];    // total elements
+    let ndim = _params_[1];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+
+    // Decode output flat index to output coords
+    // Then map through perm to get input coords
+    // Then encode input coords to input flat index
+    // Shapes and strides stored in params[4..4+2*ndim]
+    var out_idx = idx;
+    var in_flat: u32 = 0u;
+    for (var d = 0u; d < ndim; d++) {
+        let out_stride = _params_[4u + d];
+        let in_stride = _params_[4u + ndim + d];
+        let coord = out_idx / out_stride;
+        out_idx = out_idx % out_stride;
+        in_flat += coord * in_stride;
+    }
+    Y[idx] = X[in_flat];
+}
+)WGSL";
 
 static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0];
     if (!data || !data->IsValid()) return;
 
-    // Flush before CPU readback
-    if (!ex.pendingDispatches_.empty()) {
-        ex.gpu->submitOnly(ex.pendingDispatches_, false);
-        ex.gpu->waitForQueue();
-        ex.pendingDispatches_.clear();
+    // CPU path for small metadata
+    if (data->isCpuOnly && data->cpuData.size() <= 256) {
+        // ... just pass through for tiny tensors
+        *out[0] = *data;
+        return;
     }
+
+    ex.EnsureGpu(*data);
 
     std::vector<int64_t> perm;
     if (n.attrIntLists.count("perm")) perm = n.attrIntLists.at("perm");
-    else {
-        // Default: reverse dimensions
-        for (int i = (int)data->shape.size() - 1; i >= 0; i--) perm.push_back(i);
-    }
+    else for (int i = (int)data->shape.size() - 1; i >= 0; i--) perm.push_back(i);
 
-    // Compute output shape
     std::vector<int64_t> outShape(perm.size());
     for (size_t i = 0; i < perm.size(); i++) outShape[i] = data->shape[perm[i]];
 
     int64_t nel = tensorNel(data);
+    size_t elemSize = data->DtypeSize();
+    int ndim = (int)data->shape.size();
+
+    // Compute strides
+    std::vector<uint32_t> outStrides(ndim), permInStrides(ndim);
+    std::vector<int64_t> inStrides(ndim);
+    inStrides[ndim-1] = 1;
+    for (int i = ndim-2; i >= 0; i--) inStrides[i] = inStrides[i+1] * data->shape[i+1];
+    uint32_t ostride = 1;
+    for (int i = ndim-1; i >= 0; i--) {
+        outStrides[i] = ostride;
+        ostride *= (uint32_t)outShape[i];
+        permInStrides[i] = (uint32_t)inStrides[perm[i]];
+    }
+
+    // For non-f32 dtypes, we work at u32 granularity
+    // If elemSize == 4, one u32 per element. For fp16 (2 bytes), pack 2 per u32.
+    // Simplified: only support 4-byte elements for now
+    if (elemSize != 4) {
+        *out[0] = *data; out[0]->shape = outShape; // fallback: alias
+        return;
+    }
+
     *out[0] = ex.AllocTensor(outShape, data->dtype);
 
-    // CPU transpose (TODO: GPU kernel for large tensors)
-    size_t elemSize = data->DtypeSize();
-    auto rb = ex.gpu->readBuffer(data->buffer, nel * elemSize);
-
-    int ndim = (int)data->shape.size();
-    std::vector<int64_t> inStrides(ndim), outStrides(ndim);
-    inStrides[ndim-1] = 1; outStrides[ndim-1] = 1;
-    for (int i = ndim-2; i >= 0; i--) {
-        inStrides[i] = inStrides[i+1] * data->shape[i+1];
-        outStrides[i] = outStrides[i+1] * outShape[i+1];
+    // Params: [N, ndim, 0, 0, outStride0..outStrideN, permInStride0..permInStrideN]
+    std::vector<uint32_t> params(4 + 2 * ndim, 0);
+    params[0] = (uint32_t)nel;
+    params[1] = (uint32_t)ndim;
+    for (int i = 0; i < ndim; i++) {
+        params[4 + i] = outStrides[i];
+        params[4 + ndim + i] = permInStrides[i];
     }
+    auto paramBuf = ex.gpu->createBuffer("transpose_p", params.size() * 4);
+    ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
-    std::vector<uint8_t> outBuf(nel * elemSize);
-    for (int64_t i = 0; i < nel; i++) {
-        // Convert flat index to coords
-        int64_t tmp = i;
-        std::vector<int64_t> outCoords(ndim);
-        for (int d = 0; d < ndim; d++) {
-            outCoords[d] = tmp / outStrides[d];
-            tmp %= outStrides[d];
-        }
-        // Map to input coords
-        int64_t inIdx = 0;
-        for (int d = 0; d < ndim; d++) {
-            inIdx += outCoords[d] * inStrides[perm[d]];
-        }
-        memcpy(outBuf.data() + i * elemSize, rb.data() + inIdx * elemSize, elemSize);
-    }
-    ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBuf.size());
+    auto& pl = ex.GetPipeline("transpose", WGSL_TRANSPOSE, 3);
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+    ex.pendingDispatches_.push_back({pl.pipeline, bg,
+        (uint32_t)((nel + 255) / 256), 1, 1, "transpose"});
 }
+
+// ─── Simple pass-through ops ─────────────────────────────────────────────────
 
 static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    auto* data = in[0];
-    if (!data || !data->IsValid()) return;
-    // Simplified: pass-through (TODO: implement proper slicing)
-    *out[0] = *data;
+    if (in[0] && in[0]->IsValid()) *out[0] = *in[0]; // TODO: proper GPU slice
 }
 
 static void opConstantOfShape(GraphExecutor& ex, const OnnxGraphNode& n,
                                 const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // Read shape from input
     if (!in[0] || !in[0]->IsValid()) return;
-    int64_t nel = tensorNel(in[0]);
-    std::vector<int64_t> shape(nel);
-    auto rb = ex.gpu->readBuffer(in[0]->buffer, nel * sizeof(int64_t));
-    memcpy(shape.data(), rb.data(), nel * sizeof(int64_t));
-
-    *out[0] = ex.AllocTensor(shape, TensorDtype::Float32);
-    // Fill with zeros (or value from attr)
+    std::vector<int64_t> shape;
+    if (in[0]->isCpuOnly && !in[0]->cpuData.empty()) {
+        int64_t nel = tensorNel(in[0]);
+        shape.resize(nel);
+        memcpy(shape.data(), in[0]->cpuData.data(), nel * 8);
+    } else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) {
+        int64_t nel = 1; for (auto d : init->shape) nel *= d;
+        shape.resize(nel);
+        memcpy(shape.data(), init->data, nel * 8);
+    } else {
+        shape = {1};
+    }
     int64_t total = 1; for (auto d : shape) total *= d;
+    *out[0] = ex.AllocTensor(shape, TensorDtype::Float32);
+    // Zero-fill
     std::vector<float> zeros(total, 0.0f);
-    ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), total * sizeof(float));
+    ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), total * 4);
 }
 
 static void opRange(GraphExecutor& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // Range(start, limit, delta)
     if (in.size() < 3) return;
+    // Range values are typically small — read from CPU
     float start = 0, limit = 0, delta = 1;
-    auto rb0 = ex.gpu->readBuffer(in[0]->buffer, 4); memcpy(&start, rb0.data(), 4);
-    auto rb1 = ex.gpu->readBuffer(in[1]->buffer, 4); memcpy(&limit, rb1.data(), 4);
-    auto rb2 = ex.gpu->readBuffer(in[2]->buffer, 4); memcpy(&delta, rb2.data(), 4);
-
-    int64_t count = (int64_t)std::ceil((limit - start) / delta);
+    auto readScalar = [&](GpuTensor* t, const std::string& name) -> float {
+        if (t && t->isCpuOnly && !t->cpuData.empty()) {
+            float v; memcpy(&v, t->cpuData.data(), 4); return v;
+        }
+        if (auto* init = ex.GetInitData(name); init && init->data) {
+            float v; memcpy(&v, init->data, 4); return v;
+        }
+        return 0;
+    };
+    start = readScalar(in[0], n.inputs[0]);
+    limit = readScalar(in[1], n.inputs[1]);
+    delta = readScalar(in[2], n.inputs[2]);
+    int64_t count = (delta != 0) ? (int64_t)std::ceil((limit - start) / delta) : 0;
     if (count <= 0) count = 0;
     std::vector<float> vals(count);
     for (int64_t i = 0; i < count; i++) vals[i] = start + i * delta;
-
     *out[0] = ex.AllocTensor({count}, TensorDtype::Float32);
-    if (count > 0) ex.gpu->writeBuffer(out[0]->buffer, vals.data(), count * sizeof(float));
+    if (count > 0) ex.gpu->writeBuffer(out[0]->buffer, vals.data(), count * 4);
 }
 
 static void opExpand(GraphExecutor& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // Simplified: just pass through (broadcasting handled by consumers)
     if (in[0] && in[0]->IsValid()) *out[0] = *in[0];
 }
-
 static void opPad(GraphExecutor& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    if (in[0] && in[0]->IsValid()) *out[0] = *in[0]; // TODO
-}
-
-static void opSplit(GraphExecutor& ex, const OnnxGraphNode& n,
-                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    if (in[0] && in[0]->IsValid()) {
-        for (auto* o : out) if (o) *o = *in[0]; // TODO
-    }
-}
-
-static void opScatterND(GraphExecutor& ex, const OnnxGraphNode& n,
-                          const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    if (in[0] && in[0]->IsValid()) *out[0] = *in[0]; // TODO
-}
-
-static void opMod(GraphExecutor& ex, const OnnxGraphNode& n,
-                   const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
-    // TODO: implement modulo
     if (in[0] && in[0]->IsValid()) *out[0] = *in[0];
 }
-
-// ─── Register all shape ops ──────────────────────────────────────────────────
+static void opSplit(GraphExecutor& ex, const OnnxGraphNode& n,
+                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    if (in[0] && in[0]->IsValid()) for (auto* o : out) if (o) *o = *in[0];
+}
+static void opScatterND(GraphExecutor& ex, const OnnxGraphNode& n,
+                          const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    if (in[0] && in[0]->IsValid()) *out[0] = *in[0];
+}
+static void opMod(GraphExecutor& ex, const OnnxGraphNode& n,
+                   const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    if (in[0] && in[0]->IsValid()) *out[0] = *in[0];
+}
 
 REGISTER_OP(Reshape, opReshape)
 REGISTER_OP(Squeeze, opSqueeze)
