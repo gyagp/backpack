@@ -227,6 +227,16 @@ int main(int argc, char* argv[]) {
         auto noisePredTensor = bp::Tensor::Create(device, bp::DataType::Float32,
             {16, 1, (int64_t)latentH, (int64_t)latentW});
 
+        // Debug: check latent input
+        {
+            int readN = 10;
+            std::vector<float> lData(readN);
+            latentsTensor.GetData(lData.data(), readN * sizeof(float));
+            printf("  Latent in[0:10] = ");
+            for (int i = 0; i < readN; i++) printf("%.4f ", lData[i]);
+            printf("\n");
+        }
+
         auto ditSession = bp::Session::Create(dit);
         ditSession.SetInput("hidden_states", latentsTensor);
         ditSession.SetInput("timestep", timestepTensor);
@@ -237,17 +247,12 @@ int main(int argc, char* argv[]) {
         // Debug: check DiT output
         {
             int64_t nPred = noisePredTensor.GetElementCount();
-            std::vector<float> predData(nPred);
-            noisePredTensor.GetData(predData.data(), nPred * sizeof(float));
-            float pMin = 1e30f, pMax = -1e30f;
-            int pNan = 0;
-            for (int i = 0; i < (int)nPred; i++) {
-                if (std::isnan(predData[i])) { pNan++; continue; }
-                pMin = std::min(pMin, predData[i]);
-                pMax = std::max(pMax, predData[i]);
-            }
-            printf("  DiT output: min=%.4f max=%.4f nan=%d/%lld\n",
-                   pMin, pMax, pNan, (long long)nPred);
+            int readN = std::min((int)nPred, 10);
+            std::vector<float> predData(readN);
+            noisePredTensor.GetData(predData.data(), readN * sizeof(float));
+            printf("  DiT out[0:10] = ");
+            for (int i = 0; i < readN; i++) printf("%.4f ", predData[i]);
+            printf("\n");
         }
 
         // 6b. Run scheduler step

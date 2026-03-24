@@ -873,6 +873,25 @@ void GraphExecutor::Execute(
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
+            // Debug: readback first output after first few ops to verify computation
+            if (ei < 5 && outTensors[0] && outTensors[0]->IsValid() && outTensors[0]->buffer.handle) {
+                // Flush pending to ensure GPU has computed
+                if (!pendingDispatches_.empty()) {
+                    gpu->submitOnly(pendingDispatches_, false);
+                    gpu->waitForQueue();
+                    pendingDispatches_.clear();
+                }
+                size_t readN = std::min((size_t)4, outTensors[0]->buffer.size / 4);
+                if (readN > 0) {
+                    auto rb = gpu->readBuffer(outTensors[0]->buffer, readN * 4);
+                    float vals[4] = {0};
+                    memcpy(vals, rb.data(), std::min(readN * 4, rb.size()));
+                    fprintf(stderr, "  [debug] ei=%zu %s out[0:4]=[%.4f, %.4f, %.4f, %.4f]\n",
+                            ei, node.opType.c_str(), vals[0], vals[1], vals[2], vals[3]);
+                    fflush(stderr);
+                }
+            }
+
             // Buffer release: alias-aware, only for large models
             if (graph_.nodes.size() > 800) {
                 for (auto& inName : node.inputs) {

@@ -228,6 +228,7 @@ struct bp::Session::Impl {
     std::vector<GpuTensor> ownedOutputs;
     std::vector<std::string> inputNames;
     std::vector<std::string> outputNames;
+    std::vector<Tensor*> outputTensors;  // back-pointers for buffer propagation
 };
 
 bp::Session bp::Session::Create(Model& model) {
@@ -258,6 +259,7 @@ void bp::Session::SetOutput(const std::string& name, Tensor& tensor) {
     gt.dtype = ti->geDtype;
     impl_->ownedOutputs.push_back(gt);
     impl_->outputNames.push_back(name);
+    impl_->outputTensors.push_back(&tensor);
 }
 
 void bp::Session::Run() {
@@ -273,6 +275,18 @@ void bp::Session::Run() {
         outputs[impl_->outputNames[i]] = &impl_->ownedOutputs[i];
 
     impl_->model->GetImpl()->executor.Execute(inputs, outputs);
+
+    // Propagate output buffer handles back to the Tensor objects
+    // Execute may have replaced the buffer handle with the actual computed result
+    for (size_t i = 0; i < impl_->outputTensors.size(); i++) {
+        if (impl_->outputTensors[i]) {
+            auto* ti = impl_->outputTensors[i]->GetImpl();
+            if (ti) {
+                ti->gpuBuf = impl_->ownedOutputs[i].buffer;
+                ti->shape = impl_->ownedOutputs[i].shape;
+            }
+        }
+    }
 }
 
 void bp::Session::Release() { impl_.reset(); }
