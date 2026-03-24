@@ -65,6 +65,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
             let lo = unpack4xU8(b_packed & 0x0F0F0F0Fu);
             let hi = unpack4xU8((b_packed >> 4u) & 0x0F0F0F0Fu);
+            // UINT4 with default zero_point=8: dequant = (nibble - 8) * scale
             let b0 = vec4<f32>(f32(lo[0]) - 8.0, f32(hi[0]) - 8.0,
                                f32(lo[1]) - 8.0, f32(hi[1]) - 8.0) * scale;
             let b1 = vec4<f32>(f32(lo[2]) - 8.0, f32(hi[2]) - 8.0,

@@ -350,29 +350,55 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
     if (n.attrIntLists.count("perm")) perm = n.attrIntLists.at("perm");
     else for (int i=(int)data->shape.size()-1; i>=0; i--) perm.push_back(i);
 
+    // Ensure data shape matches perm dimensions
+    // If perm has more dims than data shape, pad shape with 1s (local copy)
+    auto dataShape = data->shape;
+    while ((int)dataShape.size() < (int)perm.size()) {
+        dataShape.insert(dataShape.begin(), 1);
+    }
+
     std::vector<int64_t> outShape(perm.size());
     for (size_t i=0; i<perm.size(); i++) {
-        if (perm[i] >= (int64_t)data->shape.size()) {
-            // perm index out of range — pass through with shape unchanged
+        if (perm[i] >= (int64_t)dataShape.size()) {
             *out[0] = *data;
             return;
         }
-        outShape[i] = data->shape[perm[i]];
+        outShape[i] = dataShape[perm[i]];
     }
-    int64_t nel = tensorNel(data);
+    int64_t nel = 1;
+    for (auto d : dataShape) nel *= d;
     size_t elemSize = data->DtypeSize();
-    int ndim = (int)data->shape.size();
+    int ndim = (int)dataShape.size();
 
-    if (elemSize != 4 && elemSize != 8) {
-        // For fp16 (2 bytes), can't directly use u32 transpose. Pass through.
-        *out[0] = *data; out[0]->shape = outShape; return;
+    // Check if transpose is effectively a no-op (dimensions being swapped are size 1)
+    bool isNoop = true;
+    for (size_t i = 0; i < perm.size(); i++) {
+        if (perm[i] != (int64_t)i && dataShape[i] != 1 && dataShape[perm[i]] != 1) {
+            isNoop = false;
+            break;
+        }
+    }
+    // Also check if data has <= 1 element total
+    if (nel <= 1) isNoop = true;
+
+    if (isNoop || elemSize != 4) {
+        *out[0] = *data;
+        out[0]->shape = outShape;
+        return;
+    }
+
+    // Safety: verify buffer is large enough for the kernel
+    if (!data->buffer.handle || data->buffer.size < (size_t)(nel * elemSize)) {
+        *out[0] = *data;
+        out[0]->shape = outShape;
+        return;
     }
 
     *out[0] = ex.AllocTensor(outShape, data->dtype);
 
     std::vector<int64_t> inStrides(ndim);
     inStrides[ndim-1] = 1;
-    for (int i=ndim-2; i>=0; i--) inStrides[i] = inStrides[i+1] * data->shape[i+1];
+    for (int i=ndim-2; i>=0; i--) inStrides[i] = inStrides[i+1] * dataShape[i+1];
 
     uint32_t ostride = 1;
     std::vector<uint32_t> outStrides(ndim), permInStrides(ndim);

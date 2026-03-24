@@ -178,6 +178,17 @@ int main(int argc, char* argv[]) {
     auto encMs = std::chrono::duration<double,std::milli>(tEnc1 - tEnc0).count();
     printf("  Text encoder: %.0fms\n", encMs);
 
+    // Debug: check encoder hidden state — read first 10 values
+    {
+        int64_t nHidden = hiddenTensor.GetElementCount();
+        int readN = std::min((int)nHidden, 10);
+        std::vector<float> hData(readN);
+        hiddenTensor.GetData(hData.data(), readN * sizeof(float));
+        printf("  Encoder[0:10] = ");
+        for (int i = 0; i < readN; i++) printf("%.4f ", hData[i]);
+        printf("\n");
+    }
+
     // ─── 5. Initialize latents ───────────────────────────────────────────
 
     std::mt19937 rng(seed);
@@ -222,6 +233,22 @@ int main(int argc, char* argv[]) {
         ditSession.SetInput("encoder_hidden_states", hiddenTensor);
         ditSession.SetOutput("unified_results", noisePredTensor);
         ditSession.Run();
+
+        // Debug: check DiT output
+        {
+            int64_t nPred = noisePredTensor.GetElementCount();
+            std::vector<float> predData(nPred);
+            noisePredTensor.GetData(predData.data(), nPred * sizeof(float));
+            float pMin = 1e30f, pMax = -1e30f;
+            int pNan = 0;
+            for (int i = 0; i < (int)nPred; i++) {
+                if (std::isnan(predData[i])) { pNan++; continue; }
+                pMin = std::min(pMin, predData[i]);
+                pMax = std::max(pMax, predData[i]);
+            }
+            printf("  DiT output: min=%.4f max=%.4f nan=%d/%lld\n",
+                   pMin, pMax, pNan, (long long)nPred);
+        }
 
         // 6b. Run scheduler step
         float stepInfo[2] = { schedule.sigmas[step], schedule.sigmas[step + 1] };
@@ -290,6 +317,21 @@ int main(int argc, char* argv[]) {
     int imageSize = 3 * height * width;
     std::vector<float> imageData(imageSize);
     imageTensor.GetData(imageData.data(), imageSize * sizeof(float));
+
+    // Debug: check raw pixel statistics
+    float minV = 1e30f, maxV = -1e30f;
+    double sumV = 0;
+    int nanCount = 0;
+    for (int i = 0; i < imageSize; i++) {
+        float v = imageData[i];
+        if (std::isnan(v) || std::isinf(v)) { nanCount++; continue; }
+        minV = std::min(minV, v);
+        maxV = std::max(maxV, v);
+        sumV += v;
+    }
+    printf("  Raw pixels: min=%.4f max=%.4f avg=%.4f nan=%d/%d\n",
+           minV, maxV, sumV / (imageSize - nanCount), nanCount, imageSize);
+    fflush(stdout);
 
     writePPM(outputPath, imageData.data(), width, height);
 
