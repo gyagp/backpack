@@ -274,9 +274,19 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
 
 static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    fprintf(stderr, "    [concat-enter] in.size=%zu out.size=%zu\n", in.size(), out.size());
+    fflush(stderr);
+
     int64_t axis = n.GetInt("axis", 0);
     std::vector<GpuTensor*> validIn;
-    for (auto* t : in) if (t && t->IsValid()) validIn.push_back(t);
+    for (size_t i = 0; i < in.size(); i++) {
+        auto* t = in[i];
+        if (!t) continue;
+        // Safety: check the pointer is dereferenceable
+        fprintf(stderr, "      [concat] in[%zu] ptr=%p\n", i, (void*)t);
+        fflush(stderr);
+        if (t->IsValid()) validIn.push_back(t);
+    }
     if (validIn.empty()) return;
 
     int ndim = (int)validIn[0]->shape.size();

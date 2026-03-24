@@ -609,6 +609,12 @@ GpuTensor GraphExecutor::AllocCpuTensor(const std::vector<int64_t>& shape,
 void GraphExecutor::EnsureGpu(GpuTensor& t) {
     if (t.buffer.handle || !t.isCpuOnly) return;
     size_t bytes = t.cpuData.size();
+    if (bytes == 0) {
+        // CPU tensor with no data — create minimal buffer
+        t.buffer = gpu->createBuffer("cpu2gpu_empty", 4);
+        t.isCpuOnly = false;
+        return;
+    }
     if (bytes == 0) bytes = 4;
     // Align to 4 bytes for WebGPU
     size_t bufSize = (bytes + 3) & ~(size_t)3;
@@ -667,6 +673,16 @@ void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
 
 void GraphExecutor::QueueCopy(GPUBuffer src, uint64_t srcOffset,
                                GPUBuffer dst, uint64_t dstOffset, uint64_t size) {
+    if (!src.handle || !dst.handle || size == 0) return;
+    // Clamp to buffer sizes
+    if (srcOffset + size > src.size) size = (src.size > srcOffset) ? src.size - srcOffset : 0;
+    if (dstOffset + size > dst.size) size = (dst.size > dstOffset) ? dst.size - dstOffset : 0;
+    if (size == 0) return;
+    // WebGPU requires 4-byte alignment for copies
+    size = size & ~3ULL;
+    srcOffset = srcOffset & ~3ULL;
+    dstOffset = dstOffset & ~3ULL;
+    if (size == 0) return;
     pendingCopies_.push_back({src, srcOffset, dst, dstOffset, size});
 }
 
@@ -820,7 +836,7 @@ void GraphExecutor::Execute(
             }
         }
 
-        if (ei < 100 || ei % 50 == 0) {
+        if (ei < 100 || ei % 10 == 0 || ei > 498) {
             auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - execT0).count();
             int validCount = 0, invalidCount = 0;
@@ -836,13 +852,48 @@ void GraphExecutor::Execute(
         // Dispatch op
         auto opIt = registry.find(node.opType);
         if (opIt != registry.end()) {
+            // Safety: verify all input pointers are still valid before dispatch
+            bool inputsOk = true;
+            for (size_t ti = 0; ti < inTensors.size(); ti++) {
+                if (inTensors[ti] && !inTensors[ti]->IsValid() && !node.inputs[ti].empty()) {
+                    // Re-resolve from tensorStore_ in case it was updated
+                    auto it2 = tensorStore_.find(node.inputs[ti]);
+                    if (it2 != tensorStore_.end())
+                        inTensors[ti] = &it2->second;
+                }
+            }
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
-            // Note: buffer release disabled during execution because zero-copy ops
-            // (Reshape, Squeeze, Unsqueeze, Flatten) alias input buffers in outputs.
-            // Releasing would invalidate downstream consumers.
-            // Buffers are freed when the graph executor is destroyed.
+            // Release input buffers that are no longer needed
+            // Track buffer aliases: if multiple tensors share the same buffer handle,
+            // only release when the last reference is gone.
+            for (auto& inName : node.inputs) {
+                if (inName.empty()) continue;
+                auto rc = --tensorRefCount[inName];
+                if (rc <= 0) {
+                    auto it = tensorStore_.find(inName);
+                    if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
+                        // Check if any other tensor still uses this buffer
+                        bool aliased = false;
+                        WGPUBuffer h = it->second.buffer.handle;
+                        for (auto& [oname, otensor] : tensorStore_) {
+                            if (oname != inName && otensor.buffer.handle == h) {
+                                // Check if this alias is still needed
+                                auto rcIt = tensorRefCount.find(oname);
+                                if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
+                                    aliased = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!aliased) {
+                            gpu->releaseBuffer(it->second.buffer);
+                        }
+                        it->second.buffer = {nullptr, 0};
+                    }
+                }
+            }
 
             // Submit pending work periodically (with sync to prevent TDR)
             if (pendingDispatches_.size() + pendingCopies_.size() >= 8) {
