@@ -4,70 +4,18 @@
  * Covers: Add, Sub, Mul, Div, Neg, Sqrt, Sigmoid, Tanh, Sin, Cos,
  *         Cast, Equal, GreaterOrEqual, Where, Softmax, ReduceSum.
  *
- * Most ops use a single generic WGSL kernel parameterized by op code.
- * Some ops (Cast, Where, Softmax) need specialized kernels.
+ * Uses embedded kernels from compiler/kernels/shared/.
  */
 
 #include "../graph_executor.h"
+#include "../wgsl_shaders.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
 
-// ─── Generic binary elementwise kernel ───────────────────────────────────────
-
-static const char* WGSL_BINARY_ELEMENTWISE = R"WGSL(
-@group(0) @binding(0) var<storage, read> A: array<f32>;
-@group(0) @binding(1) var<storage, read> B: array<f32>;
-@group(0) @binding(2) var<storage, read_write> C: array<f32>;
-@group(0) @binding(3) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let op = _params_[1];
-    let B_N = _params_[2]; // B element count (for broadcasting)
-    let idx = gid.x;
-    if (idx >= N) { return; }
-    let a = A[idx];
-    let b_idx = select(idx, idx % B_N, B_N < N && B_N > 0u);
-    let b = B[b_idx];
-    switch (op) {
-        case 0u: { C[idx] = a + b; }
-        case 1u: { C[idx] = a - b; }
-        case 2u: { C[idx] = a * b; }
-        case 3u: { C[idx] = a / b; }
-        default: { C[idx] = a + b; }
-    }
-}
-)WGSL";
-
-// ─── Generic unary elementwise kernel ────────────────────────────────────────
-
-static const char* WGSL_UNARY_ELEMENTWISE = R"WGSL(
-@group(0) @binding(0) var<storage, read> A: array<f32>;
-@group(0) @binding(1) var<storage, read_write> C: array<f32>;
-@group(0) @binding(2) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let op = _params_[1];
-    let idx = gid.x;
-    if (idx >= N) { return; }
-    let a = A[idx];
-    switch (op) {
-        case 0u: { C[idx] = 1.0 / (1.0 + exp(-a)); }  // sigmoid
-        case 1u: { C[idx] = tanh(a); }
-        case 2u: { C[idx] = -a; }
-        case 3u: { C[idx] = sqrt(a); }
-        case 4u: { C[idx] = sin(a); }
-        case 5u: { C[idx] = cos(a); }
-        case 6u: { C[idx] = a; }  // identity (cast to same type)
-        default: { C[idx] = a; }
-    }
-}
-)WGSL";
+// Binary and unary elementwise ops now use embedded kernels from
+// compiler/kernels/shared/binary_elementwise.wgsl and unary_elementwise.wgsl
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -165,7 +113,7 @@ static void dispatchBinaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
     *outputs[0] = ex.AllocTensor(outShape, A->dtype);
 
     auto params = makeParamBuf(ex, (uint32_t)N, opCode, (uint32_t)N_B);
-    auto& pl = ex.GetPipeline("binary_elem", WGSL_BINARY_ELEMENTWISE, 4);
+    auto& pl = ex.GetPipeline("binary_elementwise", WGSL_BINARY_ELEMENTWISE, 4);
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, outputs[0]->buffer}, {3, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, node.opType}});
@@ -184,7 +132,7 @@ static void dispatchUnaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
     *outputs[0] = ex.AllocTensor(A->shape, A->dtype);
 
     auto params = makeParamBuf(ex, (uint32_t)N, opCode);
-    auto& pl = ex.GetPipeline("unary_elem", WGSL_UNARY_ELEMENTWISE, 3);
+    auto& pl = ex.GetPipeline("unary_elementwise", WGSL_UNARY_ELEMENTWISE, 3);
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, outputs[0]->buffer}, {2, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, node.opType}});
@@ -341,33 +289,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 }
 
-// Where: condition ? X : Y
-static const char* WGSL_WHERE = R"WGSL(
-@group(0) @binding(0) var<storage, read> Cond: array<u32>;
-@group(0) @binding(1) var<storage, read> X: array<f32>;
-@group(0) @binding(2) var<storage, read> Y: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
-@group(0) @binding(4) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let N_cond = _params_[1];
-    let N_x = _params_[2];
-    let N_y = _params_[3];
-    let idx = gid.x;
-    if (idx >= N) { return; }
-    let c_idx = select(idx, idx % N_cond, N_cond < N && N_cond > 0u);
-    let x_idx = select(idx, idx % N_x, N_x < N && N_x > 0u);
-    let y_idx = select(idx, idx % N_y, N_y < N && N_y > 0u);
-    // Bool packed as bytes in u32
-    let byte_idx = c_idx / 4u;
-    let bit_pos = (c_idx % 4u) * 8u;
-    let cond_val = (Cond[byte_idx] >> bit_pos) & 0xFFu;
-    Out[idx] = select(Y[y_idx], X[x_idx], cond_val != 0u);
-}
-)WGSL";
-
+// Where: condition ? X : Y — uses embedded where_select kernel
 static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Cond = in[0];
@@ -390,15 +312,15 @@ static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(Cond),
                                 (uint32_t)tensorNel(X), (uint32_t)tensorNel(Y));
-    auto& pl = ex.GetPipeline("where_gpu", WGSL_WHERE, 5);
+    auto& pl = ex.GetPipeline("where_select", WGSL_WHERE_SELECT, 5);
     auto bg = ex.MakeBindGroup(pl, {
         {0, Cond->buffer}, {1, X->buffer}, {2, Y->buffer},
         {3, out[0]->buffer}, {4, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "where"}});
 }
 
-// Equal: compare two f32 tensors, output bool
-static const char* WGSL_EQUAL = R"WGSL(
+// Equal: compare two f32 tensors, output bool — uses inline kernel
+static const char* WGSL_EQUAL_OP = R"WGSL(
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
 @group(0) @binding(2) var<storage, read_write> Out: array<u32>;
@@ -447,7 +369,7 @@ static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
     *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
 
     auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(B));
-    auto& pl = ex.GetPipeline("equal_gpu", WGSL_EQUAL, 4);
+    auto& pl = ex.GetPipeline("equal_op", WGSL_EQUAL_OP, 4);
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "equal"}});
@@ -465,38 +387,7 @@ static void opGreaterOrEqual(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.gpu->writeBuffer(out[0]->buffer, ones.data(), bytes);
 }
 
-// Softmax: proper GPU kernel with numerical stability
-static const char* WGSL_SOFTMAX = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
-@group(0) @binding(2) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let nRows = _params_[0];
-    let rowLen = _params_[1];
-    let row = gid.x;
-    if (row >= nRows) { return; }
-    let base = row * rowLen;
-
-    // Find max for numerical stability
-    var maxVal: f32 = -1e30;
-    for (var i = 0u; i < rowLen; i++) {
-        maxVal = max(maxVal, X[base + i]);
-    }
-    // Compute exp and sum
-    var sumExp: f32 = 0.0;
-    for (var i = 0u; i < rowLen; i++) {
-        sumExp += exp(X[base + i] - maxVal);
-    }
-    // Normalize
-    let invSum = 1.0 / max(sumExp, 1e-9);
-    for (var i = 0u; i < rowLen; i++) {
-        Y[base + i] = exp(X[base + i] - maxVal) * invSum;
-    }
-}
-)WGSL";
-
+// Softmax: proper GPU kernel — uses embedded softmax kernel
 static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
@@ -511,7 +402,7 @@ static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
     *out[0] = ex.AllocTensor(X->shape, X->dtype);
 
     auto params = makeParamBuf(ex, (uint32_t)nRows, (uint32_t)rowLen);
-    auto& pl = ex.GetPipeline("softmax_gpu", WGSL_SOFTMAX, 3);
+    auto& pl = ex.GetPipeline("softmax", WGSL_SOFTMAX, 3);
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((nRows + 255) / 256), 1, 1, "softmax"}});

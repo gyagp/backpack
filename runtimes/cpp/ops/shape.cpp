@@ -1,13 +1,10 @@
 /**
  * ops/shape.cpp — Shape manipulation ONNX ops.
- * ALL GPU, ZERO CPU readback during graph execution.
- *
- * Zero-copy: Reshape, Squeeze, Unsqueeze, Flatten.
- * GPU kernels: Transpose, Gather, Concat.
- * CPU init only: Shape, Constant (produce from known metadata, upload to GPU).
+ * Uses embedded WGSL kernels from compiler/kernels/shared/.
  */
 
 #include "../graph_executor.h"
+#include "../wgsl_shaders.h"
 #include <webgpu/webgpu.h>
 #include <cstdio>
 #include <cstring>
@@ -162,31 +159,8 @@ static void opConstant(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GPU Gather kernel
+// GPU Gather — uses embedded gather kernel
 // ═══════════════════════════════════════════════════════════════════════════
-
-static const char* WGSL_GATHER = R"WGSL(
-@group(0) @binding(0) var<storage, read> Data: array<u32>;
-@group(0) @binding(1) var<storage, read> Indices: array<i32>;
-@group(0) @binding(2) var<storage, read_write> Out: array<u32>;
-@group(0) @binding(3) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let nIdx = _params_[0];
-    let sliceSize = _params_[1];  // elements per slice (u32 units)
-    let dataStride = _params_[2]; // stride on axis 0
-
-    let total = nIdx * sliceSize;
-    let idx = gid.x;
-    if (idx >= total) { return; }
-
-    let i = idx / sliceSize;
-    let j = idx % sliceSize;
-    let dataIdx = u32(Indices[i]) * dataStride + j;
-    Out[idx] = Data[dataIdx];
-}
-)WGSL";
 
 static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
@@ -261,7 +235,7 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("gather_p", 16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
-    auto& pl = ex.GetPipeline("gather_gpu", WGSL_GATHER, 4);
+    auto& pl = ex.GetPipeline("gather", WGSL_GATHER, 4);
     auto bg = ex.MakeBindGroup(pl, {
         {0, data->buffer}, {1, idxBuf}, {2, out[0]->buffer}, {3, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -362,32 +336,8 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GPU Transpose kernel
+// GPU Transpose — uses embedded transpose kernel
 // ═══════════════════════════════════════════════════════════════════════════
-
-static const char* WGSL_TRANSPOSE = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<u32>;
-@group(0) @binding(1) var<storage, read_write> Y: array<u32>;
-@group(0) @binding(2) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let ndim = _params_[1];
-    let idx = gid.x;
-    if (idx >= N) { return; }
-    var out_idx = idx;
-    var in_flat: u32 = 0u;
-    for (var d = 0u; d < ndim; d++) {
-        let out_stride = _params_[4u + d];
-        let in_stride = _params_[4u + ndim + d];
-        let coord = out_idx / out_stride;
-        out_idx = out_idx % out_stride;
-        in_flat += coord * in_stride;
-    }
-    Y[idx] = X[in_flat];
-}
-)WGSL";
 
 static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
@@ -444,37 +394,8 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GPU Slice kernel — proper axis-aware slicing
+// GPU Slice — uses embedded slice kernel
 // ═══════════════════════════════════════════════════════════════════════════
-
-static const char* WGSL_SLICE = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<u32>;
-@group(0) @binding(1) var<storage, read_write> Y: array<u32>;
-@group(0) @binding(2) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = _params_[0];
-    let ndim = _params_[1];
-    let idx = gid.x;
-    if (idx >= total) { return; }
-
-    // Decode output index to coordinates using output strides
-    var remaining = idx;
-    var in_flat: u32 = 0u;
-    for (var d = 0u; d < ndim; d++) {
-        let out_stride = _params_[4u + d];
-        let in_stride = _params_[4u + ndim + d];
-        let start = _params_[4u + 2u * ndim + d];
-        let step = _params_[4u + 3u * ndim + d];
-        let coord = remaining / out_stride;
-        remaining = remaining % out_stride;
-        let in_coord = start + coord * step;
-        in_flat += in_coord * in_stride;
-    }
-    Y[idx] = X[in_flat];
-}
-)WGSL";
 
 static int64_t readInt64FromTensor(GraphExecutor& ex, const GpuTensor* t, const std::string& name) {
     const uint8_t* p = nullptr;
@@ -612,7 +533,7 @@ static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("slice_p", params.size() * 4);
     ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
-    auto& pl = ex.GetPipeline("slice_gpu", WGSL_SLICE, 3);
+    auto& pl = ex.GetPipeline("slice", WGSL_SLICE, 3);
     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
         (totalU32 + 255) / 256, 1, 1, "slice"});
@@ -653,36 +574,8 @@ static void opRange(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Expand: broadcast tensor to a larger shape using GPU copy
+// Expand — uses embedded expand kernel
 // ═══════════════════════════════════════════════════════════════════════════
-
-static const char* WGSL_EXPAND = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
-@group(0) @binding(2) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = _params_[0];
-    let ndim = _params_[1];
-    let idx = gid.x;
-    if (idx >= total) { return; }
-
-    // Decode output index to input index using modular arithmetic
-    var remaining = idx;
-    var in_flat: u32 = 0u;
-    for (var d = 0u; d < ndim; d++) {
-        let out_stride = _params_[4u + d];
-        let in_dim = _params_[4u + ndim + d];
-        let in_stride = _params_[4u + 2u * ndim + d];
-        let coord = remaining / out_stride;
-        remaining = remaining % out_stride;
-        let in_coord = coord % in_dim; // broadcast: wrap around
-        in_flat += in_coord * in_stride;
-    }
-    Y[idx] = X[in_flat];
-}
-)WGSL";
 
 static void opExpand(GraphExecutor& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
@@ -757,7 +650,7 @@ static void opExpand(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("expand_p", params.size()*4);
     ex.gpu->writeBuffer(paramBuf, params.data(), params.size()*4);
 
-    auto& pl = ex.GetPipeline("expand_gpu", WGSL_EXPAND, 3);
+    auto& pl = ex.GetPipeline("expand", WGSL_EXPAND, 3);
     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
         (uint32_t)((totalOut+255)/256), 1, 1, "expand"});
