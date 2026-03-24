@@ -120,10 +120,23 @@ public:
     GPUContext* gpu = nullptr;
 
     ~GraphExecutor() {
-        // Just clear tensor store without releasing GPU buffers
-        // (GPU context manages buffer lifetime; releasing here can crash
-        //  if buffers are still referenced by bind groups or pending work)
-        tensorStore_.clear();
+        if (gpu) {
+            // tensorStore_ may already be cleared by Execute().
+            // Release any remaining buffers (from models that were loaded but not executed).
+            if (!tensorStore_.empty()) {
+                gpu->waitForQueue();
+                std::set<WGPUBuffer> released;
+                for (auto& [name, tensor] : tensorStore_) {
+                    if (tensor.buffer.handle && released.find(tensor.buffer.handle) == released.end()) {
+                        released.insert(tensor.buffer.handle);
+                        gpu->releaseBuffer(tensor.buffer);
+                    }
+                    tensor.buffer = {nullptr, 0};
+                }
+                tensorStore_.clear();
+            }
+            gpu->flushBufferPool();
+        }
     }
 
     /// Load and parse an ONNX model. Uploads initializer weights to GPU.

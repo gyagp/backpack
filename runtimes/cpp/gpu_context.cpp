@@ -288,7 +288,10 @@ void GPUContext::releaseBuffer(GPUBuffer buf) {
 void GPUContext::flushBufferPool() {
     for (auto& bucket : pool_) {
         for (auto& buf : bucket) {
-            if (buf.handle) wgpuBufferRelease(buf.handle);
+            if (buf.handle) {
+                wgpuBufferDestroy(buf.handle);
+                wgpuBufferRelease(buf.handle);
+            }
         }
         bucket.clear();
     }

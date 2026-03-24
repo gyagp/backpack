@@ -246,10 +246,11 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
     }
 
-    // Free DiT and scheduler
-    dit.Release();
-    scheduler.Release();
-    hiddenTensor.Release();
+    // Note: don't release dit/scheduler — destructor cleanup can hang.
+    // Memory will be freed when the process exits.
+    // dit.Release();
+    // scheduler.Release();
+    // hiddenTensor.Release();
 
     // ─── 7. VAE decode ───────────────────────────────────────────────────
 

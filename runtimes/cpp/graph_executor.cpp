@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
@@ -866,21 +867,21 @@ void GraphExecutor::Execute(
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
-            // Release input buffers that are no longer needed
-            // Track buffer aliases: if multiple tensors share the same buffer handle,
-            // only release when the last reference is gone.
+            // Release input buffers that are no longer needed.
+            // IMPORTANT: zero-copy ops (Reshape, Unsqueeze, etc.) create aliases
+            // where multiple tensors share the same buffer handle. We must nullify
+            // ALL aliases when releasing a buffer.
             for (auto& inName : node.inputs) {
                 if (inName.empty()) continue;
                 auto rc = --tensorRefCount[inName];
                 if (rc <= 0) {
                     auto it = tensorStore_.find(inName);
                     if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
-                        // Check if any other tensor still uses this buffer
+                        // Check if any LIVE alias still needs this buffer
                         bool aliased = false;
                         WGPUBuffer h = it->second.buffer.handle;
                         for (auto& [oname, otensor] : tensorStore_) {
                             if (oname != inName && otensor.buffer.handle == h) {
-                                // Check if this alias is still needed
                                 auto rcIt = tensorRefCount.find(oname);
                                 if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
                                     aliased = true;
@@ -889,9 +890,17 @@ void GraphExecutor::Execute(
                             }
                         }
                         if (!aliased) {
+                            // Release the buffer and nullify ALL aliases
                             gpu->releaseBuffer(it->second.buffer);
+                            for (auto& [oname, otensor] : tensorStore_) {
+                                if (otensor.buffer.handle == h) {
+                                    otensor.buffer = {nullptr, 0};
+                                }
+                            }
+                        } else {
+                            // Just clear this tensor's reference
+                            it->second.buffer = {nullptr, 0};
                         }
-                        it->second.buffer = {nullptr, 0};
                     }
                 }
             }
@@ -958,4 +967,23 @@ void GraphExecutor::Execute(
         pendingCopies_.clear();
     }
     gpu->waitForQueue();
+
+    // Release non-output intermediate buffers (GPU work is done, safe to free)
+    {
+        std::set<WGPUBuffer> outputHandles;
+        for (auto& [name, tensor] : outputs)
+            if (tensor && tensor->buffer.handle) outputHandles.insert(tensor->buffer.handle);
+
+        std::set<WGPUBuffer> released;
+        for (auto& [name, tensor] : tensorStore_) {
+            if (tensor.buffer.handle &&
+                outputHandles.find(tensor.buffer.handle) == outputHandles.end() &&
+                released.find(tensor.buffer.handle) == released.end()) {
+                released.insert(tensor.buffer.handle);
+                gpu->releaseBuffer(tensor.buffer);
+            }
+            tensor.buffer = {nullptr, 0};
+        }
+        tensorStore_.clear();
+    }
 }
