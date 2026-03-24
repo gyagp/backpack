@@ -106,6 +106,8 @@ struct GPUContext {
                           uint64_t offset = 0);
     /// Return a buffer to the pool for reuse.
     void      releaseBuffer(GPUBuffer buf);
+    /// Flush the buffer pool, actually freeing all pooled GPU buffers.
+    void      flushBufferPool();
 
     /// Enable/disable buffer pooling. Enabled by default.
     bool bufferPoolEnabled = true;

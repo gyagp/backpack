@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -117,6 +118,13 @@ using OpDispatchFn = std::function<void(
 class GraphExecutor {
 public:
     GPUContext* gpu = nullptr;
+
+    ~GraphExecutor() {
+        // Just clear tensor store without releasing GPU buffers
+        // (GPU context manages buffer lifetime; releasing here can crash
+        //  if buffers are still referenced by bind groups or pending work)
+        tensorStore_.clear();
+    }
 
     /// Load and parse an ONNX model. Uploads initializer weights to GPU.
     bool Load(GPUContext& gpuCtx, const std::string& onnxPath);

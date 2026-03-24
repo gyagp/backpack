@@ -402,6 +402,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
 
     printf("  Parsed: %zu initializers, %zu nodes, %zu inputs, %zu outputs\n",
            initTensors.size(), pbNodes.size(), graphInputs.size(), graphOutputs.size());
+    fflush(stdout);
 
     // Build OnnxGraph
     for (auto& vi : graphInputs) {
