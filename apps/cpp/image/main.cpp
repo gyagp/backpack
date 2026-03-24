@@ -247,12 +247,16 @@ int main(int argc, char* argv[]) {
         // Debug: check DiT output
         {
             int64_t nPred = noisePredTensor.GetElementCount();
+            auto shape = noisePredTensor.GetShape();
             int readN = std::min((int)nPred, 10);
             std::vector<float> predData(readN);
             noisePredTensor.GetData(predData.data(), readN * sizeof(float));
             printf("  DiT out[0:10] = ");
             for (int i = 0; i < readN; i++) printf("%.4f ", predData[i]);
-            printf("\n");
+            printf(" [shape=");
+            for (auto d : shape) printf("%lld,", (long long)d);
+            printf(" nel=%lld]\n", (long long)nPred);
+            fflush(stdout);
         }
 
         // 6b. Run scheduler step

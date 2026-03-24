@@ -219,10 +219,17 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
     if (srcPtr) {
         // CPU type conversion — no GPU sync needed
     } else {
-        // GPU tensor — for now, just alias with new dtype (no actual conversion)
-        // TODO: add GPU cast kernel
+        // GPU tensor — all GPU compute uses fp32, so aliasing preserves data
+        // DON'T change dtype to avoid ByteSize() mismatch
         *out[0] = *A;
-        out[0]->dtype = outDtype;
+        // Only change dtype for int↔float conversions, not float↔float
+        if ((outDtype == TensorDtype::Float32 || outDtype == TensorDtype::Float16) &&
+            (A->dtype == TensorDtype::Float32 || A->dtype == TensorDtype::Float16)) {
+            // Keep as Float32 since GPU buffers contain fp32 data
+            out[0]->dtype = TensorDtype::Float32;
+        } else {
+            out[0]->dtype = outDtype;
+        }
         return;
     }
 

@@ -873,20 +873,37 @@ void GraphExecutor::Execute(
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
-            // Debug: readback first output after first few ops to verify computation
-            if (ei < 5 && outTensors[0] && outTensors[0]->IsValid() && outTensors[0]->buffer.handle) {
-                // Flush pending to ensure GPU has computed
+            // Debug: readback outputs to trace zero propagation
+            // Debug readback disabled for production
+            if (false && ei < 200 && outTensors[0] && outTensors[0]->IsValid() && outTensors[0]->buffer.handle
+                && node.opType != "Constant" && node.opType != "Cast" && node.opType != "Reshape"
+                && node.opType != "Shape" && node.opType != "Unsqueeze" && node.opType != "Squeeze"
+                && node.opType != "Flatten" && node.opType != "Gather") {
+                // Flush ALL pending work (dispatches + copies)
                 if (!pendingDispatches_.empty()) {
                     gpu->submitOnly(pendingDispatches_, false);
-                    gpu->waitForQueue();
                     pendingDispatches_.clear();
                 }
+                if (!pendingCopies_.empty()) {
+                    WGPUCommandEncoderDescriptor enD{};
+                    auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+                    for (auto& c : pendingCopies_)
+                        wgpuCommandEncoderCopyBufferToBuffer(enc,
+                            c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+                    WGPUCommandBufferDescriptor cbD{};
+                    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+                    wgpuQueueSubmit(gpu->queue, 1, &cb);
+                    wgpuCommandBufferRelease(cb);
+                    wgpuCommandEncoderRelease(enc);
+                    pendingCopies_.clear();
+                }
+                gpu->waitForQueue();
                 size_t readN = std::min((size_t)4, outTensors[0]->buffer.size / 4);
                 if (readN > 0) {
                     auto rb = gpu->readBuffer(outTensors[0]->buffer, readN * 4);
                     float vals[4] = {0};
                     memcpy(vals, rb.data(), std::min(readN * 4, rb.size()));
-                    fprintf(stderr, "  [debug] ei=%zu %s out[0:4]=[%.4f, %.4f, %.4f, %.4f]\n",
+                    fprintf(stderr, "  [dbg] ei=%zu %s out=[%.4f, %.4f, %.4f, %.4f]\n",
                             ei, node.opType.c_str(), vals[0], vals[1], vals[2], vals[3]);
                     fflush(stderr);
                 }
