@@ -655,6 +655,12 @@ WGPUBindGroup GraphExecutor::MakeBindGroup(
         entries[i].binding = bindings[i].first;
         entries[i].buffer = bindings[i].second.handle;
         entries[i].size = bindings[i].second.size;
+        if (!entries[i].buffer) {
+            // Create a dummy 4-byte buffer to avoid null handle crash
+            auto dummy = gpu->createBuffer("dummy_bind", 4);
+            entries[i].buffer = dummy.handle;
+            entries[i].size = 4;
+        }
     }
     WGPUBindGroupDescriptor d{};
     d.layout = pl.bgLayout;
@@ -867,39 +873,35 @@ void GraphExecutor::Execute(
             opIt->second(*this, node, inTensors, outTensors);
             executed++;
 
-            // Release input buffers that are no longer needed.
-            // IMPORTANT: zero-copy ops (Reshape, Unsqueeze, etc.) create aliases
-            // where multiple tensors share the same buffer handle. We must nullify
-            // ALL aliases when releasing a buffer.
-            for (auto& inName : node.inputs) {
-                if (inName.empty()) continue;
-                auto rc = --tensorRefCount[inName];
-                if (rc <= 0) {
-                    auto it = tensorStore_.find(inName);
-                    if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
-                        // Check if any LIVE alias still needs this buffer
-                        bool aliased = false;
-                        WGPUBuffer h = it->second.buffer.handle;
-                        for (auto& [oname, otensor] : tensorStore_) {
-                            if (oname != inName && otensor.buffer.handle == h) {
-                                auto rcIt = tensorRefCount.find(oname);
-                                if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
-                                    aliased = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!aliased) {
-                            // Release the buffer and nullify ALL aliases
-                            gpu->releaseBuffer(it->second.buffer);
+            // Buffer release: alias-aware, only for large models
+            if (graph_.nodes.size() > 800) {
+                for (auto& inName : node.inputs) {
+                    if (inName.empty()) continue;
+                    auto rc = --tensorRefCount[inName];
+                    if (rc <= 0) {
+                        auto it = tensorStore_.find(inName);
+                        if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
+                            bool aliased = false;
+                            WGPUBuffer h = it->second.buffer.handle;
                             for (auto& [oname, otensor] : tensorStore_) {
-                                if (otensor.buffer.handle == h) {
-                                    otensor.buffer = {nullptr, 0};
+                                if (oname != inName && otensor.buffer.handle == h) {
+                                    auto rcIt = tensorRefCount.find(oname);
+                                    if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
+                                        aliased = true;
+                                        break;
+                                    }
                                 }
                             }
-                        } else {
-                            // Just clear this tensor's reference
-                            it->second.buffer = {nullptr, 0};
+                            if (!aliased) {
+                                gpu->releaseBuffer(it->second.buffer);
+                                for (auto& [oname, otensor] : tensorStore_) {
+                                    if (otensor.buffer.handle == h) {
+                                        otensor.buffer = {nullptr, 0};
+                                    }
+                                }
+                            } else {
+                                it->second.buffer = {nullptr, 0};
+                            }
                         }
                     }
                 }

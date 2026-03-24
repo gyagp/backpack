@@ -344,13 +344,21 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* data = in[0]; if (!data || !data->IsValid()) return;
     if (data->isCpuOnly) { *out[0] = *data; return; }
     ex.EnsureGpu(*data);
+    if (!data->buffer.handle) { *out[0] = *data; return; } // buffer was freed
 
     std::vector<int64_t> perm;
     if (n.attrIntLists.count("perm")) perm = n.attrIntLists.at("perm");
     else for (int i=(int)data->shape.size()-1; i>=0; i--) perm.push_back(i);
 
     std::vector<int64_t> outShape(perm.size());
-    for (size_t i=0; i<perm.size(); i++) outShape[i] = data->shape[perm[i]];
+    for (size_t i=0; i<perm.size(); i++) {
+        if (perm[i] >= (int64_t)data->shape.size()) {
+            // perm index out of range — pass through with shape unchanged
+            *out[0] = *data;
+            return;
+        }
+        outShape[i] = data->shape[perm[i]];
+    }
     int64_t nel = tensorNel(data);
     size_t elemSize = data->DtypeSize();
     int ndim = (int)data->shape.size();
