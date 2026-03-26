@@ -515,7 +515,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                     {0, inputBuf}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
                     {3, gateUpBuf.buffer}, {4, paramBuf}, {5, params2Buf}});
                 ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                    (uint32_t)((N_gu + 7) / 8), 1, 1, "qmoe_gateup"});
+                    (uint32_t)((N_gu + 255) / 256), 1, 1, "qmoe_gateup"});
             }
 
             // Step 2: SwiGLU
@@ -546,7 +546,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                     {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
                     {3, downBuf.buffer}, {4, paramBuf}, {5, params2Buf}});
                 ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                    (uint32_t)((N_dn + 7) / 8), 1, 1, "qmoe_down"});
+                    (uint32_t)((N_dn + 255) / 256), 1, 1, "qmoe_down"});
             }
 
             // Step 4: Weighted accumulate: output += weight * downBuf

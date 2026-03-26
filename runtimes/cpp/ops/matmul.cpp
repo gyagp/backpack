@@ -291,14 +291,14 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (N + 7) / 8, (uint32_t)M, 1, "matmul_q4_zp"});
+            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp"});
     } else {
         auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (N + 7) / 8, (uint32_t)M, 1, "matmul_q4"});
+            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4"});
     }
 }
 

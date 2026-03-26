@@ -3754,197 +3754,110 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // [onnx_q4] matmul_q4 (5 bindings, hand)
 static const char* WGSL_MATMUL_Q4 = R"WGSL(
-// MatMulNBits Q4 — ONNX GenAI quantized matmul
-// Y[m,n] = sum_k X[m,k] * dequant(W_Q4[n,k])
-//
-// Weight layout: W_Q4[N, blocks_per_col, 16] uint8 (Q4 packed, 8 nibbles per u32)
-// Scale layout: Scales[N * blocks_per_col] fp16 (packed 2 per u32)
-// block_size = 32, blocks_per_col = K / 32
-//
+// MatMulNBits Q4 — simple per-element kernel
+// Y[m,n] = sum_k X[m,k] * dequant(W[n,k])
+// Weight: W[N, K/2] packed uint8 (2 Q4 values per byte)
+// Scale: [N * blocks_per_col] fp16 packed into u32
+// block_size=32, blocks_per_col = K/32
 // Dispatch: (ceil(N/8), M, 1)
-// Workgroup: 128 threads = 8 output columns × 16 K-reduction threads
 
-@group(0) @binding(0) var<storage, read> A: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<u32>;
 @group(0) @binding(2) var<storage, read> Scales: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
-const TILE_N: u32 = 8u;
-const TILE_K_VEC: u32 = 16u;
-const WG_SIZE: u32 = 128u;
-
-var<workgroup> tile_A: array<vec4<f32>, TILE_K_VEC>;
-var<workgroup> inter_results: array<array<f32, TILE_K_VEC>, TILE_N>;
-
-@compute @workgroup_size(128)
-fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let M = _params_[0];
     let N = _params_[1];
     let K = _params_[2];
     let blocks_per_col = K / 32u;
-
-    let row = wid.y;
-    let n_tile = wid.x;
-    let local_id = lid.x;
-    let k_idx = local_id % TILE_K_VEC;
-    let n_idx = local_id / TILE_K_VEC;
-
-    inter_results[n_idx][k_idx] = 0.0;
-    workgroupBarrier();
-
-    let a_base = row * (K / 4u);
-    let b_col = n_tile * TILE_N + n_idx;
-
-    for (var k_start = 0u; k_start < K; k_start += TILE_K_VEC * 8u) {
-        if (local_id < TILE_K_VEC) {
-            let a_offset = (k_start / 4u) + local_id * 2u;
-            if (row < M && a_offset < K / 4u) {
-                tile_A[local_id] = A[a_base + a_offset];
-            } else {
-                tile_A[local_id] = vec4<f32>(0.0);
-            }
+    
+    let n = gid.x;
+    let m = gid.y;
+    if (n >= N || m >= M) { return; }
+    
+    var acc: f32 = 0.0;
+    let a_base = m * K;
+    let w_base = n * (K / 2u);
+    
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let scale_flat = n * blocks_per_col + blk;
+        let scale_u32 = Scales[scale_flat / 2u];
+        let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+        let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+        
+        let k_base = blk * 32u;
+        let w_blk_base = w_base + k_base / 2u;
+        
+        for (var j = 0u; j < 16u; j++) {
+            let byte_idx = w_blk_base + j;
+            let byte_u32 = B[byte_idx / 4u];
+            let byte_val = (byte_u32 >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+            let lo = f32(byte_val & 0xFu) - 8.0;
+            let hi = f32((byte_val >> 4u) & 0xFu) - 8.0;
+            acc += A[a_base + k_base + j * 2u] * lo * scale;
+            acc += A[a_base + k_base + j * 2u + 1u] * hi * scale;
         }
-        workgroupBarrier();
-
-        let k_elem = k_start + k_idx * 8u;
-        if (b_col < N && k_elem < K && row < M) {
-            let b_offset = b_col * blocks_per_col * 4u + k_elem / 8u;
-            let b_packed = B[b_offset];
-
-            let block_idx = k_elem / 32u;
-            let scale_flat = b_col * blocks_per_col + block_idx;
-            let scale_u32 = Scales[scale_flat / 2u];
-            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
-            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
-
-            let lo = unpack4xU8(b_packed & 0x0F0F0F0Fu);
-            let hi = unpack4xU8((b_packed >> 4u) & 0x0F0F0F0Fu);
-            // UINT4 with default zero_point=8: dequant = (nibble - 8) * scale
-            let b0 = vec4<f32>(f32(lo[0]) - 8.0, f32(hi[0]) - 8.0,
-                               f32(lo[1]) - 8.0, f32(hi[1]) - 8.0) * scale;
-            let b1 = vec4<f32>(f32(lo[2]) - 8.0, f32(hi[2]) - 8.0,
-                               f32(lo[3]) - 8.0, f32(hi[3]) - 8.0) * scale;
-
-            let a_local_offset = k_idx * 2u;
-            var sum: f32 = 0.0;
-            if (a_local_offset < TILE_K_VEC) {
-                sum += dot(tile_A[a_local_offset], b0);
-            }
-            if (a_local_offset + 1u < TILE_K_VEC) {
-                sum += dot(tile_A[a_local_offset + 1u], b1);
-            }
-            inter_results[n_idx][k_idx] += sum;
-        }
-        workgroupBarrier();
     }
-
-    if (k_idx == 0u && b_col < N && row < M) {
-        var total: f32 = 0.0;
-        for (var k = 0u; k < TILE_K_VEC; k++) {
-            total += inter_results[n_idx][k];
-        }
-        Y[row * N + b_col] = total;
-    }
+    
+    Y[m * N + n] = acc;
 }
 )WGSL";
 
 // MatMulNBits Q4 with per-block zero points
 // Same as WGSL_MATMUL_Q4 but reads ZP from binding 5.
-// ZP layout: packed uint4 nibbles, same addressing as scales.
-// Dispatch: (ceil(N/8), M, 1)
+// Dispatch: (ceil(N/256), M, 1)
 static const char* WGSL_MATMUL_Q4_ZP = R"WGSL(
-@group(0) @binding(0) var<storage, read> A: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<u32>;
 @group(0) @binding(2) var<storage, read> Scales: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 @group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
 
-const TILE_N: u32 = 8u;
-const TILE_K_VEC: u32 = 16u;
-
-var<workgroup> tile_A: array<vec4<f32>, TILE_K_VEC>;
-var<workgroup> inter_results: array<array<f32, TILE_K_VEC>, TILE_N>;
-
-@compute @workgroup_size(128)
-fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let M = _params_[0];
     let N = _params_[1];
     let K = _params_[2];
     let blocks_per_col = K / 32u;
-
-    let row = wid.y;
-    let n_tile = wid.x;
-    let local_id = lid.x;
-    let k_idx = local_id % TILE_K_VEC;
-    let n_idx = local_id / TILE_K_VEC;
-
-    inter_results[n_idx][k_idx] = 0.0;
-    workgroupBarrier();
-
-    let a_base = row * (K / 4u);
-    let b_col = n_tile * TILE_N + n_idx;
-
-    for (var k_start = 0u; k_start < K; k_start += TILE_K_VEC * 8u) {
-        if (local_id < TILE_K_VEC) {
-            let a_offset = (k_start / 4u) + local_id * 2u;
-            if (row < M && a_offset < K / 4u) {
-                tile_A[local_id] = A[a_base + a_offset];
-            } else {
-                tile_A[local_id] = vec4<f32>(0.0);
-            }
+    
+    let n = gid.x;
+    let m = gid.y;
+    if (n >= N || m >= M) { return; }
+    
+    var acc: f32 = 0.0;
+    let a_base = m * K;
+    let w_base = n * (K / 2u);
+    
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let scale_flat = n * blocks_per_col + blk;
+        let scale_u32 = Scales[scale_flat / 2u];
+        let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+        let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+        
+        // Zero point
+        let zp_byte_idx = scale_flat / 2u;
+        let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+        let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+        
+        let k_base = blk * 32u;
+        let w_blk_base = w_base + k_base / 2u;
+        
+        for (var j = 0u; j < 16u; j++) {
+            let byte_idx = w_blk_base + j;
+            let byte_u32 = B[byte_idx / 4u];
+            let byte_val = (byte_u32 >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+            let lo = f32(byte_val & 0xFu) - zp;
+            let hi = f32((byte_val >> 4u) & 0xFu) - zp;
+            acc += A[a_base + k_base + j * 2u] * lo * scale;
+            acc += A[a_base + k_base + j * 2u + 1u] * hi * scale;
         }
-        workgroupBarrier();
-
-        let k_elem = k_start + k_idx * 8u;
-        if (b_col < N && k_elem < K && row < M) {
-            let b_offset = b_col * blocks_per_col * 4u + k_elem / 8u;
-            let b_packed = B[b_offset];
-
-            let block_idx = k_elem / 32u;
-            let scale_flat = b_col * blocks_per_col + block_idx;
-            let scale_u32 = Scales[scale_flat / 2u];
-            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
-            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
-
-            // Read per-block zero point (packed uint4 nibbles like scales)
-            let zp_u32 = ZeroPoints[scale_flat / 8u];
-            let zp_nibble_idx = (scale_flat % 8u);
-            let zp_shift = (zp_nibble_idx % 2u) * 4u + (zp_nibble_idx / 2u) * 8u;
-            let zp_byte_idx = scale_flat / 2u;
-            let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
-            let zp_val = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
-
-            let lo = unpack4xU8(b_packed & 0x0F0F0F0Fu);
-            let hi = unpack4xU8((b_packed >> 4u) & 0x0F0F0F0Fu);
-            let b0 = vec4<f32>(f32(lo[0]) - zp_val, f32(hi[0]) - zp_val,
-                               f32(lo[1]) - zp_val, f32(hi[1]) - zp_val) * scale;
-            let b1 = vec4<f32>(f32(lo[2]) - zp_val, f32(hi[2]) - zp_val,
-                               f32(lo[3]) - zp_val, f32(hi[3]) - zp_val) * scale;
-
-            let a_local_offset = k_idx * 2u;
-            var sum: f32 = 0.0;
-            if (a_local_offset < TILE_K_VEC) {
-                sum += dot(tile_A[a_local_offset], b0);
-            }
-            if (a_local_offset + 1u < TILE_K_VEC) {
-                sum += dot(tile_A[a_local_offset + 1u], b1);
-            }
-            inter_results[n_idx][k_idx] += sum;
-        }
-        workgroupBarrier();
     }
-
-    if (k_idx == 0u && b_col < N && row < M) {
-        var total: f32 = 0.0;
-        for (var k = 0u; k < TILE_K_VEC; k++) {
-            total += inter_results[n_idx][k];
-        }
-        Y[row * N + b_col] = total;
-    }
+    
+    Y[m * N + n] = acc;
 }
 )WGSL";
 
@@ -6948,93 +6861,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Params: [0]=N (output dim = 2*intermediate), [1]=K (input dim = hidden),
 //         [2]=expertIdx, [3]=blocks_per_col (K/32)
 //
-// Dispatch: (ceil(N/8), 1, 1) — one row of output per workgroup
-// Workgroup: 128 threads = 8 output cols × 16 K-reduction threads
+// Dispatch: (ceil(N/256), 1, 1) — one thread per output element
 static const char* WGSL_QMOE_MATMUL_Q4 = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<u32>;
 @group(0) @binding(2) var<storage, read> Scales: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 @group(0) @binding(5) var<storage, read> _params2_: array<u32>;
 
-const TILE_N: u32 = 8u;
-const TILE_K_VEC: u32 = 16u;
-
-var<workgroup> tile_A: array<vec4<f32>, TILE_K_VEC>;
-var<workgroup> inter_results: array<array<f32, TILE_K_VEC>, TILE_N>;
-
-@compute @workgroup_size(128)
-fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let N = _params_[0];
     let K = _params_[1];
     let expert = _params_[2];
     let blocks_per_col = _params_[3];
 
-    let n_tile = wid.x;
-    let local_id = lid.x;
-    let k_idx = local_id % TILE_K_VEC;
-    let n_idx = local_id / TILE_K_VEC;
+    let n = gid.x;
+    if (n >= N) { return; }
 
-    inter_results[n_idx][k_idx] = 0.0;
-    workgroupBarrier();
-
-    let b_col = n_tile * TILE_N + n_idx;
-    // Expert offset: each expert has N * blocks_per_col * 4 u32 words of weight
-    let expert_w_offset = expert * N * blocks_per_col * 4u;
-    // Scale offset: each expert has N * blocks_per_col fp16 values = N * blocks_per_col / 2 u32 words
+    let expert_w_offset = expert * N * (K / 2u);
     let expert_s_offset = expert * N * blocks_per_col;
 
-    for (var k_start = 0u; k_start < K; k_start += TILE_K_VEC * 8u) {
-        if (local_id < TILE_K_VEC) {
-            let a_offset = (k_start / 4u) + local_id * 2u;
-            if (a_offset < K / 4u) {
-                tile_A[local_id] = X[a_offset];
-            } else {
-                tile_A[local_id] = vec4<f32>(0.0);
-            }
+    var acc: f32 = 0.0;
+    let w_base = expert_w_offset + n * (K / 2u);
+
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let scale_flat = expert_s_offset + n * blocks_per_col + blk;
+        let scale_u32 = Scales[scale_flat / 2u];
+        let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+        let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+        let k_base = blk * 32u;
+        let w_blk_base = w_base + k_base / 2u;
+
+        for (var j = 0u; j < 16u; j++) {
+            let byte_idx = w_blk_base + j;
+            let byte_u32 = W[byte_idx / 4u];
+            let byte_val = (byte_u32 >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+            let lo = f32(byte_val & 0xFu) - 8.0;
+            let hi = f32((byte_val >> 4u) & 0xFu) - 8.0;
+            acc += X[k_base + j * 2u] * lo * scale;
+            acc += X[k_base + j * 2u + 1u] * hi * scale;
         }
-        workgroupBarrier();
-
-        let k_elem = k_start + k_idx * 8u;
-        if (b_col < N && k_elem < K) {
-            let b_offset = expert_w_offset + b_col * blocks_per_col * 4u + k_elem / 8u;
-            let b_packed = W[b_offset];
-
-            let block_idx = k_elem / 32u;
-            let scale_flat = expert_s_offset + b_col * blocks_per_col + block_idx;
-            let scale_u32 = Scales[scale_flat / 2u];
-            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
-            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
-
-            let lo = unpack4xU8(b_packed & 0x0F0F0F0Fu);
-            let hi = unpack4xU8((b_packed >> 4u) & 0x0F0F0F0Fu);
-            let b0 = vec4<f32>(f32(lo[0]) - 8.0, f32(hi[0]) - 8.0,
-                               f32(lo[1]) - 8.0, f32(hi[1]) - 8.0) * scale;
-            let b1 = vec4<f32>(f32(lo[2]) - 8.0, f32(hi[2]) - 8.0,
-                               f32(lo[3]) - 8.0, f32(hi[3]) - 8.0) * scale;
-
-            let a_local_offset = k_idx * 2u;
-            var sum: f32 = 0.0;
-            if (a_local_offset < TILE_K_VEC) {
-                sum += dot(tile_A[a_local_offset], b0);
-            }
-            if (a_local_offset + 1u < TILE_K_VEC) {
-                sum += dot(tile_A[a_local_offset + 1u], b1);
-            }
-            inter_results[n_idx][k_idx] += sum;
-        }
-        workgroupBarrier();
     }
 
-    if (k_idx == 0u && b_col < N) {
-        var total: f32 = 0.0;
-        for (var k = 0u; k < TILE_K_VEC; k++) {
-            total += inter_results[n_idx][k];
-        }
-        Y[b_col] = total;
-    }
+    Y[n] = acc;
 }
 )WGSL";
 
