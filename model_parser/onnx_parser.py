@@ -15,35 +15,50 @@ from model_parser.gguf_parser import _build_gpt2_byte_tables
 
 
 def extract_onnx_config(model_dir: str) -> dict:
-    """Extract model config from genai_config.json."""
+    """Extract model config from genai_config.json or config.json."""
     config_path = os.path.join(model_dir, "genai_config.json")
+    use_genai = os.path.exists(config_path)
+    if not use_genai:
+        config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"No genai_config.json in {model_dir}")
+        raise FileNotFoundError(f"No genai_config.json or config.json in {model_dir}")
 
     with open(config_path) as f:
         cfg = json.load(f)
 
-    mc = cfg["model"]
-    dec = mc["decoder"]
+    if use_genai:
+        mc = cfg["model"]
+        dec = mc["decoder"]
+        n_head = dec["num_attention_heads"]
+        n_kv_heads = dec.get("num_key_value_heads", n_head)
+        head_dim = dec["head_size"]
+        n_embd = dec["hidden_size"]
+        n_layer = dec["num_hidden_layers"]
+        n_vocab = mc["vocab_size"]
+        eos = mc.get("eos_token_id", 0)
+        arch = mc.get("type", "phi3")
+        bos = mc.get("bos_token_id", 0)
+    else:
+        n_head = cfg.get("num_attention_heads", 32)
+        n_kv_heads = cfg.get("num_key_value_heads", n_head)
+        n_embd = cfg.get("hidden_size", 2048)
+        head_dim = n_embd // n_head
+        n_layer = cfg.get("num_hidden_layers", 24)
+        n_vocab = cfg.get("vocab_size", 32000)
+        eos = cfg.get("eos_token_id", 0)
+        arch = cfg.get("model_type", "llama")
+        bos = cfg.get("bos_token_id", 0)
 
-    n_head = dec["num_attention_heads"]
-    n_kv_heads = dec.get("num_key_value_heads", n_head)
-    head_dim = dec["head_size"]
-    n_embd = dec["hidden_size"]
-    n_layer = dec["num_hidden_layers"]
-    n_vocab = mc["vocab_size"]
-
-    eos = mc.get("eos_token_id", 0)
     if isinstance(eos, list):
         eos = eos[0]
 
     return {
-        "arch": mc.get("type", "phi3"),
+        "arch": arch,
         "n_layer": n_layer,
         "n_head": n_head,
         "n_kv_heads": n_kv_heads,
         "n_embd": n_embd,
-        "intermediate_size": 0,  # inferred from weights
+        "intermediate_size": 0,
         "n_vocab": n_vocab,
         "head_dim": head_dim,
         "rope_theta": 10000.0,
@@ -51,7 +66,7 @@ def extract_onnx_config(model_dir: str) -> dict:
         "tie_word_embeddings": True,
         "has_qk_norm": False,
         "eos_token_id": eos,
-        "bos_token_id": mc.get("bos_token_id", 0),
+        "bos_token_id": bos,
         "model_format": "onnx",
     }
 

@@ -431,6 +431,31 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
 
     for (auto* t : validIn) ex.EnsureGpu(*t);
 
+    // Normalize dtypes: if inputs have mixed f32/f16, convert all to f32
+    bool hasF32 = false, hasF16 = false;
+    for (auto* t : validIn) {
+        if (t->dtype == TensorDtype::Float32) hasF32 = true;
+        if (t->dtype == TensorDtype::Float16) hasF16 = true;
+    }
+    if (hasF32 && hasF16 && ex.gpu->supportsShaderF16) {
+        // Convert f16 inputs to f32 using cast kernel
+        for (auto* t : validIn) {
+            if (t->dtype != TensorDtype::Float16) continue;
+            int64_t nel = tensorNel(t);
+            if (nel <= 0) continue;
+            GpuTensor f32t = ex.AllocTensor(t->shape, TensorDtype::Float32);
+            uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
+            auto paramBuf = ex.gpu->createBuffer("concat_cast_p", 16);
+            ex.gpu->writeBuffer(paramBuf, params, 16);
+            auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, t->buffer}, {1, f32t.buffer}, {2, paramBuf}});
+            ex.SubmitAsync({{pl.pipeline, bg,
+                (uint32_t)((nel + 255) / 256), 1, 1, "concat_cast_f16_f32"}});
+            *t = f32t;
+        }
+    }
+
     // Filter out tensors with no GPU buffer after EnsureGpu
     std::vector<GpuTensor*> gpuIn;
     for (auto* t : validIn)

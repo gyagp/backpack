@@ -124,6 +124,17 @@ if(EXISTS ${BACKPACK_IMAGE_APP})
     )
 endif()
 
+# ─── Op test runner ──────────────────────────────────────────────────────────
+
+add_executable(op_test_runner op_test_runner.cpp $<TARGET_OBJECTS:backpack_core>)
+target_link_libraries(op_test_runner PRIVATE backpack)
+target_include_directories(op_test_runner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${DAWN_SRC}/include
+    ${DAWN_BUILD}/gen/include
+    ${DAWN_SRC}/include/dawn/native
+)
+
 # ─── Link Dawn ───────────────────────────────────────────────────────────────
 
 if(WIN32)
@@ -142,8 +153,10 @@ if(WIN32)
         target_link_libraries(backpack_image PRIVATE
             ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     endif()
+    target_link_libraries(op_test_runner PRIVATE
+        ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     # Copy DLLs next to executables
-    foreach(_target backpack_runtime backpack_llm backpack_image)
+    foreach(_target backpack_runtime backpack_llm backpack_image op_test_runner)
         if(TARGET ${_target})
             add_custom_command(TARGET ${_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -162,4 +175,5 @@ else()
     if(TARGET backpack_image)
         target_link_libraries(backpack_image PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     endif()
+    target_link_libraries(op_test_runner PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
 endif()

@@ -1,7 +1,7 @@
 // Unary elementwise ops:
 //   Sigmoid(0), Tanh(1), Neg(2), Sqrt(3), Sin(4), Cos(5), Identity(6),
 //   Gelu(7), Silu(8), Erf(9), Relu(10), Exp(11), Log(12), Abs(13),
-//   Floor(14), Ceil(15), Round(16)
+//   Floor(14), Ceil(15), Round(16), Softplus(17)
 // Dispatch: (ceil(N/256), 1, 1)
 
 @group(0) @binding(0) var<storage, read> A: array<f32>;
@@ -42,6 +42,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 14u: { C[idx] = floor(a); }                                         // Floor
         case 15u: { C[idx] = ceil(a); }                                          // Ceil
         case 16u: { C[idx] = round(a); }                                         // Round
+        case 17u: { C[idx] = log(1.0 + exp(a)); }                                   // Softplus
         default: { C[idx] = a; }
     }
 }

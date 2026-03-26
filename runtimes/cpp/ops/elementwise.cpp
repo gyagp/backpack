@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <set>
 
 // Binary and unary elementwise ops now use embedded kernels from
 // compiler/kernels/shared/binary_elementwise.wgsl and unary_elementwise.wgsl
@@ -532,6 +533,37 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
         }
         // GPU tensor — all GPU compute uses fp32, so aliasing preserves data
         // DON'T change dtype to avoid ByteSize() mismatch
+        // For conversions between float and integer types, must read back and convert
+        if ((outDtype == TensorDtype::Int64 || outDtype == TensorDtype::Int32) &&
+            (A->dtype == TensorDtype::Float32 || A->dtype == TensorDtype::Float16)) {
+            ex.FlushPendingWork();
+            size_t inBytes = (size_t)N * A->DtypeSize();
+            auto rb = ex.gpu->readBuffer(A->buffer, inBytes);
+            if (rb.size() >= inBytes) {
+                if (outDtype == TensorDtype::Int64) {
+                    std::vector<int64_t> result((size_t)N);
+                    if (A->dtype == TensorDtype::Float32) {
+                        auto* src = reinterpret_cast<const float*>(rb.data());
+                        for (int64_t i = 0; i < N; i++) result[i] = (int64_t)src[i];
+                    } else {
+                        auto* src = reinterpret_cast<const uint16_t*>(rb.data());
+                        for (int64_t i = 0; i < N; i++) result[i] = (int64_t)fp16ToFloat(src[i]);
+                    }
+                    *out[0] = ex.AllocCpuTensor(A->shape, TensorDtype::Int64, result.data(), N * 8);
+                } else {
+                    std::vector<int32_t> result((size_t)N);
+                    if (A->dtype == TensorDtype::Float32) {
+                        auto* src = reinterpret_cast<const float*>(rb.data());
+                        for (int64_t i = 0; i < N; i++) result[i] = (int32_t)src[i];
+                    } else {
+                        auto* src = reinterpret_cast<const uint16_t*>(rb.data());
+                        for (int64_t i = 0; i < N; i++) result[i] = (int32_t)fp16ToFloat(src[i]);
+                    }
+                    *out[0] = ex.AllocCpuTensor(A->shape, TensorDtype::Int32, result.data(), N * 4);
+                }
+                return;
+            }
+        }
         *out[0] = *A;
         // Only change dtype for int↔float conversions, not float↔float
         if ((outDtype == TensorDtype::Float32 || outDtype == TensorDtype::Float16) &&
@@ -720,44 +752,115 @@ static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* A = in[0];
     if (!A || !A->IsValid()) return;
     int64_t N = tensorNel(A);
+    int keepdims = (int)n.GetInt("keepdims", 1);
 
-    // Read from CPU if possible
+    // Read axes from input[1] or attribute
+    std::vector<int64_t> axes;
+    if (in.size() > 1 && in[1] && in[1]->IsValid()) {
+        std::vector<int64_t> axVals;
+        readTensorIntValues(ex, in[1], n.inputs.size() > 1 ? n.inputs[1] : "", axVals);
+        axes = axVals;
+    } else if (n.attrIntLists.count("axes")) {
+        axes = n.attrIntLists.at("axes");
+    }
+
+    int ndim = (int)A->shape.size();
+    // Normalize negative axes
+    for (auto& a : axes) { if (a < 0) a += ndim; }
+    // If no axes specified, reduce all
+    if (axes.empty()) { for (int i = 0; i < ndim; i++) axes.push_back(i); }
+
+    // Get data on CPU
     const uint8_t* ptr = nullptr;
+    std::vector<uint8_t> gpuReadback;
     if (A->isCpuOnly && !A->cpuData.empty()) ptr = A->cpuData.data();
     else if (!A->cpuData.empty()) ptr = A->cpuData.data();
     else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) ptr = init->data;
-
-    if (!ptr && A->buffer.handle && N <= 4096) {
-        // Small GPU tensor without CPU data — produce zero result
-        // (GPU readback removed for performance; this only affects metadata ops)
-        if (A->dtype == TensorDtype::Int64) {
-            int64_t z = 0;
-            *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &z, 8);
-        } else {
-            float z = 0;
-            *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &z, 4);
-        }
-        return;
+    else if (A->buffer.handle) {
+        ex.FlushPendingWork();
+        gpuReadback = ex.gpu->readBuffer(A->buffer, N * A->DtypeSize());
+        if (!gpuReadback.empty()) ptr = gpuReadback.data();
     }
+
     if (!ptr) {
-        if (A->dtype == TensorDtype::Int64) {
-            int64_t z = 0;
-            *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &z, 8);
-        } else {
-            float z = 0;
-            *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &z, 4);
-        }
+        float z = 0;
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &z, 4);
         return;
     }
 
-    if (A->dtype == TensorDtype::Int64) {
-        int64_t sum = 0;
-        for (int64_t i = 0; i < N; i++) { int64_t v; memcpy(&v, ptr + i*8, 8); sum += v; }
-        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Int64, &sum, 8);
+    // Compute output shape
+    std::vector<int64_t> outShape;
+    std::set<int> reduceSet(axes.begin(), axes.end());
+    for (int i = 0; i < ndim; i++) {
+        if (reduceSet.count(i)) {
+            if (keepdims) outShape.push_back(1);
+        } else {
+            outShape.push_back(A->shape[i]);
+        }
+    }
+    if (outShape.empty()) outShape.push_back(1);
+
+    int64_t outNel = 1;
+    for (auto d : outShape) outNel *= d;
+
+    // Compute strides for input
+    std::vector<int64_t> inStrides(ndim, 1);
+    for (int i = ndim - 2; i >= 0; i--) inStrides[i] = inStrides[i+1] * A->shape[i+1];
+
+    if (A->dtype == TensorDtype::Float32) {
+        const float* src = reinterpret_cast<const float*>(ptr);
+        std::vector<float> result(outNel, 0.0f);
+
+        // For each element in input, compute output index and accumulate
+        for (int64_t flat = 0; flat < N; flat++) {
+            // Decompose flat index into coordinates
+            int64_t remaining = flat;
+            int64_t outFlat = 0;
+            int64_t outStride = 1;
+            // Walk dims in reverse to compute output flat index
+            for (int i = ndim - 1; i >= 0; i--) {
+                int64_t coord = remaining % A->shape[i];
+                remaining /= A->shape[i];
+                if (!reduceSet.count(i)) {
+                    // Find position of this dim in output
+                    int outDimIdx = 0;
+                    for (int j = 0; j < i; j++) {
+                        if (!reduceSet.count(j) || keepdims) outDimIdx++;
+                    }
+                    // Compute output stride
+                    int64_t os = 1;
+                    for (int j = outDimIdx + 1; j < (int)outShape.size(); j++) os *= outShape[j];
+                    outFlat += coord * os;
+                }
+            }
+            result[outFlat] += src[flat];
+        }
+        *out[0] = ex.AllocCpuTensor(outShape, TensorDtype::Float32, result.data(), outNel * 4);
+    } else if (A->dtype == TensorDtype::Int64) {
+        const int64_t* src = reinterpret_cast<const int64_t*>(ptr);
+        std::vector<int64_t> result(outNel, 0);
+        for (int64_t flat = 0; flat < N; flat++) {
+            int64_t remaining = flat;
+            int64_t outFlat = 0;
+            for (int i = ndim - 1; i >= 0; i--) {
+                int64_t coord = remaining % A->shape[i];
+                remaining /= A->shape[i];
+                if (!reduceSet.count(i)) {
+                    int outDimIdx = 0;
+                    for (int j = 0; j < i; j++) {
+                        if (!reduceSet.count(j) || keepdims) outDimIdx++;
+                    }
+                    int64_t os = 1;
+                    for (int j = outDimIdx + 1; j < (int)outShape.size(); j++) os *= outShape[j];
+                    outFlat += coord * os;
+                }
+            }
+            result[outFlat] += src[flat];
+        }
+        *out[0] = ex.AllocCpuTensor(outShape, TensorDtype::Int64, result.data(), outNel * 8);
     } else {
-        float sum = 0;
-        for (int64_t i = 0; i < N; i++) { float v; memcpy(&v, ptr + i*4, 4); sum += v; }
-        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &sum, 4);
+        float z = 0;
+        *out[0] = ex.AllocCpuTensor({1}, TensorDtype::Float32, &z, 4);
     }
 }
 

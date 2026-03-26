@@ -385,25 +385,28 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
                   });
     }
 
-    // 2. Parse genai_config.json for special tokens
+    // 2. Parse genai_config.json or config.json for special tokens
     std::string cfgPath = (fs::path(modelDir) / "genai_config.json").string();
+    if (!fs::exists(cfgPath))
+        cfgPath = (fs::path(modelDir) / "config.json").string();
     std::ifstream cfgFile(cfgPath);
     if (cfgFile.is_open()) {
         std::string cfgStr((std::istreambuf_iterator<char>(cfgFile)),
                             std::istreambuf_iterator<char>());
         cfgFile.close();
         auto cfgJson = json_parse(cfgStr);
-        auto& model = cfgJson["model"];
+        // genai_config.json nests under "model", config.json is top-level
+        auto& root = cfgJson.has("model") ? cfgJson["model"] : cfgJson;
 
-        if (model.has("eos_token_id")) {
-            auto& eos = model["eos_token_id"];
+        if (root.has("eos_token_id")) {
+            auto& eos = root["eos_token_id"];
             if (eos.is_array())
                 eos_token_id = eos[0].as_int();
             else
                 eos_token_id = eos.as_int();
         }
-        if (model.has("bos_token_id"))
-            bos_token_id = model["bos_token_id"].as_int();
+        if (root.has("bos_token_id"))
+            bos_token_id = root["bos_token_id"].as_int();
     }
 
     printf("  Tokenizer: %zu tokens, %zu merges, %zu added, EOS=%d\n",

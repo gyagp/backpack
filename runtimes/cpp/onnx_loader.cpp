@@ -624,11 +624,14 @@ std::vector<float> dequantEmbedding(const uint8_t* rawData, const uint8_t* scale
 bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     auto t0 = std::chrono::steady_clock::now();
 
-    // ─── 1. Parse genai_config.json ──────────────────────────────────────
+    // ─── 1. Parse model config (genai_config.json or config.json) ──────
     std::string configPath = (fs::path(modelDir) / "genai_config.json").string();
+    bool useGenaiFormat = fs::exists(configPath);
+    if (!useGenaiFormat)
+        configPath = (fs::path(modelDir) / "config.json").string();
     std::ifstream configFile(configPath);
     if (!configFile.is_open()) {
-        fprintf(stderr, "Failed to open: %s\n", configPath.c_str());
+        fprintf(stderr, "Failed to open config: %s\n", configPath.c_str());
         return false;
     }
     std::string configStr((std::istreambuf_iterator<char>(configFile)),
@@ -636,18 +639,36 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     configFile.close();
 
     auto configJson = json_parse(configStr);
-    auto& model = configJson["model"];
-    auto& dec = model["decoder"];
 
     auto& cfg = result.cfg;
-    cfg.nHead = dec["num_attention_heads"].as_uint();
-    cfg.nKvHeads = dec.has("num_key_value_heads")
-        ? dec["num_key_value_heads"].as_uint() : cfg.nHead;
-    cfg.headDim = dec["head_size"].as_uint();
-    cfg.nEmbd = dec["hidden_size"].as_uint();
-    cfg.nLayer = dec["num_hidden_layers"].as_uint();
-    cfg.nVocab = model["vocab_size"].as_uint();
-    cfg.arch = model.has("type") ? model["type"].as_string() : "phi3";
+    if (useGenaiFormat) {
+        // GenAI format: model.decoder.num_attention_heads, etc.
+        auto& model = configJson["model"];
+        auto& dec = model["decoder"];
+        cfg.nHead = dec["num_attention_heads"].as_uint();
+        cfg.nKvHeads = dec.has("num_key_value_heads")
+            ? dec["num_key_value_heads"].as_uint() : cfg.nHead;
+        cfg.headDim = dec["head_size"].as_uint();
+        cfg.nEmbd = dec["hidden_size"].as_uint();
+        cfg.nLayer = dec["num_hidden_layers"].as_uint();
+        cfg.nVocab = model["vocab_size"].as_uint();
+        cfg.arch = model.has("type") ? model["type"].as_string() : "phi3";
+    } else {
+        // HuggingFace config.json format: flat keys
+        cfg.nHead = configJson.has("num_attention_heads")
+            ? configJson["num_attention_heads"].as_uint() : 32;
+        cfg.nKvHeads = configJson.has("num_key_value_heads")
+            ? configJson["num_key_value_heads"].as_uint() : cfg.nHead;
+        cfg.nEmbd = configJson.has("hidden_size")
+            ? configJson["hidden_size"].as_uint() : 2048;
+        cfg.headDim = cfg.nEmbd / cfg.nHead;
+        cfg.nLayer = configJson.has("num_hidden_layers")
+            ? configJson["num_hidden_layers"].as_uint() : 24;
+        cfg.nVocab = configJson.has("vocab_size")
+            ? configJson["vocab_size"].as_uint() : 32000;
+        cfg.arch = configJson.has("model_type")
+            ? configJson["model_type"].as_string() : "llama";
+    }
     cfg.rmsNormEps = 1e-5f;
     cfg.ropeTheta = 10000.0f;
     cfg.tieWordEmbeddings = true;
@@ -660,6 +681,15 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
 
     // ─── 2. Load ONNX protobuf ──────────────────────────────────────────
     std::string onnxPath = (fs::path(modelDir) / "model.onnx").string();
+    if (!fs::exists(onnxPath)) {
+        // Find any .onnx file in the directory
+        for (auto& e : fs::directory_iterator(modelDir)) {
+            if (e.is_regular_file() && e.path().extension() == ".onnx") {
+                onnxPath = e.path().string();
+                break;
+            }
+        }
+    }
     auto onnxFileSize = fs::file_size(onnxPath);
     FILE* f = fopen(onnxPath.c_str(), "rb");
     if (!f) {

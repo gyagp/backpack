@@ -33,9 +33,13 @@ static void shutdownRuntime(ModelRunner& model, GPUContext& gpu) {
 
 /// Check if a path is an ONNX model directory
 static bool isOnnxDir(const std::string& path) {
-    return fs::is_directory(path) &&
-           fs::exists(fs::path(path) / "model.onnx") &&
-           fs::exists(fs::path(path) / "genai_config.json");
+    if (!fs::is_directory(path)) return false;
+    bool hasConfig = fs::exists(fs::path(path) / "genai_config.json") ||
+                     fs::exists(fs::path(path) / "config.json");
+    if (!hasConfig) return false;
+    for (auto& e : fs::directory_iterator(path))
+        if (e.is_regular_file() && e.path().extension() == ".onnx") return true;
+    return false;
 }
 
 /// Resolve model path: accepts GGUF file, ONNX dir, or directory containing either

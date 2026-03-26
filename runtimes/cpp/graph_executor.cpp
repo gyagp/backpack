@@ -1154,6 +1154,7 @@ void GraphExecutor::Execute(
             }
             g_currentOp = g_currentOpLabel.c_str();
             opIt->second(*this, node, inTensors, outTensors);
+
             bool cachedSmallIntOutput = false;
             for (auto* outTensor : outTensors) {
                 if (!outTensor || !outTensor->buffer.handle || !outTensor->cpuData.empty()) continue;
