@@ -267,6 +267,10 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     }
     ex.EnsureGpu(*S);
 
+    // Check for zero_point input (4th input)
+    auto* ZP = (in.size() > 3 && in[3] && in[3]->IsValid()) ? in[3] : nullptr;
+    if (ZP) ex.EnsureGpu(*ZP);
+
     uint32_t N = (uint32_t)n.GetInt("N");
     uint32_t K = (uint32_t)n.GetInt("K");
     int64_t M = 1;
@@ -280,12 +284,22 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("mmnb_p", 16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
-    auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
-    auto bg = ex.MakeBindGroup(pl, {
-        {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
-        {3, out[0]->buffer}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (N + 7) / 8, (uint32_t)M, 1, "matmul_q4"});
+    if (ZP) {
+        // Use kernel with per-block zero points
+        auto& pl = ex.GetPipeline("matmul_q4_zp", WGSL_MATMUL_Q4_ZP, 6);
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+            {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (N + 7) / 8, (uint32_t)M, 1, "matmul_q4_zp"});
+    } else {
+        auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+            {3, out[0]->buffer}, {4, paramBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (N + 7) / 8, (uint32_t)M, 1, "matmul_q4"});
+    }
 }
 
 // ─── MatMul ──────────────────────────────────────────────────────────────────
