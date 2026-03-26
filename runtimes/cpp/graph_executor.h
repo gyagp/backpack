@@ -228,6 +228,8 @@ private:
     // External data (kept alive for pointer stability)
     std::vector<uint8_t> onnxData_;
     std::vector<uint8_t> externalData_;
+    // Multi-file external data: filename → data
+    std::unordered_map<std::string, std::vector<uint8_t>> externalDataFiles_;
 
 public:
     /// Register an op implementation. Called at static init time.

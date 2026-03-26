@@ -6675,12 +6675,280 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// ─── MoE routing ops ────────────────────────────────────────────────────────
+
+// [moe] topk_f16 (4 bindings, hand)
+// TopK on fp16 data along last axis. Outputs fp16 values + i32 indices.
+// Each workgroup handles one [dimSize] slice, selects top-k.
+// Params: [0]=totalSlices, [1]=dimSize, [2]=k, [3]=largest
+// Dispatch: (totalSlices, 1, 1) with workgroup_size=1
+//
+// For MoE routing: dimSize=32 experts, k=4 active.
+// Single-threaded per slice is fine for dim≤64.
+static const char* WGSL_TOPK_F16 = R"WGSL(
+enable f16;
+
+@group(0) @binding(0) var<storage, read> data: array<f16>;
+@group(0) @binding(1) var<storage, read_write> out_values: array<f16>;
+@group(0) @binding(2) var<storage, read_write> out_indices: array<i32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let totalSlices = _params_[0];
+    let dimSize = _params_[1];
+    let k = _params_[2];
+    let largest = _params_[3];
+    let slice = gid.x;
+    if (slice >= totalSlices) { return; }
+
+    let base_in = slice * dimSize;
+    let base_out = slice * k;
+
+    // Simple selection sort for top-k (dimSize is small, e.g. 32)
+    for (var ki = 0u; ki < k; ki++) {
+        var best_val = f16(-65504.0);
+        var best_idx: u32 = 0u;
+        if (largest == 0u) { best_val = f16(65504.0); }
+
+        for (var d = 0u; d < dimSize; d++) {
+            let v = data[base_in + d];
+            // Check if this index was already selected
+            var already = false;
+            for (var p = 0u; p < ki; p++) {
+                if (u32(out_indices[base_out + p]) == d) { already = true; break; }
+            }
+            if (already) { continue; }
+
+            if (largest != 0u) {
+                if (v > best_val) { best_val = v; best_idx = d; }
+            } else {
+                if (v < best_val) { best_val = v; best_idx = d; }
+            }
+        }
+        out_values[base_out + ki] = best_val;
+        out_indices[base_out + ki] = i32(best_idx);
+    }
+}
+)WGSL";
+
+// [moe] gather_elements_f16 (4 bindings, hand)
+// GatherElements on fp16 data along last axis (axis=-1).
+// Params: [0]=N (total elements in indices), [1]=dimSize (data last dim), [2]=innerSize=1
+// Dispatch: (ceil(N/256), 1, 1)
+static const char* WGSL_GATHER_ELEMENTS_F16 = R"WGSL(
+enable f16;
+
+@group(0) @binding(0) var<storage, read> data: array<f16>;
+@group(0) @binding(1) var<storage, read> indices: array<i32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f16>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let dataDim = _params_[1];  // data.shape[axis]
+    let idx = gid.x;
+    if (idx >= N) { return; }
+
+    // For axis=-1 (last axis): slice = idx / outDim, pos = idx % outDim
+    // data index = slice * dataDim + gathered_index
+    let outDim = _params_[2];  // indices.shape[axis]
+    let slice = idx / outDim;
+    var gi = indices[idx];
+    if (gi < 0) { gi = gi + i32(dataDim); }
+    output[idx] = data[slice * dataDim + u32(gi)];
+}
+)WGSL";
+
+// [moe] scatter_elements_f16 (5 bindings, hand)
+// ScatterElements on fp16 data along last axis.
+// Copies data → output, then scatters updates at index positions.
+// Params: [0]=dataN, [1]=dataDim, [2]=idxN, [3]=idxDim
+// Dispatch: (ceil(dataN/256), 1, 1) — first pass copies all data
+// Then scatter pass: (ceil(idxN/256), 1, 1)
+// We do both in one kernel with a mode flag in params[4].
+static const char* WGSL_SCATTER_ELEMENTS_F16 = R"WGSL(
+enable f16;
+
+@group(0) @binding(0) var<storage, read> data: array<f16>;
+@group(0) @binding(1) var<storage, read> indices: array<i32>;
+@group(0) @binding(2) var<storage, read> updates: array<f16>;
+@group(0) @binding(3) var<storage, read_write> output: array<f16>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let mode = _params_[4];     // 0=copy, 1=scatter
+    if (mode == 0u) {
+        // Copy pass: data → output
+        let dataN = _params_[0];
+        let idx = gid.x;
+        if (idx >= dataN) { return; }
+        output[idx] = data[idx];
+    } else {
+        // Scatter pass: write updates at indexed positions
+        let dataDim = _params_[1];
+        let idxN = _params_[2];
+        let idxDim = _params_[3];
+        let idx = gid.x;
+        if (idx >= idxN) { return; }
+        let slice = idx / idxDim;
+        var gi = indices[idx];
+        if (gi < 0) { gi = gi + i32(dataDim); }
+        let dst = slice * dataDim + u32(gi);
+        output[dst] = updates[idx];
+    }
+}
+)WGSL";
+
+// [moe] qmoe_gate_up_q4 (6 bindings, hand)
+// Q4 matmul for one MoE expert's gate_up projection.
+// Y[n] = sum_k X[k] * dequant(W[expert, n, k])
+//
+// Weight layout: W_q4[num_experts, N, K/2] uint8
+// Scale layout:  S[num_experts, N, K/block_size] fp16
+// Params: [0]=N (output dim = 2*intermediate), [1]=K (input dim = hidden),
+//         [2]=expertIdx, [3]=blocks_per_col (K/32)
+//
+// Dispatch: (ceil(N/8), 1, 1) — one row of output per workgroup
+// Workgroup: 128 threads = 8 output cols × 16 K-reduction threads
+static const char* WGSL_QMOE_MATMUL_Q4 = R"WGSL(
+@group(0) @binding(0) var<storage, read> X: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> W: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> _params2_: array<u32>;
+
+const TILE_N: u32 = 8u;
+const TILE_K_VEC: u32 = 16u;
+
+var<workgroup> tile_A: array<vec4<f32>, TILE_K_VEC>;
+var<workgroup> inter_results: array<array<f32, TILE_K_VEC>, TILE_N>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = _params_[0];
+    let K = _params_[1];
+    let expert = _params_[2];
+    let blocks_per_col = _params_[3];
+
+    let n_tile = wid.x;
+    let local_id = lid.x;
+    let k_idx = local_id % TILE_K_VEC;
+    let n_idx = local_id / TILE_K_VEC;
+
+    inter_results[n_idx][k_idx] = 0.0;
+    workgroupBarrier();
+
+    let b_col = n_tile * TILE_N + n_idx;
+    // Expert offset: each expert has N * blocks_per_col * 4 u32 words of weight
+    let expert_w_offset = expert * N * blocks_per_col * 4u;
+    // Scale offset: each expert has N * blocks_per_col fp16 values = N * blocks_per_col / 2 u32 words
+    let expert_s_offset = expert * N * blocks_per_col;
+
+    for (var k_start = 0u; k_start < K; k_start += TILE_K_VEC * 8u) {
+        if (local_id < TILE_K_VEC) {
+            let a_offset = (k_start / 4u) + local_id * 2u;
+            if (a_offset < K / 4u) {
+                tile_A[local_id] = X[a_offset];
+            } else {
+                tile_A[local_id] = vec4<f32>(0.0);
+            }
+        }
+        workgroupBarrier();
+
+        let k_elem = k_start + k_idx * 8u;
+        if (b_col < N && k_elem < K) {
+            let b_offset = expert_w_offset + b_col * blocks_per_col * 4u + k_elem / 8u;
+            let b_packed = W[b_offset];
+
+            let block_idx = k_elem / 32u;
+            let scale_flat = expert_s_offset + b_col * blocks_per_col + block_idx;
+            let scale_u32 = Scales[scale_flat / 2u];
+            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+            let lo = unpack4xU8(b_packed & 0x0F0F0F0Fu);
+            let hi = unpack4xU8((b_packed >> 4u) & 0x0F0F0F0Fu);
+            let b0 = vec4<f32>(f32(lo[0]) - 8.0, f32(hi[0]) - 8.0,
+                               f32(lo[1]) - 8.0, f32(hi[1]) - 8.0) * scale;
+            let b1 = vec4<f32>(f32(lo[2]) - 8.0, f32(hi[2]) - 8.0,
+                               f32(lo[3]) - 8.0, f32(hi[3]) - 8.0) * scale;
+
+            let a_local_offset = k_idx * 2u;
+            var sum: f32 = 0.0;
+            if (a_local_offset < TILE_K_VEC) {
+                sum += dot(tile_A[a_local_offset], b0);
+            }
+            if (a_local_offset + 1u < TILE_K_VEC) {
+                sum += dot(tile_A[a_local_offset + 1u], b1);
+            }
+            inter_results[n_idx][k_idx] += sum;
+        }
+        workgroupBarrier();
+    }
+
+    if (k_idx == 0u && b_col < N) {
+        var total: f32 = 0.0;
+        for (var k = 0u; k < TILE_K_VEC; k++) {
+            total += inter_results[n_idx][k];
+        }
+        Y[b_col] = total;
+    }
+}
+)WGSL";
+
+// [moe] swiglu_fused (3 bindings, hand)
+// SwiGLU activation: out[i] = silu(gate[i]) * up[i]
+// Input is [N*2] where first half is gate, second half is up.
+// Output is [N].
+// Params: [0]=N (half_size = moe_intermediate_size)
+// Dispatch: (ceil(N/256), 1, 1)
+static const char* WGSL_SWIGLU = R"WGSL(
+@group(0) @binding(0) var<storage, read> gate_up: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+    let gate = gate_up[idx];
+    let up = gate_up[N + idx];
+    let silu = gate / (1.0 + exp(-gate));
+    output[idx] = silu * up;
+}
+)WGSL";
+
+// [moe] weighted_accumulate (3 bindings, hand)
+// out[i] += weight * src[i]
+// Params: [0]=N, [1]=weight_as_u32
+// Dispatch: (ceil(N/256), 1, 1)
+static const char* WGSL_WEIGHTED_ADD = R"WGSL(
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+    let weight = bitcast<f32>(_params_[1]);
+    dst[idx] = dst[idx] + weight * src[idx];
+}
+)WGSL";
+
 // [shared] unary_elementwise (3 bindings, hand)
 static const char* WGSL_UNARY_ELEMENTWISE = R"WGSL(
 // Unary elementwise ops:
 //   Sigmoid(0), Tanh(1), Neg(2), Sqrt(3), Sin(4), Cos(5), Identity(6),
 //   Gelu(7), Silu(8), Erf(9), Relu(10), Exp(11), Log(12), Abs(13),
-//   Floor(14), Ceil(15), Round(16)
+//   Floor(14), Ceil(15), Round(16), Softplus(17)
 // Dispatch: (ceil(N/256), 1, 1)
 
 @group(0) @binding(0) var<storage, read> A: array<f32>;
@@ -6721,6 +6989,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 14u: { C[idx] = floor(a); }                                         // Floor
         case 15u: { C[idx] = ceil(a); }                                          // Ceil
         case 16u: { C[idx] = round(a); }                                         // Round
+        case 17u: { C[idx] = log(1.0 + exp(a)); }                                   // Softplus
         default: { C[idx] = a; }
     }
 }
@@ -6768,6 +7037,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 14u: { result = floor(a); }
         case 15u: { result = ceil(a); }
         case 16u: { result = round(a); }
+        case 17u: { result = log(1.0 + exp(a)); }
         default: { result = a; }
     }
     C[idx] = f16(result);

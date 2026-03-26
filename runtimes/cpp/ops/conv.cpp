@@ -221,13 +221,99 @@ static void debugInitFp16Stats(GraphExecutor& ex, const char* label, const std::
     fflush(stderr);
 }
 
-// ─── Conv2D ──────────────────────────────────────────────────────────────────
+// ─── Conv1D / Conv2D ─────────────────────────────────────────────────────────
 
 static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1];
     auto* B = in.size() > 2 ? in[2] : nullptr;
-    if (!X || !W || !X->IsValid() || !W->IsValid() || X->shape.size() < 4) return;
+    if (!X || !W || !X->IsValid() || !W->IsValid()) return;
+
+    // ─── Conv1D path: 3D input [batch, channels, length] ─────────────────
+    if (X->shape.size() == 3) {
+        bool useFp16Path = ex.gpu->supportsShaderF16 &&
+                           X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16 &&
+                           (!B || !B->IsValid() || B->dtype == TensorDtype::Float16);
+        if (useFp16Path) {
+            ex.EnsureGpu(*X);
+            ex.EnsureGpu(*W);
+            if (B && B->IsValid()) ex.EnsureGpu(*B);
+        } else if (!ensureTensorFloat32(ex, *X, n.inputs.empty() ? std::string() : n.inputs[0]) ||
+                   !ensureTensorFloat32(ex, *W, n.inputs.size() > 1 ? n.inputs[1] : std::string(), true) ||
+                   (B && B->IsValid() && !ensureTensorFloat32(ex, *B, n.inputs.size() > 2 ? n.inputs[2] : std::string(), true))) {
+            return;
+        }
+
+        // Reshape 3D → 4D: [batch, C, L] → [batch, C, L, 1]
+        // Weight: [C_out, C_in/group, K] → [C_out, C_in/group, K, 1]
+        auto origXShape = X->shape;
+        auto origWShape = W->shape;
+        X->shape = {origXShape[0], origXShape[1], origXShape[2], 1};
+        W->shape = {origWShape[0], origWShape[1], origWShape[2], 1};
+
+        int64_t batch = origXShape[0], C_in = origXShape[1], L_in = origXShape[2];
+        int64_t C_out = origWShape[0], K = origWShape[2];
+        int64_t group = n.GetInt("group", 1);
+
+        std::vector<int64_t> pads_1d = {0, 0};
+        std::vector<int64_t> strides_1d = {1};
+        std::vector<int64_t> dilations_1d = {1};
+        if (n.attrIntLists.count("pads")) pads_1d = n.attrIntLists.at("pads");
+        if (n.attrIntLists.count("strides")) strides_1d = n.attrIntLists.at("strides");
+        if (n.attrIntLists.count("dilations")) dilations_1d = n.attrIntLists.at("dilations");
+        int64_t pad = pads_1d.size() >= 1 ? pads_1d[0] : 0;
+        int64_t stride = strides_1d.size() >= 1 ? strides_1d[0] : 1;
+        int64_t dilation = dilations_1d.size() >= 1 ? dilations_1d[0] : 1;
+        int64_t K_eff = (K - 1) * dilation + 1;
+        int64_t L_out = (L_in + 2*pad - K_eff) / stride + 1;
+
+        *out[0] = ex.AllocTensor({batch, C_out, L_out, 1}, computeOutDtype(X->dtype));
+
+        GPUBuffer biasBuf;
+        if (B && B->IsValid()) { biasBuf = B->buffer; }
+        else {
+            if (useFp16Path) {
+                std::vector<uint16_t> zeros((size_t)C_out, 0u);
+                biasBuf = ex.gpu->createBuffer("conv1d_b0_f16", C_out * 2);
+                ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 2);
+            } else {
+                std::vector<float> zeros((size_t)C_out, 0.0f);
+                biasBuf = ex.gpu->createBuffer("conv1d_b0", C_out * 4);
+                ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 4);
+            }
+        }
+
+        // Use Conv2D kernel with H=L, W=1
+        uint32_t params[16] = {
+            (uint32_t)batch, (uint32_t)C_in, (uint32_t)L_in, 1,   // H_in=L_in, W_in=1
+            (uint32_t)C_out, (uint32_t)K, 1,                       // KH=K, KW=1
+            (uint32_t)pad, 0, (uint32_t)stride, 1,                 // pad_w=0, stride_w=1
+            (uint32_t)L_out, 1, (uint32_t)group,                   // H_out=L_out, W_out=1
+            (uint32_t)dilation, 1                                    // dil_h=dilation, dil_w=1
+        };
+        auto paramBuf = ex.gpu->createBuffer("conv1d_p", 64);
+        ex.gpu->writeBuffer(paramBuf, params, 64);
+
+        auto& pl = useFp16Path
+            ? ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5)
+            : ex.GetPipeline("conv2d", WGSL_CONV2D, 5);
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
+            {3, out[0]->buffer}, {4, paramBuf}});
+        int64_t total = batch * C_out * L_out;
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (uint32_t)((total + 255) / 256), 1, 1, "conv1d"});
+
+        // Reshape output back to 3D
+        out[0]->shape = {batch, C_out, L_out};
+        // Restore original shapes
+        X->shape = origXShape;
+        W->shape = origWShape;
+        return;
+    }
+
+    // ─── Conv2D path: 4D input [batch, channels, H, W] ──────────────────
+    if (X->shape.size() < 4) return;
 
     bool useFp16Path = ex.gpu->supportsShaderF16 && !isVaeDecoderNode(n.name) &&
                        X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16 &&

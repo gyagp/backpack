@@ -154,14 +154,34 @@ static void opUnsqueeze(GraphExecutor& ex, const OnnxGraphNode& n,
     auto* data = in[0]; if (!data || !data->IsValid()) return;
     std::vector<int64_t> axes;
     if (in.size() > 1 && in[1]) {
-        readTensorInt64Values(ex, in[1], n.inputs.size() > 1 ? n.inputs[1] : "", axes);
+        if (in[1]->isCpuOnly || !in[1]->cpuData.empty()) {
+            readTensorInt64Values(ex, in[1], n.inputs.size() > 1 ? n.inputs[1] : "", axes);
+        } else if (auto* init = ex.GetInitData(n.inputs.size() > 1 ? n.inputs[1] : ""); init && init->data) {
+            readTensorInt64Values(ex, in[1], n.inputs.size() > 1 ? n.inputs[1] : "", axes);
+        } else if (in[1]->buffer.handle) {
+            readTensorInt64Values(ex, in[1], n.inputs.size() > 1 ? n.inputs[1] : "", axes);
+        }
     } else if (n.attrIntLists.count("axes")) axes = n.attrIntLists.at("axes");
+    if (axes.empty()) {
+        // No axes → passthrough
+        *out[0] = *data;
+        return;
+    }
     int ndim = (int)data->shape.size() + (int)axes.size();
     for (auto& a : axes) if (a < 0) a += ndim;
     std::sort(axes.begin(), axes.end());
     std::vector<int64_t> ns(ndim); int si = 0;
-    for (int i = 0; i < ndim; i++)
-        ns[i] = (std::find(axes.begin(), axes.end(), i) != axes.end()) ? 1 : data->shape[si++];
+    for (int i = 0; i < ndim; i++) {
+        if (std::find(axes.begin(), axes.end(), i) != axes.end()) {
+            ns[i] = 1;
+        } else {
+            if (si < (int)data->shape.size()) {
+                ns[i] = data->shape[si++];
+            } else {
+                ns[i] = 1;
+            }
+        }
+    }
     *out[0] = *data; out[0]->shape = ns;
 }
 

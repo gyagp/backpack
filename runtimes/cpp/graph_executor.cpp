@@ -419,28 +419,61 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     fclose(f);
 
     // Read external data if present
-    std::string extPath = onnxPath + ".data";  // model.onnx.data
-    // Also check without _data suffix pattern
-    if (!fs::exists(extPath)) {
+    // Support multi-file external data: model.onnx_data, model.onnx_data_1, model.onnx_data_2, ...
+    {
         auto dir = fs::path(onnxPath).parent_path();
         auto stem = fs::path(onnxPath).filename().string();
-        extPath = (dir / (stem + "_data")).string();
-    }
-    if (fs::exists(extPath)) {
-        auto extSize = fs::file_size(extPath);
-        printf("  Loading external data: %.0f MB...\n", extSize / 1048576.0);
-        fflush(stdout);
-        FILE* ef = fopen(extPath.c_str(), "rb");
-        if (ef) {
-            externalData_.resize(extSize);
-            size_t read = 0;
-            while (read < extSize) {
-                size_t chunk = std::min((size_t)(256*1024*1024), extSize - read);
-                size_t n = fread(externalData_.data() + read, 1, chunk, ef);
-                if (n == 0) break;
-                read += n;
+
+        // Try primary external data file (model.onnx_data or model.onnx.data)
+        std::string baseName = stem + "_data";
+        std::string extPath = (dir / baseName).string();
+        if (!fs::exists(extPath)) {
+            extPath = onnxPath + ".data";
+            baseName = stem + ".data";
+        }
+        if (fs::exists(extPath)) {
+            // Load primary file
+            auto extSize = fs::file_size(extPath);
+            printf("  Loading external data: %s (%.0f MB)...\n", baseName.c_str(), extSize / 1048576.0);
+            fflush(stdout);
+            auto& data = externalDataFiles_[baseName];
+            data.resize(extSize);
+            FILE* ef = fopen(extPath.c_str(), "rb");
+            if (ef) {
+                size_t read = 0;
+                while (read < extSize) {
+                    size_t chunk = std::min((size_t)(256*1024*1024), extSize - read);
+                    size_t n = fread(data.data() + read, 1, chunk, ef);
+                    if (n == 0) break;
+                    read += n;
+                }
+                fclose(ef);
             }
-            fclose(ef);
+            // For backward compat, also set externalData_ to primary file
+            externalData_ = data;
+
+            // Load numbered continuation files: _data_1, _data_2, ...
+            for (int idx = 1; idx < 100; idx++) {
+                std::string contName = stem + "_data_" + std::to_string(idx);
+                std::string contPath = (dir / contName).string();
+                if (!fs::exists(contPath)) break;
+                auto contSize = fs::file_size(contPath);
+                printf("  Loading external data: %s (%.0f MB)...\n", contName.c_str(), contSize / 1048576.0);
+                fflush(stdout);
+                auto& contData = externalDataFiles_[contName];
+                contData.resize(contSize);
+                FILE* cf = fopen(contPath.c_str(), "rb");
+                if (cf) {
+                    size_t read = 0;
+                    while (read < contSize) {
+                        size_t chunk = std::min((size_t)(256*1024*1024), contSize - read);
+                        size_t n = fread(contData.data() + read, 1, chunk, cf);
+                        if (n == 0) break;
+                        read += n;
+                    }
+                    fclose(cf);
+                }
+            }
         }
     }
 
@@ -464,27 +497,35 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                     auto tr = graph.readLengthDelimited();
                     auto tensor = parseTensor(tr);
                     // Resolve external data
-                    if (!tensor.extLocation.empty() && !externalData_.empty()) {
-                        int64_t off = (tensor.extOffset >= 0) ? tensor.extOffset : extCursor;
-                        int64_t len = tensor.extLength;
-                        if (len < 0) {
-                            int64_t nel = 1;
-                            for (auto d : tensor.dims) nel *= d;
-                            int bpe = 1;
-                            switch (tensor.dataType) {
-                                case DT_FLOAT: bpe = 4; break;
-                                case DT_FLOAT16: bpe = 2; break;
-                                case DT_INT64: bpe = 8; break;
-                                case DT_INT32: bpe = 4; break;
-                                default: bpe = 1; break;
-                            }
-                            len = nel * bpe;
+                    if (!tensor.extLocation.empty()) {
+                        // Try multi-file lookup first
+                        auto fileIt = externalDataFiles_.find(tensor.extLocation);
+                        const std::vector<uint8_t>* extData = nullptr;
+                        if (fileIt != externalDataFiles_.end()) {
+                            extData = &fileIt->second;
+                        } else if (!externalData_.empty()) {
+                            extData = &externalData_;  // fallback to primary
                         }
-                        if (off + len <= (int64_t)externalData_.size()) {
-                            tensor.rawData = externalData_.data() + off;
-                            tensor.rawSize = (size_t)len;
-                            extCursor = off + len;
-                            extCursor = (extCursor + 63) & ~63LL;
+                        if (extData) {
+                            int64_t off = (tensor.extOffset >= 0) ? tensor.extOffset : 0;
+                            int64_t len = tensor.extLength;
+                            if (len < 0) {
+                                int64_t nel = 1;
+                                for (auto d : tensor.dims) nel *= d;
+                                int bpe = 1;
+                                switch (tensor.dataType) {
+                                    case DT_FLOAT: bpe = 4; break;
+                                    case DT_FLOAT16: bpe = 2; break;
+                                    case DT_INT64: bpe = 8; break;
+                                    case DT_INT32: bpe = 4; break;
+                                    default: bpe = 1; break;
+                                }
+                                len = nel * bpe;
+                            }
+                            if (off + len <= (int64_t)extData->size()) {
+                                tensor.rawData = extData->data() + off;
+                                tensor.rawSize = (size_t)len;
+                            }
                         }
                     }
                     if (!tensor.name.empty())
