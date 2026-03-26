@@ -2,7 +2,7 @@
 /**
  * model_runner.h — Model inference runtime (GGUF + ONNX).
  *
- * Reads model architecture from GGUF metadata or ONNX genai_config.json.
+ * Reads model architecture from GGUF metadata or ONNX config.
  * Loads WGSL kernels from embedded shader constants.
  * No manifest.json or external kernel files needed.
  *

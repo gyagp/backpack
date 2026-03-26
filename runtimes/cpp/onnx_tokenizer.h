@@ -4,7 +4,7 @@
  *
  * Supports GPT-2 style byte-level BPE (used by Phi, LLaMA, etc.)
  * Vocabulary and merges are extracted from tokenizer.json,
- * special tokens from genai_config.json.
+ * special tokens from config.json.
  */
 
 #include <string>
@@ -34,7 +34,7 @@ struct OnnxTokenizer {
 
     // --- API ---
 
-    /// Load tokenizer from model directory (tokenizer.json + genai_config.json)
+    /// Load tokenizer from model directory (tokenizer.json + config.json)
     bool load(const std::string& modelDir);
 
     /// Encode text to token IDs

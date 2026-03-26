@@ -60,7 +60,7 @@ def main():
 
     t0 = time.time()
 
-    # 1. Extract config from genai_config.json
+    # 1. Extract config from model config
     model_dir = args.model
     if not os.path.isdir(model_dir):
         print(f"Error: {model_dir} is not a directory")

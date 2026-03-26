@@ -542,7 +542,7 @@ int main(int argc, char* argv[]) {
     printf("Loading model: %s (%s)\n", resolvedPath.c_str(), modelFormat.c_str()); fflush(stdout);
     auto t0 = std::chrono::steady_clock::now();
 
-    // Standard transformer models (GGUF / ONNX with genai_config.json)
+    // Standard transformer models (GGUF or ONNX)
     LlmContext llm;
     // Generic ONNX models (LFM2, etc.)
     OnnxLlmContext onnxLlm;

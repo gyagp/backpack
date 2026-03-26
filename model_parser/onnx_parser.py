@@ -1,5 +1,5 @@
 """
-ONNX model parser — reads config and tokenizer from ONNX GenAI models.
+ONNX model parser — reads config and tokenizer from ONNX models.
 
 This is the shared parsing layer used by both compiler and runtime stages.
 For GPU weight loading, see runtimes/python/onnx_loader.py.
@@ -94,11 +94,14 @@ class OnnxTokenizer:
             self.merge_rank[key] = i
 
         config_path = os.path.join(model_dir, "genai_config.json")
+        if not os.path.exists(config_path):
+            config_path = os.path.join(model_dir, "config.json")
         with open(config_path) as f:
             cfg = json.load(f)
-        eos = cfg["model"].get("eos_token_id", 0)
+        root = cfg.get("model", cfg)
+        eos = root.get("eos_token_id", 0)
         self.eos_token_id = eos[0] if isinstance(eos, list) else eos
-        self.bos_token_id = cfg["model"].get("bos_token_id", 0)
+        self.bos_token_id = root.get("bos_token_id", 0)
 
         self._b2u, self._u2b = _build_gpt2_byte_tables()
 

@@ -2,8 +2,8 @@
 """
 ONNX model loader for the Python runtime.
 
-Loads ONNX GenAI models (like phi-4-mini) directly for inference.
-Extracts model config from genai_config.json, tokenizer from
+Loads ONNX models (like phi-4-mini) directly for inference.
+Extracts model config from config.json (or genai_config.json), tokenizer from
 tokenizer.json, and quantized weights from model.onnx + model.onnx.data.
 
 Supports:
@@ -109,11 +109,14 @@ class OnnxTokenizer:
 
         # Special tokens
         config_path = os.path.join(model_dir, "genai_config.json")
+        if not os.path.exists(config_path):
+            config_path = os.path.join(model_dir, "config.json")
         with open(config_path) as f:
             cfg = json.load(f)
-        eos = cfg["model"].get("eos_token_id", 0)
+        root = cfg.get("model", cfg)  # genai nests under "model", HF is flat
+        eos = root.get("eos_token_id", 0)
         self.eos_token_id = eos[0] if isinstance(eos, list) else eos
-        self.bos_token_id = cfg["model"].get("bos_token_id", 0)
+        self.bos_token_id = root.get("bos_token_id", 0)
 
         # GPT-2 byte encoding
         self._b2u = {}

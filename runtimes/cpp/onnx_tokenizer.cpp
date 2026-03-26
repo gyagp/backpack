@@ -203,7 +203,7 @@ static const char* skipJsonValue(const char* p, const char* end) {
 
 }  // namespace
 
-// ─── Load from tokenizer.json + genai_config.json ────────────────────────────
+// ─── Load from tokenizer.json + config ───────────────────────────────────────
 
 bool OnnxTokenizer::load(const std::string& modelDir) {
     // Build byte tables

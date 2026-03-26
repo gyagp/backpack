@@ -4,7 +4,7 @@
  *
  * Loads ONNX GenAI models (like phi-4-mini) by parsing the protobuf format
  * directly (no external onnx/protobuf dependency). Extracts model config
- * from genai_config.json, weights from model.onnx + model.onnx.data,
+ * from config.json (or genai_config.json), weights from model.onnx + model.onnx.data,
  * and pre-computed RoPE tables from ONNX initializers.
  *
  * Weights are dequantized from Q4/Q8 and repacked into Q8Repacked format
@@ -68,6 +68,6 @@ struct OnnxLoadResult {
     uint32_t ropeHalfDim = 0;           // number of columns (half of rotary_dim)
 };
 
-/// Load an ONNX model from a directory containing model.onnx + genai_config.json.
+/// Load an ONNX model from a directory containing .onnx + config.json.
 /// Populates result with all weights, config, and RoPE tables.
 bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result);

@@ -49,7 +49,7 @@ static std::string resolveModelPath(const std::string& path, std::string& format
         if (fs::exists(path)) { format = "gguf"; return path; }
     }
 
-    // ONNX directory (contains model.onnx + genai_config.json)
+    // ONNX directory (contains .onnx + config)
     if (isOnnxDir(path)) {
         format = "onnx";
         return path;
@@ -125,7 +125,7 @@ int main(int argc, char* argv[]) {
             "  [--bench-prompt-len <n>] [--bench-gen-tokens <n>]\n\n"
             "Supports:\n"
             "  - GGUF files (Q8_0 quantization)\n"
-            "  - ONNX directories (model.onnx + genai_config.json)\n",
+            "  - ONNX directories (model.onnx + config.json)\n",
             argv[0]);
         return 1;
     }
