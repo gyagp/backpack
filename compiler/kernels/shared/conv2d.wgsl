@@ -1,7 +1,7 @@
 // Conv2D — 2D convolution with bias
 // Y[n,co,oh,ow] = sum_{ci,kh,kw} X[n,ci,ih,iw] * W[co,ci,kh,kw] + bias[co]
 //
-// Supports padding, stride, and groups.
+// Supports padding, stride, dilation, and groups.
 // Dispatch: (ceil(total_output/256), 1, 1)
 
 @group(0) @binding(0) var<storage, read> X: array<f32>;
@@ -26,6 +26,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let H_out = _params_[11];
     let W_out = _params_[12];
     let group = _params_[13];
+    let dil_h = _params_[14];
+    let dil_w = _params_[15];
 
     let total = batch * C_out * H_out * W_out;
     let idx = gid.x;
@@ -45,8 +47,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ci = g * ci_per_group + ci_local;
         for (var kh = 0u; kh < KH; kh++) {
             for (var kw = 0u; kw < KW; kw++) {
-                let ih = i32(oh * stride_h + kh) - i32(pad_h);
-                let iw = i32(ow * stride_w + kw) - i32(pad_w);
+                let ih = i32(oh * stride_h + kh * dil_h) - i32(pad_h);
+                let iw = i32(ow * stride_w + kw * dil_w) - i32(pad_w);
                 if (ih >= 0 && ih < i32(H_in) && iw >= 0 && iw < i32(W_in)) {
                     let x_val = X[n * C_in * H_in * W_in + ci * H_in * W_in + u32(ih) * W_in + u32(iw)];
                     let w_val = W[co * ci_per_group * KH * KW + ci_local * KH * KW + kh * KW + kw];

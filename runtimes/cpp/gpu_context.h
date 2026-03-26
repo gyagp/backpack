@@ -93,6 +93,9 @@ struct GPUContext {
     bool supportsSubgroupMatrix = false;
     bool supportsTimestampQuery = false;
 
+    // OOM detection: set by Dawn error callback, checked after buffer creation
+    bool lastAllocFailed = false;
+
     // --- Lifecycle ---
     bool init(WGPUBackendType backend = WGPUBackendType_Vulkan);
     void destroy();

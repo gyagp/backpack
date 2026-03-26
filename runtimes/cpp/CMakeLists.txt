@@ -1,5 +1,31 @@
 cmake_minimum_required(VERSION 3.16)
 cmake_policy(SET CMP0091 NEW)  # MSVC runtime library selection via CMAKE_MSVC_RUNTIME_LIBRARY
+
+if(WIN32)
+    set(_winsdk_bin "C:/Program Files (x86)/Windows Kits/10/bin")
+    if(EXISTS "${_winsdk_bin}")
+        file(GLOB _winsdk_versions LIST_DIRECTORIES true "${_winsdk_bin}/10.0.*")
+        list(SORT _winsdk_versions COMPARE NATURAL ORDER DESCENDING)
+
+        foreach(_winsdk_dir IN LISTS _winsdk_versions)
+            if(NOT DEFINED CMAKE_MT OR CMAKE_MT MATCHES "NOTFOUND")
+                if(EXISTS "${_winsdk_dir}/x64/mt.exe")
+                    set(CMAKE_MT "${_winsdk_dir}/x64/mt.exe" CACHE FILEPATH "Manifest tool" FORCE)
+                endif()
+            endif()
+            if(NOT DEFINED CMAKE_RC_COMPILER OR CMAKE_RC_COMPILER MATCHES "-NOTFOUND$" OR CMAKE_RC_COMPILER STREQUAL "rc")
+                if(EXISTS "${_winsdk_dir}/x64/rc.exe")
+                    set(CMAKE_RC_COMPILER "${_winsdk_dir}/x64/rc.exe" CACHE FILEPATH "Windows resource compiler" FORCE)
+                endif()
+            endif()
+            if((DEFINED CMAKE_MT AND NOT CMAKE_MT MATCHES "NOTFOUND") AND
+               (DEFINED CMAKE_RC_COMPILER AND NOT CMAKE_RC_COMPILER MATCHES "-NOTFOUND$" AND NOT CMAKE_RC_COMPILER STREQUAL "rc"))
+                break()
+            endif()
+        endforeach()
+    endif()
+endif()
+
 project(backpack_runtime LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)

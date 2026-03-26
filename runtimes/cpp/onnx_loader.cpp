@@ -144,6 +144,10 @@ struct OnnxTensor {
     int64_t externalLength = -1;
     // Inline float data (if stored as repeated float)
     std::vector<float> floatData;
+    // Inline int64 data (if stored as repeated int64)
+    std::vector<int64_t> int64Data;
+    // Inline int32 data (if stored as repeated int32)
+    std::vector<int32_t> int32Data;
 };
 
 struct OnnxAttribute {
@@ -201,6 +205,22 @@ OnnxTensor parseTensorProto(PBReader& r) {
                 }
                 break;
             case 8: t.name = r.readString(); break;  // name
+            case 5: // int32_data (repeated int32, packed or individual)
+                if (wire == 2) {
+                    auto sub = r.readLengthDelimited();
+                    while (!sub.eof()) t.int32Data.push_back((int32_t)sub.readVarint());
+                } else {
+                    t.int32Data.push_back((int32_t)r.readVarint());
+                }
+                break;
+            case 7: // int64_data (repeated int64, packed or individual)
+                if (wire == 2) {
+                    auto sub = r.readLengthDelimited();
+                    while (!sub.eof()) t.int64Data.push_back((int64_t)sub.readVarint());
+                } else {
+                    t.int64Data.push_back((int64_t)r.readVarint());
+                }
+                break;
             case 15: dataLocation = (int)r.readVarint(); break;  // data_location
             case 13: { // raw_data or misplaced external_data
                 uint64_t len = r.readVarint();

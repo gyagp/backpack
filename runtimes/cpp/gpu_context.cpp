@@ -180,11 +180,17 @@ bool GPUContext::init(WGPUBackendType backend) {
     // WGPULimits struct, which would only ask for WebGPU defaults.
     ddesc.requiredLimits = &adapterLimits;
     ddesc.uncapturedErrorCallbackInfo.callback =
-        [](WGPUDevice const*, WGPUErrorType t, WGPUStringView m, void*, void*) {
+        [](WGPUDevice const*, WGPUErrorType t, WGPUStringView m, void* ud, void*) {
             const char* n[] = {"OK","Val","OOM","Int","Unk","Lost"};
             fprintf(stderr, "[DAWN %s] %.*s\n", n[std::min((int)t,5)],
                     (int)m.length, m.data);
+            // Flag OOM errors so createBuffer can detect failed allocations
+            if (t == WGPUErrorType_OutOfMemory) {
+                auto* ctx = static_cast<GPUContext*>(ud);
+                ctx->lastAllocFailed = true;
+            }
         };
+    ddesc.uncapturedErrorCallbackInfo.userdata1 = this;
 
     device = wgpuAdapterCreateDevice(adapter, &ddesc);
     if (!device) return false;
@@ -256,8 +262,8 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
         if (!pool_[bucket].empty()) {
             GPUBuffer buf = pool_[bucket].back();
             pool_[bucket].pop_back();
-            // Buffer might be larger than requested — that's fine
-            return {buf.handle, size};
+            // Return with original POOL allocation size to keep pool tracking consistent
+            return buf;
         }
         // Round up to bucket size for new allocation
         uint64_t bucketSize = 1ULL << (bucket + POOL_MIN_BITS);
@@ -270,31 +276,58 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
     d.size = size;
     d.mappedAtCreation = mappedAtCreation ? 1u : 0u;
     GPUBuffer buf{wgpuDeviceCreateBuffer(device, &d), size};
+    // Dawn may return a non-null "error" buffer on OOM. Check via the error callback flag.
+    if (lastAllocFailed) {
+        lastAllocFailed = false;
+        if (buf.handle) { wgpuBufferRelease(buf.handle); buf.handle = nullptr; }
+    }
+    if (!buf.handle) {
+        // Allocation failed — flush pool and retry
+        fprintf(stderr, "  [gpu] alloc '%s' %llu bytes FAILED, flushing pool...\n",
+                name.c_str(), (unsigned long long)size);
+        fflush(stderr);
+        flushBufferPool();
+        lastAllocFailed = false;
+        buf = {wgpuDeviceCreateBuffer(device, &d), size};
+        if (lastAllocFailed) {
+            lastAllocFailed = false;
+            if (buf.handle) { wgpuBufferRelease(buf.handle); buf.handle = nullptr; }
+        }
+        if (!buf.handle) {
+            fprintf(stderr, "  [gpu] ALLOC FAILED (after pool flush): name='%s' size=%llu bytes\n",
+                    name.c_str(), (unsigned long long)size);
+            fflush(stderr);
+        }
+    }
     buffers_[name] = buf;
     return buf;
 }
 
 void GPUContext::releaseBuffer(GPUBuffer buf) {
-    if (!buf.handle || !bufferPoolEnabled) return;
+    if (!buf.handle) return;
     int bucket = poolBucket(buf.size);
-    // Limit pool size per bucket to avoid unbounded memory growth
     if (pool_[bucket].size() < 256) {
         pool_[bucket].push_back(buf);
     } else {
+        wgpuBufferDestroy(buf.handle);
         wgpuBufferRelease(buf.handle);
     }
 }
 
 void GPUContext::flushBufferPool() {
+    size_t totalFreed = 0;
     for (auto& bucket : pool_) {
         for (auto& buf : bucket) {
             if (buf.handle) {
+                totalFreed += buf.size;
                 wgpuBufferDestroy(buf.handle);
                 wgpuBufferRelease(buf.handle);
             }
         }
         bucket.clear();
     }
+    if (totalFreed > 0)
+        fprintf(stderr, "  [pool] flushed %llu MB\n", (unsigned long long)totalFreed / 1048576);
 }
 
 GPUBuffer GPUContext::getBuffer(const std::string& name) const {
@@ -414,6 +447,11 @@ void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
     wgpuQueueSubmit(queue, 1, &cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
+
+    // Release bind groups — they held references to GPU buffers
+    for (auto& d : dispatches) {
+        if (d.bindGroup) wgpuBindGroupRelease(d.bindGroup);
+    }
 }
 
 void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
@@ -442,6 +480,10 @@ void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
     wgpuQueueSubmit(queue, 1, &cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
+
+    for (auto& d : dispatches) {
+        if (d.bindGroup) wgpuBindGroupRelease(d.bindGroup);
+    }
 }
 
 void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
@@ -463,6 +505,11 @@ void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
     wgpuQueueSubmit(queue, 1, &cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
+
+    // Release bind groups
+    for (auto& d : dispatches) {
+        if (d.bindGroup) wgpuBindGroupRelease(d.bindGroup);
+    }
 }
 
 WGPUBuffer GPUContext::getOrCreateReadbackBuf(uint64_t size) {

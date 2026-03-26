@@ -115,6 +115,11 @@ public:
     void SetData(const void* data, size_t bytes);
     void GetData(void* data, size_t bytes) const;
 
+    /// In-place element-wise scale: buf[i] *= s. GPU-only, no CPU sync.
+    void Scale(float s);
+    /// In-place negate: buf[i] = -buf[i]. Shorthand for Scale(-1).
+    void Negate();
+
     DataType GetDtype() const;
     std::vector<int64_t> GetShape() const;
     int64_t GetElementCount() const;

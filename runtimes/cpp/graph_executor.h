@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -151,7 +152,7 @@ public:
     const OnnxGraph& GetGraph() const { return graph_; }
 
     /// Allocate a GPU tensor.
-    GpuTensor AllocTensor(const std::vector<int64_t>& shape, TensorDtype dtype);
+    GpuTensor AllocTensor(std::vector<int64_t> shape, TensorDtype dtype);
 
     /// Create a CPU-only tensor (no GPU buffer). Upload to GPU lazily.
     GpuTensor AllocCpuTensor(const std::vector<int64_t>& shape, TensorDtype dtype,
@@ -171,6 +172,10 @@ public:
 
     /// Submit dispatches and wait.
     void Submit(const std::vector<Dispatch>& dispatches);
+
+    /// Flush all pending GPU work (dispatches + copies) and wait.
+    /// Must be called before any GPU readback to ensure data is written.
+    void FlushPendingWork();
 
     /// Submit dispatches (fire and forget, no sync).
     void SubmitAsync(const std::vector<Dispatch>& dispatches);
@@ -201,6 +206,13 @@ private:
     // Tensor store: all intermediate and initializer tensors by name
     // Using std::map for pointer stability (unordered_map rehashes invalidate references)
     std::map<std::string, GpuTensor> tensorStore_;
+
+    // Names of tensors loaded during LoadGraph (initializers + pre-store constants).
+    // These persist across Execute() calls; everything else is cleared.
+    std::set<std::string> persistentTensors_;
+
+    // Cached topo sort order (reused across Execute calls for the same graph)
+    std::vector<size_t> cachedExecOrder_;
 
 public:
     // Batched dispatches for the current execution (public for op access)

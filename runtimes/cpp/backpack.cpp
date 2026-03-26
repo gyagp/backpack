@@ -8,6 +8,7 @@
 #include "backpack.h"
 #include "gpu_context.h"
 #include "graph_executor.h"
+#include "wgsl_shaders.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -158,6 +159,19 @@ static TensorDtype toGeDtype(bp::DataType dt) {
     return TensorDtype::Float32;
 }
 
+static bp::DataType fromGeDtype(TensorDtype dt) {
+    switch (dt) {
+        case TensorDtype::Float32: return bp::DataType::Float32;
+        case TensorDtype::Float16: return bp::DataType::Float16;
+        case TensorDtype::Int32: return bp::DataType::Int32;
+        case TensorDtype::Int64: return bp::DataType::Int64;
+        case TensorDtype::UInt8: return bp::DataType::UInt8;
+        case TensorDtype::Int8: return bp::DataType::Int8;
+        case TensorDtype::Bool: return bp::DataType::Bool;
+    }
+    return bp::DataType::Float32;
+}
+
 static size_t dtypeSize(bp::DataType dt) {
     switch (dt) {
         case bp::DataType::Float32: case bp::DataType::Int32: return 4;
@@ -200,6 +214,25 @@ void bp::Tensor::GetData(void* data, size_t bytes) const {
     auto readback = gpuCtx->readBuffer(impl_->gpuBuf, bytes);
     memcpy(data, readback.data(), std::min(bytes, readback.size()));
 }
+
+void bp::Tensor::Scale(float s) {
+    if (!impl_ || !impl_->device) return;
+    auto* gpuCtx = static_cast<GPUContext*>(impl_->device->GetGPUContext());
+    int64_t nel = GetElementCount();
+    if (nel <= 0) return;
+
+    auto& pl = gpuCtx->getOrCreatePipeline("_scale_f32", WGSL_SCALE, 2);
+    uint32_t paramsData[4] = { (uint32_t)nel, 0, 0, 0 };
+    memcpy(&paramsData[1], &s, sizeof(float));
+    auto paramBuf = gpuCtx->createBuffer("_scale_params", 16);
+    gpuCtx->writeBuffer(paramBuf, paramsData, 16);
+
+    auto bg = gpuCtx->createBindGroup(pl, {{0, impl_->gpuBuf}, {1, paramBuf}});
+    gpuCtx->submitOnly({{pl.pipeline, bg, (uint32_t)((nel + 255) / 256), 1, 1, "scale"}});
+    gpuCtx->releaseBuffer(paramBuf);
+}
+
+void bp::Tensor::Negate() { Scale(-1.0f); }
 bp::DataType bp::Tensor::GetDtype() const {
     return impl_ ? impl_->dtype : DataType::Float32;
 }
@@ -280,10 +313,15 @@ void bp::Session::Run() {
     // Execute may have replaced the buffer handle with the actual computed result
     for (size_t i = 0; i < impl_->outputTensors.size(); i++) {
         if (impl_->outputTensors[i]) {
+            if (!impl_->ownedOutputs[i].buffer.handle && impl_->ownedOutputs[i].isCpuOnly) {
+                impl_->model->GetImpl()->executor.EnsureGpu(impl_->ownedOutputs[i]);
+            }
             auto* ti = impl_->outputTensors[i]->GetImpl();
             if (ti) {
                 ti->gpuBuf = impl_->ownedOutputs[i].buffer;
                 ti->shape = impl_->ownedOutputs[i].shape;
+                ti->geDtype = impl_->ownedOutputs[i].dtype;
+                ti->dtype = fromGeDtype(impl_->ownedOutputs[i].dtype);
             }
         }
     }

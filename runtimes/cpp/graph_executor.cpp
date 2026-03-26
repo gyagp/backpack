@@ -6,6 +6,7 @@
  */
 
 #include "graph_executor.h"
+#include "wgsl_shaders.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,110 @@
 #include <unordered_set>
 
 namespace fs = std::filesystem;
+
+static constexpr bool kDebugExecTrace = false;
+
+namespace {
+
+struct PipelineWarmupSpec {
+    const char* name;
+    const char* wgsl;
+    uint32_t numBindings;
+};
+
+static const PipelineWarmupSpec* warmupSpecForOp(const std::string& opType) {
+    static const PipelineWarmupSpec kBinaryElementwise{"binary_elementwise", WGSL_BINARY_ELEMENTWISE, 4};
+    static const PipelineWarmupSpec kUnaryElementwise{"unary_elementwise", WGSL_UNARY_ELEMENTWISE, 3};
+    static const PipelineWarmupSpec kWhereSelect{"where_select", WGSL_WHERE_SELECT, 5};
+    static const PipelineWarmupSpec kEqualOp{"equal_op", WGSL_EQUAL_OP, 4};
+    static const PipelineWarmupSpec kSoftmax{"softmax", WGSL_SOFTMAX, 3};
+    static const PipelineWarmupSpec kMatmulF32{"matmul_f32", WGSL_MATMUL_F32, 4};
+    static const PipelineWarmupSpec kMatmulQ4{"matmul_q4", WGSL_MATMUL_Q4, 5};
+    static const PipelineWarmupSpec kGemm{"gemm", WGSL_GEMM, 5};
+    static const PipelineWarmupSpec kConv2d{"conv2d", WGSL_CONV2D, 5};
+    static const PipelineWarmupSpec kConvTranspose2d{"conv_transpose2d", WGSL_CONV_TRANSPOSE2D, 5};
+    static const PipelineWarmupSpec kResizeNearest{"resize_nearest", WGSL_RESIZE_NEAREST, 3};
+    static const PipelineWarmupSpec kLayerNorm{"layer_norm", WGSL_LAYER_NORM, 5};
+    static const PipelineWarmupSpec kInstanceNorm{"instance_norm", WGSL_INSTANCE_NORM, 5};
+    static const PipelineWarmupSpec kGroupNorm{"group_norm", WGSL_GROUP_NORM, 5};
+    static const PipelineWarmupSpec kGather{"gather", WGSL_GATHER, 4};
+    static const PipelineWarmupSpec kTranspose{"transpose", WGSL_TRANSPOSE, 3};
+    static const PipelineWarmupSpec kSlice{"slice", WGSL_SLICE, 3};
+    static const PipelineWarmupSpec kExpand{"expand", WGSL_EXPAND, 3};
+    static const PipelineWarmupSpec kBidirectionalAttn{"bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN, 5};
+    static const PipelineWarmupSpec kRotaryEmbedding{"rotary_embedding", WGSL_ROTARY_EMBEDDING, 6};
+
+    if (opType == "Add" || opType == "Sub" || opType == "Mul" || opType == "Div") return &kBinaryElementwise;
+    if (opType == "Sigmoid" || opType == "Tanh" || opType == "Neg" || opType == "Sqrt" ||
+        opType == "Sin" || opType == "Cos" || opType == "Gelu" || opType == "Silu" ||
+        opType == "Erf" || opType == "Relu" || opType == "Exp" || opType == "Log" ||
+        opType == "Abs" || opType == "Floor" || opType == "Ceil" || opType == "Round") return &kUnaryElementwise;
+    if (opType == "Where") return &kWhereSelect;
+    if (opType == "Equal") return &kEqualOp;
+    if (opType == "Softmax") return &kSoftmax;
+    if (opType == "MatMul") return &kMatmulF32;
+    if (opType == "MatMulNBits") return &kMatmulQ4;
+    if (opType == "Gemm") return &kGemm;
+    if (opType == "Conv") return &kConv2d;
+    if (opType == "ConvTranspose") return &kConvTranspose2d;
+    if (opType == "Resize") return &kResizeNearest;
+    if (opType == "LayerNormalization") return &kLayerNorm;
+    if (opType == "InstanceNormalization") return &kInstanceNorm;
+    if (opType == "GroupNorm") return &kGroupNorm;
+    if (opType == "Gather") return &kGather;
+    if (opType == "Transpose") return &kTranspose;
+    if (opType == "Slice") return &kSlice;
+    if (opType == "Expand") return &kExpand;
+    if (opType == "MultiHeadAttention") return &kBidirectionalAttn;
+    if (opType == "RotaryEmbedding") return &kRotaryEmbedding;
+    return nullptr;
+}
+
+static size_t warmupGraphPipelines(GraphExecutor& ex) {
+    std::set<std::string> warmed;
+    for (const auto& node : ex.GetGraph().nodes) {
+        if (node.opType == "Gemm" && ex.gpu->supportsSubgroups) {
+            if (warmed.insert("fp16_gemm").second)
+                ex.GetPipeline("fp16_gemm", WGSL_FP16_GEMM, 5);
+            if (warmed.insert("fp16_gemm_wide").second)
+                ex.GetPipeline("fp16_gemm_wide", WGSL_FP16_GEMM_WIDE, 5);
+        }
+        if (ex.gpu->supportsShaderF16) {
+            if (node.opType == "MatMul" && warmed.insert("matmul_f16").second)
+                ex.GetPipeline("matmul_f16", WGSL_MATMUL_F16, 4);
+            if (node.opType == "Cast") {
+                if (warmed.insert("cast_f32_to_f16").second)
+                    ex.GetPipeline("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
+                if (warmed.insert("cast_f16_to_f32").second)
+                    ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+            }
+            if ((node.opType == "Add" || node.opType == "Sub" || node.opType == "Mul" || node.opType == "Div") &&
+                warmed.insert("binary_elementwise_f16").second) {
+                ex.GetPipeline("binary_elementwise_f16", WGSL_BINARY_ELEMENTWISE_F16, 4);
+            }
+            if ((node.opType == "Sigmoid" || node.opType == "Tanh" || node.opType == "Neg" || node.opType == "Sqrt" ||
+                 node.opType == "Sin" || node.opType == "Cos" || node.opType == "Gelu" || node.opType == "Silu" ||
+                 node.opType == "Erf" || node.opType == "Relu" || node.opType == "Exp" || node.opType == "Log" ||
+                 node.opType == "Abs" || node.opType == "Floor" || node.opType == "Ceil" || node.opType == "Round") &&
+                warmed.insert("unary_elementwise_f16").second) {
+                ex.GetPipeline("unary_elementwise_f16", WGSL_UNARY_ELEMENTWISE_F16, 3);
+            }
+            if (node.opType == "Conv" && warmed.insert("conv2d_f16").second) {
+                ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5);
+            }
+            if (node.opType == "ConvTranspose" && warmed.insert("conv_transpose2d_f16").second) {
+                ex.GetPipeline("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5);
+            }
+        }
+        const PipelineWarmupSpec* spec = warmupSpecForOp(node.opType);
+        if (!spec) continue;
+        if (!warmed.insert(spec->name).second) continue;
+        ex.GetPipeline(spec->name, spec->wgsl, spec->numBindings);
+    }
+    return warmed.size();
+}
+
+}  // anonymous namespace
 
 // ─── Op Registry (static) ───────────────────────────────────────────────────
 
@@ -428,6 +533,9 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             else if (a.type == 3) node.attrStrings[a.name] = a.s; // STRING
             else if (a.type == 7) node.attrIntLists[a.name] = a.ints; // INTS
 
+            // Debug: log perm attribute for Transpose nodes
+            // (disabled for performance)
+
             // Handle tensor-valued 'value' attribute (Constant nodes)
             if (a.hasTensor && a.name == "value" && node.opType == "Constant" && !node.outputs.empty()) {
                 auto& t = a.tensor;
@@ -453,17 +561,37 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                     memcpy(gt.cpuData.data(), rawPtr, rawLen);
                     // Pre-store in tensor store so the Constant op finds it
                     tensorStore_[node.outputs[0]] = std::move(gt);
-                    if (node.outputs[0].find("INT64") != std::string::npos) {
-                        auto& stored = tensorStore_[node.outputs[0]];
-                        fprintf(stderr, "  [pre-store] '%s' shape=[", node.outputs[0].c_str());
-                        for (size_t i = 0; i < stored.shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)stored.shape[i]);
-                        fprintf(stderr, "] cpuData=%zu isCpu=%d\n", stored.cpuData.size(), stored.isCpuOnly);
-                        fflush(stderr);
-                    }
+                    persistentTensors_.insert(node.outputs[0]);
                 }
             }
         }
         graph_.nodes.push_back(std::move(node));
+    }
+
+    std::set<std::string> nativeFp16Initializers;
+    for (const auto& node : graph_.nodes) {
+        if (node.opType == "Gemm" && node.inputs.size() >= 2 && node.GetInt("transB", 0) == 1) {
+            nativeFp16Initializers.insert(node.inputs[1]);
+        }
+        if (node.opType == "MatMul" && node.inputs.size() >= 2) {
+            nativeFp16Initializers.insert(node.inputs[1]);
+        }
+        if ((node.opType == "Conv" || node.opType == "ConvTranspose") && node.inputs.size() >= 2) {
+            nativeFp16Initializers.insert(node.inputs[1]);
+            if (node.inputs.size() >= 3) nativeFp16Initializers.insert(node.inputs[2]);
+        }
+        if ((node.opType == "SimplifiedLayerNormalization" ||
+             node.opType == "SkipSimplifiedLayerNormalization" ||
+             node.opType == "LayerNormalization" ||
+             node.opType == "InstanceNormalization" ||
+             node.opType == "GroupNorm") && node.inputs.size() >= 2) {
+            nativeFp16Initializers.insert(node.inputs[1]);
+            if (node.inputs.size() >= 3) nativeFp16Initializers.insert(node.inputs[2]);
+        }
+        if ((node.opType == "Add" || node.opType == "Sub" || node.opType == "Mul" || node.opType == "Div") && node.inputs.size() >= 2) {
+            nativeFp16Initializers.insert(node.inputs[0]);
+            nativeFp16Initializers.insert(node.inputs[1]);
+        }
     }
 
     // Upload initializers to GPU
@@ -477,6 +605,9 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                 memcpy(inlineDataBuf.data(), t.int64Data.data(), inlineDataBuf.size());
                 t.rawData = inlineDataBuf.data();
                 t.rawSize = inlineDataBuf.size();
+                if (t.name.find("reshape_shape") != std::string::npos)
+                    fprintf(stderr, "    [int64data] '%s': %zu int64 values resolved\n",
+                            t.name.c_str(), t.int64Data.size());
             } else if (!t.floatData.empty()) {
                 inlineDataBuf.resize(t.floatData.size() * 4);
                 memcpy(inlineDataBuf.data(), t.floatData.data(), inlineDataBuf.size());
@@ -495,6 +626,17 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                 fprintf(stderr, "    [nodata] '%s' dims=%zu rawSize=%zu extLoc='%s' extOff=%lld\n",
                         t.name.c_str(), t.dims.size(), t.rawSize,
                         t.extLocation.c_str(), (long long)t.extOffset);
+            // Still register as a valid empty CPU tensor so it's in tensorStore_
+            // (other nodes may depend on this name for topo sort resolution)
+            auto emptyDtype = fromOnnxDtype(t.dataType);
+            GpuTensor gt;
+            gt.shape = t.dims;
+            gt.dtype = emptyDtype;
+            gt.isCpuOnly = true;
+            // Empty dims = empty tensor (0 elements), completely valid
+            tensorStore_[t.name] = std::move(gt);
+            persistentTensors_.insert(t.name);
+            uploaded++;
             continue;
         }
         auto dtype = fromOnnxDtype(t.dataType);
@@ -511,7 +653,10 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             gt.cpuData.resize(t.rawSize);
             memcpy(gt.cpuData.data(), t.rawData, t.rawSize);
             tensorStore_[t.name] = std::move(gt);
-            graph_.initializers[t.name] = {t.rawData, t.rawSize, dtype, t.dims};
+            // Store initializer data from the OWNED cpuData (not from inlineDataBuf which is going away)
+            auto& stored = tensorStore_[t.name];
+            graph_.initializers[t.name] = {stored.cpuData.data(), stored.cpuData.size(), dtype, t.dims};
+            persistentTensors_.insert(t.name);
             uploaded++;
             continue;
         }
@@ -526,7 +671,10 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         bool isScale = (t.name.find("scale") != std::string::npos ||
                         t.name.find("Scale") != std::string::npos ||
                         t.name.find("_scales") != std::string::npos);
-        bool convertToF32 = (dtype == TensorDtype::Float16 && !isLargeWeight && !isScale);
+        bool keepPackedFp16 = (dtype == TensorDtype::Float16 &&
+                   nativeFp16Initializers.count(t.name) > 0);
+        bool convertToF32 = (dtype == TensorDtype::Float16 && !isLargeWeight && !isScale &&
+                     !keepPackedFp16);
 
         if (convertToF32) {
             // Convert fp16 → fp32
@@ -542,6 +690,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             gpu->writeBuffer(gt.buffer, fp32.data(), f32Size);
             tensorStore_[t.name] = std::move(gt);
             graph_.initializers[t.name] = {t.rawData, t.rawSize, TensorDtype::Float16, t.dims};
+            persistentTensors_.insert(t.name);
             uploaded++;
             continue;
         }
@@ -573,25 +722,47 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
 
         // Also record in graph initializers (for metadata)
         graph_.initializers[t.name] = {t.rawData, t.rawSize, dtype, t.dims};
+        persistentTensors_.insert(t.name);
         uploaded++;
     }
 
+    auto warmupT0 = std::chrono::steady_clock::now();
+    size_t warmedPipelines = warmupGraphPipelines(*this);
+    auto warmupT1 = std::chrono::steady_clock::now();
+
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    printf("  %d initializers uploaded, %d no-data, %lldms\n", uploaded, nodata, (long long)ms);
+    auto warmupMs = std::chrono::duration_cast<std::chrono::milliseconds>(warmupT1 - warmupT0).count();
+    printf("  %d initializers uploaded, %d no-data, %zu pipelines warmed, %lldms\n",
+           uploaded, nodata, warmedPipelines, (long long)ms);
+    if (warmedPipelines > 0) {
+        printf("  Pipeline warmup: %lldms\n", (long long)warmupMs);
+    }
 
     return true;
 }
 
 // ─── Tensor Allocation ──────────────────────────────────────────────────────
 
-GpuTensor GraphExecutor::AllocTensor(const std::vector<int64_t>& shape,
+static std::string g_currentOpLabel;
+static const char* g_currentOp = nullptr;  // for debug tracking
+
+GpuTensor GraphExecutor::AllocTensor(std::vector<int64_t> shape,
                                       TensorDtype dtype) {
     GpuTensor t;
-    t.shape = shape;
+    t.shape = std::move(shape);
     t.dtype = dtype;
     size_t bytes = t.ByteSize();
     if (bytes == 0) bytes = 4;  // minimum
+    // Sanity check: no single tensor should exceed 2GB
+    if (bytes > 2ULL * 1024 * 1024 * 1024) {
+        fprintf(stderr, "  [alloc] CORRUPT in %s: shape=[", g_currentOp ? g_currentOp : "?");
+        for (size_t i = 0; i < t.shape.size(); i++) fprintf(stderr, "%s%lld", i?",":"", (long long)t.shape[i]);
+        fprintf(stderr, "] dtype=%d -- RETURNING MINIMAL BUFFER\n", (int)dtype);
+        fflush(stderr);
+        bytes = 4;  // fallback to minimal
+        t.shape = {1};  // fix shape to prevent cascading corruption
+    }
     t.buffer = gpu->createBuffer("tmp", bytes);
     return t;
 }
@@ -674,6 +845,27 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
     gpu->waitForQueue();
 }
 
+void GraphExecutor::FlushPendingWork() {
+    if (!pendingDispatches_.empty()) {
+        gpu->submitOnly(pendingDispatches_, false);
+        pendingDispatches_.clear();
+    }
+    if (!pendingCopies_.empty()) {
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+        for (auto& c : pendingCopies_)
+            wgpuCommandEncoderCopyBufferToBuffer(enc,
+                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+        WGPUCommandBufferDescriptor cbD{};
+        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        wgpuCommandBufferRelease(cb);
+        wgpuCommandEncoderRelease(enc);
+        pendingCopies_.clear();
+    }
+    gpu->waitForQueue();
+}
+
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
     pendingDispatches_.insert(pendingDispatches_.end(),
                               dispatches.begin(), dispatches.end());
@@ -691,6 +883,19 @@ void GraphExecutor::QueueCopy(GPUBuffer src, uint64_t srcOffset,
     srcOffset = srcOffset & ~3ULL;
     dstOffset = dstOffset & ~3ULL;
     if (size == 0) return;
+
+    if (src.handle == dst.handle && srcOffset == dstOffset) return;
+
+    if (!pendingCopies_.empty()) {
+        auto& last = pendingCopies_.back();
+        if (last.src.handle == src.handle && last.dst.handle == dst.handle &&
+            last.srcOff + last.size == srcOffset &&
+            last.dstOff + last.size == dstOffset) {
+            last.size += size;
+            return;
+        }
+    }
+
     pendingCopies_.push_back({src, srcOffset, dst, dstOffset, size});
 }
 
@@ -705,6 +910,29 @@ void GraphExecutor::Execute(
         std::unordered_map<std::string, GpuTensor*>& outputs) {
 
     // Bind graph inputs into tensor store
+    // Clear stale intermediate tensors from any previous Execute() call.
+    // Persistent entries (initializers + pre-store constants) are preserved.
+    for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+        if (persistentTensors_.count(it->first))
+            ++it;
+        else
+            it = tensorStore_.erase(it);
+    }
+
+    // Save persistent tensor state (dtype + buffer) before execution.
+    // Ops may convert persistent fp16 tensors to f32 in-place via
+    // ensureTensorFloat32/ensureCpuBackedFloat32. We restore them at the end
+    // so the next Execute() call sees the original state.
+    struct SavedState { TensorDtype dtype; GPUBuffer buffer; std::vector<uint8_t> cpuData; bool isCpuOnly; };
+    std::unordered_map<std::string, SavedState> savedPersistent;
+    for (auto& name : persistentTensors_) {
+        auto it = tensorStore_.find(name);
+        if (it != tensorStore_.end()) {
+            savedPersistent[name] = {it->second.dtype, it->second.buffer,
+                                     it->second.cpuData, it->second.isCpuOnly};
+        }
+    }
+
     for (auto& [name, tensor] : inputs) {
         tensorStore_[name] = *tensor;
         // For int64 inputs, also store as CPU data for metadata ops
@@ -730,9 +958,9 @@ void GraphExecutor::Execute(
     // Clear dispatch batch
     pendingDispatches_.clear();
 
-    // Topological sort using Kahn's algorithm (O(N+E), not O(N²))
-    std::vector<size_t> execOrder;
-    {
+    // Topological sort (cached across Execute calls)
+    std::vector<size_t>& execOrder = cachedExecOrder_;
+    if (execOrder.empty()) {
         auto sortT0 = std::chrono::steady_clock::now();
         size_t N = graph_.nodes.size();
         std::unordered_set<std::string> available;
@@ -758,6 +986,7 @@ void GraphExecutor::Execute(
         for (size_t ni = 0; ni < N; ni++)
             if (depCount[ni] == 0) ready.push_back(ni);
 
+
         while (!ready.empty()) {
             size_t ni = ready.back(); ready.pop_back();
             execOrder.push_back(ni);
@@ -776,9 +1005,13 @@ void GraphExecutor::Execute(
         }
 
         // Add remaining unresolved nodes
-        if (execOrder.size() < N)
+        if (execOrder.size() < N) {
+            size_t unresolved = N - execOrder.size();
+            fprintf(stderr, "  [topo] WARNING: %zu unresolved nodes (deps not met)!\n", unresolved);
             for (size_t ni = 0; ni < N; ni++)
                 if (depCount[ni] > 0) execOrder.push_back(ni);
+            fflush(stderr);
+        }
 
         auto sortT1 = std::chrono::steady_clock::now();
         auto sortMs = std::chrono::duration_cast<std::chrono::milliseconds>(sortT1 - sortT0).count();
@@ -798,6 +1031,10 @@ void GraphExecutor::Execute(
     for (auto& [name, _] : outputs) tensorRefCount[name] += 1000;
     // Initializers should not be released
     for (auto& [name, _] : graph_.initializers) tensorRefCount[name] += 1000;
+
+    // Track tensor name aliases: if op X aliases output to input (same buffer handle),
+    // record the relationship so we know not to recycle the input while output is live.
+    std::unordered_map<std::string, std::string> aliasOf;
 
     // Execute nodes in topological order
     auto execT0 = std::chrono::steady_clock::now();
@@ -844,7 +1081,7 @@ void GraphExecutor::Execute(
             }
         }
 
-        if (ei < 100 || ei % 10 == 0 || ei > 498) {
+        if (kDebugExecTrace && graph_.nodes.size() > 1000 && ei < 128) {
             auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - execT0).count();
             int validCount = 0, invalidCount = 0;
@@ -856,7 +1093,6 @@ void GraphExecutor::Execute(
                     pendingDispatches_.size());
             fflush(stderr);
         }
-
         // Dispatch op
         auto opIt = registry.find(node.opType);
         if (opIt != registry.end()) {
@@ -870,85 +1106,140 @@ void GraphExecutor::Execute(
                         inTensors[ti] = &it2->second;
                 }
             }
+            g_currentOpLabel = node.opType;
+            if (!node.name.empty()) {
+                g_currentOpLabel += ":";
+                g_currentOpLabel += node.name;
+            }
+            g_currentOp = g_currentOpLabel.c_str();
             opIt->second(*this, node, inTensors, outTensors);
+            bool cachedSmallIntOutput = false;
+            for (auto* outTensor : outTensors) {
+                if (!outTensor || !outTensor->buffer.handle || !outTensor->cpuData.empty()) continue;
+                if (outTensor->dtype != TensorDtype::Int64 && outTensor->dtype != TensorDtype::Int32) continue;
+                int64_t nel = outTensor->ElementCount();
+                if (nel <= 0 || nel > 1024) continue;
+                if (!cachedSmallIntOutput) {
+                    FlushPendingWork();
+                    cachedSmallIntOutput = true;
+                }
+                size_t bytes = (size_t)nel * outTensor->DtypeSize();
+                auto rb = gpu->readBuffer(outTensor->buffer, bytes);
+                if (rb.size() >= bytes) {
+                    outTensor->cpuData.resize(bytes);
+                    memcpy(outTensor->cpuData.data(), rb.data(), bytes);
+                }
+            }
             executed++;
+            if (kDebugExecTrace && graph_.nodes.size() > 1000 && ei < 128) {
+                fprintf(stderr, "  [exec] ei=%zu done %s pending=%zu\n",
+                        ei, node.opType.c_str(), pendingDispatches_.size() + pendingCopies_.size());
+                fflush(stderr);
+            }
 
-            // Debug: readback outputs to trace zero propagation
-            // Debug readback disabled for production
-            if (false && ei < 200 && outTensors[0] && outTensors[0]->IsValid() && outTensors[0]->buffer.handle
-                && node.opType != "Constant" && node.opType != "Cast" && node.opType != "Reshape"
-                && node.opType != "Shape" && node.opType != "Unsqueeze" && node.opType != "Squeeze"
-                && node.opType != "Flatten" && node.opType != "Gather") {
-                // Flush ALL pending work (dispatches + copies)
-                if (!pendingDispatches_.empty()) {
-                    gpu->submitOnly(pendingDispatches_, false);
-                    pendingDispatches_.clear();
-                }
-                if (!pendingCopies_.empty()) {
-                    WGPUCommandEncoderDescriptor enD{};
-                    auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-                    for (auto& c : pendingCopies_)
-                        wgpuCommandEncoderCopyBufferToBuffer(enc,
-                            c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-                    WGPUCommandBufferDescriptor cbD{};
-                    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-                    wgpuQueueSubmit(gpu->queue, 1, &cb);
-                    wgpuCommandBufferRelease(cb);
-                    wgpuCommandEncoderRelease(enc);
-                    pendingCopies_.clear();
-                }
-                gpu->waitForQueue();
-                size_t readN = std::min((size_t)4, outTensors[0]->buffer.size / 4);
-                if (readN > 0) {
-                    auto rb = gpu->readBuffer(outTensors[0]->buffer, readN * 4);
-                    float vals[4] = {0};
-                    memcpy(vals, rb.data(), std::min(readN * 4, rb.size()));
-                    fprintf(stderr, "  [dbg] ei=%zu %s out=[%.4f, %.4f, %.4f, %.4f]\n",
-                            ei, node.opType.c_str(), vals[0], vals[1], vals[2], vals[3]);
-                    fflush(stderr);
+            // Track aliases: if an op aliased its output to an input buffer
+            for (size_t oi = 0; oi < outTensors.size() && oi < node.outputs.size(); oi++) {
+                if (!outTensors[oi] || !outTensors[oi]->buffer.handle || node.outputs[oi].empty()) continue;
+                // Trace output buffer for graph outputs (disabled for perf)
+                for (size_t ti = 0; ti < inTensors.size() && ti < node.inputs.size(); ti++) {
+                    if (!inTensors[ti] || node.inputs[ti].empty()) continue;
+                    if (outTensors[oi]->buffer.handle == inTensors[ti]->buffer.handle) {
+                        aliasOf[node.outputs[oi]] = node.inputs[ti];
+                    }
                 }
             }
 
-            // Buffer release: alias-aware, only for large models
-            if (graph_.nodes.size() > 800) {
+            // Debug: readback outputs to trace zero propagation
+            // Debug readback for first few ops (production mode: change to false)
+            if (false && graph_.nodes.size() > 1000) {
+                // Always log the op type and output validity
+                fprintf(stderr, "  [dbg] ei=%zu %s valid=%d buf=%p",
+                        ei, node.opType.c_str(),
+                        (outTensors[0] && outTensors[0]->IsValid()) ? 1 : 0,
+                        outTensors[0] ? (void*)outTensors[0]->buffer.handle : nullptr);
+                // If valid, readback
+                if (outTensors[0] && outTensors[0]->IsValid() && outTensors[0]->buffer.handle) {
+                    if (!pendingDispatches_.empty()) {
+                        gpu->submitOnly(pendingDispatches_, false);
+                        pendingDispatches_.clear();
+                    }
+                    if (!pendingCopies_.empty()) {
+                        WGPUCommandEncoderDescriptor enD{};
+                        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+                        for (auto& c : pendingCopies_)
+                            wgpuCommandEncoderCopyBufferToBuffer(enc,
+                                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+                        WGPUCommandBufferDescriptor cbD{};
+                        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+                        wgpuQueueSubmit(gpu->queue, 1, &cb);
+                        wgpuCommandBufferRelease(cb);
+                        wgpuCommandEncoderRelease(enc);
+                        pendingCopies_.clear();
+                    }
+                    gpu->waitForQueue();
+                    size_t readN = std::min((size_t)4, outTensors[0]->buffer.size / 4);
+                    if (readN > 0) {
+                        auto rb = gpu->readBuffer(outTensors[0]->buffer, readN * 4);
+                        float vals[4] = {0};
+                        memcpy(vals, rb.data(), std::min(readN * 4, rb.size()));
+                        fprintf(stderr, " out=[%.4f, %.4f, %.4f, %.4f]", vals[0], vals[1], vals[2], vals[3]);
+                    }
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
+
+            // Buffer release: temporarily disabled to diagnose corruption
+            if (false && graph_.nodes.size() > 100) {
                 for (auto& inName : node.inputs) {
                     if (inName.empty()) continue;
+                    if (persistentTensors_.count(inName)) continue;
+                    // Never recycle output tensors
+                    if (outputs.count(inName)) continue;
                     auto rc = --tensorRefCount[inName];
                     if (rc <= 0) {
                         auto it = tensorStore_.find(inName);
                         if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
+                            // Check if any live tensor transitively aliases this input.
+                            // Follow the alias chain: if A→B→C and C has refcount>0,
+                            // then A's buffer must not be released.
                             bool aliased = false;
-                            WGPUBuffer h = it->second.buffer.handle;
-                            for (auto& [oname, otensor] : tensorStore_) {
-                                if (oname != inName && otensor.buffer.handle == h) {
-                                    auto rcIt = tensorRefCount.find(oname);
-                                    if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
-                                        aliased = true;
+                            std::string checkName = inName;
+                            for (;;) {
+                                bool foundNext = false;
+                                for (auto& [aliasOut, aliasIn] : aliasOf) {
+                                    if (aliasIn == checkName) {
+                                        if (persistentTensors_.count(aliasOut) ||
+                                            outputs.count(aliasOut)) {
+                                            aliased = true; break;
+                                        }
+                                        auto rcIt = tensorRefCount.find(aliasOut);
+                                        if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
+                                            aliased = true; break;
+                                        }
+                                        // Follow chain to next level
+                                        checkName = aliasOut;
+                                        foundNext = true;
                                         break;
                                     }
                                 }
+                                if (aliased || !foundNext) break;
                             }
+                            // Release buffer back to pool for reuse
                             if (!aliased) {
                                 gpu->releaseBuffer(it->second.buffer);
-                                for (auto& [oname, otensor] : tensorStore_) {
-                                    if (otensor.buffer.handle == h) {
-                                        otensor.buffer = {nullptr, 0};
-                                    }
-                                }
-                            } else {
-                                it->second.buffer = {nullptr, 0};
                             }
+                            it->second.buffer = {nullptr, 0};
                         }
                     }
                 }
             }
 
             // Submit pending work periodically (with sync to prevent TDR)
-            if (pendingDispatches_.size() + pendingCopies_.size() >= 8) {
+            if (pendingDispatches_.size() + pendingCopies_.size() >= 64) {
                 totalDispatches += (int)pendingDispatches_.size();
                 totalCopies += (int)pendingCopies_.size();
                 if (!pendingDispatches_.empty())
-                    gpu->submitOnly(pendingDispatches_, false);
+                    gpu->submitOnly(pendingDispatches_, true);  // single pass for perf
                 if (!pendingCopies_.empty()) {
                     WGPUCommandEncoderDescriptor enD{};
                     auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
@@ -977,7 +1268,23 @@ void GraphExecutor::Execute(
     for (auto& [name, tensor] : outputs) {
         auto it = tensorStore_.find(name);
         if (it != tensorStore_.end() && it->second.IsValid()) {
-            *tensor = it->second;
+            size_t outBytes = it->second.ByteSize();
+            if (outBytes == 0) outBytes = 4;
+            if (tensor && tensor->buffer.handle && it->second.buffer.handle &&
+                tensor->buffer.handle != it->second.buffer.handle &&
+                tensor->buffer.size >= outBytes && !it->second.isCpuOnly) {
+                tensor->shape = it->second.shape;
+                tensor->dtype = it->second.dtype;
+                tensor->isCpuOnly = false;
+                tensor->cpuData.clear();
+                QueueCopy(it->second.buffer, 0, tensor->buffer, 0, outBytes);
+            } else {
+                *tensor = it->second;
+            }
+        } else {
+            fprintf(stderr, "  [exec] WARNING: output '%s' not found or invalid buf=%p\n",
+                    name.c_str(), (it != tensorStore_.end()) ? (void*)it->second.buffer.handle : nullptr);
+            fflush(stderr);
         }
     }
 
@@ -988,7 +1295,7 @@ void GraphExecutor::Execute(
 
     // Submit all remaining batched GPU work
     if (!pendingDispatches_.empty()) {
-        gpu->submitOnly(pendingDispatches_, false);
+        gpu->submitOnly(pendingDispatches_, true);  // single pass for perf
         pendingDispatches_.clear();
     }
     if (!pendingCopies_.empty()) {
@@ -1006,22 +1313,45 @@ void GraphExecutor::Execute(
     }
     gpu->waitForQueue();
 
-    // Release non-output intermediate buffers (GPU work is done, safe to free)
+    // Release non-output, non-persistent intermediate buffers
+    // (GPU work is done, safe to free)
     {
-        std::set<WGPUBuffer> outputHandles;
+        std::set<WGPUBuffer> keepHandles;
         for (auto& [name, tensor] : outputs)
-            if (tensor && tensor->buffer.handle) outputHandles.insert(tensor->buffer.handle);
+            if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
+        // Persistent tensors (initializers, pre-store constants) must survive for re-execution
+        for (auto& name : persistentTensors_) {
+            auto it = tensorStore_.find(name);
+            if (it != tensorStore_.end() && it->second.buffer.handle)
+                keepHandles.insert(it->second.buffer.handle);
+        }
 
         std::set<WGPUBuffer> released;
-        for (auto& [name, tensor] : tensorStore_) {
-            if (tensor.buffer.handle &&
-                outputHandles.find(tensor.buffer.handle) == outputHandles.end() &&
-                released.find(tensor.buffer.handle) == released.end()) {
-                released.insert(tensor.buffer.handle);
-                gpu->releaseBuffer(tensor.buffer);
+        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+            if (persistentTensors_.count(it->first)) {
+                ++it;  // keep persistent entries
+                continue;
             }
-            tensor.buffer = {nullptr, 0};
+            if (it->second.buffer.handle &&
+                keepHandles.find(it->second.buffer.handle) == keepHandles.end() &&
+                released.find(it->second.buffer.handle) == released.end()) {
+                released.insert(it->second.buffer.handle);
+                gpu->releaseBuffer(it->second.buffer);
+            }
+            it = tensorStore_.erase(it);
         }
-        tensorStore_.clear();
+    }
+
+    // Restore persistent tensors that may have been modified during execution
+    // (e.g. ensureTensorFloat32 converting fp16 weights to f32 in-place)
+    for (auto& [name, saved] : savedPersistent) {
+        auto it = tensorStore_.find(name);
+        if (it != tensorStore_.end() &&
+            (it->second.dtype != saved.dtype || it->second.buffer.handle != saved.buffer.handle)) {
+            it->second.dtype = saved.dtype;
+            it->second.buffer = saved.buffer;
+            it->second.cpuData = std::move(saved.cpuData);
+            it->second.isCpuOnly = saved.isCpuOnly;
+        }
     }
 }
