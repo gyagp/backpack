@@ -472,6 +472,14 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
 
     // For axis=0 or 1D tensors, simple byte concatenation
     if (axis == 0 || ndim <= 1) {
+        // Debug: log when we hit axis-0 path for conv-related concat
+        if (validIn.size() == 2 && validIn[0]->shape.size() == 3 && validIn[0]->shape[2] <= 4) {
+            fprintf(stderr, "  [concat] axis=%lld ndim=%d shapes=[%lld,%lld,%lld]+[%lld,%lld,%lld] → axis0 path\n",
+                    (long long)axis, ndim,
+                    (long long)validIn[0]->shape[0], (long long)validIn[0]->shape[1], (long long)validIn[0]->shape[2],
+                    (long long)validIn[1]->shape[0], (long long)validIn[1]->shape[1], (long long)validIn[1]->shape[2]);
+            fflush(stderr);
+        }
         size_t offset = 0;
         for (auto* t : gpuIn) {
             size_t bytes = t->ByteSize();
@@ -507,30 +515,15 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
         }
 
         // For non-axis-0 concat, use appropriate copy method
-        if (elemSize >= 4) {
-            // f32/i32: GPU slab copies are always 4-byte aligned
-            int64_t dstAxisOffset = 0;
-            for (auto* t : gpuIn) {
-                int64_t srcAxisSize = t->shape[axis];
-                for (int64_t o = 0; o < outerSize; o++) {
-                    size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
-                    size_t dstOff = (size_t)((o * totalOnAxis + dstAxisOffset) * innerSize * elemSize);
-                    size_t copySize = (size_t)(srcAxisSize * innerSize * elemSize);
-                    if (copySize > 0 && t->buffer.handle)
-                        ex.QueueCopy(t->buffer, srcOff, out[0]->buffer, dstOff, copySize);
-                }
-                dstAxisOffset += srcAxisSize;
-            }
-            // Flush copies immediately so subsequent ops can read the concat output.
-            // Without this, the next op's dispatch may execute before these copies.
-            ex.FlushPendingWork();
-        } else {
-            // fp16/i8: CPU fallback for sub-4-byte element types
+        // Non-axis-0 concat: use CPU to avoid GPU copy/dispatch ordering issues.
+        // Read all inputs, interleave on CPU, upload result.
+        {
             int64_t outNel = 1;
             for (auto d : outShape) outNel *= d;
             size_t outBytes = (size_t)(outNel * elemSize);
             std::vector<uint8_t> outBuf(outBytes, 0);
 
+            // Ensure all input data is on GPU and ready
             ex.FlushPendingWork();
 
             int64_t dstAxisOff = 0;
@@ -956,6 +949,34 @@ static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
     // For simple cases (single contiguous slice), use buffer copy
     // For general case, use GPU kernel
     *out[0] = ex.AllocTensor(outShape, data->dtype);
+
+    // CPU path for small tensors (avoids GPU copy/dispatch ordering issues)
+    if (totalOut <= 4000000 && elemSize <= 4) {
+        ex.FlushPendingWork();
+        size_t inBytes = (size_t)data->ElementCount() * elemSize;
+        auto rb = ex.gpu->readBuffer(data->buffer, inBytes);
+        if (rb.size() >= inBytes) {
+            std::vector<int64_t> inStrides64(ndim, 1), outStrides64(ndim, 1);
+            for (int i = ndim-2; i >= 0; i--) {
+                inStrides64[i] = inStrides64[i+1] * data->shape[i+1];
+                outStrides64[i] = outStrides64[i+1] * outShape[i+1];
+            }
+            std::vector<uint8_t> outBuf((size_t)totalOut * elemSize, 0);
+            for (int64_t outIdx = 0; outIdx < totalOut; outIdx++) {
+                int64_t rem = outIdx;
+                int64_t inIdx = 0;
+                for (int i = 0; i < ndim; i++) {
+                    int64_t coord = rem / outStrides64[i];
+                    rem %= outStrides64[i];
+                    inIdx += (startVals[i] + coord * stepVals[i]) * inStrides64[i];
+                }
+                memcpy(outBuf.data() + (size_t)outIdx * elemSize,
+                       rb.data() + (size_t)inIdx * elemSize, elemSize);
+            }
+            ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBuf.size());
+            return;
+        }
+    }
 
     bool simpleContiguousSlice = true;
     int sliceAxis = -1;
@@ -1398,6 +1419,9 @@ static void opSplit(GraphExecutor& ex, const OnnxGraphNode& n,
         }
         offset += splits[i];
     }
+    // Flush copies so downstream dispatch-based ops can read the split outputs
+    if (!ex.pendingCopies_.empty())
+        ex.FlushPendingWork();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
