@@ -186,6 +186,18 @@ int main(int argc, char* argv[]) {
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fprintf(stderr, "Execute: %.1fms\n", ms);
 
+    // Debug: check output tensor states
+    for (auto& name : outputNames) {
+        auto* t = outputs[name];
+        if (!t) { fprintf(stderr, "  out '%s': null ptr\n", name.c_str()); continue; }
+        fprintf(stderr, "  out '%s': valid=%d buf=%p bufsize=%llu dtype=%d shape=[",
+                name.c_str(), t->IsValid(), (void*)t->buffer.handle,
+                (unsigned long long)t->buffer.size, (int)t->dtype);
+        for (auto d : t->shape) fprintf(stderr, "%lld,", (long long)d);
+        fprintf(stderr, "] cpu=%d nel=%lld\n", t->isCpuOnly,
+                (long long)t->ElementCount());
+    }
+
     // 7. Write outputs
     std::string outManifest = "{\n  \"outputs\": [\n";
     for (size_t i = 0; i < outputNames.size(); i++) {

@@ -506,16 +506,35 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
             }
         }
 
-        if (needsCpuCopy) {
-            // CPU fallback: read all inputs, interleave, upload
+        // For non-axis-0 concat, use appropriate copy method
+        if (elemSize >= 4) {
+            // f32/i32: GPU slab copies are always 4-byte aligned
+            int64_t dstAxisOffset = 0;
+            for (auto* t : gpuIn) {
+                int64_t srcAxisSize = t->shape[axis];
+                for (int64_t o = 0; o < outerSize; o++) {
+                    size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
+                    size_t dstOff = (size_t)((o * totalOnAxis + dstAxisOffset) * innerSize * elemSize);
+                    size_t copySize = (size_t)(srcAxisSize * innerSize * elemSize);
+                    if (copySize > 0 && t->buffer.handle)
+                        ex.QueueCopy(t->buffer, srcOff, out[0]->buffer, dstOff, copySize);
+                }
+                dstAxisOffset += srcAxisSize;
+            }
+            // Flush copies immediately so subsequent ops can read the concat output.
+            // Without this, the next op's dispatch may execute before these copies.
+            ex.FlushPendingWork();
+        } else {
+            // fp16/i8: CPU fallback for sub-4-byte element types
             int64_t outNel = 1;
             for (auto d : outShape) outNel *= d;
             size_t outBytes = (size_t)(outNel * elemSize);
             std::vector<uint8_t> outBuf(outBytes, 0);
 
+            ex.FlushPendingWork();
+
             int64_t dstAxisOff = 0;
             for (auto* t : gpuIn) {
-                ex.FlushPendingWork();
                 int64_t srcAxisSize = t->shape[axis];
                 size_t srcBytes = t->ByteSize();
                 auto rb = ex.gpu->readBuffer(t->buffer, srcBytes);
@@ -530,21 +549,6 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
                 dstAxisOff += srcAxisSize;
             }
             ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBytes);
-        } else {
-            int64_t dstAxisOffset = 0;
-            for (auto* t : gpuIn) {
-                int64_t srcAxisSize = t->shape[axis];
-                for (int64_t o = 0; o < outerSize; o++) {
-                    size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
-                    size_t dstOff = (size_t)((o * totalOnAxis + dstAxisOffset) * innerSize * elemSize);
-                    size_t copySize = (size_t)(srcAxisSize * innerSize * elemSize);
-                    if (copySize > 0 && t->buffer.handle)
-                        ex.QueueCopy(t->buffer, srcOff, out[0]->buffer, dstOff, copySize);
-                }
-                dstAxisOffset += srcAxisSize;
-            }
-            // Flush copies so subsequent dispatch-based ops see the data
-            ex.FlushPendingWork();
         }
     }
 }

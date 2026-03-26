@@ -156,7 +156,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
 
     int64_t num_heads = n.GetInt("num_heads", 32);
     int64_t kv_heads = n.GetInt("kv_num_heads", num_heads);
-    float scale = n.GetFloat("scale", 0.125f);
+    float scale = n.GetFloat("scale", 0.0f);
     int64_t doRotary = n.GetInt("do_rotary", 0);
     int64_t rotaryInterleaved = n.GetInt("rotary_interleaved", 0);
 
@@ -167,6 +167,9 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t seqQ = (Q->shape.size() >= 2) ? Q->shape[1] : 1;
     int64_t qDim = Q->shape.back();
     int64_t head_dim = qDim / num_heads;
+
+    // Default scale = 1/sqrt(head_dim)
+    if (scale <= 0.0f) scale = 1.0f / sqrtf((float)head_dim);
 
     // past KV: [batch, kv_heads, past_seq, head_dim]
     int64_t pastSeq = 0;
