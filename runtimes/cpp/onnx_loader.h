@@ -4,7 +4,7 @@
  *
  * Loads ONNX GenAI models (like phi-4-mini) by parsing the protobuf format
  * directly (no external onnx/protobuf dependency). Extracts model config
- * from config.json (or genai_config.json), weights from model.onnx + model.onnx.data,
+ * from config.json, weights from model.onnx + model.onnx.data,
  * and pre-computed RoPE tables from ONNX initializers.
  *
  * Weights are dequantized from Q4/Q8 and repacked into Q8Repacked format

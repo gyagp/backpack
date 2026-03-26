@@ -385,17 +385,14 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
                   });
     }
 
-    // 2. Parse genai_config.json or config.json for special tokens
-    std::string cfgPath = (fs::path(modelDir) / "genai_config.json").string();
-    if (!fs::exists(cfgPath))
-        cfgPath = (fs::path(modelDir) / "config.json").string();
+    // 2. Parse config for special tokens
+    std::string cfgPath = (fs::path(modelDir) / "config.json").string();
     std::ifstream cfgFile(cfgPath);
     if (cfgFile.is_open()) {
         std::string cfgStr((std::istreambuf_iterator<char>(cfgFile)),
                             std::istreambuf_iterator<char>());
         cfgFile.close();
         auto cfgJson = json_parse(cfgStr);
-        // genai_config.json nests under "model", config.json is top-level
         auto& root = cfgJson.has("model") ? cfgJson["model"] : cfgJson;
 
         if (root.has("eos_token_id")) {

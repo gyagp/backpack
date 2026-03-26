@@ -34,8 +34,7 @@ static void shutdownRuntime(ModelRunner& model, GPUContext& gpu) {
 /// Check if a path is an ONNX model directory
 static bool isOnnxDir(const std::string& path) {
     if (!fs::is_directory(path)) return false;
-    bool hasConfig = fs::exists(fs::path(path) / "genai_config.json") ||
-                     fs::exists(fs::path(path) / "config.json");
+    bool hasConfig = fs::exists(fs::path(path) / "config.json");
     if (!hasConfig) return false;
     for (auto& e : fs::directory_iterator(path))
         if (e.is_regular_file() && e.path().extension() == ".onnx") return true;

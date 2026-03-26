@@ -34,12 +34,11 @@ namespace fs = std::filesystem;
 // ─── Path resolution ─────────────────────────────────────────────────────────
 
 /// Check if a directory is a standard ONNX model (transformer architecture).
-/// Requires config (genai_config.json or config.json) + tokenizer + .onnx file.
+/// Requires config.json + tokenizer + .onnx file.
 static bool isStandardOnnxDir(const std::string& path) {
     if (!fs::is_directory(path)) return false;
     // Must have some config
-    bool hasConfig = fs::exists(fs::path(path) / "genai_config.json") ||
-                     fs::exists(fs::path(path) / "config.json");
+    bool hasConfig = fs::exists(fs::path(path) / "config.json");
     if (!hasConfig) return false;
     // Must have tokenizer
     if (!fs::exists(fs::path(path) / "tokenizer.json")) return false;

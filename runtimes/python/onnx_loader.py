@@ -3,7 +3,7 @@
 ONNX model loader for the Python runtime.
 
 Loads ONNX models (like phi-4-mini) directly for inference.
-Extracts model config from config.json (or genai_config.json), tokenizer from
+Extracts model config from config.json, tokenizer from
 tokenizer.json, and quantized weights from model.onnx + model.onnx.data.
 
 Supports:
@@ -21,13 +21,11 @@ import numpy as np
 
 
 def extract_onnx_config(model_dir: str) -> dict:
-    """Extract model config from genai_config.json or config.json."""
-    config_path = os.path.join(model_dir, "genai_config.json")
-    use_genai = os.path.exists(config_path)
-    if not use_genai:
-        config_path = os.path.join(model_dir, "config.json")
+    """Extract model config from config.json."""
+    config_path = os.path.join(model_dir, "config.json")
+    use_genai = False
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"No genai_config.json or config.json in {model_dir}")
+        raise FileNotFoundError(f"No config.json in {model_dir}")
 
     with open(config_path) as f:
         cfg = json.load(f)
@@ -108,9 +106,7 @@ class OnnxTokenizer:
             self.merge_rank[key] = i
 
         # Special tokens
-        config_path = os.path.join(model_dir, "genai_config.json")
-        if not os.path.exists(config_path):
-            config_path = os.path.join(model_dir, "config.json")
+        config_path = os.path.join(model_dir, "config.json")
         with open(config_path) as f:
             cfg = json.load(f)
         root = cfg.get("model", cfg)  # genai nests under "model", HF is flat

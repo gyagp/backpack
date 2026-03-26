@@ -1281,7 +1281,7 @@ void GraphExecutor::Execute(
                 totalDispatches += (int)pendingDispatches_.size();
                 totalCopies += (int)pendingCopies_.size();
                 if (!pendingDispatches_.empty())
-                    gpu->submitOnly(pendingDispatches_, true);  // single pass for perf
+                    gpu->submitOnly(pendingDispatches_, true);
                 if (!pendingCopies_.empty()) {
                     WGPUCommandEncoderDescriptor enD{};
                     auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
@@ -1294,7 +1294,7 @@ void GraphExecutor::Execute(
                     wgpuCommandBufferRelease(cb);
                     wgpuCommandEncoderRelease(enc);
                 }
-                gpu->waitForQueue();  // Sync to prevent TDR
+                gpu->waitForQueue();
                 pendingDispatches_.clear();
                 pendingCopies_.clear();
             }

@@ -431,13 +431,16 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
 
     for (auto* t : validIn) ex.EnsureGpu(*t);
 
-    // Normalize dtypes: if inputs have mixed f32/f16, convert all to f32
+    // Normalize dtypes: if inputs have mixed f32/f16, convert all to f32.
+    // Also convert pure f16 to f32 for non-axis-0 concat (WebGPU requires
+    // 4-byte aligned copies, and fp16 slabs may be 2-byte aligned).
     bool hasF32 = false, hasF16 = false;
     for (auto* t : validIn) {
         if (t->dtype == TensorDtype::Float32) hasF32 = true;
         if (t->dtype == TensorDtype::Float16) hasF16 = true;
     }
-    if (hasF32 && hasF16 && ex.gpu->supportsShaderF16) {
+    bool needF16ToF32 = (hasF32 && hasF16) || (hasF16 && axis > 0);
+    if (needF16ToF32 && ex.gpu->supportsShaderF16) {
         // Convert f16 inputs to f32 using cast kernel
         for (auto* t : validIn) {
             if (t->dtype != TensorDtype::Float16) continue;
@@ -454,6 +457,8 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
                 (uint32_t)((nel + 255) / 256), 1, 1, "concat_cast_f16_f32"}});
             *t = f32t;
         }
+        // Flush cast dispatches before doing copy-based concat
+        ex.FlushPendingWork();
     }
 
     // Filter out tensors with no GPU buffer after EnsureGpu
@@ -484,17 +489,62 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
         int64_t outerSize = 1;
         for (int i = 0; i < (int)axis; i++) outerSize *= outShape[i];
 
-        int64_t dstAxisOffset = 0;
-        for (auto* t : gpuIn) {
-            int64_t srcAxisSize = t->shape[axis];
-            for (int64_t o = 0; o < outerSize; o++) {
-                size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
-                size_t dstOff = (size_t)((o * totalOnAxis + dstAxisOffset) * innerSize * elemSize);
-                size_t copySize = (size_t)(srcAxisSize * innerSize * elemSize);
-                if (copySize > 0 && t->buffer.handle)
-                    ex.QueueCopy(t->buffer, srcOff, out[0]->buffer, dstOff, copySize);
+        // WebGPU requires copy offsets and sizes to be multiples of 4.
+        // For fp16 (2 bytes per element), slab copies may not be 4-byte aligned.
+        // Fall back to CPU copy in that case.
+        bool needsCpuCopy = (elemSize < 4 && (innerSize * elemSize) % 4 != 0);
+        // Also check if any slab's offset would be misaligned
+        if (!needsCpuCopy && elemSize < 4) {
+            int64_t tmpOff = 0;
+            for (auto* t : gpuIn) {
+                if ((tmpOff * innerSize * elemSize) % 4 != 0 ||
+                    (t->shape[axis] * innerSize * elemSize) % 4 != 0) {
+                    needsCpuCopy = true;
+                    break;
+                }
+                tmpOff += t->shape[axis];
             }
-            dstAxisOffset += srcAxisSize;
+        }
+
+        if (needsCpuCopy) {
+            // CPU fallback: read all inputs, interleave, upload
+            int64_t outNel = 1;
+            for (auto d : outShape) outNel *= d;
+            size_t outBytes = (size_t)(outNel * elemSize);
+            std::vector<uint8_t> outBuf(outBytes, 0);
+
+            int64_t dstAxisOff = 0;
+            for (auto* t : gpuIn) {
+                ex.FlushPendingWork();
+                int64_t srcAxisSize = t->shape[axis];
+                size_t srcBytes = t->ByteSize();
+                auto rb = ex.gpu->readBuffer(t->buffer, srcBytes);
+
+                for (int64_t o = 0; o < outerSize; o++) {
+                    size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
+                    size_t dstOff = (size_t)((o * totalOnAxis + dstAxisOff) * innerSize * elemSize);
+                    size_t copyLen = (size_t)(srcAxisSize * innerSize * elemSize);
+                    if (srcOff + copyLen <= rb.size() && dstOff + copyLen <= outBuf.size())
+                        memcpy(outBuf.data() + dstOff, rb.data() + srcOff, copyLen);
+                }
+                dstAxisOff += srcAxisSize;
+            }
+            ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBytes);
+        } else {
+            int64_t dstAxisOffset = 0;
+            for (auto* t : gpuIn) {
+                int64_t srcAxisSize = t->shape[axis];
+                for (int64_t o = 0; o < outerSize; o++) {
+                    size_t srcOff = (size_t)(o * srcAxisSize * innerSize * elemSize);
+                    size_t dstOff = (size_t)((o * totalOnAxis + dstAxisOffset) * innerSize * elemSize);
+                    size_t copySize = (size_t)(srcAxisSize * innerSize * elemSize);
+                    if (copySize > 0 && t->buffer.handle)
+                        ex.QueueCopy(t->buffer, srcOff, out[0]->buffer, dstOff, copySize);
+                }
+                dstAxisOffset += srcAxisSize;
+            }
+            // Flush copies so subsequent dispatch-based ops see the data
+            ex.FlushPendingWork();
         }
     }
 }
@@ -918,10 +968,41 @@ static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
     if (simpleContiguousSlice && sliceAxis == 0 && stepVals[0] == 1) {
         size_t copyBytes = (size_t)totalOut * elemSize;
         size_t srcOffset = (size_t)startVals[0] * (size_t)(tensorNel(data) / data->shape[0]) * elemSize;
-        if (copyBytes > 0) {
+        // WebGPU requires 4-byte aligned copies
+        if (copyBytes % 4 == 0 && srcOffset % 4 == 0 && copyBytes > 0) {
             ex.QueueCopy(data->buffer, srcOffset, out[0]->buffer, 0, copyBytes);
+            return;
         }
-        return;
+    }
+
+    // For fp16 data, the GPU kernel operates on u32 which doesn't handle
+    // element-level slicing correctly. Fall back to CPU.
+    if (elemSize == 2 && totalOut <= 4000000) {
+        ex.FlushPendingWork();
+        size_t inBytes = (size_t)data->ElementCount() * elemSize;
+        auto rb = ex.gpu->readBuffer(data->buffer, inBytes);
+        if (rb.size() >= inBytes) {
+            std::vector<int64_t> inStrides64(ndim, 1), outStrides64(ndim, 1);
+            for (int i = ndim-2; i >= 0; i--) {
+                inStrides64[i] = inStrides64[i+1] * data->shape[i+1];
+                outStrides64[i] = outStrides64[i+1] * outShape[i+1];
+            }
+            std::vector<uint8_t> outBytes((size_t)totalOut * elemSize, 0);
+            for (int64_t outIdx = 0; outIdx < totalOut; outIdx++) {
+                int64_t rem = outIdx;
+                int64_t inIdx = 0;
+                for (int i = 0; i < ndim; i++) {
+                    int64_t coord = rem / outStrides64[i];
+                    rem %= outStrides64[i];
+                    inIdx += (startVals[i] + coord * stepVals[i]) * inStrides64[i];
+                }
+                memcpy(outBytes.data() + (size_t)outIdx * elemSize,
+                       rb.data() + (size_t)inIdx * elemSize, elemSize);
+            }
+            *out[0] = ex.AllocTensor(outShape, data->dtype);
+            ex.gpu->writeBuffer(out[0]->buffer, outBytes.data(), outBytes.size());
+            return;
+        }
     }
 
     // Compute strides

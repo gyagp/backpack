@@ -624,11 +624,9 @@ std::vector<float> dequantEmbedding(const uint8_t* rawData, const uint8_t* scale
 bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     auto t0 = std::chrono::steady_clock::now();
 
-    // ─── 1. Parse model config (genai_config.json or config.json) ──────
-    std::string configPath = (fs::path(modelDir) / "genai_config.json").string();
-    bool useGenaiFormat = fs::exists(configPath);
-    if (!useGenaiFormat)
-        configPath = (fs::path(modelDir) / "config.json").string();
+    // ─── 1. Parse model config ────────────────────────────────────────
+    std::string configPath = (fs::path(modelDir) / "config.json").string();
+    bool useGenaiFormat = false;
     std::ifstream configFile(configPath);
     if (!configFile.is_open()) {
         fprintf(stderr, "Failed to open config: %s\n", configPath.c_str());
