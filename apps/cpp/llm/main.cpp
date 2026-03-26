@@ -284,8 +284,8 @@ struct OnnxLlmContext {
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string name = "present_conv." + std::to_string(convLayerIndices[i]);
             convOuts[i].shape = {1, hiddenSize, convLCache};
-            convOuts[i].dtype = TensorDtype::Float16;
-            convOuts[i].buffer = gpu->createBuffer(name + "_o", hiddenSize * convLCache * 2);
+            convOuts[i].dtype = TensorDtype::Float32;  // may be f32 after Concat conversion
+            convOuts[i].buffer = gpu->createBuffer(name + "_o", hiddenSize * convLCache * 4);
             outputs[name] = &convOuts[i];
         }
 
