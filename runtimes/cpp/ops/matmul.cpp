@@ -469,7 +469,8 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t block_size_attr = n.GetInt("block_size", 32);
     uint32_t n_groups, bs, K;
     if (bits == 4) {
-        K = (uint32_t)W->shape.back();
+        // Q4: each byte has 2 nibbles, so actual K = packed_dim * 2
+        K = (uint32_t)W->shape.back() * 2;
         bs = (uint32_t)block_size_attr;
         n_groups = K / bs;
     } else if (W->shape.size() >= 3) {
@@ -488,6 +489,10 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
 
     if (!Scales || !Scales->IsValid()) return;
     ex.EnsureGpu(*Scales);
+
+    // Check for zero_point input (4th input)
+    auto* ZP = (in.size() > 3 && in[3] && in[3]->IsValid()) ? in[3] : nullptr;
+    if (ZP) ex.EnsureGpu(*ZP);
 
     // Handle int64 indices → int32 conversion
     GPUBuffer idxBuf = Indices->buffer;
@@ -515,14 +520,25 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("gbq_p", 16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
-    const char* kernelSrc = (bits == 4) ? WGSL_GATHER_BQ_Q4 : WGSL_GATHER_BQ_Q8;
-    const char* plName = (bits == 4) ? "gather_bq_q4" : "gather_bq_q8";
-    auto& pl = ex.GetPipeline(plName, kernelSrc, 5);
-    auto bg = ex.MakeBindGroup(pl, {
-        {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},
-        {3, out[0]->buffer}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq"});
+    const char* kernelSrc = (bits == 4) ? (ZP ? WGSL_GATHER_BQ_Q4_ZP : WGSL_GATHER_BQ_Q4)
+                                        : WGSL_GATHER_BQ_Q8;
+    const char* plName = (bits == 4) ? (ZP ? "gather_bq_q4_zp" : "gather_bq_q4")
+                                      : "gather_bq_q8";
+    int numBindings = (bits == 4 && ZP) ? 6 : 5;
+    auto& pl = ex.GetPipeline(plName, kernelSrc, numBindings);
+    if (ZP) {
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},
+            {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq_zp"});
+    } else {
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},
+            {3, out[0]->buffer}, {4, paramBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq"});
+    }
 }
 
 REGISTER_OP(MatMul, opMatMul)

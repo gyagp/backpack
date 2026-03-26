@@ -3676,6 +3676,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// GatherBlockQuantized Q4 with per-block zero points
+static const char* WGSL_GATHER_BQ_Q4_ZP = R"WGSL(
+@group(0) @binding(0) var<storage, read> W: array<u32>;
+@group(0) @binding(1) var<storage, read> Scales: array<u32>;
+@group(0) @binding(2) var<storage, read> Indices: array<i32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let nIdx = _params_[0];
+    let K = _params_[1];
+    let n_groups = _params_[2];
+    let bs = _params_[3];
+    let idx_i = gid.y;
+    let k = gid.x;
+    if (idx_i >= nIdx || k >= K) { return; }
+    let vocab_idx = u32(Indices[idx_i]);
+    let group = k / bs;
+    // Scale
+    let scale_flat = vocab_idx * n_groups + group;
+    let scale_u32 = Scales[scale_flat / 2u];
+    let scale_f16 = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+    let scale = unpack2x16float(scale_f16 | (scale_f16 << 16u)).x;
+    // Zero point (packed nibbles like scales)
+    let zp_byte_idx = scale_flat / 2u;
+    let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+    let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+    // Weight nibble
+    let byte_flat = vocab_idx * (K / 2u) + k / 2u;
+    let byte_u32 = W[byte_flat / 4u];
+    let byte_val = (byte_u32 >> ((byte_flat % 4u) * 8u)) & 0xFFu;
+    let nibble = select(byte_val & 0x0Fu, (byte_val >> 4u) & 0x0Fu, (k & 1u) != 0u);
+    let centered = f32(i32(nibble)) - zp;
+    Y[idx_i * K + k] = centered * scale;
+}
+)WGSL";
+
 // [onnx_q4] gather_bq_q8 (5 bindings, hand)
 static const char* WGSL_GATHER_BQ_Q8 = R"WGSL(
 // GatherBlockQuantized Q8 — ONNX Q8 embedding lookup
