@@ -244,6 +244,9 @@ public:
     // Deferred int readbacks — flushed at periodic sync or when needed
     std::vector<GpuTensor*> pendingIntReadbacks_;
 
+    // Deferred buffer releases — flushed at periodic GPU sync points
+    std::vector<std::string> pendingReleases_;
+
     // Param buffer pool: pre-allocated buffers for dispatch params.
     // Indexed by size bucket: [0]=16B, [1]=32B, [2]=48B, [3]=64B
     static constexpr int PARAM_POOL_BUCKETS = 4;

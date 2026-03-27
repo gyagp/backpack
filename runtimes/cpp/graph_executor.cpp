@@ -1111,6 +1111,8 @@ void GraphExecutor::Execute(
     for (auto& [name, _] : outputs) tensorRefCount[name] += 1000;
     // Initializers should not be released
     for (auto& [name, _] : graph_.initializers) tensorRefCount[name] += 1000;
+    // Model inputs should not be released (they may be read multiple times)
+    for (auto& [name, _] : inputs) tensorRefCount[name] += 1000;
 
     // Track tensor name aliases: if op X aliases output to input (same buffer handle),
     // record the relationship so we know not to recycle the input while output is live.
@@ -1290,49 +1292,13 @@ void GraphExecutor::Execute(
                 fprintf(stderr, "\n"); fflush(stderr);
             }
 
-            // Buffer release: temporarily disabled to diagnose corruption
-            if (false && graph_.nodes.size() > 100) {
-                for (auto& inName : node.inputs) {
+            // Buffer lifetime tracking: decrement refcounts for later cleanup.
+            // Actual release happens at end of Execute() to avoid GPU read-after-free.
+            if (graph_.nodes.size() > 100) {
+                for (size_t ti = 0; ti < node.inputs.size(); ti++) {
+                    auto& inName = node.inputs[ti];
                     if (inName.empty()) continue;
-                    if (persistentTensors_.count(inName)) continue;
-                    // Never recycle output tensors
-                    if (outputs.count(inName)) continue;
-                    auto rc = --tensorRefCount[inName];
-                    if (rc <= 0) {
-                        auto it = tensorStore_.find(inName);
-                        if (it != tensorStore_.end() && it->second.buffer.handle && !it->second.isCpuOnly) {
-                            // Check if any live tensor transitively aliases this input.
-                            // Follow the alias chain: if A→B→C and C has refcount>0,
-                            // then A's buffer must not be released.
-                            bool aliased = false;
-                            std::string checkName = inName;
-                            for (;;) {
-                                bool foundNext = false;
-                                for (auto& [aliasOut, aliasIn] : aliasOf) {
-                                    if (aliasIn == checkName) {
-                                        if (persistentTensors_.count(aliasOut) ||
-                                            outputs.count(aliasOut)) {
-                                            aliased = true; break;
-                                        }
-                                        auto rcIt = tensorRefCount.find(aliasOut);
-                                        if (rcIt != tensorRefCount.end() && rcIt->second > 0) {
-                                            aliased = true; break;
-                                        }
-                                        // Follow chain to next level
-                                        checkName = aliasOut;
-                                        foundNext = true;
-                                        break;
-                                    }
-                                }
-                                if (aliased || !foundNext) break;
-                            }
-                            // Release buffer back to pool for reuse
-                            if (!aliased) {
-                                gpu->releaseBuffer(it->second.buffer);
-                            }
-                            it->second.buffer = {nullptr, 0};
-                        }
-                    }
+                    tensorRefCount[inName]--;
                 }
             }
 
@@ -1361,6 +1327,11 @@ void GraphExecutor::Execute(
                 gpu->waitForQueue();
                 pendingDispatches_.clear();
                 pendingCopies_.clear();
+
+                // Buffer release at sync points is disabled for now — the shared
+                // handle detection needs more work to handle aliased tensors safely.
+                // TODO: implement proper buffer lifetime analysis.
+                pendingReleases_.clear();
             }
         } else {
             if (skipped < 5)
