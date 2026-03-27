@@ -360,7 +360,7 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t total = (uint32_t)(nIdx * sliceSizeU32);
     uint32_t params[4] = {(uint32_t)nIdx, sliceSizeU32, dataStrideU32, 0};
-    auto paramBuf = ex.gpu->createBuffer("gather_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     auto& pl = ex.GetPipeline("gather", WGSL_GATHER, 4);
@@ -450,7 +450,7 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
             if (nel <= 0) continue;
             GpuTensor f32t = ex.AllocTensor(t->shape, TensorDtype::Float32);
             uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
-            auto paramBuf = ex.gpu->createBuffer("concat_cast_p", 16);
+            auto paramBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(paramBuf, params, 16);
             auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
             auto bg = ex.MakeBindGroup(pl, {
@@ -531,7 +531,7 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
 
             uint32_t params[4] = {(uint32_t)outNel, (uint32_t)gpuIn[0]->shape[axis],
                                    (uint32_t)outShape[axis], (uint32_t)innerSize};
-            auto paramBuf = ex.gpu->createBuffer("concat_p", 16);
+            auto paramBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(paramBuf, params, 16);
 
             const char* kernelName = isF16 ? "concat_2input_f16" : "concat_2input_f32";
@@ -1059,7 +1059,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         (uint32_t)startVals[2], (uint32_t)startVals[1], (uint32_t)startVals[0],
                         (uint32_t)data->shape[1], (uint32_t)data->shape[2], 0, 0, 0
                     };
-                    auto pBuf = ex.gpu->createBuffer("slice3d_p", 48);
+                    auto pBuf = ex.getParamBuffer(48);
                     ex.gpu->writeBuffer(pBuf, params, 48);
                     auto& pl = ex.GetPipeline("slice_3d_f32", SLICE_3D_F32, 3);
                     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, pBuf}});

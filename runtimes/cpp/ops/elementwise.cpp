@@ -39,14 +39,14 @@ static std::vector<int64_t> preferredIntOutputShape(const GpuTensor* A, const Gp
 static GPUBuffer makeParamBuf(GraphExecutor& ex, uint32_t p0, uint32_t p1 = 0,
                                uint32_t p2 = 0, uint32_t p3 = 0) {
     uint32_t data[4] = {p0, p1, p2, p3};
-    auto buf = ex.gpu->createBuffer("params", 16);
+    auto buf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(buf, data, 16);
     return buf;
 }
 
 static GPUBuffer makeScalarParamBuf(GraphExecutor& ex, uint32_t p0) {
     uint32_t data[4] = {p0, 0, 0, 0};
-    auto buf = ex.gpu->createBuffer("params1", 16);
+    auto buf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(buf, data, 16);
     return buf;
 }

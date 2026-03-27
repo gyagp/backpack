@@ -852,6 +852,30 @@ void GraphExecutor::EnsureGpu(GpuTensor& t) {
     t.isCpuOnly = false;
 }
 
+// ─── Param Buffer Pool ───────────────────────────────────────────────────────
+
+GPUBuffer GraphExecutor::getParamBuffer(uint32_t sizeBytes) {
+    // Round up to 16-byte aligned bucket
+    int bucket;
+    if (sizeBytes <= 16) { bucket = 0; sizeBytes = 16; }
+    else if (sizeBytes <= 32) { bucket = 1; sizeBytes = 32; }
+    else if (sizeBytes <= 48) { bucket = 2; sizeBytes = 48; }
+    else { bucket = 3; sizeBytes = 64; }
+
+    auto& pool = paramPool_[bucket];
+    if (pool.buffers.empty()) {
+        // Lazy init: pre-allocate a batch
+        pool.buffers.resize(PARAM_POOL_SIZE);
+        for (int i = 0; i < PARAM_POOL_SIZE; i++) {
+            pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
+        }
+        pool.nextIdx = 0;
+    }
+    GPUBuffer buf = pool.buffers[pool.nextIdx];
+    pool.nextIdx = (pool.nextIdx + 1) % (int)pool.buffers.size();
+    return buf;
+}
+
 // ─── Pipeline / Dispatch Helpers ─────────────────────────────────────────────
 
 const CompiledPipeline& GraphExecutor::GetPipeline(const std::string& name,
@@ -1372,8 +1396,11 @@ void GraphExecutor::Execute(
 
     totalDispatches += (int)pendingDispatches_.size();
     totalCopies += (int)pendingCopies_.size();
-    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback)\n",
-            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, intReadbackSyncs_);
+    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (0 from int-readback), bufs=%d (pool=%d)\n",
+            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, 
+            gpu->createBufferCount, gpu->poolHitCount);
+    gpu->createBufferCount = 0;
+    gpu->poolHitCount = 0;
     // Print sync sources on first call
     static int printSyncCount = 0;
     if (printSyncCount < 2 && !flushSources_.empty()) {

@@ -49,7 +49,7 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     f32t.isCpuOnly = false;
 
     uint32_t p[4] = {(uint32_t)count, 0, 0, 0};
-    auto pb = ex.gpu->createBuffer("mmnb_cast_p", 16);
+    auto pb = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(pb, p, 16);
     auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
     auto bg = ex.MakeBindGroup(pl, {{0, tensor.buffer}, {1, f32t.buffer}, {2, pb}});
@@ -272,7 +272,7 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
 
     uint32_t params[4] = {(uint32_t)M, N, K, 0};
-    auto paramBuf = ex.gpu->createBuffer("mmnb_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (ZP) {
@@ -322,7 +322,7 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
 
     uint32_t params[4] = {(uint32_t)M, (uint32_t)N_out, (uint32_t)K, 0};
-    auto paramBuf = ex.gpu->createBuffer("mm_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (A->dtype == TensorDtype::Float32 && B->dtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
@@ -406,7 +406,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     uint32_t params[4] = {(uint32_t)M, (uint32_t)N_out, (uint32_t)K, (uint32_t)transB};
-    auto paramBuf = ex.gpu->createBuffer("gemm_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (canUsePackedFp16) {
@@ -415,7 +415,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         const char* kernelSrc = useWide ? WGSL_FP16_GEMM_WIDE : WGSL_FP16_GEMM;
         uint32_t tileN = useWide ? 32u : 8u;
         uint32_t fp16Params[4] = {(uint32_t)K, (uint32_t)N_out, 0u, 0u};
-        auto fp16ParamBuf = ex.gpu->createBuffer("gemm_fp16_p", 16);
+        auto fp16ParamBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(fp16ParamBuf, fp16Params, 16);
 
         auto& pl = ex.GetPipeline(kernelName, kernelSrc, 5);
@@ -508,7 +508,7 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     uint32_t params[4] = {(uint32_t)nIdx, K, n_groups, bs};
-    auto paramBuf = ex.gpu->createBuffer("gbq_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     const char* kernelSrc = (bits == 4) ? (ZP ? WGSL_GATHER_BQ_Q4_ZP : WGSL_GATHER_BQ_Q4)

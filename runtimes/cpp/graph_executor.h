@@ -151,6 +151,10 @@ public:
     /// Enable per-op profiling. Call before Execute(). Results printed to stderr.
     bool profilingEnabled = false;
 
+    /// Get a reusable param buffer (16/32/48 bytes). Avoids per-dispatch createBuffer.
+    /// The buffer is valid until the next Execute() call.
+    GPUBuffer getParamBuffer(uint32_t sizeBytes);
+
     /// GPU hardware timestamp profiler (owned, optional).
     /// Call enableGpuProfiling() to activate. After Execute(), call
     /// printGpuProfileReport() to read timestamps and generate HTML.
@@ -239,6 +243,16 @@ public:
 
     // Deferred int readbacks — flushed at periodic sync or when needed
     std::vector<GpuTensor*> pendingIntReadbacks_;
+
+    // Param buffer pool: pre-allocated buffers for dispatch params.
+    // Indexed by size bucket: [0]=16B, [1]=32B, [2]=48B, [3]=64B
+    static constexpr int PARAM_POOL_BUCKETS = 4;
+    static constexpr int PARAM_POOL_SIZE = 512;  // max buffers per bucket
+    struct ParamPool {
+        std::vector<GPUBuffer> buffers;
+        int nextIdx = 0;
+    };
+    ParamPool paramPool_[PARAM_POOL_BUCKETS];
 
     // Profiling accumulators (per op-type, in ms)
     std::unordered_map<std::string, double> profileData_;

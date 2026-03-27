@@ -262,13 +262,15 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
         if (!pool_[bucket].empty()) {
             GPUBuffer buf = pool_[bucket].back();
             pool_[bucket].pop_back();
-            // Return with original POOL allocation size to keep pool tracking consistent
+            poolHitCount++;
+            createBufferCount++;
             return buf;
         }
         // Round up to bucket size for new allocation
         uint64_t bucketSize = 1ULL << (bucket + POOL_MIN_BITS);
         size = std::max(size, bucketSize);
     }
+    createBufferCount++;
 
     WGPUBufferDescriptor d{};
     d.label = {name.c_str(), name.size()};

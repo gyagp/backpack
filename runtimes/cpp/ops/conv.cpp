@@ -291,7 +291,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
             (uint32_t)L_out, 1, (uint32_t)group,                   // H_out=L_out, W_out=1
             (uint32_t)dilation, 1                                    // dil_h=dilation, dil_w=1
         };
-        auto paramBuf = ex.gpu->createBuffer("conv1d_p", 64);
+        auto paramBuf = ex.getParamBuffer(64);
         ex.gpu->writeBuffer(paramBuf, params, 64);
 
         auto& pl = useFp16Path
@@ -381,7 +381,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
         (uint32_t)H_out, (uint32_t)W_out, (uint32_t)group,
         (uint32_t)dil_h, (uint32_t)dil_w
     };
-    auto paramBuf = ex.gpu->createBuffer("conv_p", 64);
+    auto paramBuf = ex.getParamBuffer(64);
     ex.gpu->writeBuffer(paramBuf, params, 64);
 
     auto& pl = useFp16Path
@@ -470,7 +470,7 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
         (uint32_t)H_out, (uint32_t)W_out, (uint32_t)group,
         (uint32_t)out_pad_h, (uint32_t)out_pad_w
     };
-    auto paramBuf = ex.gpu->createBuffer("ct_p", 64);
+    auto paramBuf = ex.getParamBuffer(64);
     ex.gpu->writeBuffer(paramBuf, params, 64);
 
     auto& pl = useFp16Path
@@ -521,7 +521,7 @@ static void opResize(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[8] = {(uint32_t)N, (uint32_t)C, (uint32_t)H_in, (uint32_t)W_in,
                            (uint32_t)H_out, (uint32_t)W_out, 0, 0};
-    auto paramBuf = ex.gpu->createBuffer("resize_p", 32);
+    auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
     auto& pl = ex.GetPipeline("resize_nearest", WGSL_RESIZE_NEAREST, 3);

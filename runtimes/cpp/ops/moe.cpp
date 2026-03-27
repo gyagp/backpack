@@ -187,7 +187,7 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
         GpuTensor idxTensor = ex.AllocTensor(outShape, TensorDtype::Int32);
 
         uint32_t params[4] = {(uint32_t)totalSlices, (uint32_t)dimSize, (uint32_t)k, (uint32_t)largest};
-        auto paramBuf = ex.gpu->createBuffer("topk_p", 16);
+        auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
         auto& pl = ex.GetPipeline("topk_f16", WGSL_TOPK_F16, 4);
@@ -210,7 +210,7 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
         GpuTensor idxTensor = ex.AllocTensor(outShape, TensorDtype::Int32);
 
         uint32_t params[4] = {(uint32_t)totalSlices, (uint32_t)dimSize, (uint32_t)k, (uint32_t)largest};
-        auto paramBuf = ex.gpu->createBuffer("topk_p", 16);
+        auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
         auto& pl = ex.GetPipeline("topk_f32", WGSL_TOPK_F32, 4);
@@ -289,7 +289,7 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
 
         uint32_t params[4] = {(uint32_t)outNel, (uint32_t)data->shape[axis],
                                (uint32_t)indices->shape[axis], 0};
-        auto paramBuf = ex.gpu->createBuffer("ge_p", 16);
+        auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
         auto& pl = ex.GetPipeline("gather_elements_f16", WGSL_GATHER_ELEMENTS_F16, 4);
@@ -312,7 +312,7 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
 
         uint32_t params[4] = {(uint32_t)outNel, (uint32_t)data->shape[axis],
                                (uint32_t)indices->shape[axis], 0};
-        auto paramBuf = ex.gpu->createBuffer("ge_p", 16);
+        auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
         auto& pl = ex.GetPipeline("gather_elements_f32", WGSL_GATHER_ELEMENTS_F32, 4);
@@ -387,7 +387,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 0};
-            auto paramBuf = ex.gpu->createBuffer("se_p1", 32);
+            auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
 
             auto& pl = ex.GetPipeline("scatter_elements_f16", WGSL_SCATTER_ELEMENTS_F16, 5);
@@ -401,7 +401,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 1};
-            auto paramBuf = ex.gpu->createBuffer("se_p2", 32);
+            auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
 
             auto& pl = ex.GetPipeline("scatter_elements_f16", WGSL_SCATTER_ELEMENTS_F16, 5);
@@ -428,7 +428,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 0};
-            auto paramBuf = ex.gpu->createBuffer("se_p1", 32);
+            auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
             auto& pl = ex.GetPipeline("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_F32, 5);
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
@@ -439,7 +439,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 1};
-            auto paramBuf = ex.gpu->createBuffer("se_p2", 32);
+            auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
             auto& pl = ex.GetPipeline("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_F32, 5);
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
@@ -553,7 +553,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
 
     {
         uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, 0};
-        auto gpBuf = ex.gpu->createBuffer("moe_gate_p", 16);
+        auto gpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(gpBuf, gateParams, 16);
         auto& pl = ex.GetPipeline("moe_gate", WGSL_MOE_GATE, 4);
         auto bg = ex.MakeBindGroup(pl, {
@@ -572,7 +572,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t params[4] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
                                    (uint32_t)blocksPerCol_gu, slot};
-            auto pBuf = ex.gpu->createBuffer("moe_gu_p", 16);
+            auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
             auto& pl = ex.GetPipeline("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT, 6);
             auto bg = ex.MakeBindGroup(pl, {
@@ -585,7 +585,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         // SwiGLU (interleaved layout)
         {
             uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
-            auto pBuf = ex.gpu->createBuffer("moe_sg_p", 16);
+            auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
             auto& pl = ex.GetPipeline("swiglu", WGSL_SWIGLU, 3);
             auto bg = ex.MakeBindGroup(pl, {
@@ -598,7 +598,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t params[4] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
                                    (uint32_t)blocksPerCol_dn, slot};
-            auto pBuf = ex.gpu->createBuffer("moe_dn_p", 16);
+            auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
             auto& pl = ex.GetPipeline("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT, 6);
             auto bg = ex.MakeBindGroup(pl, {
@@ -611,7 +611,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         // Weighted accumulate (indirect weight from GPU buffer)
         {
             uint32_t params[4] = {(uint32_t)N_dn, slot, 0, 0};
-            auto pBuf = ex.gpu->createBuffer("moe_wa_p", 16);
+            auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
             auto& pl = ex.GetPipeline("weighted_add_indirect", WGSL_WEIGHTED_ADD_INDIRECT, 4);
             auto bg = ex.MakeBindGroup(pl, {

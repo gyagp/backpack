@@ -140,7 +140,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t scale_u32; memcpy(&scale_u32, &scale, 4);
         uint32_t params[8] = {(uint32_t)T, (uint32_t)num_heads, (uint32_t)head_dim,
                                (uint32_t)T, scale_u32, (uint32_t)kv_heads, 0, 0};
-        auto paramBuf = ex.gpu->createBuffer("gqa_p", 32);
+        auto paramBuf = ex.getParamBuffer(32);
         ex.gpu->writeBuffer(paramBuf, params, 32);
 
         auto& pl = ex.GetPipeline("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN, 5);
@@ -184,7 +184,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         if (nel <= 0) return;
         GpuTensor f32t = ex.AllocTensor(t.shape, TensorDtype::Float32);
         uint32_t p[4] = {(uint32_t)nel, 0, 0, 0};
-        auto pb = ex.gpu->createBuffer("attn_cast_p", 16);
+        auto pb = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(pb, p, 16);
         auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
         auto bg = ex.MakeBindGroup(pl, {{0, t.buffer}, {1, f32t.buffer}, {2, pb}});
@@ -214,7 +214,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         // RoPE on Q
         uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                    (uint32_t)rotaryDim, (uint32_t)posOffset};
-        auto rpBuf = ex.gpu->createBuffer("rope_pq", 16);
+        auto rpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
         auto& roPl = ex.GetPipeline("rope_inplace", WGSL_ROPE_INPLACE, 4);
         auto roBg = ex.MakeBindGroup(roPl, {
@@ -224,7 +224,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
 
         // RoPE on K
         ropeParams[0] = (uint32_t)kv_heads;
-        auto rpBufK = ex.gpu->createBuffer("rope_pk", 16);
+        auto rpBufK = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
         auto roBgK = ex.MakeBindGroup(roPl, {
             {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
@@ -244,19 +244,19 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
             ex.EnsureGpu(*pastKey);
             pastKeyBuf = pastKey->buffer;
         } else {
-            pastKeyBuf = ex.gpu->createBuffer("past_k_empty", 4);
+            pastKeyBuf = ex.getParamBuffer(4);
         }
         if (pastVal && pastSeq > 0) {
             gpuCastF16ToF32(*pastVal);
             ex.EnsureGpu(*pastVal);
             pastValBuf = pastVal->buffer;
         } else {
-            pastValBuf = ex.gpu->createBuffer("past_v_empty", 4);
+            pastValBuf = ex.getParamBuffer(4);
         }
 
         uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
                                  (uint32_t)pastSeq, (uint32_t)totalSeq};
-        auto kvpBuf = ex.gpu->createBuffer("kv_app_p", 16);
+        auto kvpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
 
         auto& kvPl = ex.GetPipeline("kv_cache_append", WGSL_KV_CACHE_APPEND, 4);
@@ -279,7 +279,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t attnParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                    (uint32_t)totalSeq, (uint32_t)kv_heads,
                                    scale_u32, 0, 0, 0};
-        auto apBuf = ex.gpu->createBuffer("gqa_p", 32);
+        auto apBuf = ex.getParamBuffer(32);
         ex.gpu->writeBuffer(apBuf, attnParams, 32);
 
         auto& attnPl = ex.GetPipeline("gqa_decode", WGSL_GQA_DECODE, 5);
@@ -337,7 +337,7 @@ static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
     uint32_t params[8] = {(uint32_t)T_q, (uint32_t)num_heads, (uint32_t)head_dim,
                            (uint32_t)T_kv, scale_u32, 0, 0, 0};
 
-    auto paramBuf = ex.gpu->createBuffer("mha_p", 32);
+    auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
     auto& pl = ex.GetPipeline("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN, 5);
@@ -404,7 +404,7 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
         }
     } else {
         int32_t zero = 0;
-        posIdsBuf = ex.gpu->createBuffer("rope_pos0", 4);
+        posIdsBuf = ex.getParamBuffer(4);
         ex.gpu->writeBuffer(posIdsBuf, &zero, 4);
     }
 
@@ -416,7 +416,7 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
     uint32_t params[8] = {(uint32_t)total, (uint32_t)head_dim,
                            (uint32_t)interleaved, (uint32_t)nPosIds,
                            (uint32_t)seqLen, 0, 0, 0};
-    auto paramBuf = ex.gpu->createBuffer("rope_p", 32);
+    auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
     auto& pl = ex.GetPipeline("rotary_embedding", WGSL_ROTARY_EMBEDDING, 6);

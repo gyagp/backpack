@@ -101,6 +101,8 @@ struct GPUContext {
     void destroy();
 
     // --- Buffers ---
+    int createBufferCount = 0;  // allocation counter for profiling
+    int poolHitCount = 0;  // pool reuse counter
     GPUBuffer createBuffer(const std::string& name, uint64_t size,
                            uint64_t usage = BUF_DEFAULT,
                            bool mappedAtCreation = false);

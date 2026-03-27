@@ -226,7 +226,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     p.stride = (int32_t)(nRows * hiddenDim);
     p.N = (int32_t)hiddenDim;
     p.eps = eps;
-    auto paramBuf = ex.gpu->createBuffer("rmsn_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, &p, 12);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W)) {
@@ -493,7 +493,7 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)hiddenDim, (uint32_t)nRows, eps_u32, 0};
-    auto paramBuf = ex.gpu->createBuffer("srmsn_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W) && Skip->dtype == TensorDtype::Float32) {
@@ -557,7 +557,7 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)hiddenDim, (uint32_t)nRows, eps_u32, 0};
-    auto paramBuf = ex.gpu->createBuffer("ln_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (B && !isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W, B)) {
@@ -607,7 +607,7 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)C, (uint32_t)HW, (uint32_t)N_batch, eps_u32};
-    auto paramBuf = ex.gpu->createBuffer("in_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, Scale, Bias)) {
@@ -660,7 +660,7 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)C, (uint32_t)HW, (uint32_t)numGroups, eps_u32};
-    auto paramBuf = ex.gpu->createBuffer("gn_p", 16);
+    auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, Scale, Bias)) {
