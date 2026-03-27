@@ -512,16 +512,13 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
 
     int64_t blockSize = n.GetInt("block_size", 32);
     int64_t normRouting = n.GetInt("normalize_routing_weights", 1);
+    int64_t k = n.GetInt("k", 4);
 
-    int64_t batchSeq = 1;
     int64_t hiddenSize = input->shape.back();
-    for (size_t i = 0; i + 1 < input->shape.size(); i++) batchSeq *= input->shape[i];
-
     int64_t numExperts = gateUpW->shape[0];
-    int64_t N_gu = gateUpW->shape[1];   // 2 * moe_intermediate_size
+    int64_t N_gu = gateUpW->shape[1];
     int64_t moeIntermediate = N_gu / 2;
-    int64_t N_dn = downW->shape[1];     // hidden_size
-
+    int64_t N_dn = downW->shape[1];
     int64_t blocksPerCol_gu = hiddenSize / blockSize;
     int64_t blocksPerCol_dn = moeIntermediate / blockSize;
 
@@ -530,167 +527,97 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         fprintf(stderr, "QMoE: cannot convert input to f32\n");
         return;
     }
+
+    // Ensure router weights are f32 on GPU (for the gate kernel)
+    if (routerWeights->dtype == TensorDtype::Float16) {
+        ensureTensorFloat32(ex, *routerWeights, n.inputs[1]);
+    }
+    ex.EnsureGpu(*routerWeights);
     ex.EnsureGpu(*gateUpW);
     ex.EnsureGpu(*gateUpS);
     ex.EnsureGpu(*downW);
     ex.EnsureGpu(*downS);
-
-    // Read router weights to CPU (tiny readback: 32*2 = 64 bytes per token)
-    ex.FlushPendingWork();
-    std::vector<float> routerVals;
-    if (!loadTensorFloats(ex, routerWeights, n.inputs[1], routerVals)) {
-        fprintf(stderr, "QMoE: cannot read router weights\n");
-        return;
-    }
 
     // Allocate output (zero-filled)
     auto outShape = input->shape;
     outShape.back() = hiddenSize;
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
     {
-        std::vector<float> zeros(batchSeq * hiddenSize, 0.0f);
+        std::vector<float> zeros(hiddenSize, 0.0f);
         ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), zeros.size() * sizeof(float));
     }
 
-    // Use the validated MATMUL_Q4 kernel (5 bindings) for each expert,
-    // with buffer offsets for expert weight/scale selection.
+    // GPU expert selection: gate kernel produces indices + weights on GPU
+    auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)k * 4);
+    auto expertWtBuf = ex.gpu->createBuffer("moe_expert_wt", (size_t)k * 4);
 
-    // Scratch buffers for intermediate results (reused across experts)
+    {
+        uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, 0};
+        auto gpBuf = ex.gpu->createBuffer("moe_gate_p", 16);
+        ex.gpu->writeBuffer(gpBuf, gateParams, 16);
+        auto& pl = ex.GetPipeline("moe_gate", WGSL_MOE_GATE, 4);
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, routerWeights->buffer}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg, 1, 1, 1, "moe_gate"});
+    }
+
+    // Scratch buffers (reused across expert slots)
     GpuTensor gateUpBuf = ex.AllocTensor({N_gu}, TensorDtype::Float32);
     GpuTensor intermediateBuf = ex.AllocTensor({moeIntermediate}, TensorDtype::Float32);
     GpuTensor downBuf = ex.AllocTensor({N_dn}, TensorDtype::Float32);
 
-    for (int64_t b = 0; b < batchSeq; b++) {
-        float* rw = routerVals.data() + b * numExperts;
-
-        struct ExpertInfo { int64_t idx; float weight; };
-        std::vector<ExpertInfo> activeExperts;
-        for (int64_t e = 0; e < numExperts; e++) {
-            if (rw[e] > -60000.0f) {
-                activeExperts.push_back({e, rw[e]});
-            }
+    // Dispatch k expert pipelines — each reads its expert index from GPU buffer
+    for (uint32_t slot = 0; slot < (uint32_t)k; slot++) {
+        // Gate-up Q4 matmul (indirect expert index)
+        {
+            uint32_t params[4] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
+                                   (uint32_t)blocksPerCol_gu, slot};
+            auto pBuf = ex.gpu->createBuffer("moe_gu_p", 16);
+            ex.gpu->writeBuffer(pBuf, params, 16);
+            auto& pl = ex.GetPipeline("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT, 6);
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, input->buffer}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
+                {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                (uint32_t)((N_gu + 255) / 256), 1, 1, "moe_gateup"});
         }
 
-        // Router weights are ln(sigmoid(logits)) — exponentiate to get sigmoid values
-        for (auto& ae : activeExperts) {
-            ae.weight = std::exp(ae.weight);
+        // SwiGLU (interleaved layout)
+        {
+            uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
+            auto pBuf = ex.gpu->createBuffer("moe_sg_p", 16);
+            ex.gpu->writeBuffer(pBuf, params, 16);
+            auto& pl = ex.GetPipeline("swiglu", WGSL_SWIGLU, 3);
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "moe_swiglu"});
         }
 
-        if (normRouting && !activeExperts.empty()) {
-            float sum = 0.0f;
-            for (auto& ae : activeExperts) sum += ae.weight;
-            if (sum > 0.0f) {
-                for (auto& ae : activeExperts) ae.weight /= sum;
-            }
+        // Down Q4 matmul (indirect expert index)
+        {
+            uint32_t params[4] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
+                                   (uint32_t)blocksPerCol_dn, slot};
+            auto pBuf = ex.gpu->createBuffer("moe_dn_p", 16);
+            ex.gpu->writeBuffer(pBuf, params, 16);
+            auto& pl = ex.GetPipeline("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT, 6);
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
+                {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_down"});
         }
 
-        GPUBuffer outputBuf = out[0]->buffer;
-
-        for (auto& ae : activeExperts) {
-            uint32_t expertIdx = (uint32_t)ae.idx;
-
-            // Expert weight/scale offsets
-            size_t gu_w_offset = (size_t)expertIdx * N_gu * (hiddenSize / 2);
-            size_t gu_s_offset = (size_t)expertIdx * N_gu * blocksPerCol_gu * 2;  // fp16 = 2 bytes
-            size_t dn_w_offset = (size_t)expertIdx * N_dn * (moeIntermediate / 2);
-            size_t dn_s_offset = (size_t)expertIdx * N_dn * blocksPerCol_dn * 2;
-
-            size_t gu_w_size = (size_t)N_gu * (hiddenSize / 2);
-            size_t gu_s_size = (size_t)N_gu * blocksPerCol_gu * 2;
-            size_t dn_w_size = (size_t)N_dn * (moeIntermediate / 2);
-            size_t dn_s_size = (size_t)N_dn * blocksPerCol_dn * 2;
-
-            // Align offsets to 256 bytes (WebGPU requirement for storage buffers)
-            // Since expert * N * K/2 with N=3584, K/2=1024 → expert*3670016 → ≡ 0 mod 256 ✓
-
-            // Step 1: Gate-up Q4 matmul using MATMUL_Q4 with buffer offset
-            {
-                uint32_t params[4] = {1, (uint32_t)N_gu, (uint32_t)hiddenSize, 0};
-                auto paramBuf = ex.gpu->createBuffer("qmoe_gu_p", 16);
-                ex.gpu->writeBuffer(paramBuf, params, 16);
-
-                auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
-
-                // Create bind group with buffer offsets for expert weights
-                WGPUBindGroupEntry entries[5];
-                memset(entries, 0, sizeof(entries));
-                entries[0] = {/*.nextInChain=*/nullptr, /*.binding=*/0, /*.buffer=*/input->buffer.handle,
-                              /*.offset=*/0, /*.size=*/input->buffer.size};
-                entries[1] = {nullptr, 1, gateUpW->buffer.handle,
-                              gu_w_offset, gu_w_size};
-                entries[2] = {nullptr, 2, gateUpS->buffer.handle,
-                              gu_s_offset, gu_s_size};
-                entries[3] = {nullptr, 3, gateUpBuf.buffer.handle,
-                              0, gateUpBuf.buffer.size};
-                entries[4] = {nullptr, 4, paramBuf.handle,
-                              0, paramBuf.size};
-                WGPUBindGroupDescriptor bgd{};
-                bgd.layout = pl.bgLayout;
-                bgd.entryCount = 5;
-                bgd.entries = entries;
-                auto bg = wgpuDeviceCreateBindGroup(ex.gpu->device, &bgd);
-
-                ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                    (uint32_t)((N_gu + 255) / 256), 1, 1, "qmoe_gateup"});
-            }
-
-            // Step 2: SwiGLU (interleaved layout)
-            {
-                uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
-                auto paramBuf = ex.gpu->createBuffer("qmoe_sg_p", 16);
-                ex.gpu->writeBuffer(paramBuf, params, 16);
-
-                auto& pl = ex.GetPipeline("swiglu", WGSL_SWIGLU, 3);
-                auto bg = ex.MakeBindGroup(pl, {
-                    {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, paramBuf}});
-                ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                    (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "qmoe_swiglu"});
-            }
-
-            // Step 3: Down Q4 matmul using MATMUL_Q4 with buffer offset
-            {
-                uint32_t params[4] = {1, (uint32_t)N_dn, (uint32_t)moeIntermediate, 0};
-                auto paramBuf = ex.gpu->createBuffer("qmoe_dn_p", 16);
-                ex.gpu->writeBuffer(paramBuf, params, 16);
-
-                auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
-
-                WGPUBindGroupEntry entries[5];
-                memset(entries, 0, sizeof(entries));
-                entries[0] = {nullptr, 0, intermediateBuf.buffer.handle,
-                              0, intermediateBuf.buffer.size};
-                entries[1] = {nullptr, 1, downW->buffer.handle,
-                              dn_w_offset, dn_w_size};
-                entries[2] = {nullptr, 2, downS->buffer.handle,
-                              dn_s_offset, dn_s_size};
-                entries[3] = {nullptr, 3, downBuf.buffer.handle,
-                              0, downBuf.buffer.size};
-                entries[4] = {nullptr, 4, paramBuf.handle,
-                              0, paramBuf.size};
-                WGPUBindGroupDescriptor bgd{};
-                bgd.layout = pl.bgLayout;
-                bgd.entryCount = 5;
-                bgd.entries = entries;
-                auto bg = wgpuDeviceCreateBindGroup(ex.gpu->device, &bgd);
-
-                ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                    (uint32_t)((N_dn + 255) / 256), 1, 1, "qmoe_down"});
-            }
-
-            // Step 4: Weighted accumulate: output += weight * downBuf
-            {
-                uint32_t weight_u32;
-                memcpy(&weight_u32, &ae.weight, sizeof(float));
-                uint32_t params[4] = {(uint32_t)N_dn, weight_u32, 0, 0};
-                auto paramBuf = ex.gpu->createBuffer("qmoe_wa_p", 16);
-                ex.gpu->writeBuffer(paramBuf, params, 16);
-
-                auto& pl = ex.GetPipeline("weighted_add", WGSL_WEIGHTED_ADD, 3);
-                auto bg = ex.MakeBindGroup(pl, {
-                    {0, downBuf.buffer}, {1, outputBuf}, {2, paramBuf}});
-                ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                    (uint32_t)((N_dn + 255) / 256), 1, 1, "qmoe_accum"});
-            }
+        // Weighted accumulate (indirect weight from GPU buffer)
+        {
+            uint32_t params[4] = {(uint32_t)N_dn, slot, 0, 0};
+            auto pBuf = ex.gpu->createBuffer("moe_wa_p", 16);
+            ex.gpu->writeBuffer(pBuf, params, 16);
+            auto& pl = ex.GetPipeline("weighted_add_indirect", WGSL_WEIGHTED_ADD_INDIRECT, 4);
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, downBuf.buffer}, {1, out[0]->buffer}, {2, pBuf}, {3, expertWtBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_accum"});
         }
     }
 }
