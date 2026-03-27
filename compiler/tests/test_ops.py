@@ -529,6 +529,283 @@ def test_concat_mixed_dtype():
         pass  # Mixed dtype is expected to potentially differ from ORT
 
 
+# ── New ops: MoE routing ──────────────────────────────────────────────────────
+
+def test_topk_f32():
+    """TopK with f32 data along last axis — MoE routing."""
+    np.random.seed(7)
+    X = np.random.randn(1, 8).astype(np.float32)
+    K = np.array([3], dtype=np.int64)
+    model = _make_model(
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 8]),
+         helper.make_tensor_value_info("K", TensorProto.INT64, [1])],
+        [helper.make_tensor_value_info("values", TensorProto.FLOAT, None),
+         helper.make_tensor_value_info("indices", TensorProto.INT64, None)],
+        [helper.make_node("TopK", ["X", "K"], ["values", "indices"], axis=-1, largest=1)],
+    )
+    run_op_test(model, {"X": X, "K": K}, atol=1e-3, output_names=["values"])
+
+
+def test_topk_fp16():
+    """TopK with fp16 data along last axis."""
+    np.random.seed(7)
+    X = np.random.randn(1, 32).astype(np.float16)
+    K = np.array([4], dtype=np.int64)
+    model = _make_model(
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT16, [1, 32]),
+         helper.make_tensor_value_info("K", TensorProto.INT64, [1])],
+        [helper.make_tensor_value_info("values", TensorProto.FLOAT16, None),
+         helper.make_tensor_value_info("indices", TensorProto.INT64, None)],
+        [helper.make_node("TopK", ["X", "K"], ["values", "indices"], axis=-1, largest=1)],
+    )
+    run_op_test(model, {"X": X, "K": K}, atol=0.1, output_names=["values"])
+
+
+def test_gather_elements_f32():
+    """GatherElements f32 along last axis — MoE routing."""
+    data = np.array([[10, 20, 30, 40, 50]], dtype=np.float32)
+    indices = np.array([[4, 1, 0]], dtype=np.int32)
+    model = _make_model(
+        [helper.make_tensor_value_info("data", TensorProto.FLOAT, [1, 5]),
+         helper.make_tensor_value_info("indices", TensorProto.INT32, [1, 3])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, None)],
+        [helper.make_node("GatherElements", ["data", "indices"], ["Y"], axis=1)],
+    )
+    run_op_test(model, {"data": data, "indices": indices})
+
+
+def test_gather_elements_fp16():
+    """GatherElements fp16 along last axis."""
+    data = np.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=np.float16)
+    indices = np.array([[7, 0, 3]], dtype=np.int64)
+    model = _make_model(
+        [helper.make_tensor_value_info("data", TensorProto.FLOAT16, [1, 8]),
+         helper.make_tensor_value_info("indices", TensorProto.INT64, [1, 3])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT16, None)],
+        [helper.make_node("GatherElements", ["data", "indices"], ["Y"], axis=1)],
+    )
+    run_op_test(model, {"data": data, "indices": indices}, atol=0.1)
+
+
+def test_scatter_elements_f32():
+    """ScatterElements f32 along last axis — MoE routing."""
+    data = np.zeros((1, 5), dtype=np.float32)
+    indices = np.array([[1, 3]], dtype=np.int32)
+    updates = np.array([[100., 200.]], dtype=np.float32)
+    model = _make_model(
+        [helper.make_tensor_value_info("data", TensorProto.FLOAT, [1, 5]),
+         helper.make_tensor_value_info("indices", TensorProto.INT32, [1, 2]),
+         helper.make_tensor_value_info("updates", TensorProto.FLOAT, [1, 2])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, None)],
+        [helper.make_node("ScatterElements", ["data", "indices", "updates"], ["Y"], axis=1)],
+    )
+    run_op_test(model, {"data": data, "indices": indices, "updates": updates})
+
+
+def test_scatter_elements_fp16():
+    """ScatterElements fp16 along last axis."""
+    data = np.zeros((1, 8), dtype=np.float16)
+    indices = np.array([[0, 5, 7]], dtype=np.int64)
+    updates = np.array([[10., 50., 70.]], dtype=np.float16)
+    model = _make_model(
+        [helper.make_tensor_value_info("data", TensorProto.FLOAT16, [1, 8]),
+         helper.make_tensor_value_info("indices", TensorProto.INT64, [1, 3]),
+         helper.make_tensor_value_info("updates", TensorProto.FLOAT16, [1, 3])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT16, None)],
+        [helper.make_node("ScatterElements", ["data", "indices", "updates"], ["Y"], axis=1)],
+    )
+    run_op_test(model, {"data": data, "indices": indices, "updates": updates}, atol=0.1)
+
+
+# ── New ops: GQA with KV cache ────────────────────────────────────────────────
+
+def test_gqa_decode_no_cache():
+    """GroupQueryAttention decode step with no past KV (first token)."""
+    np.random.seed(42)
+    batch, seq, num_heads, kv_heads, head_dim = 1, 1, 4, 2, 16
+    Q = np.random.randn(batch, seq, num_heads * head_dim).astype(np.float32)
+    K = np.random.randn(batch, seq, kv_heads * head_dim).astype(np.float32)
+    V = np.random.randn(batch, seq, kv_heads * head_dim).astype(np.float32)
+    seqlen_k = np.array([0], dtype=np.int32)
+    total_seq = np.array([1], dtype=np.int32)
+    cos_cache = np.ones((128, head_dim // 2), dtype=np.float32)
+    sin_cache = np.zeros((128, head_dim // 2), dtype=np.float32)
+
+    model = _make_model(
+        [helper.make_tensor_value_info("Q", TensorProto.FLOAT, [batch, seq, num_heads * head_dim]),
+         helper.make_tensor_value_info("K", TensorProto.FLOAT, [batch, seq, kv_heads * head_dim]),
+         helper.make_tensor_value_info("V", TensorProto.FLOAT, [batch, seq, kv_heads * head_dim]),
+         helper.make_tensor_value_info("past_key", TensorProto.FLOAT, [batch, kv_heads, 0, head_dim]),
+         helper.make_tensor_value_info("past_value", TensorProto.FLOAT, [batch, kv_heads, 0, head_dim]),
+         helper.make_tensor_value_info("seqlen_k", TensorProto.INT32, [batch]),
+         helper.make_tensor_value_info("total_seq", TensorProto.INT32, [batch])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, None),
+         helper.make_tensor_value_info("present_key", TensorProto.FLOAT, None),
+         helper.make_tensor_value_info("present_value", TensorProto.FLOAT, None)],
+        [helper.make_node("GroupQueryAttention",
+            ["Q", "K", "V", "past_key", "past_value", "seqlen_k", "total_seq",
+             "cos_cache", "sin_cache"],
+            ["output", "present_key", "present_value"],
+            domain="com.microsoft",
+            num_heads=num_heads, kv_num_heads=kv_heads,
+            do_rotary=1, scale=0.0)],
+        initializers=[
+            numpy_helper.from_array(cos_cache, name="cos_cache"),
+            numpy_helper.from_array(sin_cache, name="sin_cache"),
+        ],
+    )
+    past_key = np.zeros((batch, kv_heads, 0, head_dim), dtype=np.float32)
+    past_value = np.zeros((batch, kv_heads, 0, head_dim), dtype=np.float32)
+    run_op_test(model, {
+        "Q": Q, "K": K, "V": V,
+        "past_key": past_key, "past_value": past_value,
+        "seqlen_k": seqlen_k, "total_seq": total_seq,
+    }, atol=0.01, output_names=["output", "present_key", "present_value"])
+
+
+def test_gqa_decode_with_cache():
+    """GroupQueryAttention decode step with past KV cache."""
+    np.random.seed(99)
+    batch, num_heads, kv_heads, head_dim = 1, 4, 2, 16
+    past_seq = 3
+    Q = np.random.randn(batch, 1, num_heads * head_dim).astype(np.float32)
+    K = np.random.randn(batch, 1, kv_heads * head_dim).astype(np.float32)
+    V = np.random.randn(batch, 1, kv_heads * head_dim).astype(np.float32)
+    past_key = np.random.randn(batch, kv_heads, past_seq, head_dim).astype(np.float32)
+    past_value = np.random.randn(batch, kv_heads, past_seq, head_dim).astype(np.float32)
+    seqlen_k = np.array([past_seq], dtype=np.int32)
+    total_seq = np.array([past_seq + 1], dtype=np.int32)
+    cos_cache = np.cos(np.arange(128)[:, None] * np.arange(head_dim // 2)[None, :] * 0.01).astype(np.float32)
+    sin_cache = np.sin(np.arange(128)[:, None] * np.arange(head_dim // 2)[None, :] * 0.01).astype(np.float32)
+
+    model = _make_model(
+        [helper.make_tensor_value_info("Q", TensorProto.FLOAT, [batch, 1, num_heads * head_dim]),
+         helper.make_tensor_value_info("K", TensorProto.FLOAT, [batch, 1, kv_heads * head_dim]),
+         helper.make_tensor_value_info("V", TensorProto.FLOAT, [batch, 1, kv_heads * head_dim]),
+         helper.make_tensor_value_info("past_key", TensorProto.FLOAT, [batch, kv_heads, past_seq, head_dim]),
+         helper.make_tensor_value_info("past_value", TensorProto.FLOAT, [batch, kv_heads, past_seq, head_dim]),
+         helper.make_tensor_value_info("seqlen_k", TensorProto.INT32, [batch]),
+         helper.make_tensor_value_info("total_seq", TensorProto.INT32, [batch])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, None),
+         helper.make_tensor_value_info("present_key", TensorProto.FLOAT, None),
+         helper.make_tensor_value_info("present_value", TensorProto.FLOAT, None)],
+        [helper.make_node("GroupQueryAttention",
+            ["Q", "K", "V", "past_key", "past_value", "seqlen_k", "total_seq",
+             "cos_cache", "sin_cache"],
+            ["output", "present_key", "present_value"],
+            domain="com.microsoft",
+            num_heads=num_heads, kv_num_heads=kv_heads,
+            do_rotary=1, scale=0.0)],
+        initializers=[
+            numpy_helper.from_array(cos_cache, name="cos_cache"),
+            numpy_helper.from_array(sin_cache, name="sin_cache"),
+        ],
+    )
+    run_op_test(model, {
+        "Q": Q, "K": K, "V": V,
+        "past_key": past_key, "past_value": past_value,
+        "seqlen_k": seqlen_k, "total_seq": total_seq,
+    }, atol=0.01, output_names=["output", "present_key", "present_value"])
+
+
+# ── New ops: GPU Concat and Slice ─────────────────────────────────────────────
+
+def test_concat_f32_axis2():
+    """Concat f32 along axis=2 — GPU concat kernel path."""
+    np.random.seed(42)
+    a = np.random.randn(1, 16, 3).astype(np.float32)
+    b = np.random.randn(1, 16, 1).astype(np.float32)
+    model = _make_model(
+        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 16, 3]),
+         helper.make_tensor_value_info("B", TensorProto.FLOAT, [1, 16, 1])],
+        [helper.make_tensor_value_info("C", TensorProto.FLOAT, [1, 16, 4])],
+        [helper.make_node("Concat", ["A", "B"], ["C"], axis=2)],
+    )
+    run_op_test(model, {"A": a, "B": b})
+
+
+def test_slice_3d_axis2():
+    """Slice 3D tensor along axis=2 — GPU slice kernel path (conv cache)."""
+    np.random.seed(42)
+    X = np.random.randn(1, 64, 4).astype(np.float32)
+    starts = np.array([1], dtype=np.int64)
+    ends = np.array([4], dtype=np.int64)
+    axes = np.array([2], dtype=np.int64)
+    model = _make_model(
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64, 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64, 3])],
+        [helper.make_node("Slice", ["X", "starts", "ends", "axes"], ["Y"])],
+        initializers=[
+            numpy_helper.from_array(starts, name="starts"),
+            numpy_helper.from_array(ends, name="ends"),
+            numpy_helper.from_array(axes, name="axes"),
+        ],
+    )
+    run_op_test(model, {"X": X})
+
+
+def test_slice_3d_negative_start():
+    """Slice with negative start (conv cache: [-3:] along axis=2)."""
+    np.random.seed(42)
+    X = np.random.randn(1, 32, 5).astype(np.float32)
+    starts = np.array([-3], dtype=np.int64)
+    ends = np.array([9223372036854775807], dtype=np.int64)
+    axes = np.array([2], dtype=np.int64)
+    model = _make_model(
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 32, 5])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 32, 3])],
+        [helper.make_node("Slice", ["X", "starts", "ends", "axes"], ["Y"])],
+        initializers=[
+            numpy_helper.from_array(starts, name="starts"),
+            numpy_helper.from_array(ends, name="ends"),
+            numpy_helper.from_array(axes, name="axes"),
+        ],
+    )
+    run_op_test(model, {"X": X})
+
+
+def test_softplus():
+    """Softplus op — used in MoE routing."""
+    np.random.seed(42)
+    X = np.random.randn(1, 32).astype(np.float32)
+    model = _make_model(
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 32])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 32])],
+        [helper.make_node("Softplus", ["X"], ["Y"])],
+    )
+    run_op_test(model, {"X": X})
+
+
+# ── Integration: MoE router pipeline ─────────────────────────────────────────
+
+def test_moe_router_pipeline():
+    """MoE router: Sigmoid → Add → TopK → Neg → Softplus → Neg → GatherElements → Expand → ScatterElements.
+    Tests the full router pattern used in LFM2 MoE layers."""
+    np.random.seed(42)
+    N = 8  # num_experts
+    K = 3  # top-k
+
+    logits = np.random.randn(1, N).astype(np.float32)
+    bias = np.random.randn(N).astype(np.float32)
+
+    # Sigmoid → Add → TopK
+    model = _make_model(
+        [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, N])],
+        [helper.make_tensor_value_info("topk_values", TensorProto.FLOAT, None),
+         helper.make_tensor_value_info("topk_indices", TensorProto.INT64, None)],
+        [
+            helper.make_node("Sigmoid", ["logits"], ["sig"]),
+            helper.make_node("Add", ["sig", "bias"], ["added"]),
+            helper.make_node("TopK", ["added", "k"], ["topk_values", "topk_indices"], axis=-1, largest=1),
+        ],
+        initializers=[
+            numpy_helper.from_array(bias, name="bias"),
+            numpy_helper.from_array(np.array([K], dtype=np.int64), name="k"),
+        ],
+    )
+    run_op_test(model, {"logits": logits}, atol=1e-3, output_names=["topk_values"])
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
