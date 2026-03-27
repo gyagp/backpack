@@ -432,14 +432,16 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
     for (auto* t : validIn) ex.EnsureGpu(*t);
 
     // Normalize dtypes: if inputs have mixed f32/f16, convert all to f32.
-    // Also convert pure f16 to f32 for non-axis-0 concat (WebGPU requires
-    // 4-byte aligned copies, and fp16 slabs may be 2-byte aligned).
+    // For pure fp16 non-axis-0 with 2 inputs, the GPU concat kernel handles it directly.
     bool hasF32 = false, hasF16 = false;
     for (auto* t : validIn) {
         if (t->dtype == TensorDtype::Float32) hasF32 = true;
         if (t->dtype == TensorDtype::Float16) hasF16 = true;
     }
-    bool needF16ToF32 = (hasF32 && hasF16) || (hasF16 && axis > 0);
+    bool canUseF16GpuConcat = (hasF16 && !hasF32 && validIn.size() == 2 &&
+                                axis > 0 && ex.gpu->supportsShaderF16);
+    bool needF16ToF32 = (hasF32 && hasF16) ||
+                         (hasF16 && axis > 0 && !canUseF16GpuConcat);
     if (needF16ToF32 && ex.gpu->supportsShaderF16) {
         // Convert f16 inputs to f32 using cast kernel
         for (auto* t : validIn) {
@@ -515,7 +517,32 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
         }
 
         // For non-axis-0 concat, use appropriate copy method
-        // Non-axis-0 concat: use CPU to avoid GPU copy/dispatch ordering issues.
+        // GPU kernel for 2-input concat (avoids CPU readback)
+        if (gpuIn.size() == 2 && gpuIn[0]->dtype == gpuIn[1]->dtype &&
+            (gpuIn[0]->dtype == TensorDtype::Float32 ||
+             (gpuIn[0]->dtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16))) {
+            bool isF16 = (gpuIn[0]->dtype == TensorDtype::Float16);
+            int64_t outNel = 1;
+            for (auto d : outShape) outNel *= d;
+
+            uint32_t params[4] = {(uint32_t)outNel, (uint32_t)gpuIn[0]->shape[axis],
+                                   (uint32_t)outShape[axis], (uint32_t)innerSize};
+            auto paramBuf = ex.gpu->createBuffer("concat_p", 16);
+            ex.gpu->writeBuffer(paramBuf, params, 16);
+
+            const char* kernelName = isF16 ? "concat_2input_f16" : "concat_2input_f32";
+            const char* kernelSrc = isF16 ? WGSL_CONCAT_2INPUT_F16 : WGSL_CONCAT_2INPUT_F32;
+            auto& pl = ex.GetPipeline(kernelName, kernelSrc, 4);
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, gpuIn[0]->buffer}, {1, gpuIn[1]->buffer},
+                {2, out[0]->buffer}, {3, paramBuf}});
+            uint32_t dispatchN = isF16 ? (uint32_t)(((outNel + 1) / 2 + 255) / 256)
+                                       : (uint32_t)((outNel + 255) / 256);
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                dispatchN, 1, 1, isF16 ? "concat_f16" : "concat_f32"});
+            return;
+        }
+        // CPU fallback for non-axis-0 concat
         // Read all inputs, interleave on CPU, upload result.
         {
             int64_t outNel = 1;
@@ -1419,9 +1446,26 @@ static void opSplit(GraphExecutor& ex, const OnnxGraphNode& n,
         }
         offset += splits[i];
     }
-    // Flush copies so downstream dispatch-based ops can read the split outputs
-    if (!ex.pendingCopies_.empty())
-        ex.FlushPendingWork();
+    // Submit pending copies so downstream dispatch-based ops see them.
+    // WebGPU guarantees ordering within the same queue, so we submit without waiting.
+    if (!ex.pendingCopies_.empty()) {
+        // First submit any pending dispatches (they must complete before copies read their outputs)
+        if (!ex.pendingDispatches_.empty()) {
+            ex.gpu->submitOnly(ex.pendingDispatches_, false);
+            ex.pendingDispatches_.clear();
+        }
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(ex.gpu->device, &enD);
+        for (auto& c : ex.pendingCopies_)
+            wgpuCommandEncoderCopyBufferToBuffer(enc,
+                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+        WGPUCommandBufferDescriptor cbD{};
+        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuQueueSubmit(ex.gpu->queue, 1, &cb);
+        wgpuCommandBufferRelease(cb);
+        wgpuCommandEncoderRelease(enc);
+        ex.pendingCopies_.clear();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

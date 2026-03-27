@@ -3773,24 +3773,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let N = _params_[1];
     let K = _params_[2];
     let blocks_per_col = K / 32u;
-    
+
     let n = gid.x;
     let m = gid.y;
     if (n >= N || m >= M) { return; }
-    
+
     var acc: f32 = 0.0;
     let a_base = m * K;
     let w_base = n * (K / 2u);
-    
+
     for (var blk = 0u; blk < blocks_per_col; blk++) {
         let scale_flat = n * blocks_per_col + blk;
         let scale_u32 = Scales[scale_flat / 2u];
         let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
         let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
-        
+
         let k_base = blk * 32u;
         let w_blk_base = w_base + k_base / 2u;
-        
+
         for (var j = 0u; j < 16u; j++) {
             let byte_idx = w_blk_base + j;
             let byte_u32 = B[byte_idx / 4u];
@@ -3801,7 +3801,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc += A[a_base + k_base + j * 2u + 1u] * hi * scale;
         }
     }
-    
+
     Y[m * N + n] = acc;
 }
 )WGSL";
@@ -3823,29 +3823,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let N = _params_[1];
     let K = _params_[2];
     let blocks_per_col = K / 32u;
-    
+
     let n = gid.x;
     let m = gid.y;
     if (n >= N || m >= M) { return; }
-    
+
     var acc: f32 = 0.0;
     let a_base = m * K;
     let w_base = n * (K / 2u);
-    
+
     for (var blk = 0u; blk < blocks_per_col; blk++) {
         let scale_flat = n * blocks_per_col + blk;
         let scale_u32 = Scales[scale_flat / 2u];
         let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
         let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
-        
+
         // Zero point
         let zp_byte_idx = scale_flat / 2u;
         let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
         let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
-        
+
         let k_base = blk * 32u;
         let w_blk_base = w_base + k_base / 2u;
-        
+
         for (var j = 0u; j < 16u; j++) {
             let byte_idx = w_blk_base + j;
             let byte_u32 = B[byte_idx / 4u];
@@ -3856,7 +3856,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc += A[a_base + k_base + j * 2u + 1u] * hi * scale;
         }
     }
-    
+
     Y[m * N + n] = acc;
 }
 )WGSL";
@@ -4245,6 +4245,148 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     Out[q_base + d] = acc;
+}
+)WGSL";
+
+// [attn] rope_inplace — Apply rotary position embeddings in-place on f32 data.
+// Input/Output: [batch, seq, num_heads * head_dim]  (Q or K, single buffer read_write)
+// cos_cache, sin_cache: [max_pos, rotary_dim/2]
+// Params: [0]=num_heads, [1]=head_dim, [2]=rotary_dim, [3]=position_offset
+// Dispatch: (ceil(num_heads/1), 1, 1) — one thread per head
+static const char* WGSL_ROPE_INPLACE = R"WGSL(
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<storage, read> cos_cache: array<f32>;
+@group(0) @binding(2) var<storage, read> sin_cache: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let num_heads = _params_[0];
+    let head_dim = _params_[1];
+    let rotary_dim = _params_[2];
+    let pos = _params_[3];
+
+    let h = gid.x;
+    if (h >= num_heads) { return; }
+
+    let half_rot = rotary_dim / 2u;
+    let head_base = h * head_dim;
+    let cache_base = pos * half_rot;
+
+    for (var d = 0u; d < half_rot; d++) {
+        let cos_val = cos_cache[cache_base + d];
+        let sin_val = sin_cache[cache_base + d];
+        let x0 = data[head_base + d];
+        let x1 = data[head_base + half_rot + d];
+        data[head_base + d] = x0 * cos_val - x1 * sin_val;
+        data[head_base + half_rot + d] = x1 * cos_val + x0 * sin_val;
+    }
+}
+)WGSL";
+
+// [attn] kv_cache_append — Copy new K or V into present_key/value at position offset.
+// new_kv: [batch, 1, kv_heads * head_dim]  (f32, from current step)
+// present: [batch, kv_heads, total_seq, head_dim]  (f32, output = past + new)
+// past: [batch, kv_heads, past_seq, head_dim]  (f32, input)
+// Params: [0]=kv_heads, [1]=head_dim, [2]=past_seq, [3]=total_seq
+// Dispatch: (ceil(kv_heads * head_dim / 256), 1, 1)
+static const char* WGSL_KV_CACHE_APPEND = R"WGSL(
+@group(0) @binding(0) var<storage, read> new_kv: array<f32>;
+@group(0) @binding(1) var<storage, read> past: array<f32>;
+@group(0) @binding(2) var<storage, read_write> present: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let kv_heads = _params_[0];
+    let head_dim = _params_[1];
+    let past_seq = _params_[2];
+    let total_seq = _params_[3];
+
+    let flat = gid.x;
+    let total_elems = kv_heads * head_dim;
+    if (flat >= total_elems) { return; }
+
+    let h = flat / head_dim;
+    let d = flat % head_dim;
+
+    // Copy past values: present[h, 0..past_seq-1, d] = past[h, 0..past_seq-1, d]
+    for (var s = 0u; s < past_seq; s++) {
+        present[(h * total_seq + s) * head_dim + d] = past[(h * past_seq + s) * head_dim + d];
+    }
+
+    // Append new value: present[h, past_seq, d] = new_kv[h * head_dim + d]
+    present[(h * total_seq + past_seq) * head_dim + d] = new_kv[h * head_dim + d];
+}
+)WGSL";
+
+// [attn] gqa_decode — GQA decode: single query attending to all KV cache entries.
+// Q: [num_heads * head_dim]  (f32, single token)
+// K: [kv_heads, total_seq, head_dim]  (f32)
+// V: [kv_heads, total_seq, head_dim]  (f32)
+// Out: [num_heads * head_dim]  (f32)
+// Params: [0]=num_heads, [1]=head_dim, [2]=total_seq, [3]=kv_heads, [4]=scale_u32
+// One workgroup per Q head. Each thread in the workgroup handles one output dim.
+// Dispatch: (1, num_heads, 1)
+static const char* WGSL_GQA_DECODE = R"WGSL(
+@group(0) @binding(0) var<storage, read> Q: array<f32>;
+@group(0) @binding(1) var<storage, read> K: array<f32>;
+@group(0) @binding(2) var<storage, read> V: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let num_heads = _params_[0];
+    let head_dim = _params_[1];
+    let total_seq = _params_[2];
+    let kv_heads = _params_[3];
+    let scale = bitcast<f32>(_params_[4]);
+
+    let h = wid.y;  // Q head index
+    if (h >= num_heads) { return; }
+
+    let kv_h = h / (num_heads / kv_heads);  // map Q head to KV head
+    let q_base = h * head_dim;
+
+    // Each thread handles multiple output dimensions
+    let d_start = lid.x;
+
+    // Online softmax: iterate over all KV positions
+    var m_prev: f32 = -1e30;
+    var l_prev: f32 = 0.0;
+    var acc: f32 = 0.0;
+
+    for (var s = 0u; s < total_seq; s++) {
+        let k_base = (kv_h * total_seq + s) * head_dim;
+
+        // Compute Q·K score (full dot product in each thread — head_dim is small, 64)
+        var score: f32 = 0.0;
+        for (var dd = 0u; dd < head_dim; dd++) {
+            score += Q[q_base + dd] * K[k_base + dd];
+        }
+        score *= scale;
+
+        // Online softmax
+        let m_new = max(m_prev, score);
+        let exp_prev = exp(m_prev - m_new);
+        let exp_score = exp(score - m_new);
+        let l_new = l_prev * exp_prev + exp_score;
+
+        let rescale = l_prev * exp_prev / max(l_new, 1e-10);
+        let w = exp_score / max(l_new, 1e-10);
+
+        let v_base = (kv_h * total_seq + s) * head_dim;
+        acc = acc * rescale + w * V[v_base + d_start];
+
+        m_prev = m_new;
+        l_prev = l_new;
+    }
+
+    if (d_start < head_dim) {
+        Out[q_base + d_start] = acc;
+    }
 }
 )WGSL";
 
@@ -6912,7 +7054,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // [moe] swiglu_fused (3 bindings, hand)
 // SwiGLU activation: out[i] = silu(gate[i]) * up[i]
-// Input is [N*2] where first half is gate, second half is up.
+// Input is [N*2] with interleaved layout: [gate[0], up[0], gate[1], up[1], ...]
 // Output is [N].
 // Params: [0]=N (half_size = moe_intermediate_size)
 // Dispatch: (ceil(N/256), 1, 1)
@@ -6926,8 +7068,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let N = _params_[0];
     let idx = gid.x;
     if (idx >= N) { return; }
-    let gate = gate_up[idx];
-    let up = gate_up[N + idx];
+    let gate = gate_up[idx * 2u];
+    let up = gate_up[idx * 2u + 1u];
     let silu = gate / (1.0 + exp(-gate));
     output[idx] = silu * up;
 }
@@ -6949,6 +7091,118 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= N) { return; }
     let weight = bitcast<f32>(_params_[1]);
     dst[idx] = dst[idx] + weight * src[idx];
+}
+)WGSL";
+
+// [shape] concat_2input_f16 — GPU concat of 2 inputs along any axis.
+// Works on fp16 data using u32 element access (2 fp16 per u32).
+// Params: [0]=total_elements (in fp16 units), [1]=axis_dim_A (A's size along concat axis),
+//         [2]=axis_dim_out (total output size along concat axis),
+//         [3]=inner_size (product of dims after concat axis)
+// Dispatch: ceil(total_elements / 512)  (each thread handles 2 fp16 via u32)
+static const char* WGSL_CONCAT_2INPUT_F16 = R"WGSL(
+@group(0) @binding(0) var<storage, read> A: array<u32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<u32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total_u32 = (_params_[0] + 1u) / 2u;  // total in u32 units
+    let idx = gid.x;
+    if (idx >= total_u32) { return; }
+
+    let total_fp16 = _params_[0];
+    let axis_dim_a = _params_[1];
+    let axis_dim_out = _params_[2];
+    let inner = _params_[3];
+
+    // Process 2 fp16 elements per u32
+    let fp16_idx_0 = idx * 2u;
+    let fp16_idx_1 = fp16_idx_0 + 1u;
+
+    var result: u32 = 0u;
+
+    // Element 0 (low 16 bits)
+    if (fp16_idx_0 < total_fp16) {
+        let flat = fp16_idx_0;
+        let outer_idx = flat / (axis_dim_out * inner);
+        let rem = flat % (axis_dim_out * inner);
+        let axis_idx = rem / inner;
+        let inner_idx = rem % inner;
+
+        if (axis_idx < axis_dim_a) {
+            let src_flat = (outer_idx * axis_dim_a + axis_idx) * inner + inner_idx;
+            let src_u32 = A[src_flat / 2u];
+            result = select(src_u32 & 0xFFFFu, (src_u32 >> 16u) & 0xFFFFu, (src_flat & 1u) != 0u);
+        } else {
+            let b_axis = axis_idx - axis_dim_a;
+            let b_dim = axis_dim_out - axis_dim_a;
+            let src_flat = (outer_idx * b_dim + b_axis) * inner + inner_idx;
+            let src_u32 = B[src_flat / 2u];
+            result = select(src_u32 & 0xFFFFu, (src_u32 >> 16u) & 0xFFFFu, (src_flat & 1u) != 0u);
+        }
+    }
+
+    // Element 1 (high 16 bits)
+    if (fp16_idx_1 < total_fp16) {
+        let flat = fp16_idx_1;
+        let outer_idx = flat / (axis_dim_out * inner);
+        let rem = flat % (axis_dim_out * inner);
+        let axis_idx = rem / inner;
+        let inner_idx = rem % inner;
+
+        var hi: u32 = 0u;
+        if (axis_idx < axis_dim_a) {
+            let src_flat = (outer_idx * axis_dim_a + axis_idx) * inner + inner_idx;
+            let src_u32 = A[src_flat / 2u];
+            hi = select(src_u32 & 0xFFFFu, (src_u32 >> 16u) & 0xFFFFu, (src_flat & 1u) != 0u);
+        } else {
+            let b_axis = axis_idx - axis_dim_a;
+            let b_dim = axis_dim_out - axis_dim_a;
+            let src_flat = (outer_idx * b_dim + b_axis) * inner + inner_idx;
+            let src_u32 = B[src_flat / 2u];
+            hi = select(src_u32 & 0xFFFFu, (src_u32 >> 16u) & 0xFFFFu, (src_flat & 1u) != 0u);
+        }
+        result = result | (hi << 16u);
+    }
+
+    Out[idx] = result;
+}
+)WGSL";
+
+// [shape] concat_2input_f32 — GPU concat of 2 f32 inputs along any axis.
+// Params: [0]=total_elements, [1]=axis_dim_A, [2]=axis_dim_out, [3]=inner_size
+// Dispatch: ceil(total_elements / 256)
+static const char* WGSL_CONCAT_2INPUT_F32 = R"WGSL(
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = _params_[0];
+    let axis_dim_a = _params_[1];
+    let axis_dim_out = _params_[2];
+    let inner = _params_[3];
+    let idx = gid.x;
+    if (idx >= total) { return; }
+
+    let outer_idx = idx / (axis_dim_out * inner);
+    let rem = idx % (axis_dim_out * inner);
+    let axis_idx = rem / inner;
+    let inner_idx = rem % inner;
+
+    if (axis_idx < axis_dim_a) {
+        let src = (outer_idx * axis_dim_a + axis_idx) * inner + inner_idx;
+        Out[idx] = A[src];
+    } else {
+        let b_axis = axis_idx - axis_dim_a;
+        let b_dim = axis_dim_out - axis_dim_a;
+        let src = (outer_idx * b_dim + b_axis) * inner + inner_idx;
+        Out[idx] = B[src];
+    }
 }
 )WGSL";
 

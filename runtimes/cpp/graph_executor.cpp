@@ -7,6 +7,8 @@
 
 #include "graph_executor.h"
 #include "wgsl_shaders.h"
+#include "clock_calibration.h"
+#include "profile_html.h"
 
 #include <algorithm>
 #include <chrono>
@@ -888,7 +890,11 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
 
 void GraphExecutor::FlushPendingWork() {
     if (!pendingDispatches_.empty()) {
-        gpu->submitOnly(pendingDispatches_, false);
+        if (gpuProfiler && gpuProfiler->enabled()) {
+            gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
+        } else {
+            gpu->submitOnly(pendingDispatches_, false);
+        }
         pendingDispatches_.clear();
     }
     if (!pendingCopies_.empty()) {
@@ -903,6 +909,10 @@ void GraphExecutor::FlushPendingWork() {
         wgpuCommandBufferRelease(cb);
         wgpuCommandEncoderRelease(enc);
         pendingCopies_.clear();
+    }
+    flushCount_++;
+    if (profilingEnabled) {
+        flushSources_[g_currentOpLabel]++;
     }
     gpu->waitForQueue();
 }
@@ -1153,23 +1163,44 @@ void GraphExecutor::Execute(
                 g_currentOpLabel += node.name;
             }
             g_currentOp = g_currentOpLabel.c_str();
-            opIt->second(*this, node, inTensors, outTensors);
 
-            bool cachedSmallIntOutput = false;
-            for (auto* outTensor : outTensors) {
-                if (!outTensor || !outTensor->buffer.handle || !outTensor->cpuData.empty()) continue;
-                if (outTensor->dtype != TensorDtype::Int64 && outTensor->dtype != TensorDtype::Int32) continue;
-                int64_t nel = outTensor->ElementCount();
-                if (nel <= 0 || nel > 1024) continue;
-                if (!cachedSmallIntOutput) {
-                    FlushPendingWork();
-                    cachedSmallIntOutput = true;
-                }
-                size_t bytes = (size_t)nel * outTensor->DtypeSize();
-                auto rb = gpu->readBuffer(outTensor->buffer, bytes);
-                if (rb.size() >= bytes) {
-                    outTensor->cpuData.resize(bytes);
-                    memcpy(outTensor->cpuData.data(), rb.data(), bytes);
+            auto opT0 = profilingEnabled ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+            opIt->second(*this, node, inTensors, outTensors);
+            if (profilingEnabled) {
+                // Include GPU sync in the op time if the op flushed
+                auto opT1 = std::chrono::steady_clock::now();
+                double opMs = std::chrono::duration<double, std::milli>(opT1 - opT0).count();
+                profileData_[node.opType] += opMs;
+                profileCounts_[node.opType]++;
+            }
+
+            // Cache small int outputs to CPU for downstream metadata ops.
+            // Skip for ops whose int outputs are consumed purely by GPU kernels.
+            {
+                bool isCpuIntConsumer = true;
+                // TopK indices go to GPU GatherElements/ScatterElements — skip readback
+                if (node.opType == "TopK") isCpuIntConsumer = false;
+
+                if (isCpuIntConsumer) {
+                    bool flushed = false;
+                    for (auto* outTensor : outTensors) {
+                        if (!outTensor || !outTensor->buffer.handle || !outTensor->cpuData.empty()) continue;
+                        if (outTensor->dtype != TensorDtype::Int64 && outTensor->dtype != TensorDtype::Int32) continue;
+                        int64_t nel = outTensor->ElementCount();
+                        if (nel <= 0 || nel > 1024) continue;
+                        if (!flushed) {
+                            FlushPendingWork();
+                            flushed = true;
+                            intReadbackSyncs_++;
+                        }
+                        size_t bytes = (size_t)nel * outTensor->DtypeSize();
+                        auto rb = gpu->readBuffer(outTensor->buffer, bytes);
+                        if (rb.size() >= bytes) {
+                            outTensor->cpuData.resize(bytes);
+                            memcpy(outTensor->cpuData.data(), rb.data(), bytes);
+                        }
+                    }
                 }
             }
             executed++;
@@ -1280,8 +1311,12 @@ void GraphExecutor::Execute(
             if (pendingDispatches_.size() + pendingCopies_.size() >= 64) {
                 totalDispatches += (int)pendingDispatches_.size();
                 totalCopies += (int)pendingCopies_.size();
-                if (!pendingDispatches_.empty())
-                    gpu->submitOnly(pendingDispatches_, true);
+                if (!pendingDispatches_.empty()) {
+                    if (gpuProfiler && gpuProfiler->enabled())
+                        gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
+                    else
+                        gpu->submitOnly(pendingDispatches_, true);
+                }
                 if (!pendingCopies_.empty()) {
                     WGPUCommandEncoderDescriptor enD{};
                     auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
@@ -1332,12 +1367,17 @@ void GraphExecutor::Execute(
 
     totalDispatches += (int)pendingDispatches_.size();
     totalCopies += (int)pendingCopies_.size();
-    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies\n",
-            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies);
+    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback)\n",
+            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, intReadbackSyncs_);
+    flushCount_ = 0;
+    intReadbackSyncs_ = 0;
 
     // Submit all remaining batched GPU work
     if (!pendingDispatches_.empty()) {
-        gpu->submitOnly(pendingDispatches_, true);  // single pass for perf
+        if (gpuProfiler && gpuProfiler->enabled())
+            gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
+        else
+            gpu->submitOnly(pendingDispatches_, true);
         pendingDispatches_.clear();
     }
     if (!pendingCopies_.empty()) {
@@ -1396,4 +1436,153 @@ void GraphExecutor::Execute(
             it->second.isCpuOnly = saved.isCpuOnly;
         }
     }
+
+    // Print profiling report
+    if (profilingEnabled && !profileData_.empty()) {
+        double totalMs = 0;
+        for (auto& [op, ms] : profileData_) totalMs += ms;
+
+        // Sort by time descending
+        std::vector<std::pair<std::string, double>> sorted(profileData_.begin(), profileData_.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        fprintf(stderr, "\n  ┌─ Profile (%d ops, %.1fms total) ─────────────────────┐\n",
+                executed, totalMs);
+        fprintf(stderr, "  │ %-25s %7s %5s %7s │\n", "Op", "ms", "cnt", "%");
+        fprintf(stderr, "  ├───────────────────────────────────────────────────────┤\n");
+        for (auto& [op, ms] : sorted) {
+            int cnt = profileCounts_[op];
+            double pct = totalMs > 0 ? 100.0 * ms / totalMs : 0;
+            fprintf(stderr, "  │ %-25s %7.1f %5d %6.1f%% │\n", op.c_str(), ms, cnt, pct);
+        }
+        fprintf(stderr, "  └───────────────────────────────────────────────────────┘\n");
+        fflush(stderr);
+        profileData_.clear();
+        profileCounts_.clear();
+
+        // Print sync sources
+        if (!flushSources_.empty()) {
+            std::vector<std::pair<std::string, int>> sortedSync(flushSources_.begin(), flushSources_.end());
+            std::sort(sortedSync.begin(), sortedSync.end(),
+                      [](auto& a, auto& b) { return a.second > b.second; });
+            fprintf(stderr, "\n  GPU syncs (%d total):\n", flushCount_);
+            for (auto& [op, cnt] : sortedSync) {
+                fprintf(stderr, "    %-40s %d\n", op.c_str(), cnt);
+            }
+            flushSources_.clear();
+        }
+    }
+}
+
+// ─── GPU Hardware Timestamp Profiling ────────────────────────────────────────
+
+void GraphExecutor::enableGpuProfiling() {
+    if (!gpu || !gpu->supportsTimestampQuery) {
+        fprintf(stderr, "GPU timestamp queries not supported\n");
+        return;
+    }
+    gpuProfiler = new GPUProfiler();
+    if (!gpuProfiler->init(gpu->device, gpu->instance, gpu->queue)) {
+        fprintf(stderr, "Failed to init GPU profiler\n");
+        delete gpuProfiler;
+        gpuProfiler = nullptr;
+        return;
+    }
+    auto cal = acquireClockCalibration(gpu->device, gpu->backendType);
+    if (cal.valid) {
+        clockCalibration = new ClockCalibration(cal);
+    }
+}
+
+void GraphExecutor::printGpuProfileReport(int nDecodeTokens, double decodeMs,
+                                           const std::string& htmlPath) {
+    if (!gpuProfiler || !gpuProfiler->enabled() || gpuProfiler->nextIndex == 0) {
+        fprintf(stderr, "No GPU profile data\n");
+        return;
+    }
+
+    // Resolve timestamps
+    {
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+        gpuProfiler->resolveAndReport(enc);
+        WGPUCommandBufferDescriptor cbD{};
+        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        wgpuCommandBufferRelease(cb);
+        wgpuCommandEncoderRelease(enc);
+    }
+    gpu->waitForQueue();
+
+    // Map readback buffer
+    uint32_t count = gpuProfiler->nextIndex;
+    uint64_t readSize = count * 8;
+    struct { bool done; uint32_t status; } ms{false, 0};
+    WGPUBufferMapCallbackInfo mcb{};
+    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
+    mcb.callback = [](WGPUMapAsyncStatus s, WGPUStringView, void* u, void*) {
+        auto* p = static_cast<decltype(&ms)>(u);
+        p->done = true; p->status = s;
+    };
+    mcb.userdata1 = &ms;
+    auto mf = wgpuBufferMapAsync(gpuProfiler->readbackBuf, 1, 0, readSize, mcb);
+    WGPUFutureWaitInfo mw{mf, 0};
+    wgpuInstanceWaitAny(gpu->instance, 1, &mw, UINT64_MAX);
+
+    if (ms.status != 1) {
+        fprintf(stderr, "Failed to map profiler readback buffer\n");
+        return;
+    }
+
+    auto ptr = (const uint64_t*)wgpuBufferGetConstMappedRange(
+        gpuProfiler->readbackBuf, 0, readSize);
+
+    // Aggregate by kernel name
+    struct AggEntry { double totalUs = 0; uint32_t count = 0; };
+    std::unordered_map<std::string, AggEntry> agg;
+    double totalGpuUs = 0;
+    for (auto& e : gpuProfiler->entries) {
+        uint64_t begin = ptr[e.beginIdx], end = ptr[e.endIdx];
+        if (end <= begin || begin == 0) continue;
+        double durUs = (double)(end - begin) / 1000.0;
+        agg[e.name].totalUs += durUs;
+        agg[e.name].count++;
+        totalGpuUs += durUs;
+    }
+
+    std::vector<std::pair<std::string, AggEntry>> sorted(agg.begin(), agg.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](auto& a, auto& b) { return a.second.totalUs > b.second.totalUs; });
+
+    fprintf(stderr, "\n--- GPU Profile (hardware timestamps, %d dispatches) ---\n",
+            (int)gpuProfiler->entries.size());
+    fprintf(stderr, "%-25s %10s %6s %10s %6s\n",
+            "Kernel", "Total(ms)", "Count", "Avg(us)", "%%");
+    fprintf(stderr, "%-25s %10s %6s %10s %6s\n",
+            "-------------------------", "----------", "------", "----------", "------");
+    for (auto& [name, e] : sorted) {
+        double totalMs = e.totalUs / 1000.0;
+        double avgUs = e.totalUs / e.count;
+        double pct = totalGpuUs > 0 ? e.totalUs / totalGpuUs * 100.0 : 0;
+        fprintf(stderr, "%-25s %10.2f %6u %10.1f %5.1f%%\n",
+                name.c_str(), totalMs, e.count, avgUs, pct);
+    }
+    double totalGpuMs = totalGpuUs / 1000.0;
+    double cpuMs = decodeMs / std::max(1, nDecodeTokens);
+    fprintf(stderr, "%-25s %10.2f\n", "GPU TOTAL", totalGpuMs);
+    fprintf(stderr, "\nGPU HW time: %.1fms/tok   CPU wall time: %.1fms/tok   Bubble: %.0f%%\n",
+            totalGpuMs / std::max(1, nDecodeTokens), cpuMs,
+            cpuMs > 0 ? (1.0 - totalGpuMs / std::max(1, nDecodeTokens) / cpuMs) * 100 : 0);
+
+    // Generate HTML timeline
+    generateProfileHTML(*gpu, *gpuProfiler, clockCalibration, ptr,
+                        nDecodeTokens, 0, 0, decodeMs, htmlPath);
+    fprintf(stderr, "Profile HTML: %s\n", htmlPath.c_str());
+
+    wgpuBufferUnmap(gpuProfiler->readbackBuf);
+    gpuProfiler->destroy();
+    delete gpuProfiler;
+    gpuProfiler = nullptr;
+    if (clockCalibration) { delete clockCalibration; clockCalibration = nullptr; }
 }

@@ -148,6 +148,23 @@ public:
         const std::unordered_map<std::string, GpuTensor*>& inputs,
         std::unordered_map<std::string, GpuTensor*>& outputs);
 
+    /// Enable per-op profiling. Call before Execute(). Results printed to stderr.
+    bool profilingEnabled = false;
+
+    /// GPU hardware timestamp profiler (owned, optional).
+    /// Call enableGpuProfiling() to activate. After Execute(), call
+    /// printGpuProfileReport() to read timestamps and generate HTML.
+    GPUProfiler* gpuProfiler = nullptr;
+    struct ClockCalibration* clockCalibration = nullptr;
+
+    /// Enable GPU hardware timestamp profiling. Creates query sets.
+    void enableGpuProfiling();
+
+    /// Read back GPU timestamps, print report, generate HTML timeline.
+    /// Call after all profiled Execute() runs are done.
+    void printGpuProfileReport(int nDecodeTokens, double decodeMs,
+                               const std::string& htmlPath = "profile.html");
+
     /// Get graph metadata.
     const OnnxGraph& GetGraph() const { return graph_; }
 
@@ -219,6 +236,16 @@ public:
     std::vector<Dispatch> pendingDispatches_;
     struct PendingCopy { GPUBuffer src; uint64_t srcOff; GPUBuffer dst; uint64_t dstOff; uint64_t size; };
     std::vector<PendingCopy> pendingCopies_;
+
+    // Deferred int readbacks — flushed at periodic sync or when needed
+    std::vector<GpuTensor*> pendingIntReadbacks_;
+
+    // Profiling accumulators (per op-type, in ms)
+    std::unordered_map<std::string, double> profileData_;
+    std::unordered_map<std::string, int> profileCounts_;
+    int flushCount_ = 0;  // GPU sync count per Execute
+    int intReadbackSyncs_ = 0;  // syncs from int readback only
+    std::unordered_map<std::string, int> flushSources_;  // sync count by op
 
 private:
 

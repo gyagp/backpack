@@ -470,6 +470,9 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), zeros.size() * sizeof(float));
     }
 
+    // Use the validated MATMUL_Q4 kernel (5 bindings) for each expert,
+    // with buffer offsets for expert weight/scale selection.
+
     // Scratch buffers for intermediate results (reused across experts)
     GpuTensor gateUpBuf = ex.AllocTensor({N_gu}, TensorDtype::Float32);
     GpuTensor intermediateBuf = ex.AllocTensor({moeIntermediate}, TensorDtype::Float32);
@@ -486,6 +489,11 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             }
         }
 
+        // Router weights are ln(sigmoid(logits)) — exponentiate to get sigmoid values
+        for (auto& ae : activeExperts) {
+            ae.weight = std::exp(ae.weight);
+        }
+
         if (normRouting && !activeExperts.empty()) {
             float sum = 0.0f;
             for (auto& ae : activeExperts) sum += ae.weight;
@@ -494,31 +502,57 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             }
         }
 
-        GPUBuffer inputBuf = input->buffer;
         GPUBuffer outputBuf = out[0]->buffer;
 
         for (auto& ae : activeExperts) {
             uint32_t expertIdx = (uint32_t)ae.idx;
 
-            // Step 1: Gate-up Q4 matmul
+            // Expert weight/scale offsets
+            size_t gu_w_offset = (size_t)expertIdx * N_gu * (hiddenSize / 2);
+            size_t gu_s_offset = (size_t)expertIdx * N_gu * blocksPerCol_gu * 2;  // fp16 = 2 bytes
+            size_t dn_w_offset = (size_t)expertIdx * N_dn * (moeIntermediate / 2);
+            size_t dn_s_offset = (size_t)expertIdx * N_dn * blocksPerCol_dn * 2;
+
+            size_t gu_w_size = (size_t)N_gu * (hiddenSize / 2);
+            size_t gu_s_size = (size_t)N_gu * blocksPerCol_gu * 2;
+            size_t dn_w_size = (size_t)N_dn * (moeIntermediate / 2);
+            size_t dn_s_size = (size_t)N_dn * blocksPerCol_dn * 2;
+
+            // Align offsets to 256 bytes (WebGPU requirement for storage buffers)
+            // Since expert * N * K/2 with N=3584, K/2=1024 → expert*3670016 → ≡ 0 mod 256 ✓
+
+            // Step 1: Gate-up Q4 matmul using MATMUL_Q4 with buffer offset
             {
-                uint32_t params[4] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
-                                       expertIdx, (uint32_t)blocksPerCol_gu};
+                uint32_t params[4] = {1, (uint32_t)N_gu, (uint32_t)hiddenSize, 0};
                 auto paramBuf = ex.gpu->createBuffer("qmoe_gu_p", 16);
                 ex.gpu->writeBuffer(paramBuf, params, 16);
-                auto params2Buf = ex.gpu->createBuffer("qmoe_gu_p2", 16);
-                uint32_t z[4] = {};
-                ex.gpu->writeBuffer(params2Buf, z, 16);
 
-                auto& pl = ex.GetPipeline("qmoe_matmul_q4", WGSL_QMOE_MATMUL_Q4, 6);
-                auto bg = ex.MakeBindGroup(pl, {
-                    {0, inputBuf}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
-                    {3, gateUpBuf.buffer}, {4, paramBuf}, {5, params2Buf}});
+                auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
+
+                // Create bind group with buffer offsets for expert weights
+                WGPUBindGroupEntry entries[5];
+                memset(entries, 0, sizeof(entries));
+                entries[0] = {/*.nextInChain=*/nullptr, /*.binding=*/0, /*.buffer=*/input->buffer.handle,
+                              /*.offset=*/0, /*.size=*/input->buffer.size};
+                entries[1] = {nullptr, 1, gateUpW->buffer.handle,
+                              gu_w_offset, gu_w_size};
+                entries[2] = {nullptr, 2, gateUpS->buffer.handle,
+                              gu_s_offset, gu_s_size};
+                entries[3] = {nullptr, 3, gateUpBuf.buffer.handle,
+                              0, gateUpBuf.buffer.size};
+                entries[4] = {nullptr, 4, paramBuf.handle,
+                              0, paramBuf.size};
+                WGPUBindGroupDescriptor bgd{};
+                bgd.layout = pl.bgLayout;
+                bgd.entryCount = 5;
+                bgd.entries = entries;
+                auto bg = wgpuDeviceCreateBindGroup(ex.gpu->device, &bgd);
+
                 ex.pendingDispatches_.push_back({pl.pipeline, bg,
                     (uint32_t)((N_gu + 255) / 256), 1, 1, "qmoe_gateup"});
             }
 
-            // Step 2: SwiGLU
+            // Step 2: SwiGLU (interleaved layout)
             {
                 uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
                 auto paramBuf = ex.gpu->createBuffer("qmoe_sg_p", 16);
@@ -531,20 +565,32 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                     (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "qmoe_swiglu"});
             }
 
-            // Step 3: Down Q4 matmul
+            // Step 3: Down Q4 matmul using MATMUL_Q4 with buffer offset
             {
-                uint32_t params[4] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
-                                       expertIdx, (uint32_t)blocksPerCol_dn};
+                uint32_t params[4] = {1, (uint32_t)N_dn, (uint32_t)moeIntermediate, 0};
                 auto paramBuf = ex.gpu->createBuffer("qmoe_dn_p", 16);
                 ex.gpu->writeBuffer(paramBuf, params, 16);
-                auto params2Buf = ex.gpu->createBuffer("qmoe_dn_p2", 16);
-                uint32_t z[4] = {};
-                ex.gpu->writeBuffer(params2Buf, z, 16);
 
-                auto& pl = ex.GetPipeline("qmoe_matmul_q4", WGSL_QMOE_MATMUL_Q4, 6);
-                auto bg = ex.MakeBindGroup(pl, {
-                    {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
-                    {3, downBuf.buffer}, {4, paramBuf}, {5, params2Buf}});
+                auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
+
+                WGPUBindGroupEntry entries[5];
+                memset(entries, 0, sizeof(entries));
+                entries[0] = {nullptr, 0, intermediateBuf.buffer.handle,
+                              0, intermediateBuf.buffer.size};
+                entries[1] = {nullptr, 1, downW->buffer.handle,
+                              dn_w_offset, dn_w_size};
+                entries[2] = {nullptr, 2, downS->buffer.handle,
+                              dn_s_offset, dn_s_size};
+                entries[3] = {nullptr, 3, downBuf.buffer.handle,
+                              0, downBuf.buffer.size};
+                entries[4] = {nullptr, 4, paramBuf.handle,
+                              0, paramBuf.size};
+                WGPUBindGroupDescriptor bgd{};
+                bgd.layout = pl.bgLayout;
+                bgd.entryCount = 5;
+                bgd.entries = entries;
+                auto bg = wgpuDeviceCreateBindGroup(ex.gpu->device, &bgd);
+
                 ex.pendingDispatches_.push_back({pl.pipeline, bg,
                     (uint32_t)((N_dn + 255) / 256), 1, 1, "qmoe_down"});
             }

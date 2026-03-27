@@ -122,6 +122,8 @@ static std::string applyChatTemplate(const std::string& message,
     if (arch.find("qwen3") != std::string::npos)
         return "<|im_start|>user\n" + message + "<|im_end|>\n"
                "<|im_start|>assistant\n<think>\n</think>\n";
+    if (arch.find("lfm2") != std::string::npos)
+        return "<|startoftext|><|im_start|>user\n" + message + "<|im_end|>\n<|im_start|>assistant\n";
     return "<|im_start|>user\n" + message + "<|im_end|>\n<|im_start|>assistant\n";
 }
 
@@ -307,16 +309,69 @@ struct OnnxLlmContext {
 
         executor.Execute(inputs, outputs);
 
-        // Update caches
+        // Update caches — conv state must be fp16 (model expects Float16 inputs)
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
-            if (convOuts[i].IsValid()) convState[inName] = convOuts[i];
+            if (!convOuts[i].IsValid()) continue;
+            // The internal Concat may produce f32 output; convert back to fp16
+            if (convOuts[i].dtype == TensorDtype::Float32) {
+                int64_t nel = convOuts[i].ElementCount();
+                auto rb = gpu->readBuffer(convOuts[i].buffer, nel * 4);
+                auto* f32 = reinterpret_cast<const float*>(rb.data());
+                std::vector<uint16_t> fp16(nel);
+                for (int64_t j = 0; j < nel; j++) {
+                    // f32 → fp16 conversion
+                    uint32_t bits;
+                    memcpy(&bits, &f32[j], 4);
+                    uint32_t sign = (bits >> 16) & 0x8000;
+                    int32_t exp = ((bits >> 23) & 0xFF) - 127;
+                    uint32_t mant = bits & 0x7FFFFF;
+                    if (exp > 15) fp16[j] = (uint16_t)(sign | 0x7C00);        // inf/overflow
+                    else if (exp < -14) fp16[j] = (uint16_t)sign;              // underflow → 0
+                    else fp16[j] = (uint16_t)(sign | ((exp + 15) << 10) | (mant >> 13));
+                }
+                GpuTensor t;
+                t.shape = convOuts[i].shape;
+                t.dtype = TensorDtype::Float16;
+                t.buffer = gpu->createBuffer(inName, nel * 2);
+                gpu->writeBuffer(t.buffer, fp16.data(), nel * 2);
+                convState[inName] = t;
+            } else {
+                convState[inName] = convOuts[i];
+            }
         }
+        // KV cache — also ensure fp16
         for (size_t i = 0; i < attnLayerIndices.size(); i++) {
             std::string kIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".key";
             std::string vIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".value";
-            if (kvOuts[i*2].IsValid()) kvState[kIn] = kvOuts[i*2];
-            if (kvOuts[i*2+1].IsValid()) kvState[vIn] = kvOuts[i*2+1];
+            auto convertToFp16 = [&](GpuTensor& src, const std::string& name) {
+                if (src.dtype == TensorDtype::Float32) {
+                    int64_t nel = src.ElementCount();
+                    auto rb = gpu->readBuffer(src.buffer, nel * 4);
+                    auto* f32 = reinterpret_cast<const float*>(rb.data());
+                    std::vector<uint16_t> fp16(nel);
+                    for (int64_t j = 0; j < nel; j++) {
+                        uint32_t bits; memcpy(&bits, &f32[j], 4);
+                        uint32_t sign = (bits >> 16) & 0x8000;
+                        int32_t exp = ((bits >> 23) & 0xFF) - 127;
+                        uint32_t mant = bits & 0x7FFFFF;
+                        if (exp > 15) fp16[j] = (uint16_t)(sign | 0x7C00);
+                        else if (exp < -14) fp16[j] = (uint16_t)sign;
+                        else fp16[j] = (uint16_t)(sign | ((exp + 15) << 10) | (mant >> 13));
+                    }
+                    src.dtype = TensorDtype::Float16;
+                    src.buffer = gpu->createBuffer(name, nel * 2);
+                    gpu->writeBuffer(src.buffer, fp16.data(), nel * 2);
+                }
+            };
+            if (kvOuts[i*2].IsValid()) {
+                convertToFp16(kvOuts[i*2], kIn);
+                kvState[kIn] = kvOuts[i*2];
+            }
+            if (kvOuts[i*2+1].IsValid()) {
+                convertToFp16(kvOuts[i*2+1], vIn);
+                kvState[vIn] = kvOuts[i*2+1];
+            }
         }
 
         // Read logits
@@ -496,7 +551,7 @@ struct LlmContext {
 int main(int argc, char* argv[]) {
     std::string modelPath, prompt, chatMessage, backendStr;
     int maxTokens = 100;
-    bool benchmark = false;
+    bool benchmark = false, profile = false;
     int benchPromptLen = 0, benchGenTokens = 128;
 
     for (int i = 1; i < argc; i++) {
@@ -507,6 +562,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--max-tokens" && i+1 < argc) maxTokens = atoi(argv[++i]);
         else if (arg == "--backend" && i+1 < argc)    backendStr = argv[++i];
         else if (arg == "--benchmark")                benchmark = true;
+        else if (arg == "--profile")                  profile = true;
         else if (arg == "--bench-prompt-len" && i+1 < argc) benchPromptLen = atoi(argv[++i]);
         else if (arg == "--bench-gen-tokens" && i+1 < argc) benchGenTokens = atoi(argv[++i]);
     }
@@ -519,7 +575,8 @@ int main(int argc, char* argv[]) {
             "  --chat <message>   Chat message (auto-template)\n"
             "  --max-tokens <n>   Max tokens (default: 100)\n"
             "  --backend <name>   vulkan / d3d12 / metal\n"
-            "  --benchmark        Prefill+decode sweep\n", argv[0]);
+            "  --benchmark        Prefill+decode sweep\n"
+            "  --profile          GPU timestamp profiling + HTML timeline\n", argv[0]);
         return 1;
     }
 
@@ -575,8 +632,69 @@ int main(int argc, char* argv[]) {
     // 3. Benchmark
     if (benchmark) {
         if (isGenericOnnx) {
-            fprintf(stderr, "Benchmark not yet supported for generic ONNX models.\n");
-            return 1;
+            printf("=== Benchmark: %s (generic ONNX) ===\n", onnxLlm.arch.c_str());
+            int warmup = 3;
+            int genTokens = benchGenTokens > 0 ? benchGenTokens : 20;
+
+            // Warmup
+            onnxLlm.ResetCaches();
+            int32_t tok = 1; // BOS
+            for (int i = 0; i < warmup; i++) {
+                auto logits = onnxLlm.RunStep(tok);
+                tok = onnxLlm.Argmax(logits);
+            }
+
+            // Timed decode
+            auto t2 = std::chrono::steady_clock::now();
+            for (int i = 0; i < genTokens; i++) {
+                auto logits = onnxLlm.RunStep(tok);
+                tok = onnxLlm.Argmax(logits);
+            }
+            auto t3 = std::chrono::steady_clock::now();
+            double dcMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
+            double dcTps = genTokens * 1000.0 / dcMs;
+            printf("  Decode: %d tokens in %.0fms (%.1f tok/s, %.1f ms/tok)\n",
+                   genTokens, dcMs, dcTps, dcMs / genTokens);
+
+            // Profile run: one more step with per-op CPU profiling
+            printf("\n=== Profile (single decode step) ===\n");
+            onnxLlm.executor.profilingEnabled = true;
+            auto logits = onnxLlm.RunStep(tok);
+            onnxLlm.executor.profilingEnabled = false;
+
+            // GPU hardware timestamp profiling (if --profile)
+            if (profile) {
+                printf("\n=== GPU Hardware Timestamp Profile (%d tokens) ===\n", genTokens);
+                onnxLlm.ResetCaches();
+                onnxLlm.executor.enableGpuProfiling();
+                tok = 1;
+
+                // Warmup without profiling
+                for (int i = 0; i < warmup; i++) {
+                    auto lg = onnxLlm.RunStep(tok);
+                    tok = onnxLlm.Argmax(lg);
+                }
+
+                // Reset profiler counters to only capture timed tokens
+                if (onnxLlm.executor.gpuProfiler) {
+                    onnxLlm.executor.gpuProfiler->nextIndex = 0;
+                    onnxLlm.executor.gpuProfiler->entries.clear();
+                }
+
+                auto pt0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < genTokens; i++) {
+                    auto lg = onnxLlm.RunStep(tok);
+                    tok = onnxLlm.Argmax(lg);
+                }
+                auto pt1 = std::chrono::steady_clock::now();
+                double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
+
+                std::string htmlPath = (fs::path(onnxLlm.modelDir) / "profile.html").string();
+                onnxLlm.executor.printGpuProfileReport(genTokens, profMs, htmlPath);
+            }
+
+            printf("\n");
+            return 0;
         }
         printf("=== Benchmark: %s ===\n", llm.arch.c_str());
         printf("%-12s %10s %10s %10s %10s\n",

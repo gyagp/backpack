@@ -152,194 +152,134 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    // ─── Full GQA with KV cache and RoPE (CPU path for correctness) ─────
+    // ─── Full GQA with KV cache and RoPE ─────────────────────────────────
 
     int64_t num_heads = n.GetInt("num_heads", 32);
     int64_t kv_heads = n.GetInt("kv_num_heads", num_heads);
     float scale = n.GetFloat("scale", 0.0f);
     int64_t doRotary = n.GetInt("do_rotary", 0);
-    int64_t rotaryInterleaved = n.GetInt("rotary_interleaved", 0);
 
     // Q: [batch, seq_q, num_heads * head_dim]
-    // K: [batch, seq_q, kv_heads * head_dim]
-    // V: [batch, seq_q, kv_heads * head_dim]
     int64_t batch = Q->shape[0];
     int64_t seqQ = (Q->shape.size() >= 2) ? Q->shape[1] : 1;
     int64_t qDim = Q->shape.back();
     int64_t head_dim = qDim / num_heads;
 
-    // Default scale = 1/sqrt(head_dim)
     if (scale <= 0.0f) scale = 1.0f / sqrtf((float)head_dim);
 
     // past KV: [batch, kv_heads, past_seq, head_dim]
     int64_t pastSeq = 0;
-    if (pastKey && pastKey->shape.size() >= 4) {
-        pastSeq = pastKey->shape[2];
-    }
+    if (pastKey && pastKey->shape.size() >= 4) pastSeq = pastKey->shape[2];
     int64_t totalSeq = pastSeq + seqQ;
 
-    // Read seqlen_k to get the position offset for RoPE
+    // Read seqlen_k to get position offset for RoPE
     int64_t posOffset = pastSeq;
     if (seqLenK) {
         std::vector<int64_t> slk;
-        if (readTensorInt64Values(ex, seqLenK, 16, slk) && !slk.empty()) {
+        if (readTensorInt64Values(ex, seqLenK, 16, slk) && !slk.empty())
             posOffset = slk[0];
-        }
     }
 
-    // Read all inputs to CPU
-    std::vector<float> qData, kData, vData;
-    std::vector<float> pastKeyData, pastValData;
-    std::vector<float> cosData, sinData;
+    // Convert Q, K, V to f32 on GPU
+    ensureFloat32(ex, *Q);
+    ensureFloat32(ex, *K);
+    ensureFloat32(ex, *V);
+    ex.EnsureGpu(*Q);
+    ex.EnsureGpu(*K);
+    ex.EnsureGpu(*V);
 
-    auto readToFloat = [&](GpuTensor* t, const std::string& name, std::vector<float>& dst) {
-        if (!t) return;
-        ensureFloat32(ex, *t);
-        ex.EnsureGpu(*t);
-        ex.FlushPendingWork();
-        int64_t nel = tensorNel(t);
-        if (nel <= 0) return;
-        auto rb = ex.gpu->readBuffer(t->buffer, nel * 4);
-        dst.resize(nel);
-        memcpy(dst.data(), rb.data(), nel * 4);
-    };
-
-    readToFloat(Q, n.inputs[0], qData);
-    readToFloat(K, n.inputs[1], kData);
-    readToFloat(V, n.inputs[2], vData);
-    if (pastKey && pastSeq > 0) readToFloat(pastKey, n.inputs[3], pastKeyData);
-    if (pastVal && pastSeq > 0) readToFloat(pastVal, n.inputs[4], pastValData);
-    if (cosCache && doRotary) readToFloat(cosCache, n.inputs[7], cosData);
-    if (sinCache && doRotary) readToFloat(sinCache, n.inputs[8], sinData);
-
-    int64_t headGroup = num_heads / kv_heads;
+    // Apply RoPE on GPU if needed
     int64_t rotaryDim = head_dim;
-    if (!cosData.empty() && cosCache) {
-        // cos_cache shape: [max_pos, head_dim/2]
-        rotaryDim = cosCache->shape.back() * 2;
+    if (doRotary && cosCache && sinCache) {
+        ensureFloat32(ex, *cosCache);
+        ensureFloat32(ex, *sinCache);
+        ex.EnsureGpu(*cosCache);
+        ex.EnsureGpu(*sinCache);
+
+        if (cosCache->shape.size() >= 2) rotaryDim = cosCache->shape.back() * 2;
+
+        // RoPE on Q
+        uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
+                                   (uint32_t)rotaryDim, (uint32_t)posOffset};
+        auto rpBuf = ex.gpu->createBuffer("rope_pq", 16);
+        ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
+        auto& roPl = ex.GetPipeline("rope_inplace", WGSL_ROPE_INPLACE, 4);
+        auto roBg = ex.MakeBindGroup(roPl, {
+            {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
+        ex.pendingDispatches_.push_back({roPl.pipeline, roBg,
+            (uint32_t)((num_heads + 63) / 64), 1, 1, "rope_q"});
+
+        // RoPE on K
+        ropeParams[0] = (uint32_t)kv_heads;
+        auto rpBufK = ex.gpu->createBuffer("rope_pk", 16);
+        ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
+        auto roBgK = ex.MakeBindGroup(roPl, {
+            {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
+        ex.pendingDispatches_.push_back({roPl.pipeline, roBgK,
+            (uint32_t)((kv_heads + 63) / 64), 1, 1, "rope_k"});
     }
 
-    // Reshape Q: [batch, seqQ, num_heads * head_dim] → [batch, seqQ, num_heads, head_dim]
-    // Apply RoPE to Q and K
-    auto applyRoPE = [&](float* data, int64_t nHeads, int64_t pos) {
-        if (cosData.empty() || sinData.empty()) return;
-        int64_t cosStride = rotaryDim / 2;
-        for (int64_t h = 0; h < nHeads; h++) {
-            float* head = data + h * head_dim;
-            for (int64_t d = 0; d < rotaryDim / 2; d++) {
-                float cosVal = cosData[pos * cosStride + d];
-                float sinVal = sinData[pos * cosStride + d];
-                float x0 = head[d];
-                float x1 = head[d + rotaryDim / 2];
-                head[d] = x0 * cosVal - x1 * sinVal;
-                head[d + rotaryDim / 2] = x1 * cosVal + x0 * sinVal;
-            }
-        }
-    };
+    // Build present KV on GPU: append new K/V to past cache
+    GpuTensor presentKey = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
+    GpuTensor presentVal = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
 
-    // Apply RoPE to Q and K for each position in the sequence
-    if (doRotary) {
-        for (int64_t b = 0; b < batch; b++) {
-            for (int64_t s = 0; s < seqQ; s++) {
-                int64_t pos = posOffset + s;
-                float* qHead = qData.data() + (b * seqQ + s) * num_heads * head_dim;
-                float* kHead = kData.data() + (b * seqQ + s) * kv_heads * head_dim;
-                applyRoPE(qHead, num_heads, pos);
-                applyRoPE(kHead, kv_heads, pos);
-            }
+    {
+        // Need past key buffer — if pastSeq==0, create dummy
+        GPUBuffer pastKeyBuf, pastValBuf;
+        if (pastKey && pastSeq > 0) {
+            ensureFloat32(ex, *pastKey);
+            ex.EnsureGpu(*pastKey);
+            pastKeyBuf = pastKey->buffer;
+        } else {
+            pastKeyBuf = ex.gpu->createBuffer("past_k_empty", 4);
         }
+        if (pastVal && pastSeq > 0) {
+            ensureFloat32(ex, *pastVal);
+            ex.EnsureGpu(*pastVal);
+            pastValBuf = pastVal->buffer;
+        } else {
+            pastValBuf = ex.gpu->createBuffer("past_v_empty", 4);
+        }
+
+        uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
+                                 (uint32_t)pastSeq, (uint32_t)totalSeq};
+        auto kvpBuf = ex.gpu->createBuffer("kv_app_p", 16);
+        ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
+
+        auto& kvPl = ex.GetPipeline("kv_cache_append", WGSL_KV_CACHE_APPEND, 4);
+        auto kvBgK = ex.MakeBindGroup(kvPl, {
+            {0, K->buffer}, {1, pastKeyBuf}, {2, presentKey.buffer}, {3, kvpBuf}});
+        ex.pendingDispatches_.push_back({kvPl.pipeline, kvBgK,
+            (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_append_k"});
+
+        auto kvBgV = ex.MakeBindGroup(kvPl, {
+            {0, V->buffer}, {1, pastValBuf}, {2, presentVal.buffer}, {3, kvpBuf}});
+        ex.pendingDispatches_.push_back({kvPl.pipeline, kvBgV,
+            (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_append_v"});
     }
 
-    // Build full KV: concat past + current
-    // present_key: [batch, kv_heads, totalSeq, head_dim]
-    std::vector<float> fullKey(batch * kv_heads * totalSeq * head_dim, 0.0f);
-    std::vector<float> fullVal(batch * kv_heads * totalSeq * head_dim, 0.0f);
-
-    for (int64_t b = 0; b < batch; b++) {
-        for (int64_t h = 0; h < kv_heads; h++) {
-            // Copy past KV
-            for (int64_t s = 0; s < pastSeq; s++) {
-                for (int64_t d = 0; d < head_dim; d++) {
-                    int64_t dstIdx = ((b * kv_heads + h) * totalSeq + s) * head_dim + d;
-                    int64_t srcIdx = ((b * kv_heads + h) * pastSeq + s) * head_dim + d;
-                    fullKey[dstIdx] = pastKeyData.empty() ? 0.0f : pastKeyData[srcIdx];
-                    fullVal[dstIdx] = pastValData.empty() ? 0.0f : pastValData[srcIdx];
-                }
-            }
-            // Copy current KV (K is [batch, seqQ, kv_heads * head_dim], need to reshape)
-            for (int64_t s = 0; s < seqQ; s++) {
-                for (int64_t d = 0; d < head_dim; d++) {
-                    int64_t dstIdx = ((b * kv_heads + h) * totalSeq + (pastSeq + s)) * head_dim + d;
-                    int64_t srcIdx = (b * seqQ + s) * kv_heads * head_dim + h * head_dim + d;
-                    fullKey[dstIdx] = kData[srcIdx];
-                    fullVal[dstIdx] = vData[srcIdx];
-                }
-            }
-        }
-    }
-
-    // Compute attention: output[batch, seqQ, num_heads, head_dim]
-    std::vector<float> output(batch * seqQ * num_heads * head_dim, 0.0f);
-    std::vector<float> attnScores(totalSeq);
-
-    for (int64_t b = 0; b < batch; b++) {
-        for (int64_t h = 0; h < num_heads; h++) {
-            int64_t kvH = h / headGroup;  // map Q head to KV head
-            for (int64_t sq = 0; sq < seqQ; sq++) {
-                // Q[b, sq, h, :] dot K[b, kvH, sk, :] for all sk
-                float* qVec = qData.data() + (b * seqQ + sq) * num_heads * head_dim + h * head_dim;
-
-                // Compute attention scores
-                float maxScore = -1e30f;
-                for (int64_t sk = 0; sk < totalSeq; sk++) {
-                    float* kVec = fullKey.data() + ((b * kv_heads + kvH) * totalSeq + sk) * head_dim;
-                    float dot = 0.0f;
-                    for (int64_t d = 0; d < head_dim; d++) {
-                        dot += qVec[d] * kVec[d];
-                    }
-                    dot *= scale;
-                    attnScores[sk] = dot;
-                    if (dot > maxScore) maxScore = dot;
-                }
-
-                // Softmax
-                float sumExp = 0.0f;
-                for (int64_t sk = 0; sk < totalSeq; sk++) {
-                    attnScores[sk] = expf(attnScores[sk] - maxScore);
-                    sumExp += attnScores[sk];
-                }
-                if (sumExp > 0.0f) {
-                    for (int64_t sk = 0; sk < totalSeq; sk++) {
-                        attnScores[sk] /= sumExp;
-                    }
-                }
-
-                // Weighted sum of values
-                float* outVec = output.data() + (b * seqQ + sq) * num_heads * head_dim + h * head_dim;
-                for (int64_t sk = 0; sk < totalSeq; sk++) {
-                    float w = attnScores[sk];
-                    float* vVec = fullVal.data() + ((b * kv_heads + kvH) * totalSeq + sk) * head_dim;
-                    for (int64_t d = 0; d < head_dim; d++) {
-                        outVec[d] += w * vVec[d];
-                    }
-                }
-            }
-        }
-    }
-
-    // Write outputs
+    // Compute attention on GPU
     *out[0] = ex.AllocTensor({batch, seqQ, num_heads * head_dim}, TensorDtype::Float32);
-    ex.gpu->writeBuffer(out[0]->buffer, output.data(), output.size() * sizeof(float));
 
-    // present_key/value: [batch, kv_heads, totalSeq, head_dim]
-    if (out.size() > 1 && out[1]) {
-        *out[1] = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
-        ex.gpu->writeBuffer(out[1]->buffer, fullKey.data(), fullKey.size() * sizeof(float));
+    {
+        uint32_t scale_u32; memcpy(&scale_u32, &scale, 4);
+        uint32_t attnParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
+                                   (uint32_t)totalSeq, (uint32_t)kv_heads,
+                                   scale_u32, 0, 0, 0};
+        auto apBuf = ex.gpu->createBuffer("gqa_p", 32);
+        ex.gpu->writeBuffer(apBuf, attnParams, 32);
+
+        auto& attnPl = ex.GetPipeline("gqa_decode", WGSL_GQA_DECODE, 5);
+        auto attnBg = ex.MakeBindGroup(attnPl, {
+            {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
+            {3, out[0]->buffer}, {4, apBuf}});
+        ex.pendingDispatches_.push_back({attnPl.pipeline, attnBg,
+            1, (uint32_t)num_heads, 1, "gqa_decode"});
     }
-    if (out.size() > 2 && out[2]) {
-        *out[2] = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
-        ex.gpu->writeBuffer(out[2]->buffer, fullVal.data(), fullVal.size() * sizeof(float));
-    }
+
+    // Output present KV
+    if (out.size() > 1 && out[1]) *out[1] = presentKey;
+    if (out.size() > 2 && out[2]) *out[2] = presentVal;
 }
 
 static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
