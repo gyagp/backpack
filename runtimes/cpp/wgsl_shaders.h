@@ -4326,7 +4326,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // V: [kv_heads, total_seq, head_dim]  (f32)
 // Out: [num_heads * head_dim]  (f32)
 // Params: [0]=num_heads, [1]=head_dim, [2]=total_seq, [3]=kv_heads, [4]=scale_u32
-// One workgroup per Q head. Each thread in the workgroup handles one output dim.
+// One workgroup per Q head. Each thread handles dims d, d+64, d+128, ...
+// Score/softmax are shared across dims (only depend on Q·K, not V).
 // Dispatch: (1, num_heads, 1)
 static const char* WGSL_GQA_DECODE = R"WGSL(
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
@@ -4349,19 +4350,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     let kv_h = h / (num_heads / kv_heads);  // map Q head to KV head
     let q_base = h * head_dim;
+    let d0 = lid.x;  // base dimension for this thread
 
-    // Each thread handles multiple output dimensions
-    let d_start = lid.x;
+    // Each thread accumulates up to 4 V dimensions (supports head_dim up to 256)
+    var acc0: f32 = 0.0; var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0; var acc3: f32 = 0.0;
 
-    // Online softmax: iterate over all KV positions
+    // Online softmax state (shared across all dims — only depends on Q·K scores)
     var m_prev: f32 = -1e30;
     var l_prev: f32 = 0.0;
-    var acc: f32 = 0.0;
 
     for (var s = 0u; s < total_seq; s++) {
         let k_base = (kv_h * total_seq + s) * head_dim;
 
-        // Compute Q·K score (full dot product in each thread — head_dim is small, 64)
+        // Compute Q·K score once per position (same for all dims)
         var score: f32 = 0.0;
         for (var dd = 0u; dd < head_dim; dd++) {
             score += Q[q_base + dd] * K[k_base + dd];
@@ -4377,16 +4379,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let rescale = l_prev * exp_prev / max(l_new, 1e-10);
         let w = exp_score / max(l_new, 1e-10);
 
+        // Accumulate V for all dims this thread handles
         let v_base = (kv_h * total_seq + s) * head_dim;
-        acc = acc * rescale + w * V[v_base + d_start];
+        acc0 = acc0 * rescale + w * V[v_base + d0];
+        if (d0 + 64u < head_dim) { acc1 = acc1 * rescale + w * V[v_base + d0 + 64u]; }
+        if (d0 + 128u < head_dim) { acc2 = acc2 * rescale + w * V[v_base + d0 + 128u]; }
+        if (d0 + 192u < head_dim) { acc3 = acc3 * rescale + w * V[v_base + d0 + 192u]; }
 
         m_prev = m_new;
         l_prev = l_new;
     }
 
-    if (d_start < head_dim) {
-        Out[q_base + d_start] = acc;
-    }
+    // Write results
+    if (d0 < head_dim) { Out[q_base + d0] = acc0; }
+    if (d0 + 64u < head_dim) { Out[q_base + d0 + 64u] = acc1; }
+    if (d0 + 128u < head_dim) { Out[q_base + d0 + 128u] = acc2; }
+    if (d0 + 192u < head_dim) { Out[q_base + d0 + 192u] = acc3; }
 }
 )WGSL";
 

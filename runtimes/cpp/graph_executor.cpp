@@ -1342,45 +1342,6 @@ void GraphExecutor::Execute(
                 }
             }
 
-            // Debug: readback outputs to trace zero propagation
-            // Debug readback for first few ops (production mode: change to false)
-            if (false && graph_.nodes.size() > 1000) {
-                // Always log the op type and output validity
-                fprintf(stderr, "  [dbg] ei=%zu %s valid=%d buf=%p",
-                        ei, node.opType.c_str(),
-                        (outTensors[0] && outTensors[0]->IsValid()) ? 1 : 0,
-                        outTensors[0] ? (void*)outTensors[0]->buffer.handle : nullptr);
-                // If valid, readback
-                if (outTensors[0] && outTensors[0]->IsValid() && outTensors[0]->buffer.handle) {
-                    if (!pendingDispatches_.empty()) {
-                        gpu->submitOnly(pendingDispatches_, false);
-                        pendingDispatches_.clear();
-                    }
-                    if (!pendingCopies_.empty()) {
-                        WGPUCommandEncoderDescriptor enD{};
-                        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-                        for (auto& c : pendingCopies_)
-                            wgpuCommandEncoderCopyBufferToBuffer(enc,
-                                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-                        WGPUCommandBufferDescriptor cbD{};
-                        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-                        wgpuQueueSubmit(gpu->queue, 1, &cb);
-                        wgpuCommandBufferRelease(cb);
-                        wgpuCommandEncoderRelease(enc);
-                        pendingCopies_.clear();
-                    }
-                    gpu->waitForQueue();
-                    size_t readN = std::min((size_t)4, outTensors[0]->buffer.size / 4);
-                    if (readN > 0) {
-                        auto rb = gpu->readBuffer(outTensors[0]->buffer, readN * 4);
-                        float vals[4] = {0};
-                        memcpy(vals, rb.data(), std::min(readN * 4, rb.size()));
-                        fprintf(stderr, " out=[%.4f, %.4f, %.4f, %.4f]", vals[0], vals[1], vals[2], vals[3]);
-                    }
-                }
-                fprintf(stderr, "\n"); fflush(stderr);
-            }
-
             // Buffer lifetime tracking: decrement refcounts for later cleanup.
             // Actual release happens at end of Execute() to avoid GPU read-after-free.
             if (graph_.nodes.size() > 100) {
@@ -1458,7 +1419,7 @@ void GraphExecutor::Execute(
     totalCopies += (int)pendingCopies_.size();
 
     fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (0 from int-readback), bufs=%d (pool=%d)\n",
-            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, 
+            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_,
             gpu->createBufferCount, gpu->poolHitCount);
     gpu->createBufferCount = 0;
     gpu->poolHitCount = 0;
