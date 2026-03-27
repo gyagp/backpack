@@ -172,18 +172,31 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     if (pastKey && pastKey->shape.size() >= 4) pastSeq = pastKey->shape[2];
     int64_t totalSeq = pastSeq + seqQ;
 
-    // Read seqlen_k to get position offset for RoPE
+    // Position offset from past_key shape — no GPU readback needed.
+    // ORT also derives position from the KV cache length.
     int64_t posOffset = pastSeq;
-    if (seqLenK) {
-        std::vector<int64_t> slk;
-        if (readTensorInt64Values(ex, seqLenK, 16, slk) && !slk.empty())
-            posOffset = slk[0];
-    }
 
-    // Convert Q, K, V to f32 on GPU
-    ensureFloat32(ex, *Q);
-    ensureFloat32(ex, *K);
-    ensureFloat32(ex, *V);
+    // GPU fp16→f32 cast helper: dispatches a cast kernel without CPU sync.
+    auto gpuCastF16ToF32 = [&](GpuTensor& t) {
+        if (t.dtype != TensorDtype::Float16) return;
+        ex.EnsureGpu(t);
+        int64_t nel = tensorNel(&t);
+        if (nel <= 0) return;
+        GpuTensor f32t = ex.AllocTensor(t.shape, TensorDtype::Float32);
+        uint32_t p[4] = {(uint32_t)nel, 0, 0, 0};
+        auto pb = ex.gpu->createBuffer("attn_cast_p", 16);
+        ex.gpu->writeBuffer(pb, p, 16);
+        auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+        auto bg = ex.MakeBindGroup(pl, {{0, t.buffer}, {1, f32t.buffer}, {2, pb}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (uint32_t)((nel + 255) / 256), 1, 1, "attn_cast"});
+        t = f32t;
+    };
+
+    // Convert Q, K, V to f32 on GPU — no CPU readback
+    gpuCastF16ToF32(*Q);
+    gpuCastF16ToF32(*K);
+    gpuCastF16ToF32(*V);
     ex.EnsureGpu(*Q);
     ex.EnsureGpu(*K);
     ex.EnsureGpu(*V);
@@ -191,8 +204,8 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     // Apply RoPE on GPU if needed
     int64_t rotaryDim = head_dim;
     if (doRotary && cosCache && sinCache) {
-        ensureFloat32(ex, *cosCache);
-        ensureFloat32(ex, *sinCache);
+        gpuCastF16ToF32(*cosCache);
+        gpuCastF16ToF32(*sinCache);
         ex.EnsureGpu(*cosCache);
         ex.EnsureGpu(*sinCache);
 
@@ -227,14 +240,14 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         // Need past key buffer — if pastSeq==0, create dummy
         GPUBuffer pastKeyBuf, pastValBuf;
         if (pastKey && pastSeq > 0) {
-            ensureFloat32(ex, *pastKey);
+            gpuCastF16ToF32(*pastKey);
             ex.EnsureGpu(*pastKey);
             pastKeyBuf = pastKey->buffer;
         } else {
             pastKeyBuf = ex.gpu->createBuffer("past_k_empty", 4);
         }
         if (pastVal && pastSeq > 0) {
-            ensureFloat32(ex, *pastVal);
+            gpuCastF16ToF32(*pastVal);
             ex.EnsureGpu(*pastVal);
             pastValBuf = pastVal->buffer;
         } else {

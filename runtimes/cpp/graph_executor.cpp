@@ -1370,14 +1370,14 @@ void GraphExecutor::Execute(
     fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback)\n",
             executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, intReadbackSyncs_);
     // Print sync sources on first call
-    static bool printedSyncSources = false;
-    if (!printedSyncSources && !flushSources_.empty()) {
+    static int printSyncCount = 0;
+    if (printSyncCount < 2 && !flushSources_.empty()) {
         std::vector<std::pair<std::string, int>> sorted(flushSources_.begin(), flushSources_.end());
         std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
         fprintf(stderr, "  [sync sources] %d total:\n", flushCount_);
         for (auto& [op, cnt] : sorted)
             fprintf(stderr, "    %-50s %d\n", op.c_str(), cnt);
-        printedSyncSources = true;
+        printSyncCount++;
     }
     flushCount_ = 0;
     intReadbackSyncs_ = 0;

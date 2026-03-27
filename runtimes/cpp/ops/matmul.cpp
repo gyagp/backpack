@@ -37,35 +37,26 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
         return tensor.buffer.handle != nullptr;
     }
 
+    // GPU fp16→f32 cast — no CPU readback needed
+    ex.EnsureGpu(tensor);
     size_t count = (size_t)tensor.ElementCount();
-    size_t bytes = count * sizeof(uint16_t);
-    const uint8_t* src = nullptr;
-    std::vector<uint8_t> raw;
-    if (!tensor.cpuData.empty() && tensor.cpuData.size() >= bytes) {
-        src = tensor.cpuData.data();
-    } else if (auto* init = ex.GetInitData(name); init && init->data && init->size >= bytes) {
-        src = init->data;
-    } else if (tensor.buffer.handle && tensor.buffer.size >= bytes) {
-        ex.FlushPendingWork();
-        raw = ex.gpu->readBuffer(tensor.buffer, bytes);
-        if (raw.size() >= bytes) src = raw.data();
-    }
-    if (!src) return false;
+    if (count <= 0 || !tensor.buffer.handle) return false;
 
-    std::vector<float> values(count, 0.0f);
-    auto* srcFp16 = reinterpret_cast<const uint16_t*>(src);
-    for (size_t i = 0; i < count; i++) values[i] = fp16ToFloat(srcFp16[i]);
+    GpuTensor f32t;
+    f32t.shape = tensor.shape;
+    f32t.dtype = TensorDtype::Float32;
+    f32t.buffer = ex.gpu->createBuffer(name.empty() ? "mmnb_f32_cast" : name, count * 4);
+    f32t.isCpuOnly = false;
 
-    GpuTensor rebuilt;
-    rebuilt.shape = tensor.shape;
-    rebuilt.dtype = TensorDtype::Float32;
-    rebuilt.cpuData.resize(values.size() * sizeof(float));
-    memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-    rebuilt.buffer = ex.gpu->createBuffer(name.empty() ? "mmnb_f32_cast" : name,
-                                          rebuilt.cpuData.size());
-    ex.gpu->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
-    rebuilt.isCpuOnly = false;
-    tensor = std::move(rebuilt);
+    uint32_t p[4] = {(uint32_t)count, 0, 0, 0};
+    auto pb = ex.gpu->createBuffer("mmnb_cast_p", 16);
+    ex.gpu->writeBuffer(pb, p, 16);
+    auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+    auto bg = ex.MakeBindGroup(pl, {{0, tensor.buffer}, {1, f32t.buffer}, {2, pb}});
+    ex.pendingDispatches_.push_back({pl.pipeline, bg,
+        (uint32_t)((count + 255) / 256), 1, 1, "mmnb_cast"});
+
+    tensor = std::move(f32t);
     return tensor.buffer.handle != nullptr;
 }
 
