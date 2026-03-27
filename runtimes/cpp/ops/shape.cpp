@@ -459,8 +459,9 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
                 (uint32_t)((nel + 255) / 256), 1, 1, "concat_cast_f16_f32"}});
             *t = f32t;
         }
-        // Flush cast dispatches before doing copy-based concat
-        ex.FlushPendingWork();
+        // Don't flush here — GPU kernels execute in order.
+        // The f32 concat GPU kernel will see the cast results.
+        // Only flush if we need the CPU copy path (axis=0).
     }
 
     // Filter out tensors with no GPU buffer after EnsureGpu
@@ -474,6 +475,9 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
 
     // For axis=0 or 1D tensors, simple byte concatenation
     if (axis == 0 || ndim <= 1) {
+        // Flush any pending cast dispatches before buffer copies
+        if (needF16ToF32 && !ex.pendingDispatches_.empty())
+            ex.FlushPendingWork();
         // Debug: log when we hit axis-0 path for conv-related concat
         if (validIn.size() == 2 && validIn[0]->shape.size() == 3 && validIn[0]->shape[2] <= 4) {
             fprintf(stderr, "  [concat] axis=%lld ndim=%d shapes=[%lld,%lld,%lld]+[%lld,%lld,%lld] → axis0 path\n",
@@ -977,7 +981,90 @@ static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
     // For general case, use GPU kernel
     *out[0] = ex.AllocTensor(outShape, data->dtype);
 
-    // CPU path for small tensors (avoids GPU copy/dispatch ordering issues)
+    // GPU copy path: for step=1 slices, use buffer copies (no CPU readback)
+    bool allStepsOne = true;
+    for (auto s : stepVals) if (s != 1) { allStepsOne = false; break; }
+
+    if (allStepsOne && data->buffer.handle) {
+        // Compute slab-based copy offsets
+        int64_t sliceAxis = -1;
+        for (int i = 0; i < ndim; i++) {
+            if (startVals[i] != 0 || outShape[i] != data->shape[i]) {
+                sliceAxis = i; break;
+            }
+        }
+
+        if (sliceAxis >= 0) {
+            int64_t innerSize = elemSize;
+            for (int i = (int)sliceAxis + 1; i < ndim; i++) innerSize *= outShape[i];
+            int64_t outerCount = 1;
+            for (int i = 0; i < (int)sliceAxis; i++) outerCount *= outShape[i];
+
+            int64_t srcInner = elemSize;
+            for (int i = (int)sliceAxis + 1; i < ndim; i++) srcInner *= data->shape[i];
+            int64_t srcStride = data->shape[sliceAxis] * srcInner;
+            int64_t dstStride = outShape[sliceAxis] * innerSize;
+
+            // Check 4-byte alignment for GPU copy
+            bool aligned = (innerSize % 4 == 0) &&
+                            ((startVals[sliceAxis] * srcInner) % 4 == 0);
+
+            if (aligned && outerCount <= 16) {
+                // Few outer iterations — use GPU buffer copies directly
+                for (int64_t o = 0; o < outerCount; o++) {
+                    uint64_t srcOff = (uint64_t)(o * srcStride + startVals[sliceAxis] * srcInner);
+                    uint64_t dstOff = (uint64_t)(o * dstStride);
+                    uint64_t copySize = (uint64_t)(outShape[sliceAxis] * innerSize);
+                    ex.QueueCopy(data->buffer, srcOff, out[0]->buffer, dstOff, copySize);
+                }
+                return;
+            }
+
+            // Many outer iterations — use GPU concat kernel as a general copy
+            // Reinterpret as a 2-input concat: [0:start] is ignored, [start:start+out] is copied
+            // Simpler: just use f32 array indexing
+            if (data->dtype == TensorDtype::Float32) {
+                // GPU slice kernel: each thread copies one element
+                if (ndim == 3) {
+                    static const char* SLICE_3D_F32 = R"WGSL(
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<storage, read> _p: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p[0]; let idx = gid.x;
+    if (idx >= N) { return; }
+    let d2 = _p[1]; let d1 = _p[2]; let d0 = _p[3];
+    let s2 = _p[4]; let s1 = _p[5]; let s0 = _p[6];
+    let id1 = _p[7]; let id2 = _p[8];
+    let o0 = idx / (d1 * d2);
+    let rem = idx % (d1 * d2);
+    let o1 = rem / d2;
+    let o2 = rem % d2;
+    let src_idx = (o0 + s0) * id1 * id2 + (o1 + s1) * id2 + (o2 + s2);
+    dst[idx] = src[src_idx];
+}
+)WGSL";
+                    uint32_t outN = (uint32_t)totalOut;
+                    uint32_t params[12] = {
+                        outN,
+                        (uint32_t)outShape[2], (uint32_t)outShape[1], (uint32_t)outShape[0],
+                        (uint32_t)startVals[2], (uint32_t)startVals[1], (uint32_t)startVals[0],
+                        (uint32_t)data->shape[1], (uint32_t)data->shape[2], 0, 0, 0
+                    };
+                    auto pBuf = ex.gpu->createBuffer("slice3d_p", 48);
+                    ex.gpu->writeBuffer(pBuf, params, 48);
+                    auto& pl = ex.GetPipeline("slice_3d_f32", SLICE_3D_F32, 3);
+                    auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, pBuf}});
+                    ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                        (uint32_t)((outN + 255) / 256), 1, 1, "slice_3d"});
+                    return;
+                }
+            }
+        }
+    }
+
+    // CPU path for small tensors
     if (totalOut <= 4000000 && elemSize <= 4) {
         ex.FlushPendingWork();
         size_t inBytes = (size_t)data->ElementCount() * elemSize;

@@ -6994,6 +6994,85 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// [moe] topk_f32 — same as topk_f16 but for f32 data
+static const char* WGSL_TOPK_F32 = R"WGSL(
+@group(0) @binding(0) var<storage, read> data: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out_values: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out_indices: array<i32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let totalSlices = _params_[0];
+    let dimSize = _params_[1];
+    let k = _params_[2];
+    let largest = _params_[3];
+    let slice = gid.x;
+    if (slice >= totalSlices) { return; }
+    let base_in = slice * dimSize;
+    let base_out = slice * k;
+    for (var ki = 0u; ki < k; ki++) {
+        var best_val: f32 = select(1e30, -1e30, largest != 0u);
+        var best_idx: u32 = 0u;
+        for (var d = 0u; d < dimSize; d++) {
+            let v = data[base_in + d];
+            var already = false;
+            for (var p = 0u; p < ki; p++) {
+                if (u32(out_indices[base_out + p]) == d) { already = true; break; }
+            }
+            if (already) { continue; }
+            if (largest != 0u) { if (v > best_val) { best_val = v; best_idx = d; } }
+            else { if (v < best_val) { best_val = v; best_idx = d; } }
+        }
+        out_values[base_out + ki] = best_val;
+        out_indices[base_out + ki] = i32(best_idx);
+    }
+}
+)WGSL";
+
+// [moe] gather_elements_f32 — same as f16 but for f32 data
+static const char* WGSL_GATHER_ELEMENTS_F32 = R"WGSL(
+@group(0) @binding(0) var<storage, read> data: array<f32>;
+@group(0) @binding(1) var<storage, read> indices: array<i32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0]; let dataDim = _params_[1]; let outDim = _params_[2];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+    let slice = idx / outDim;
+    var gi = indices[idx];
+    if (gi < 0) { gi = gi + i32(dataDim); }
+    output[idx] = data[slice * dataDim + u32(gi)];
+}
+)WGSL";
+
+// [moe] scatter_elements_f32 — same as f16 but for f32 data
+static const char* WGSL_SCATTER_ELEMENTS_F32 = R"WGSL(
+@group(0) @binding(0) var<storage, read> data: array<f32>;
+@group(0) @binding(1) var<storage, read> indices: array<i32>;
+@group(0) @binding(2) var<storage, read> updates: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let mode = _params_[4];
+    if (mode == 0u) {
+        let dataN = _params_[0]; let idx = gid.x;
+        if (idx >= dataN) { return; }
+        output[idx] = data[idx];
+    } else {
+        let dataDim = _params_[1]; let idxN = _params_[2]; let idxDim = _params_[3];
+        let idx = gid.x;
+        if (idx >= idxN) { return; }
+        let slice = idx / idxDim;
+        var gi = indices[idx];
+        if (gi < 0) { gi = gi + i32(dataDim); }
+        output[slice * dataDim + u32(gi)] = updates[idx];
+    }
+}
+)WGSL";
+
 // [moe] qmoe_gate_up_q4 (6 bindings, hand)
 // Q4 matmul for one MoE expert's gate_up projection.
 // Y[n] = sum_k X[k] * dequant(W[expert, n, k])

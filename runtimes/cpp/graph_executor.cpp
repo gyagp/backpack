@@ -911,9 +911,9 @@ void GraphExecutor::FlushPendingWork() {
         pendingCopies_.clear();
     }
     flushCount_++;
-    if (profilingEnabled) {
-        flushSources_[g_currentOpLabel]++;
-    }
+    std::string key = g_currentOp ? g_currentOp : "(no-op-context)";
+    // Capture call stack source
+    flushSources_[key]++;
     gpu->waitForQueue();
 }
 
@@ -1369,8 +1369,19 @@ void GraphExecutor::Execute(
     totalCopies += (int)pendingCopies_.size();
     fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback)\n",
             executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, intReadbackSyncs_);
+    // Print sync sources on first call
+    static bool printedSyncSources = false;
+    if (!printedSyncSources && !flushSources_.empty()) {
+        std::vector<std::pair<std::string, int>> sorted(flushSources_.begin(), flushSources_.end());
+        std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        fprintf(stderr, "  [sync sources] %d total:\n", flushCount_);
+        for (auto& [op, cnt] : sorted)
+            fprintf(stderr, "    %-50s %d\n", op.c_str(), cnt);
+        printedSyncSources = true;
+    }
     flushCount_ = 0;
     intReadbackSyncs_ = 0;
+    flushSources_.clear();
 
     // Submit all remaining batched GPU work
     if (!pendingDispatches_.empty()) {

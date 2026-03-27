@@ -202,6 +202,29 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
+    // GPU path for f32 data along last axis
+    if (data->dtype == TensorDtype::Float32 && axis == ndim - 1) {
+        ex.EnsureGpu(*data);
+
+        *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
+        GpuTensor idxTensor = ex.AllocTensor(outShape, TensorDtype::Int32);
+
+        uint32_t params[4] = {(uint32_t)totalSlices, (uint32_t)dimSize, (uint32_t)k, (uint32_t)largest};
+        auto paramBuf = ex.gpu->createBuffer("topk_p", 16);
+        ex.gpu->writeBuffer(paramBuf, params, 16);
+
+        auto& pl = ex.GetPipeline("topk_f32", WGSL_TOPK_F32, 4);
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, data->buffer}, {1, out[0]->buffer},
+            {2, idxTensor.buffer}, {3, paramBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (uint32_t)totalSlices, 1, 1, "topk_f32"});
+
+        *out[1] = idxTensor;
+        out[1]->dtype = TensorDtype::Int32;
+        return;
+    }
+
     // CPU fallback for non-fp16 or non-last-axis
     std::vector<float> values;
     if (!loadTensorFloats(ex, data, n.inputs.empty() ? "" : n.inputs[0], values) || values.empty()) {
@@ -275,6 +298,29 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
             {2, out[0]->buffer}, {3, paramBuf}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
             (uint32_t)((outNel + 255) / 256), 1, 1, "gather_elements_f16"});
+        return;
+    }
+
+    // GPU path for f32 data with i32 indices, axis = last dim
+    if (data->dtype == TensorDtype::Float32 &&
+        indices->dtype == TensorDtype::Int32 &&
+        axis == ndim - 1) {
+        ex.EnsureGpu(*data);
+        ex.EnsureGpu(*indices);
+
+        *out[0] = ex.AllocTensor(indices->shape, TensorDtype::Float32);
+
+        uint32_t params[4] = {(uint32_t)outNel, (uint32_t)data->shape[axis],
+                               (uint32_t)indices->shape[axis], 0};
+        auto paramBuf = ex.gpu->createBuffer("ge_p", 16);
+        ex.gpu->writeBuffer(paramBuf, params, 16);
+
+        auto& pl = ex.GetPipeline("gather_elements_f32", WGSL_GATHER_ELEMENTS_F32, 4);
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, data->buffer}, {1, indices->buffer},
+            {2, out[0]->buffer}, {3, paramBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (uint32_t)((outNel + 255) / 256), 1, 1, "gather_elements_f32"});
         return;
     }
 
@@ -364,6 +410,42 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
                 {3, out[0]->buffer}, {4, paramBuf}});
             ex.pendingDispatches_.push_back({pl.pipeline, bg,
                 (uint32_t)((idxNel + 255) / 256), 1, 1, "scatter_write"});
+        }
+        return;
+    }
+
+    // GPU path for f32 data with i32 indices, axis = last dim
+    if (data->dtype == TensorDtype::Float32 &&
+        indices->dtype == TensorDtype::Int32 &&
+        updates->dtype == TensorDtype::Float32 &&
+        axis == ndim - 1) {
+        ex.EnsureGpu(*data);
+        ex.EnsureGpu(*indices);
+        ex.EnsureGpu(*updates);
+
+        *out[0] = ex.AllocTensor(data->shape, TensorDtype::Float32);
+
+        {
+            uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
+                                   (uint32_t)idxNel, (uint32_t)indices->shape[axis], 0};
+            auto paramBuf = ex.gpu->createBuffer("se_p1", 32);
+            ex.gpu->writeBuffer(paramBuf, params, 20);
+            auto& pl = ex.GetPipeline("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_F32, 5);
+            auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
+                {3, out[0]->buffer}, {4, paramBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                (uint32_t)((dataNel + 255) / 256), 1, 1, "scatter_copy_f32"});
+        }
+        {
+            uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
+                                   (uint32_t)idxNel, (uint32_t)indices->shape[axis], 1};
+            auto paramBuf = ex.gpu->createBuffer("se_p2", 32);
+            ex.gpu->writeBuffer(paramBuf, params, 20);
+            auto& pl = ex.GetPipeline("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_F32, 5);
+            auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
+                {3, out[0]->buffer}, {4, paramBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg,
+                (uint32_t)((idxNel + 255) / 256), 1, 1, "scatter_write_f32"});
         }
         return;
     }
