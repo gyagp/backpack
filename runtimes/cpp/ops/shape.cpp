@@ -897,6 +897,13 @@ static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
 
     int64_t totalOut = 1;
     for (auto d : outShape) totalOut *= d;
+
+    // Identity shortcut: if output shape equals input shape, just alias
+    if (outShape == data->shape) {
+        *out[0] = *data;
+        return;
+    }
+
     if (totalOut <= 0) {
         *out[0] = ex.AllocTensor({0}, data->dtype);
         return;

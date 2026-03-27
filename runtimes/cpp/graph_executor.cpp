@@ -889,6 +889,7 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
 }
 
 void GraphExecutor::FlushPendingWork() {
+    bool didWork = false;
     if (!pendingDispatches_.empty()) {
         if (gpuProfiler && gpuProfiler->enabled()) {
             gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
@@ -896,6 +897,7 @@ void GraphExecutor::FlushPendingWork() {
             gpu->submitOnly(pendingDispatches_, false);
         }
         pendingDispatches_.clear();
+        didWork = true;
     }
     if (!pendingCopies_.empty()) {
         WGPUCommandEncoderDescriptor enD{};
@@ -909,12 +911,15 @@ void GraphExecutor::FlushPendingWork() {
         wgpuCommandBufferRelease(cb);
         wgpuCommandEncoderRelease(enc);
         pendingCopies_.clear();
+        didWork = true;
     }
-    flushCount_++;
-    std::string key = g_currentOp ? g_currentOp : "(no-op-context)";
-    // Capture call stack source
-    flushSources_[key]++;
+    // Always wait (callers expect data to be ready after flush)
     gpu->waitForQueue();
+    if (didWork) {
+        flushCount_++;
+        std::string key = g_currentOp ? g_currentOp : "(no-op-context)";
+        flushSources_[key]++;
+    }
 }
 
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
