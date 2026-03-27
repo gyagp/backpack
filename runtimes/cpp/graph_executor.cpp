@@ -7,6 +7,7 @@
 
 #include "graph_executor.h"
 #include "wgsl_shaders.h"
+#include "wgsl_template.h"
 #include "clock_calibration.h"
 #include "profile_html.h"
 
@@ -1098,6 +1099,9 @@ void GraphExecutor::Execute(
         fprintf(stderr, "  [exec] topo sort: %zu/%zu nodes in %lldms\n",
                 execOrder.size(), N, (long long)sortMs);
         fflush(stderr);
+
+        // Detect fuseable patterns (one-time, cached with topo order)
+        DetectFusions();
     }
 
     // Build tensor reference counts for buffer recycling
@@ -1175,6 +1179,91 @@ void GraphExecutor::Execute(
                     pendingDispatches_.size());
             fflush(stderr);
         }
+
+        // ─── Fused dispatch ──────────────────────────────────────────────
+        // Skip nodes that are interior to a fused group (not the first node)
+        if (fusedNodeIndices_.count(ni) && !fusedGroups_.count(ni)) {
+            continue;  // handled by the group leader
+        }
+
+        // If this is the first node of a fused group, dispatch the fused kernel
+        if (auto fIt = fusedGroups_.find(ni); fIt != fusedGroups_.end()) {
+            auto& group = fIt->second;
+            bool ok = true;
+
+            // Resolve external inputs
+            std::vector<GpuTensor*> extInputs;
+            for (auto& name : group.externalInputs) {
+                auto tIt = tensorStore_.find(name);
+                extInputs.push_back(tIt != tensorStore_.end() ? &tIt->second : nullptr);
+            }
+
+            // Determine dtype from first input
+            TensorDtype dtype = TensorDtype::Float32;
+            if (!extInputs.empty() && extInputs[0] && extInputs[0]->IsValid()) {
+                dtype = extInputs[0]->dtype;
+            }
+            if (dtype != TensorDtype::Float16) dtype = TensorDtype::Float32;
+
+            // Get primary input info
+            auto* primaryIn = extInputs.empty() ? nullptr : extInputs[0];
+            if (!primaryIn || !primaryIn->IsValid()) {
+                ok = false;
+            }
+
+            if (ok) {
+                EnsureGpu(*primaryIn);
+                int64_t N = 1;
+                for (auto d : primaryIn->shape) N *= d;
+
+                // Ensure output tensor exists (last node's output)
+                auto& outTensor = tensorStore_[group.outputName];
+                outTensor = AllocTensor(primaryIn->shape, dtype);
+
+                // Build pipeline with dtype suffix
+                std::string pname = group.pipelineName + dtypeSuffix(dtype);
+                auto& pl = GetPipelineT(pname, group.numBindings,
+                    [&group, dtype]() {
+                        return group.shaderGenerator(dtype);
+                    });
+
+                // Build params: [N, N_E0, N_E1, ...]
+                std::vector<uint32_t> params = {(uint32_t)N};
+                for (size_t ei2 = 1; ei2 < extInputs.size(); ei2++) {
+                    if (extInputs[ei2] && extInputs[ei2]->IsValid()) {
+                        int64_t en = 1;
+                        for (auto d : extInputs[ei2]->shape) en *= d;
+                        params.push_back((uint32_t)en);
+                    } else {
+                        params.push_back((uint32_t)N);
+                    }
+                }
+                size_t pbSize = std::max((size_t)16, params.size() * 4);
+                auto paramBuf = getParamBuffer((uint32_t)pbSize);
+                gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
+
+                // Build bind group
+                std::vector<std::pair<uint32_t, GPUBuffer>> bindings = {
+                    {0, primaryIn->buffer},
+                    {1, outTensor.buffer},
+                    {2, paramBuf}
+                };
+                for (size_t ei2 = 1; ei2 < extInputs.size(); ei2++) {
+                    if (extInputs[ei2] && extInputs[ei2]->IsValid()) {
+                        EnsureGpu(*extInputs[ei2]);
+                        bindings.push_back({(uint32_t)(2 + ei2), extInputs[ei2]->buffer});
+                    }
+                }
+
+                auto bg = MakeBindGroup(pl, bindings);
+                uint32_t nwg = (uint32_t)(((N + 1) / 2 + 255) / 256);
+                pendingDispatches_.push_back({pl.pipeline, bg,
+                    nwg, 1, 1, group.pipelineName.c_str()});
+                continue;
+            }
+            // If !ok, fall through to regular dispatch
+        }
+
         // Dispatch op
         auto opIt = registry.find(node.opType);
         if (opIt != registry.end()) {
@@ -1367,6 +1456,7 @@ void GraphExecutor::Execute(
 
     totalDispatches += (int)pendingDispatches_.size();
     totalCopies += (int)pendingCopies_.size();
+
     fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (0 from int-readback), bufs=%d (pool=%d)\n",
             executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_, 
             gpu->createBufferCount, gpu->poolHitCount);

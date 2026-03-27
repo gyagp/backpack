@@ -1,4 +1,4 @@
-"""Proxy: runtimes/python/common/kernels.py -> compiler/kernels.py"""
+"""Proxy: runtimes/python/common/kernels.py -> compiler/kernels.py (legacy)"""
 import sys, os
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _root not in sys.path:

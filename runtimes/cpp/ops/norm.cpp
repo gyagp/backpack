@@ -6,6 +6,7 @@
 
 #include "../graph_executor.h"
 #include "../wgsl_shaders.h"
+#include "../wgsl_template.h"
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -144,7 +145,7 @@ static bool canUseFp16NormWeights(const GraphExecutor& ex, const GpuTensor* x,
 }
 
 // ─── RMSNorm (SimplifiedLayerNormalization) ──────────────────────────────────
-// Uses the optimized rms_norm kernel from compiler/kernels/shared/ when available,
+// Uses the optimized rms_norm kernel from runtimes/cpp/kernels/shared/ when available,
 // falls back to a simple per-row kernel otherwise.
 
 static const char* WGSL_RMSNORM_SIMPLE = R"WGSL(
@@ -209,7 +210,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
     if (!W || !W->IsValid()) return;
 
-    *out[0] = ex.AllocTensor(X->shape, TensorDtype::Float32);
+    *out[0] = ex.AllocTensor(X->shape, X->dtype);  // Match input dtype
     if (out.size() > 1 && out[1]) *out[1] = ex.AllocTensor({nRows}, TensorDtype::Float32);
 
     // Allocate Rstd output
@@ -220,8 +221,6 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         rstdBuf = ex.gpu->createBuffer("rstd", std::max((int64_t)4, nRows * 4));
     }
 
-    // Use simple RMSNorm (the optimized rms_norm requires subgroups which
-    // might not match the binding layout for the graph executor)
     struct { int32_t stride; int32_t N; float eps; } p;
     p.stride = (int32_t)(nRows * hiddenDim);
     p.N = (int32_t)hiddenDim;
@@ -229,10 +228,26 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, &p, 12);
 
+    // Templated path: both X and W are fp16 → use fp16 template
+    if (X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16) {
+        ex.EnsureGpu(*X);
+        ex.EnsureGpu(*W);
+        auto& pl = ex.GetPipelineT("rmsnorm_t_f16", 5, []() {
+            return instantiateTemplate(WGSL_RMSNORM_T, TensorDtype::Float16);
+        });
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
+            {3, rstdBuf}, {4, paramBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm_f16"});
+        return;
+    }
+
+    // Legacy paths for f32 or mixed dtype
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W)) {
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*W);
-        auto& pl = ex.GetPipeline("rmsnorm_simple_f16w", WGSL_RMSNORM_SIMPLE_F16W, 5);
+        auto& pl = ex.GetPipelineT("rmsnorm_simple_f16w", 5, []() { return std::string(WGSL_RMSNORM_SIMPLE_F16W); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
             {3, rstdBuf}, {4, paramBuf}});
@@ -246,7 +261,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipeline("rmsnorm_simple", WGSL_RMSNORM_SIMPLE, 5);
+    auto& pl = ex.GetPipelineT("rmsnorm_simple", 5, []() { return std::string(WGSL_RMSNORM_SIMPLE); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
         {3, rstdBuf}, {4, paramBuf}});
@@ -500,7 +515,7 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*Skip);
         ex.EnsureGpu(*W);
-        auto& pl = ex.GetPipeline("skip_rmsnorm_f16w", WGSL_SKIP_RMSNORM_F16W, 6);
+        auto& pl = ex.GetPipelineT("skip_rmsnorm_f16w", 6, []() { return std::string(WGSL_SKIP_RMSNORM_F16W); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Skip->buffer}, {2, W->buffer},
             {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
@@ -515,7 +530,7 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipeline("skip_rmsnorm", WGSL_SKIP_RMSNORM, 6);
+    auto& pl = ex.GetPipelineT("skip_rmsnorm", 6, []() { return std::string(WGSL_SKIP_RMSNORM); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Skip->buffer}, {2, W->buffer},
         {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
@@ -564,7 +579,7 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*W);
         ex.EnsureGpu(*B);
-        auto& pl = ex.GetPipeline("layer_norm_f16wb", WGSL_LAYER_NORM_F16WB, 5);
+        auto& pl = ex.GetPipelineT("layer_norm_f16wb", 5, []() { return std::string(WGSL_LAYER_NORM_F16WB); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -573,7 +588,7 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipeline("layer_norm", WGSL_LAYER_NORM, 5);
+    auto& pl = ex.GetPipelineT("layer_norm", 5, []() { return std::string(WGSL_LAYER_NORM); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -614,7 +629,7 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*Scale);
         ex.EnsureGpu(*Bias);
-        auto& pl = ex.GetPipeline("instance_norm_f16wb", WGSL_INSTANCE_NORM_F16WB, 5);
+        auto& pl = ex.GetPipelineT("instance_norm_f16wb", 5, []() { return std::string(WGSL_INSTANCE_NORM_F16WB); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -623,7 +638,7 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipeline("instance_norm", WGSL_INSTANCE_NORM, 5);
+    auto& pl = ex.GetPipelineT("instance_norm", 5, []() { return std::string(WGSL_INSTANCE_NORM); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -667,7 +682,7 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*Scale);
         ex.EnsureGpu(*Bias);
-        auto& pl = ex.GetPipeline("group_norm_f16wb", WGSL_GROUP_NORM_F16WB, 5);
+        auto& pl = ex.GetPipelineT("group_norm_f16wb", 5, []() { return std::string(WGSL_GROUP_NORM_F16WB); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -676,7 +691,7 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipeline("group_norm", WGSL_GROUP_NORM, 5);
+    auto& pl = ex.GetPipelineT("group_norm", 5, []() { return std::string(WGSL_GROUP_NORM); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});

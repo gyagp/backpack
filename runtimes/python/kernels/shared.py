@@ -1,17 +1,17 @@
 """Shared WGSL kernels — used by all model formats.
 
-Loads WGSL source from compiler/kernels/shared/*.wgsl.
+Loads WGSL source from runtimes/cpp/kernels/shared/*.wgsl.
 These are the canonical kernel definitions shared by all runtimes.
 """
 
 import os
 
 _KERNEL_DIR = os.path.join(
-    os.path.dirname(__file__), '..', '..', '..', 'compiler', 'kernels', 'shared')
+    os.path.dirname(__file__), '..', '..', 'cpp', 'kernels', 'shared')
 
 
 def _load_wgsl(name: str) -> str:
-    """Load a .wgsl kernel from compiler/kernels/shared/."""
+    """Load a .wgsl kernel from runtimes/cpp/kernels/shared/."""
     path = os.path.join(_KERNEL_DIR, name + '.wgsl')
     with open(path) as f:
         return f.read()

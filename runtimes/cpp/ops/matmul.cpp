@@ -9,6 +9,7 @@
 
 #include "../graph_executor.h"
 #include "../wgsl_shaders.h"
+#include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -51,7 +52,7 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     uint32_t p[4] = {(uint32_t)count, 0, 0, 0};
     auto pb = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(pb, p, 16);
-    auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+    auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
     auto bg = ex.MakeBindGroup(pl, {{0, tensor.buffer}, {1, f32t.buffer}, {2, pb}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
         (uint32_t)((count + 255) / 256), 1, 1, "mmnb_cast"});
@@ -209,7 +210,8 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
                            const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1]; auto* S = in[2];
     if (!X || !W || !S || !X->IsValid() || !W->IsValid() || !S->IsValid()) return;
-    if (!ensureTensorFloat32(ex, *X, n.inputs.empty() ? std::string() : n.inputs[0])) return;
+    // Keep input dtype (fp16 or f32) — the templated kernel handles both
+    ex.EnsureGpu(*X);
     ex.EnsureGpu(*W);
 
     // The kernel reads scales as packed fp16 pairs (u32 containing two f16).
@@ -267,24 +269,32 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t M = 1;
     for (size_t i = 0; i + 1 < X->shape.size(); i++) M *= X->shape[i];
 
+    // Output dtype matches input dtype (f32 or fp16)
+    TensorDtype outDtype = X->dtype;
+    if (outDtype != TensorDtype::Float16) outDtype = TensorDtype::Float32;
+
     auto outShape = X->shape;
     outShape.back() = N;
-    *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
+    *out[0] = ex.AllocTensor(outShape, outDtype);
 
     uint32_t params[4] = {(uint32_t)M, N, K, 0};
     auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (ZP) {
-        // Use kernel with per-block zero points
-        auto& pl = ex.GetPipeline("matmul_q4_zp", WGSL_MATMUL_Q4_ZP, 6);
+        // Use templated kernel — auto-selects f32 or fp16 I/O.
+        // Shader generated once on first cache miss.
+        std::string pname = "matmul_q4_zp_t" + std::string(dtypeSuffix(outDtype));
+        auto& pl = ex.GetPipelineT(pname, 6, [outDtype]() {
+            return instantiateTemplate(WGSL_MATMUL_Q4_ZP_T, outDtype);
+        });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
             (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp"});
     } else {
-        auto& pl = ex.GetPipeline("matmul_q4", WGSL_MATMUL_Q4, 5);
+        auto& pl = ex.GetPipelineT("matmul_q4", 5, []() { return std::string(WGSL_MATMUL_Q4); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -326,7 +336,7 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (A->dtype == TensorDtype::Float32 && B->dtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
-        auto& pl = ex.GetPipeline("matmul_f16", WGSL_MATMUL_F16, 4);
+        auto& pl = ex.GetPipelineT("matmul_f16", 4, []() { return std::string(WGSL_MATMUL_F16); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -342,7 +352,7 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
         ensureTensorFloat32(ex, *B, n.inputs.size() > 1 ? n.inputs[1] : std::string());
     }
 
-    auto& pl = ex.GetPipeline("matmul_f32", WGSL_MATMUL_F32, 4);
+    auto& pl = ex.GetPipelineT("matmul_f32", 4, []() { return std::string(WGSL_MATMUL_F32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -418,7 +428,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto fp16ParamBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(fp16ParamBuf, fp16Params, 16);
 
-        auto& pl = ex.GetPipeline(kernelName, kernelSrc, 5);
+        auto& pl = ex.GetPipelineT(kernelName, 5, [kernelSrc]() { return std::string(kernelSrc); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, A->buffer}, {1, B->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, fp16ParamBuf}});
@@ -428,7 +438,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipeline("gemm", WGSL_GEMM, 5);
+    auto& pl = ex.GetPipelineT("gemm", 5, []() { return std::string(WGSL_GEMM); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -516,7 +526,7 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
     const char* plName = (bits == 4) ? (ZP ? "gather_bq_q4_zp" : "gather_bq_q4")
                                       : "gather_bq_q8";
     int numBindings = (bits == 4 && ZP) ? 6 : 5;
-    auto& pl = ex.GetPipeline(plName, kernelSrc, numBindings);
+    auto& pl = ex.GetPipelineT(plName, numBindings, [kernelSrc]() { return std::string(kernelSrc); });
     if (ZP) {
         auto bg = ex.MakeBindGroup(pl, {
             {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},

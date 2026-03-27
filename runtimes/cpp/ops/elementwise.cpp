@@ -4,11 +4,12 @@
  * Covers: Add, Sub, Mul, Div, Neg, Sqrt, Sigmoid, Tanh, Sin, Cos,
  *         Cast, Equal, GreaterOrEqual, Where, Softmax, ReduceSum.
  *
- * Uses embedded kernels from compiler/kernels/shared/.
+ * Uses embedded kernels from runtimes/cpp/kernels/shared/.
  */
 
 #include "../graph_executor.h"
 #include "../wgsl_shaders.h"
+#include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -16,7 +17,7 @@
 #include <set>
 
 // Binary and unary elementwise ops now use embedded kernels from
-// compiler/kernels/shared/binary_elementwise.wgsl and unary_elementwise.wgsl
+// runtimes/cpp/kernels/shared/binary_elementwise.wgsl and unary_elementwise.wgsl
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -302,50 +303,37 @@ static void dispatchBinaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
         return;
     }
 
-    if (ex.gpu->supportsShaderF16 && A->dtype == TensorDtype::Float16 && B->dtype == TensorDtype::Float16) {
-        ex.EnsureGpu(*A);
-        ex.EnsureGpu(*B);
-        int64_t N_A = tensorNel(A);
-        int64_t N_B = tensorNel(B);
-        int64_t N = std::max(N_A, N_B);
-        auto& outShape = (N_A >= N_B) ? A->shape : B->shape;
-        *outputs[0] = ex.AllocTensor(outShape, TensorDtype::Float16);
-
-        auto params = makeParamBuf(ex, (uint32_t)N, opCode, (uint32_t)N_A, (uint32_t)N_B);
-        auto& pl = ex.GetPipeline("binary_elementwise_f16", WGSL_BINARY_ELEMENTWISE_F16, 4);
-        auto bg = ex.MakeBindGroup(pl, {
-            {0, A->buffer}, {1, B->buffer}, {2, outputs[0]->buffer}, {3, params}});
-        ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, node.opType + "_f16"}});
-        return;
+    // Determine dtype: use fp16 if both inputs are fp16, else f32
+    TensorDtype dtype = TensorDtype::Float32;
+    if (A->dtype == TensorDtype::Float16 && B->dtype == TensorDtype::Float16) {
+        dtype = TensorDtype::Float16;
+    } else {
+        // Cast fp16 → f32 if mixed
+        if (!ensureCpuBackedFloat32(ex, *A, node.inputs.empty() ? std::string() : node.inputs[0]) ||
+            !ensureCpuBackedFloat32(ex, *B, node.inputs.size() > 1 ? node.inputs[1] : std::string())) {
+            return;
+        }
     }
 
-    if (!ensureCpuBackedFloat32(ex, *A, node.inputs.empty() ? std::string() : node.inputs[0]) ||
-        !ensureCpuBackedFloat32(ex, *B, node.inputs.size() > 1 ? node.inputs[1] : std::string())) {
-        return;
-    }
-
-    // GPU kernel for fp32 binary ops
     ex.EnsureGpu(*A);
     ex.EnsureGpu(*B);
 
     int64_t N_A = tensorNel(A);
     int64_t N_B = tensorNel(B);
     int64_t N = std::max(N_A, N_B);
-
-    // Output shape = broadcast shape (simplified: take the larger)
     auto& outShape = (N_A >= N_B) ? A->shape : B->shape;
-    TensorDtype outDtype = A->dtype;
-    if (outDtype == TensorDtype::Float16 || outDtype == TensorDtype::Float32 ||
-        B->dtype == TensorDtype::Float16 || B->dtype == TensorDtype::Float32) {
-        outDtype = TensorDtype::Float32;
-    }
-    *outputs[0] = ex.AllocTensor(outShape, outDtype);
+    *outputs[0] = ex.AllocTensor(outShape, dtype);
 
     auto params = makeParamBuf(ex, (uint32_t)N, opCode, (uint32_t)N_A, (uint32_t)N_B);
-    auto& pl = ex.GetPipeline("binary_elementwise", WGSL_BINARY_ELEMENTWISE, 4);
+    std::string pipelineName = "binary_t" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pipelineName, 4, [dtype]() {
+        return instantiateTemplate(WGSL_BINARY_ELEMENTWISE_T, dtype);
+    });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, outputs[0]->buffer}, {3, params}});
-    ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, node.opType}});
+    // Each thread handles 2 elements
+    uint32_t numWorkgroups = (uint32_t)(((N + 1) / 2 + 255) / 256);
+    ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
 }
 
 // ─── Unary elementwise dispatch ──────────────────────────────────────────────
@@ -356,35 +344,29 @@ static void dispatchUnaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
     auto* A = inputs[0];
     if (!A || !A->IsValid()) return;
 
-    if (ex.gpu->supportsShaderF16 && A->dtype == TensorDtype::Float16) {
-        ex.EnsureGpu(*A);
-        int64_t N = tensorNel(A);
-        *outputs[0] = ex.AllocTensor(A->shape, TensorDtype::Float16);
-
-        auto params = makeParamBuf(ex, (uint32_t)N, opCode);
-        auto& pl = ex.GetPipeline("unary_elementwise_f16", WGSL_UNARY_ELEMENTWISE_F16, 3);
-        auto bg = ex.MakeBindGroup(pl, {
-            {0, A->buffer}, {1, outputs[0]->buffer}, {2, params}});
-        ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, node.opType + "_f16"}});
-        return;
-    }
-
-    if (!ensureCpuBackedFloat32(ex, *A, node.inputs.empty() ? std::string() : node.inputs[0])) {
-        return;
+    // Determine dtype: use fp16 if input is fp16, else f32
+    TensorDtype dtype = A->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *A, node.inputs.empty() ? std::string() : node.inputs[0])) {
+            return;
+        }
     }
 
     ex.EnsureGpu(*A);
     int64_t N = tensorNel(A);
-    TensorDtype outDtype = (A->dtype == TensorDtype::Float16 || A->dtype == TensorDtype::Float32)
-                               ? TensorDtype::Float32
-                               : A->dtype;
-    *outputs[0] = ex.AllocTensor(A->shape, outDtype);
+    *outputs[0] = ex.AllocTensor(A->shape, dtype);
 
     auto params = makeParamBuf(ex, (uint32_t)N, opCode);
-    auto& pl = ex.GetPipeline("unary_elementwise", WGSL_UNARY_ELEMENTWISE, 3);
+    std::string pipelineName = "unary_t" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pipelineName, 3, [dtype]() {
+        return instantiateTemplate(WGSL_UNARY_ELEMENTWISE_T, dtype);
+    });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, outputs[0]->buffer}, {2, params}});
-    ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, node.opType}});
+    // Each thread handles 2 elements
+    uint32_t numWorkgroups = (uint32_t)(((N + 1) / 2 + 255) / 256);
+    ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
 }
 
 // ─── Op Registrations ────────────────────────────────────────────────────────
@@ -488,7 +470,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
                 ex.EnsureGpu(*A);
                 *out[0] = ex.AllocTensor(A->shape, TensorDtype::Float16);
                 auto params = makeScalarParamBuf(ex, (uint32_t)N);
-                auto& pl = ex.GetPipeline("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
+                auto& pl = ex.GetPipelineT("cast_f32_to_f16", 3, []() { return std::string(WGSL_CAST_F32_TO_F16); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, A->buffer}, {1, out[0]->buffer}, {2, params}});
                 ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "cast_f32_to_f16"}});
@@ -498,7 +480,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
                 ex.EnsureGpu(*A);
                 *out[0] = ex.AllocTensor(A->shape, TensorDtype::Float32);
                 auto params = makeScalarParamBuf(ex, (uint32_t)N);
-                auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+                auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, A->buffer}, {1, out[0]->buffer}, {2, params}});
                 ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "cast_f16_to_f32"}});
@@ -672,7 +654,7 @@ static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(Cond),
                                 (uint32_t)tensorNel(X), (uint32_t)tensorNel(Y));
-    auto& pl = ex.GetPipeline("where_select", WGSL_WHERE_SELECT, 5);
+    auto& pl = ex.GetPipelineT("where_select", 5, []() { return std::string(WGSL_WHERE_SELECT); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, Cond->buffer}, {1, X->buffer}, {2, Y->buffer},
         {3, out[0]->buffer}, {4, params}});
@@ -703,7 +685,7 @@ static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
     *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
 
     auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(B));
-    auto& pl = ex.GetPipeline("equal_op", WGSL_EQUAL_OP, 4);
+    auto& pl = ex.GetPipelineT("equal_op", 4, []() { return std::string(WGSL_EQUAL_OP); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "equal"}});
@@ -726,7 +708,13 @@ static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     if (!X || !X->IsValid()) return;
-    if (!ensureCpuBackedFloat32(ex, *X, n.inputs.empty() ? std::string() : n.inputs[0])) return;
+
+    // Determine dtype
+    TensorDtype dtype = X->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *X, n.inputs.empty() ? std::string() : n.inputs[0])) return;
+    }
     ex.EnsureGpu(*X);
 
     int64_t axis = n.GetInt("axis", -1);
@@ -734,13 +722,57 @@ static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t rowLen = (axis < (int64_t)X->shape.size()) ? X->shape[axis] : X->shape.back();
     int64_t nRows = tensorNel(X) / rowLen;
 
-    TensorDtype outDtype = (X->dtype == TensorDtype::Float16 || X->dtype == TensorDtype::Float32)
-                             ? TensorDtype::Float32
-                             : X->dtype;
-    *out[0] = ex.AllocTensor(X->shape, outDtype);
+    *out[0] = ex.AllocTensor(X->shape, dtype);
+
+    // Softmax needs internal f32 accumulation (max, exp_sum).
+    // Template handles storage access; computation is always f32.
+    static const char* SOFTMAX_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let nRows = _params_[0];
+    let rowLen = _params_[1];
+    let row = gid.x;
+    if (row >= nRows) { return; }
+    let base = row * rowLen;
+
+    // Find max (f32)
+    var mx: f32 = -1e30;
+    for (var i = 0u; i < rowLen; i++) {
+        mx = max(mx, t_read(&X, base + i));
+    }
+    // Exp sum
+    var expSum: f32 = 0.0;
+    for (var i = 0u; i < rowLen; i++) {
+        expSum += exp(t_read(&X, base + i) - mx);
+    }
+    let invSum = 1.0 / max(expSum, 1e-10);
+    // Write output in pairs
+    let pairs = rowLen / 2u;
+    for (var i = 0u; i < pairs; i++) {
+        let i0 = i * 2u;
+        let v0 = exp(t_read(&X, base + i0) - mx) * invSum;
+        let v1 = exp(t_read(&X, base + i0 + 1u) - mx) * invSum;
+        t_write2(&Y, base + i0, v0, v1);
+    }
+    if ((rowLen & 1u) != 0u) {
+        let last = rowLen - 1u;
+        t_write2(&Y, base + last, exp(t_read(&X, base + last) - mx) * invSum, 0.0);
+    }
+}
+)WGSL";
 
     auto params = makeParamBuf(ex, (uint32_t)nRows, (uint32_t)rowLen);
-    auto& pl = ex.GetPipeline("softmax", WGSL_SOFTMAX, 3);
+    std::string pname = "softmax_t" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+        return instantiateTemplate(SOFTMAX_T, dtype);
+    });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((nRows + 255) / 256), 1, 1, "softmax"}});

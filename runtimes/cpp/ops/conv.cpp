@@ -295,8 +295,8 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
         ex.gpu->writeBuffer(paramBuf, params, 64);
 
         auto& pl = useFp16Path
-            ? ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5)
-            : ex.GetPipeline("conv2d", WGSL_CONV2D, 5);
+            ? ex.GetPipelineT("conv2d_f16", 5, []() { return std::string(WGSL_CONV2D_F16); })
+            : ex.GetPipelineT("conv2d_f32", 5, []() { return std::string(WGSL_CONV2D); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -385,8 +385,8 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.gpu->writeBuffer(paramBuf, params, 64);
 
     auto& pl = useFp16Path
-        ? ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5)
-        : ex.GetPipeline("conv2d", WGSL_CONV2D, 5);
+        ? ex.GetPipelineT("conv2d_f16", 5, []() { return std::string(WGSL_CONV2D_F16); })
+        : ex.GetPipelineT("conv2d_f32", 5, []() { return std::string(WGSL_CONV2D); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -474,8 +474,8 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.gpu->writeBuffer(paramBuf, params, 64);
 
     auto& pl = useFp16Path
-        ? ex.GetPipeline("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5)
-        : ex.GetPipeline("conv_transpose2d", WGSL_CONV_TRANSPOSE2D, 5);
+        ? ex.GetPipelineT("conv_transpose2d_f16", 5, []() { return std::string(WGSL_CONV_TRANSPOSE2D_F16); })
+        : ex.GetPipelineT("conv_transpose2d_f32", 5, []() { return std::string(WGSL_CONV_TRANSPOSE2D); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -524,7 +524,7 @@ static void opResize(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipeline("resize_nearest", WGSL_RESIZE_NEAREST, 3);
+    auto& pl = ex.GetPipelineT("resize_nearest", 3, []() { return std::string(WGSL_RESIZE_NEAREST); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     int64_t total = N * C * H_out * W_out;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate wgsl_shaders.h from compiler/kernels/*.wgsl.
+"""Generate wgsl_shaders.h from runtimes/cpp/kernels/*.wgsl.
 
 C++ runtime build step: embeds WGSL kernel sources as C++ string constants.
 Run this whenever kernel .wgsl files change:
@@ -10,7 +10,7 @@ import re
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
-KERNEL_DIR = os.path.join(_ROOT, "compiler", "kernels")
+KERNEL_DIR = os.path.join(_HERE, "kernels")
 OUTPUT = os.path.join(_HERE, "wgsl_shaders.h")
 
 
@@ -39,8 +39,8 @@ def main():
     lines = []
     lines.append('#pragma once')
     lines.append('/**')
-    lines.append(' * wgsl_shaders.h -- Auto-generated from compiler/kernels/*.wgsl')
-    lines.append(' * Do not edit manually. Regenerate with: python compiler/gen_wgsl_shaders.py')
+    lines.append(' * wgsl_shaders.h -- Auto-generated from runtimes/cpp/kernels/*.wgsl')
+    lines.append(' * Do not edit manually. Regenerate with: python runtimes/cpp/gen_wgsl_shaders.py')
     lines.append(' */')
     lines.append('')
     lines.append('#include <string>')

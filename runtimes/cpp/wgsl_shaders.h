@@ -1,6 +1,6 @@
 #pragma once
 /**
- * wgsl_shaders.h -- Auto-generated from compiler/kernels/*.wgsl
+ * wgsl_shaders.h -- Auto-generated from runtimes/cpp/kernels/*.wgsl
  * Do not edit manually. Regenerate with: python compiler/gen_wgsl_shaders.py
  */
 
@@ -4456,6 +4456,258 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// ─── Templated Kernels (dtype-polymorphic via wgsl_template.h) ───────────────
+// These use ${T} markers that get replaced by instantiateTemplate() at runtime.
+// See wgsl_template.h for the substitution rules.
+
+// [template] binary_elementwise — Add/Sub/Mul/Div with broadcasting.
+// Works with f32 or fp16 via template instantiation.
+// For fp16: each thread processes a PAIR of elements to avoid u32 write races.
+static const char* WGSL_BINARY_ELEMENTWISE_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> A: array<${T}>;
+@group(0) @binding(1) var<storage, read> B: array<${T}>;
+@group(0) @binding(2) var<storage, read_write> C: array<${T}>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+fn compute_op(a: f32, b: f32, op: u32) -> f32 {
+    switch (op) {
+        case 0u: { return a + b; }
+        case 1u: { return a - b; }
+        case 2u: { return a * b; }
+        case 3u: { return a / b; }
+        default: { return a + b; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let op = _params_[1];
+    let A_N = _params_[2];
+    let B_N = _params_[3];
+
+    // Each thread handles 2 elements (one u32 for fp16, or 2 f32s)
+    let base = gid.x * 2u;
+    if (base >= N) { return; }
+
+    let i0 = base;
+    let a0_idx = select(i0, i0 % A_N, A_N < N && A_N > 0u);
+    let b0_idx = select(i0, i0 % B_N, B_N < N && B_N > 0u);
+    let r0 = compute_op(t_read(&A, a0_idx), t_read(&B, b0_idx), op);
+
+    var r1: f32 = 0.0;
+    if (base + 1u < N) {
+        let i1 = base + 1u;
+        let a1_idx = select(i1, i1 % A_N, A_N < N && A_N > 0u);
+        let b1_idx = select(i1, i1 % B_N, B_N < N && B_N > 0u);
+        r1 = compute_op(t_read(&A, a1_idx), t_read(&B, b1_idx), op);
+    }
+
+    t_write2(&C, base, r0, r1);
+}
+)WGSL";
+
+// [template] unary_elementwise — Sigmoid/Tanh/Neg/Sqrt/Sin/Cos/Gelu/Silu/etc.
+// Each thread processes a PAIR of elements.
+static const char* WGSL_UNARY_ELEMENTWISE_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+fn compute_unary(x: f32, op: u32) -> f32 {
+    switch (op) {
+        case 0u: { return 1.0 / (1.0 + exp(-x)); }            // sigmoid
+        case 1u: { return tanh(x); }                            // tanh
+        case 2u: { return -x; }                                 // neg
+        case 3u: { return sqrt(max(x, 0.0)); }                  // sqrt
+        case 4u: { return sin(x); }                             // sin
+        case 5u: { return cos(x); }                             // cos
+        case 6u: { return x * 0.5 * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x))); } // gelu
+        case 7u: { return x / (1.0 + exp(-x)); }               // silu
+        case 10u: { return max(x, 0.0); }                       // relu
+        case 11u: { return exp(x); }                            // exp
+        case 12u: { return log(max(x, 1e-10)); }                // log
+        case 13u: { return abs(x); }                            // abs
+        case 14u: { return floor(x); }                          // floor
+        case 15u: { return ceil(x); }                           // ceil
+        case 16u: { return round(x); }                          // round
+        case 18u: { if (x > 20.0) { return x; } return log(exp(x) + 1.0); }  // softplus (clamped for overflow)
+        default: { return x; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let op = _params_[1];
+
+    let base = gid.x * 2u;
+    if (base >= N) { return; }
+
+    let r0 = compute_unary(t_read(&X, base), op);
+    var r1: f32 = 0.0;
+    if (base + 1u < N) {
+        r1 = compute_unary(t_read(&X, base + 1u), op);
+    }
+    t_write2(&Y, base, r0, r1);
+}
+)WGSL";
+
+// [template] matmul_q4_zp — Q4 matmul with zero points, templated I/O.
+// Input A and Output Y use ${T} (f32 or fp16).
+// Weights B and Scales always u32. Accumulation always f32.
+static const char* WGSL_MATMUL_Q4_ZP_T = R"WGSL(
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> A: array<${T}>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let blocks_per_col = K / 32u;
+
+    let n = gid.x;
+    let m = gid.y;
+    if (n >= N || m >= M) { return; }
+
+    var acc: f32 = 0.0;
+    let a_base = m * K;
+    let w_base = n * (K / 2u);
+
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let scale_flat = n * blocks_per_col + blk;
+        let scale_u32 = Scales[scale_flat / 2u];
+        let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+        let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+        let zp_byte_idx = scale_flat / 2u;
+        let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+        let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+
+        let k_base = blk * 32u;
+        let w_blk_base = w_base + k_base / 2u;
+
+        for (var j = 0u; j < 16u; j++) {
+            let byte_idx = w_blk_base + j;
+            let byte_u32 = B[byte_idx / 4u];
+            let byte_val = (byte_u32 >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+            let lo = f32(byte_val & 0xFu) - zp;
+            let hi = f32((byte_val >> 4u) & 0xFu) - zp;
+            acc += t_read(&A, a_base + k_base + j * 2u) * lo * scale;
+            acc += t_read(&A, a_base + k_base + j * 2u + 1u) * hi * scale;
+        }
+    }
+
+    t_write(&Y, m * N + n, acc);
+}
+)WGSL";
+
+// [template] rmsnorm — SimplifiedLayerNormalization.
+// X, Y: activation data in ${T}; W: norm weights in ${T}
+// Rstd: always f32 (scalar per row). Params: always u32/f32.
+// Internal accumulation in f32 for numerical stability.
+static const char* WGSL_RMSNORM_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(2) var<storage, read> W: array<${T}>;
+@group(0) @binding(3) var<storage, read_write> Rstd: array<f32>;
+
+struct Params { stride: i32, N: i32, eps: f32, };
+@group(0) @binding(4) var<storage, read> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let N = u32(params.N);
+    if (row >= u32(params.stride) / N) { return; }
+    let base = row * N;
+    var sum_sq: f32 = 0.0;
+    for (var i = 0u; i < N; i++) { let v = t_read(&X, base + i); sum_sq += v * v; }
+    let rms = sqrt(sum_sq / f32(N) + params.eps);
+    let inv_rms = 1.0 / rms;
+    // Write pairs to avoid fp16 u32 write races
+    let pairs = N / 2u;
+    for (var i = 0u; i < pairs; i++) {
+        let i0 = i * 2u;
+        let v0 = t_read(&X, base + i0) * inv_rms * t_read(&W, i0);
+        let v1 = t_read(&X, base + i0 + 1u) * inv_rms * t_read(&W, i0 + 1u);
+        t_write2(&Y, base + i0, v0, v1);
+    }
+    if ((N & 1u) != 0u) {
+        let last = N - 1u;
+        t_write2(&Y, base + last, t_read(&X, base + last) * inv_rms * t_read(&W, last), 0.0);
+    }
+    if (gid.x == 0u) { Rstd[row] = inv_rms; }
+}
+)WGSL";
+
+// [template] expand — Broadcast tensor to larger shape.
+// Uses t_read/t_write2 for dtype-transparent copy.
+static const char* WGSL_EXPAND_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = _params_[0];
+    let ndim = _params_[1];
+
+    // Each thread handles 2 elements
+    let base = gid.x * 2u;
+    if (base >= total) { return; }
+
+    // Process first element
+    var remaining0 = base;
+    var inIdx0 = 0u;
+    for (var d = 0u; d < ndim; d++) {
+        let out_stride = _params_[4u + d];
+        let in_dim = _params_[4u + ndim + d];
+        let in_stride = _params_[4u + 2u * ndim + d];
+        let coord = remaining0 / out_stride;
+        remaining0 = remaining0 % out_stride;
+        inIdx0 += (coord % in_dim) * in_stride;
+    }
+    let v0 = t_read(&X, inIdx0);
+
+    var v1: f32 = 0.0;
+    if (base + 1u < total) {
+        var remaining1 = base + 1u;
+        var inIdx1 = 0u;
+        for (var d = 0u; d < ndim; d++) {
+            let out_stride = _params_[4u + d];
+            let in_dim = _params_[4u + ndim + d];
+            let in_stride = _params_[4u + 2u * ndim + d];
+            let coord = remaining1 / out_stride;
+            remaining1 = remaining1 % out_stride;
+            inIdx1 += (coord % in_dim) * in_stride;
+        }
+        v1 = t_read(&X, inIdx1);
+    }
+    t_write2(&Y, base, v0, v1);
+}
+)WGSL";
+
 // [shared] causal_attn (5 bindings, hand)
 static const char* WGSL_CAUSAL_ATTN = R"WGSL(
 enable f16;
@@ -6804,6 +7056,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// Slice — dtype-polymorphic version using t_read/t_write
+static const char* WGSL_SLICE_T = R"WGSL(
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = _params_[0];
+    let ndim = _params_[1];
+    let idx = gid.x;
+    if (idx >= total) { return; }
+
+    var remaining = idx;
+    var in_flat: u32 = 0u;
+    for (var d = 0u; d < ndim; d++) {
+        let out_stride = _params_[4u + d];
+        let in_stride = _params_[4u + ndim + d];
+        let start = _params_[4u + 2u * ndim + d];
+        let step = _params_[4u + 3u * ndim + d];
+        let coord = remaining / out_stride;
+        remaining = remaining % out_stride;
+        let in_coord = start + coord * step;
+        in_flat += in_coord * in_stride;
+    }
+    let val = t_read(&X, in_flat);
+    t_write(&Y, idx, val);
+}
+)WGSL";
+
 // [shared] softmax (3 bindings, hand)
 static const char* WGSL_SOFTMAX = R"WGSL(
 // Softmax — numerically stable per-row softmax
@@ -6864,6 +7149,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         in_flat += coord * in_stride;
     }
     Y[idx] = X[in_flat];
+}
+)WGSL";
+
+// Transpose — dtype-polymorphic version using t_read/t_write2
+// Reads/writes individual logical elements (handles fp16 packing).
+// Params: [nel, ndim, 0, 0, out_strides[ndim], in_strides[ndim]]
+// Dispatch: (ceil((nel+1)/2 / 256), 1, 1) for pair-write
+static const char* WGSL_TRANSPOSE_T = R"WGSL(
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(2) var<storage, read> _params_: array<u32>;
+
+fn flat_to_in(idx: u32, ndim: u32) -> u32 {
+    var out_idx = idx;
+    var in_flat: u32 = 0u;
+    for (var d = 0u; d < ndim; d++) {
+        let out_stride = _params_[4u + d];
+        let in_stride = _params_[4u + ndim + d];
+        let coord = out_idx / out_stride;
+        out_idx = out_idx % out_stride;
+        in_flat += coord * in_stride;
+    }
+    return in_flat;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let ndim = _params_[1];
+    let idx = gid.x;
+    if (idx >= N) { return; }
+    let in_idx = flat_to_in(idx, ndim);
+    let val = t_read(&X, in_idx);
+    t_write(&Y, idx, val);
 }
 )WGSL";
 

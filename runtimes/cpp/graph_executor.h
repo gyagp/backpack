@@ -102,6 +102,32 @@ struct OnnxGraph {
     std::unordered_map<std::string, InitData> initializers;
 };
 
+// ─── Op Fusion ───────────────────────────────────────────────────────────────
+
+/// Describes a fused group of ONNX nodes replaced by a single GPU dispatch.
+/// The fusion pass detects patterns in the graph and generates a combined
+/// shader at pipeline creation time (one-time cost).
+struct FusedGroup {
+    /// Indices into OnnxGraph::nodes for the fused nodes (in execution order).
+    std::vector<size_t> nodeIndices;
+
+    /// The fused op dispatches using this pipeline name (cached after first use).
+    std::string pipelineName;
+
+    /// Number of shader bindings for the fused kernel.
+    uint32_t numBindings = 0;
+
+    /// Input tensor names consumed from outside the group.
+    std::vector<std::string> externalInputs;
+
+    /// Output tensor name produced by the group (last node's output).
+    std::string outputName;
+
+    /// The shader generator — called once per dtype to produce the fused WGSL.
+    /// Captures the op types, opcodes needed for generation.
+    std::function<std::string(TensorDtype)> shaderGenerator;
+};
+
 // ─── Op Dispatch Function ────────────────────────────────────────────────────
 
 class GraphExecutor;  // forward
@@ -182,14 +208,42 @@ public:
     /// Ensure a tensor has a GPU buffer (uploads CPU data if needed).
     void EnsureGpu(GpuTensor& t);
 
+    /// GPU-side fp16→f32 cast. Dispatches a compute shader — no CPU readback.
+    /// Replaces the tensor in-place with a new f32 GPU tensor.
+    /// Returns true if the tensor is now f32 on GPU.
+    bool EnsureFloat32(GpuTensor& t);
+
     /// Get or create a WGSL compute pipeline.
     const CompiledPipeline& GetPipeline(const std::string& name,
                                          const std::string& wgsl,
                                          uint32_t numBindings);
 
+    /// Get or create a pipeline from a generator function.
+    /// The generator is only called on first use (cache miss).
+    /// Use for template-generated shaders to avoid per-dispatch string work.
+    ///   auto& pl = ex.GetPipelineT("binary_f16", 4, []() {
+    ///       return instantiateTemplate(WGSL_BINARY_ELEMENTWISE_T, TensorDtype::Float16);
+    ///   });
+    template<typename F>
+    const CompiledPipeline& GetPipelineT(const std::string& name,
+                                          uint32_t numBindings,
+                                          F&& generator) {
+        // Check cache first (fast path — no string generation)
+        if (gpu->hasPipeline(name)) {
+            return gpu->getOrCreatePipeline(name, "", numBindings);
+        }
+        // Cache miss — generate shader once
+        std::string wgsl = generator();
+        return gpu->getOrCreatePipeline(name, wgsl, numBindings);
+    }
+
     /// Create a bind group.
     WGPUBindGroup MakeBindGroup(const CompiledPipeline& pl,
                                  const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
+
+    /// Detect fuseable patterns in the graph. Called once after Load().
+    /// Populates fusedGroups_ with fusion descriptors.
+    void DetectFusions();
 
     /// Submit dispatches and wait.
     void Submit(const std::vector<Dispatch>& dispatches);
@@ -234,6 +288,12 @@ private:
 
     // Cached topo sort order (reused across Execute calls for the same graph)
     std::vector<size_t> cachedExecOrder_;
+
+    // Fused op groups detected at graph analysis time.
+    // Key: first node index in the group. Value: fusion descriptor.
+    std::unordered_map<size_t, FusedGroup> fusedGroups_;
+    // Set of node indices that are part of a fusion (skip individual dispatch)
+    std::set<size_t> fusedNodeIndices_;
 
 public:
     // Batched dispatches for the current execution (public for op access)

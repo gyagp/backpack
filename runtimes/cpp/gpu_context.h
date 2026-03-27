@@ -122,6 +122,9 @@ struct GPUContext {
         const std::string& name, const std::string& wgsl,
         uint32_t numBindings);
 
+    /// Check if a pipeline with the given name is already cached.
+    bool hasPipeline(const std::string& name) const;
+
     // --- Bind groups ---
     /// Create a bind group from a list of (binding_index, GPUBuffer) pairs.
     WGPUBindGroup createBindGroup(

@@ -190,7 +190,7 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
         auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
-        auto& pl = ex.GetPipeline("topk_f16", WGSL_TOPK_F16, 4);
+        auto& pl = ex.GetPipelineT("topk_f16", 4, []() { return std::string(WGSL_TOPK_F16); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, data->buffer}, {1, out[0]->buffer},
             {2, idxTensor.buffer}, {3, paramBuf}});
@@ -213,7 +213,7 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
         auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
-        auto& pl = ex.GetPipeline("topk_f32", WGSL_TOPK_F32, 4);
+        auto& pl = ex.GetPipelineT("topk_f32", 4, []() { return std::string(WGSL_TOPK_F32); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, data->buffer}, {1, out[0]->buffer},
             {2, idxTensor.buffer}, {3, paramBuf}});
@@ -292,7 +292,7 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
         auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
-        auto& pl = ex.GetPipeline("gather_elements_f16", WGSL_GATHER_ELEMENTS_F16, 4);
+        auto& pl = ex.GetPipelineT("gather_elements_f16", 4, []() { return std::string(WGSL_GATHER_ELEMENTS_F16); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, data->buffer}, {1, indices->buffer},
             {2, out[0]->buffer}, {3, paramBuf}});
@@ -315,7 +315,7 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
         auto paramBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(paramBuf, params, 16);
 
-        auto& pl = ex.GetPipeline("gather_elements_f32", WGSL_GATHER_ELEMENTS_F32, 4);
+        auto& pl = ex.GetPipelineT("gather_elements_f32", 4, []() { return std::string(WGSL_GATHER_ELEMENTS_F32); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, data->buffer}, {1, indices->buffer},
             {2, out[0]->buffer}, {3, paramBuf}});
@@ -390,7 +390,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
             auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
 
-            auto& pl = ex.GetPipeline("scatter_elements_f16", WGSL_SCATTER_ELEMENTS_F16, 5);
+            auto& pl = ex.GetPipelineT("scatter_elements_f16", 5, []() { return std::string(WGSL_SCATTER_ELEMENTS_F16); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
@@ -404,7 +404,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
             auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
 
-            auto& pl = ex.GetPipeline("scatter_elements_f16", WGSL_SCATTER_ELEMENTS_F16, 5);
+            auto& pl = ex.GetPipelineT("scatter_elements_f16", 5, []() { return std::string(WGSL_SCATTER_ELEMENTS_F16); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
@@ -430,7 +430,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 0};
             auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
-            auto& pl = ex.GetPipeline("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_F32, 5);
+            auto& pl = ex.GetPipelineT("scatter_elements_f32", 5, []() { return std::string(WGSL_SCATTER_ELEMENTS_F32); });
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
             ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -441,7 +441,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 1};
             auto paramBuf = ex.getParamBuffer(32);
             ex.gpu->writeBuffer(paramBuf, params, 20);
-            auto& pl = ex.GetPipeline("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_F32, 5);
+            auto& pl = ex.GetPipelineT("scatter_elements_f32", 5, []() { return std::string(WGSL_SCATTER_ELEMENTS_F32); });
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
             ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -555,7 +555,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, 0};
         auto gpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(gpBuf, gateParams, 16);
-        auto& pl = ex.GetPipeline("moe_gate", WGSL_MOE_GATE, 4);
+        auto& pl = ex.GetPipelineT("moe_gate", 4, []() { return std::string(WGSL_MOE_GATE); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, routerWeights->buffer}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg, 1, 1, 1, "moe_gate"});
@@ -574,7 +574,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)blocksPerCol_gu, slot};
             auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipeline("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT, 6);
+            auto& pl = ex.GetPipelineT("matmul_q4_indirect", 6, []() { return std::string(WGSL_MATMUL_Q4_INDIRECT); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, input->buffer}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
                 {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
@@ -587,7 +587,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
             auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipeline("swiglu", WGSL_SWIGLU, 3);
+            auto& pl = ex.GetPipelineT("swiglu", 3, []() { return std::string(WGSL_SWIGLU); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
             ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -600,7 +600,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)blocksPerCol_dn, slot};
             auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipeline("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT, 6);
+            auto& pl = ex.GetPipelineT("matmul_q4_indirect", 6, []() { return std::string(WGSL_MATMUL_Q4_INDIRECT); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
                 {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
@@ -613,7 +613,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t params[4] = {(uint32_t)N_dn, slot, 0, 0};
             auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipeline("weighted_add_indirect", WGSL_WEIGHTED_ADD_INDIRECT, 4);
+            auto& pl = ex.GetPipelineT("weighted_add_indirect", 4, []() { return std::string(WGSL_WEIGHTED_ADD_INDIRECT); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, downBuf.buffer}, {1, out[0]->buffer}, {2, pBuf}, {3, expertWtBuf}});
             ex.pendingDispatches_.push_back({pl.pipeline, bg,

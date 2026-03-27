@@ -53,6 +53,7 @@ set(BACKPACK_CORE_SOURCES
     json_parser.cpp
     graph_executor.cpp
     ops/elementwise.cpp
+    ops/fusion.cpp
     ops/shape.cpp
     ops/matmul.cpp
     ops/norm.cpp

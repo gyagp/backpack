@@ -348,6 +348,10 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
 
 // ─── Pipelines ───────────────────────────────────────────────────────────────
 
+bool GPUContext::hasPipeline(const std::string& name) const {
+    return pipelines_.find(name) != pipelines_.end();
+}
+
 const CompiledPipeline& GPUContext::getOrCreatePipeline(
         const std::string& name, const std::string& wgsl, uint32_t numBindings) {
     auto it = pipelines_.find(name);

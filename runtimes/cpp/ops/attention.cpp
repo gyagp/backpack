@@ -143,7 +143,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         auto paramBuf = ex.getParamBuffer(32);
         ex.gpu->writeBuffer(paramBuf, params, 32);
 
-        auto& pl = ex.GetPipeline("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN, 5);
+        auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return std::string(WGSL_BIDIRECTIONAL_ATTN); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, Q->buffer}, {1, K->buffer}, {2, V->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -186,7 +186,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t p[4] = {(uint32_t)nel, 0, 0, 0};
         auto pb = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(pb, p, 16);
-        auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+        auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
         auto bg = ex.MakeBindGroup(pl, {{0, t.buffer}, {1, f32t.buffer}, {2, pb}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
             (uint32_t)((nel + 255) / 256), 1, 1, "attn_cast"});
@@ -216,7 +216,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)rotaryDim, (uint32_t)posOffset};
         auto rpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
-        auto& roPl = ex.GetPipeline("rope_inplace", WGSL_ROPE_INPLACE, 4);
+        auto& roPl = ex.GetPipelineT("rope_inplace", 4, []() { return std::string(WGSL_ROPE_INPLACE); });
         auto roBg = ex.MakeBindGroup(roPl, {
             {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
         ex.pendingDispatches_.push_back({roPl.pipeline, roBg,
@@ -259,7 +259,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         auto kvpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
 
-        auto& kvPl = ex.GetPipeline("kv_cache_append", WGSL_KV_CACHE_APPEND, 4);
+        auto& kvPl = ex.GetPipelineT("kv_cache_append", 4, []() { return std::string(WGSL_KV_CACHE_APPEND); });
         auto kvBgK = ex.MakeBindGroup(kvPl, {
             {0, K->buffer}, {1, pastKeyBuf}, {2, presentKey.buffer}, {3, kvpBuf}});
         ex.pendingDispatches_.push_back({kvPl.pipeline, kvBgK,
@@ -282,7 +282,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         auto apBuf = ex.getParamBuffer(32);
         ex.gpu->writeBuffer(apBuf, attnParams, 32);
 
-        auto& attnPl = ex.GetPipeline("gqa_decode", WGSL_GQA_DECODE, 5);
+        auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return std::string(WGSL_GQA_DECODE); });
         auto attnBg = ex.MakeBindGroup(attnPl, {
             {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
             {3, out[0]->buffer}, {4, apBuf}});
@@ -340,7 +340,7 @@ static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipeline("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN, 5);
+    auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return std::string(WGSL_BIDIRECTIONAL_ATTN); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, Q->buffer}, {1, K->buffer}, {2, V->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -419,7 +419,7 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipeline("rotary_embedding", WGSL_ROTARY_EMBEDDING, 6);
+    auto& pl = ex.GetPipelineT("rotary_embedding", 6, []() { return std::string(WGSL_ROTARY_EMBEDDING); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, posIdsBuf}, {2, CosCache->buffer},
         {3, SinCache->buffer}, {4, out[0]->buffer}, {5, paramBuf}});

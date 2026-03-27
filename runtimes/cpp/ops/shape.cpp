@@ -1,10 +1,11 @@
 /**
  * ops/shape.cpp — Shape manipulation ONNX ops.
- * Uses embedded WGSL kernels from compiler/kernels/shared/.
+ * Uses embedded WGSL kernels from runtimes/cpp/kernels/shared/.
  */
 
 #include "../graph_executor.h"
 #include "../wgsl_shaders.h"
+#include "../wgsl_template.h"
 #include <webgpu/webgpu.h>
 #include <cstdio>
 #include <cstring>
@@ -363,7 +364,7 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(16);
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
-    auto& pl = ex.GetPipeline("gather", WGSL_GATHER, 4);
+    auto& pl = ex.GetPipelineT("gather", 4, []() { return std::string(WGSL_GATHER); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, data->buffer}, {1, idxBuf}, {2, out[0]->buffer}, {3, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
@@ -452,7 +453,7 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
             auto paramBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(paramBuf, params, 16);
-            auto& pl = ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+            auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, t->buffer}, {1, f32t.buffer}, {2, paramBuf}});
             ex.SubmitAsync({{pl.pipeline, bg,
@@ -524,26 +525,68 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
         // GPU kernel for 2-input concat (avoids CPU readback)
         if (gpuIn.size() == 2 && gpuIn[0]->dtype == gpuIn[1]->dtype &&
             (gpuIn[0]->dtype == TensorDtype::Float32 ||
-             (gpuIn[0]->dtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16))) {
-            bool isF16 = (gpuIn[0]->dtype == TensorDtype::Float16);
+             gpuIn[0]->dtype == TensorDtype::Float16)) {
+            TensorDtype dtype = gpuIn[0]->dtype;
             int64_t outNel = 1;
             for (auto d : outShape) outNel *= d;
+
+            // Templated concat kernel
+            static const char* CONCAT_2INPUT_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> A: array<${T}>;
+@group(0) @binding(1) var<storage, read> B: array<${T}>;
+@group(0) @binding(2) var<storage, read_write> Out: array<${T}>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let a_split = _params_[1];
+    let total_split = _params_[2];
+    let inner = _params_[3];
+
+    let base = gid.x * 2u;
+    if (base >= N) { return; }
+
+    var v0: f32 = 0.0;
+    var v1: f32 = 0.0;
+    for (var k = 0u; k < 2u; k++) {
+        let idx = base + k;
+        if (idx >= N) { break; }
+        let outer = idx / (total_split * inner);
+        let rem = idx % (total_split * inner);
+        let split_pos = rem / inner;
+        let inner_pos = rem % inner;
+        var val: f32;
+        if (split_pos < a_split) {
+            val = t_read(&A, outer * a_split * inner + split_pos * inner + inner_pos);
+        } else {
+            let b_split = total_split - a_split;
+            val = t_read(&B, outer * b_split * inner + (split_pos - a_split) * inner + inner_pos);
+        }
+        if (k == 0u) { v0 = val; } else { v1 = val; }
+    }
+    t_write2(&Out, base, v0, v1);
+}
+)WGSL";
 
             uint32_t params[4] = {(uint32_t)outNel, (uint32_t)gpuIn[0]->shape[axis],
                                    (uint32_t)outShape[axis], (uint32_t)innerSize};
             auto paramBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(paramBuf, params, 16);
 
-            const char* kernelName = isF16 ? "concat_2input_f16" : "concat_2input_f32";
-            const char* kernelSrc = isF16 ? WGSL_CONCAT_2INPUT_F16 : WGSL_CONCAT_2INPUT_F32;
-            auto& pl = ex.GetPipeline(kernelName, kernelSrc, 4);
+            std::string pname = "concat_2t" + std::string(dtypeSuffix(dtype));
+            auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
+                return instantiateTemplate(CONCAT_2INPUT_T, dtype);
+            });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, gpuIn[0]->buffer}, {1, gpuIn[1]->buffer},
                 {2, out[0]->buffer}, {3, paramBuf}});
-            uint32_t dispatchN = isF16 ? (uint32_t)(((outNel + 1) / 2 + 255) / 256)
-                                       : (uint32_t)((outNel + 255) / 256);
+            uint32_t nwg = (uint32_t)(((outNel + 1) / 2 + 255) / 256);
             ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                dispatchN, 1, 1, isF16 ? "concat_f16" : "concat_f32"});
+                nwg, 1, 1, "concat"});
             return;
         }
         // CPU fallback for non-axis-0 concat
@@ -670,7 +713,7 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
     // The embedded transpose kernel operates on u32 lanes. Use it for element
     // sizes that map cleanly to u32 units, but keep small integer metadata on
     // CPU to avoid shape corruption in downstream ops like Pad.
-    if ((elemSize == 4 || elemSize == 8) && !preferCpuMetadata) {
+    if ((elemSize == 4 || elemSize == 8 || elemSize == 2) && !preferCpuMetadata) {
         if (!data->buffer.handle) { *out[0] = *data; out[0]->shape = outShape; return; }
         if (!data->buffer.handle || data->buffer.size < (size_t)(nel * elemSize)) {
             *out[0] = *data;
@@ -688,51 +731,40 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
             permInStrides[i] = (uint32_t)inStrides[perm[i]];
         }
 
-        uint32_t elemsU32 = (elemSize == 8) ? (uint32_t)(nel * 2) : (uint32_t)nel;
-        std::vector<uint32_t> params(4 + 2 * ndim, 0);
-        params[0] = elemsU32;
-        params[1] = (uint32_t)ndim;
-        for (int i = 0; i < ndim; i++) {
-            params[4 + i] = (elemSize == 8) ? outStrides[i] * 2 : outStrides[i];
-            params[4 + ndim + i] = (elemSize == 8) ? permInStrides[i] * 2 : permInStrides[i];
-        }
+        if (elemSize == 2 || elemSize == 4) {
+            // fp16 or f32: use templated kernel with element-level read/write
+            uint32_t nelU = (uint32_t)nel;
+            std::vector<uint32_t> params(4 + 2 * ndim, 0);
+            params[0] = nelU;
+            params[1] = (uint32_t)ndim;
+            for (int i = 0; i < ndim; i++) {
+                params[4 + i] = outStrides[i];
+                params[4 + ndim + i] = permInStrides[i];
+            }
+            auto paramBuf = ex.gpu->createBuffer("tr_p", params.size() * 4);
+            ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
-        // Debug: log transpose kernel params for Transpose_2
-        if (n.name == "/Transpose_2") {
-            fprintf(stderr, "  [transpose-kernel] %s: nel=%u ndim=%d\n", n.name.c_str(), elemsU32, ndim);
-            fprintf(stderr, "    outStrides=[");
-            for (int i = 0; i < ndim; i++) fprintf(stderr, "%s%u", i?",":"", params[4+i]);
-            fprintf(stderr, "]\n    permInStrides=[");
-            for (int i = 0; i < ndim; i++) fprintf(stderr, "%s%u", i?",":"", params[4+ndim+i]);
-            fprintf(stderr, "]\n");
-            // What numpy would give:
-            // inStrides for [1,16,16,1,2,2,16] = [16384, 1024, 64, 64, 32, 16, 1]
-            // perm = [6,0,3,1,4,2,5]
-            // permInStrides[i] = inStrides[perm[i]]
-            // permInStrides[0] = inStrides[6] = 1
-            // permInStrides[1] = inStrides[0] = 16384
-            // permInStrides[2] = inStrides[3] = 64
-            // permInStrides[3] = inStrides[1] = 1024
-            // permInStrides[4] = inStrides[4] = 32
-            // permInStrides[5] = inStrides[2] = 64
-            // permInStrides[6] = inStrides[5] = 16
-            fprintf(stderr, "    expected permInStrides=[1,16384,64,1024,32,64,16]\n");
-            // outShape = [16,1,1,16,2,16,2], outStrides:
-            // outStrides[6]=1, [5]=2, [4]=32, [3]=64, [2]=1024, [1]=1024, [0]=1024
-            fprintf(stderr, "    expected outStrides=[1024,1024,1024,64,32,2,1]\n");
-            fflush(stderr);
-        }
-        for (int i = 0; i < ndim; i++) {
-            params[4 + i] = (elemSize == 8) ? outStrides[i] * 2 : outStrides[i];
-            params[4 + ndim + i] = (elemSize == 8) ? permInStrides[i] * 2 : permInStrides[i];
-        }
+            auto& pl = ex.GetPipelineT("transpose" + std::string(dtypeSuffix(data->dtype)), 3,
+                [&]() { return instantiateTemplate(WGSL_TRANSPOSE_T, data->dtype); });
+            auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg, (nelU + 255) / 256, 1, 1, "transpose"});
+        } else {
+            // i64: existing u32-level kernel (2 u32 per i64 element)
+            uint32_t elemsU32 = (uint32_t)(nel * 2);
+            std::vector<uint32_t> params(4 + 2 * ndim, 0);
+            params[0] = elemsU32;
+            params[1] = (uint32_t)ndim;
+            for (int i = 0; i < ndim; i++) {
+                params[4 + i] = outStrides[i] * 2;
+                params[4 + ndim + i] = permInStrides[i] * 2;
+            }
+            auto paramBuf = ex.gpu->createBuffer("tr_p", params.size() * 4);
+            ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
-        auto paramBuf = ex.gpu->createBuffer("tr_p", params.size() * 4);
-        ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
-
-        auto& pl = ex.GetPipeline("transpose", WGSL_TRANSPOSE, 3);
-        auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg, (elemsU32 + 255) / 256, 1, 1, "transpose"});
+            auto& pl = ex.GetPipelineT("transpose", 3, []() { return std::string(WGSL_TRANSPOSE); });
+            auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+            ex.pendingDispatches_.push_back({pl.pipeline, bg, (elemsU32 + 255) / 256, 1, 1, "transpose"});
+        }
         return;
     }
 
@@ -1027,31 +1059,47 @@ static void opSlice(GraphExecutor& ex, const OnnxGraphNode& n,
                 return;
             }
 
-            // Many outer iterations — use GPU concat kernel as a general copy
-            // Reinterpret as a 2-input concat: [0:start] is ignored, [start:start+out] is copied
-            // Simpler: just use f32 array indexing
-            if (data->dtype == TensorDtype::Float32) {
-                // GPU slice kernel: each thread copies one element
+            // Many outer iterations — use GPU slice kernel
+            if (data->dtype == TensorDtype::Float32 || data->dtype == TensorDtype::Float16) {
                 if (ndim == 3) {
-                    static const char* SLICE_3D_F32 = R"WGSL(
-@group(0) @binding(0) var<storage, read> src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+                    // Templated GPU slice kernel: each thread copies a pair of elements
+                    static const char* SLICE_3D_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> src: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> dst: array<${T}>;
 @group(0) @binding(2) var<storage, read> _p: array<u32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _p[0]; let idx = gid.x;
-    if (idx >= N) { return; }
+    let N = _p[0];
+    let base = gid.x * 2u;
+    if (base >= N) { return; }
     let d2 = _p[1]; let d1 = _p[2]; let d0 = _p[3];
     let s2 = _p[4]; let s1 = _p[5]; let s0 = _p[6];
     let id1 = _p[7]; let id2 = _p[8];
-    let o0 = idx / (d1 * d2);
-    let rem = idx % (d1 * d2);
-    let o1 = rem / d2;
-    let o2 = rem % d2;
-    let src_idx = (o0 + s0) * id1 * id2 + (o1 + s1) * id2 + (o2 + s2);
-    dst[idx] = src[src_idx];
+
+    let o0_0 = base / (d1 * d2);
+    let rem0 = base % (d1 * d2);
+    let o1_0 = rem0 / d2;
+    let o2_0 = rem0 % d2;
+    let src_idx0 = (o0_0 + s0) * id1 * id2 + (o1_0 + s1) * id2 + (o2_0 + s2);
+    let v0 = t_read(&src, src_idx0);
+
+    var v1: f32 = 0.0;
+    if (base + 1u < N) {
+        let idx1 = base + 1u;
+        let o0_1 = idx1 / (d1 * d2);
+        let rem1 = idx1 % (d1 * d2);
+        let o1_1 = rem1 / d2;
+        let o2_1 = rem1 % d2;
+        let src_idx1 = (o0_1 + s0) * id1 * id2 + (o1_1 + s1) * id2 + (o2_1 + s2);
+        v1 = t_read(&src, src_idx1);
+    }
+    t_write2(&dst, base, v0, v1);
 }
 )WGSL";
+                    TensorDtype dtype = data->dtype;
                     uint32_t outN = (uint32_t)totalOut;
                     uint32_t params[12] = {
                         outN,
@@ -1061,10 +1109,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     };
                     auto pBuf = ex.getParamBuffer(48);
                     ex.gpu->writeBuffer(pBuf, params, 48);
-                    auto& pl = ex.GetPipeline("slice_3d_f32", SLICE_3D_F32, 3);
+                    std::string pname = "slice_3d_t" + std::string(dtypeSuffix(dtype));
+                    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+                        return instantiateTemplate(SLICE_3D_T, dtype);
+                    });
                     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, pBuf}});
+                    uint32_t nwg = (uint32_t)(((outN + 1) / 2 + 255) / 256);
                     ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                        (uint32_t)((outN + 255) / 256), 1, 1, "slice_3d"});
+                        nwg, 1, 1, "slice_3d"});
                     return;
                 }
             }
@@ -1151,6 +1203,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // For fp16 and f32: use templated kernel with element-level access
+    if (elemSize == 2 || elemSize == 4) {
+        // Strides in element units (not u32)
+        std::vector<uint32_t> inStridesE(ndim), outStridesE(ndim);
+        uint32_t se = 1;
+        for (int i = ndim-1; i >= 0; i--) { outStridesE[i] = se; se *= (uint32_t)outShape[i]; }
+        se = 1;
+        for (int i = ndim-1; i >= 0; i--) { inStridesE[i] = se; se *= (uint32_t)data->shape[i]; }
+
+        std::vector<uint32_t> params(4 + 4 * ndim, 0);
+        params[0] = (uint32_t)totalOut;
+        params[1] = (uint32_t)ndim;
+        for (int i = 0; i < ndim; i++) {
+            params[4 + i] = outStridesE[i];
+            params[4 + ndim + i] = inStridesE[i];
+            params[4 + 2*ndim + i] = (uint32_t)startVals[i];
+            params[4 + 3*ndim + i] = (uint32_t)(stepVals[i] < 0 ? (uint32_t)(int32_t)stepVals[i] : (uint32_t)stepVals[i]);
+        }
+        auto paramBuf = ex.gpu->createBuffer("slice_p", params.size() * 4);
+        ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
+
+        auto& pl = ex.GetPipelineT("slice" + std::string(dtypeSuffix(data->dtype)), 3,
+            [&]() { return instantiateTemplate(WGSL_SLICE_T, data->dtype); });
+        auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+            ((uint32_t)totalOut + 255) / 256, 1, 1, "slice"});
+        return;
+    }
+
     // Compute strides
     std::vector<uint32_t> inStrides(ndim), outStrides(ndim);
     uint32_t s = 1;
@@ -1190,7 +1271,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     auto paramBuf = ex.gpu->createBuffer("slice_p", params.size() * 4);
     ex.gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
-    auto& pl = ex.GetPipeline("slice", WGSL_SLICE, 3);
+    auto& pl = ex.GetPipelineT("slice", 3, []() { return std::string(WGSL_SLICE); });
     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
         (totalU32 + 255) / 256, 1, 1, "slice"});
@@ -1372,10 +1453,18 @@ static void opExpand(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.gpu->createBuffer("expand_p", params.size()*4);
     ex.gpu->writeBuffer(paramBuf, params.data(), params.size()*4);
 
-    auto& pl = ex.GetPipeline("expand", WGSL_EXPAND, 3);
+    // Use templated kernel for dtype-transparent expand
+    TensorDtype dtype = data->dtype;
+    if (dtype != TensorDtype::Float16) dtype = TensorDtype::Float32;
+    std::string pname = "expand_t" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+        return instantiateTemplate(WGSL_EXPAND_T, dtype);
+    });
     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+    // Each thread handles 2 elements
+    uint32_t numWorkgroups = (uint32_t)(((totalOut + 1) / 2 + 255) / 256);
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((totalOut+255)/256), 1, 1, "expand"});
+        numWorkgroups, 1, 1, "expand"});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
