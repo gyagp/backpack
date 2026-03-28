@@ -4,6 +4,7 @@
 
 #include "../graph_executor.h"
 #include "../wgsl_shaders.h"
+#include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -20,9 +21,9 @@ static bool isVaeDecoderNode(const std::string& nodeName) {
 }
 
 static TensorDtype computeOutDtype(TensorDtype dtype) {
-    return (dtype == TensorDtype::Float16 || dtype == TensorDtype::Float32)
-             ? TensorDtype::Float32
-             : dtype;
+    if (dtype == TensorDtype::Float16) return TensorDtype::Float16;
+    if (dtype == TensorDtype::Float32) return TensorDtype::Float32;
+    return dtype;
 }
 
 static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
@@ -296,7 +297,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
 
         auto& pl = useFp16Path
             ? ex.GetPipelineT("conv2d_f16", 5, []() { return std::string(WGSL_CONV2D_F16); })
-            : ex.GetPipelineT("conv2d_f32", 5, []() { return std::string(WGSL_CONV2D); });
+            : ex.GetPipelineT("conv2d_f32", 5, []() { return instantiateTemplate(WGSL_CONV2D_T, TensorDtype::Float32); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -386,7 +387,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto& pl = useFp16Path
         ? ex.GetPipelineT("conv2d_f16", 5, []() { return std::string(WGSL_CONV2D_F16); })
-        : ex.GetPipelineT("conv2d_f32", 5, []() { return std::string(WGSL_CONV2D); });
+        : ex.GetPipelineT("conv2d_f32", 5, []() { return instantiateTemplate(WGSL_CONV2D_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -475,7 +476,7 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto& pl = useFp16Path
         ? ex.GetPipelineT("conv_transpose2d_f16", 5, []() { return std::string(WGSL_CONV_TRANSPOSE2D_F16); })
-        : ex.GetPipelineT("conv_transpose2d_f32", 5, []() { return std::string(WGSL_CONV_TRANSPOSE2D); });
+        : ex.GetPipelineT("conv_transpose2d_f32", 5, []() { return instantiateTemplate(WGSL_CONV_TRANSPOSE2D_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -524,7 +525,7 @@ static void opResize(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipelineT("resize_nearest", 3, []() { return std::string(WGSL_RESIZE_NEAREST); });
+    auto& pl = ex.GetPipelineT("resize_nearest", 3, []() { return instantiateTemplate(WGSL_RESIZE_NEAREST_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     int64_t total = N * C * H_out * W_out;

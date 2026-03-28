@@ -217,7 +217,7 @@ def test_scale():
 # ── MatMul f32 ────────────────────────────────────────────────────────────────
 
 def test_matmul_f32():
-    wgsl = load_wgsl("shared", "matmul_f32")
+    wgsl = load_wgsl("shared", "matmul")
     M, N, K = 4, 8, 16
     np.random.seed(42)
     A = np.random.randn(M, K).astype(np.float32)
@@ -229,7 +229,7 @@ def test_matmul_f32():
          bb(3, "_params_", "u32")],
         {"A": A.ravel(), "B": B.ravel(), "C": np.zeros(M * N, dtype=np.float32),
          "_params_": params},
-        grid=(ceil_div(N, 16), ceil_div(M, 16), 1),
+        grid=(ceil_div(N, 32), ceil_div(M, 16), 1),
         workgroup_size=(16 * 16))
 
     expected = (A @ B).ravel()

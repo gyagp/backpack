@@ -43,6 +43,7 @@ struct Dispatch {
 struct GPUBuffer {
     WGPUBuffer handle = nullptr;
     uint64_t   size   = 0;
+    uint64_t   offset = 0;   // bind offset (for buffer views/aliases)
 };
 
 /// GPU profiler using WebGPU timestamp queries.
@@ -125,6 +126,9 @@ struct GPUContext {
     /// Check if a pipeline with the given name is already cached.
     bool hasPipeline(const std::string& name) const;
 
+    /// Find a cached pipeline by name. Returns nullptr on cache miss.
+    const CompiledPipeline* findPipeline(const std::string& name) const;
+
     // --- Bind groups ---
     /// Create a bind group from a list of (binding_index, GPUBuffer) pairs.
     WGPUBindGroup createBindGroup(
@@ -193,6 +197,10 @@ struct GPUContext {
 
     /// Get or create a MAP_READ staging buffer of at least 'size' bytes.
     WGPUBuffer getOrCreateReadbackBuf(uint64_t size);
+
+    /// Map the readback buffer and return its contents. Use after the readback
+    /// copy was included in a submitted+waited command buffer (no new submit).
+    std::vector<uint8_t> mapReadbackBuffer(uint64_t readSize);
 
 private:
     std::unordered_map<std::string, CompiledPipeline> pipelines_;

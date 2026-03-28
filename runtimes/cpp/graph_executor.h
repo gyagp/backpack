@@ -228,11 +228,9 @@ public:
     const CompiledPipeline& GetPipelineT(const std::string& name,
                                           uint32_t numBindings,
                                           F&& generator) {
-        // Check cache first (fast path — no string generation)
-        if (gpu->hasPipeline(name)) {
-            return gpu->getOrCreatePipeline(name, "", numBindings);
-        }
-        // Cache miss — generate shader once
+        // Single lookup on cache hit (hot path)
+        if (auto* p = gpu->findPipeline(name)) return *p;
+        // Cache miss — generate shader once, compile and cache
         std::string wgsl = generator();
         return gpu->getOrCreatePipeline(name, wgsl, numBindings);
     }
@@ -251,6 +249,11 @@ public:
     /// Flush all pending GPU work (dispatches + copies) and wait.
     /// Must be called before any GPU readback to ensure data is written.
     void FlushPendingWork();
+
+    /// Submit all pending dispatches + copies without waiting.
+    /// Useful when GPU work can complete asynchronously (e.g. cache casts
+    /// that only need to finish before the next Execute() call).
+    void SubmitPending();
 
     /// Submit dispatches (fire and forget, no sync).
     void SubmitAsync(const std::vector<Dispatch>& dispatches);
@@ -301,11 +304,28 @@ public:
     struct PendingCopy { GPUBuffer src; uint64_t srcOff; GPUBuffer dst; uint64_t dstOff; uint64_t size; };
     std::vector<PendingCopy> pendingCopies_;
 
+    /// Flush pending dispatches+copies into a command encoder and submit.
+    void flushToEncoder();
+
+    /// Optional: request a readback copy at the end of the next flushToEncoder.
+    /// The copy is appended to the same command buffer, avoiding a separate
+    /// submission. After waitForQueue(), map readbackDst_ to read the result.
+    GPUBuffer readbackSrc_;
+    GPUBuffer readbackDst_;      // Must have MAP_READ usage
+    uint64_t readbackSize_ = 0;
+    void RequestReadback(GPUBuffer src, GPUBuffer dst, uint64_t size) {
+        readbackSrc_ = src; readbackDst_ = dst; readbackSize_ = size;
+    }
+
     // Deferred int readbacks — flushed at periodic sync or when needed
     std::vector<GpuTensor*> pendingIntReadbacks_;
 
     // Deferred buffer releases — flushed at periodic GPU sync points
     std::vector<std::string> pendingReleases_;
+
+    // Deferred GPU buffer releases — buffers are kept alive until the next Execute
+    // call, when we know the previous GPU work is complete (caller synced between calls).
+    std::vector<GPUBuffer> deferredBufferReleases_;
 
     // Param buffer pool: pre-allocated buffers for dispatch params.
     // Indexed by size bucket: [0]=16B, [1]=32B, [2]=48B, [3]=64B

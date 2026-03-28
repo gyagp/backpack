@@ -1,8 +1,13 @@
 // Softmax — numerically stable per-row softmax
 // Dispatch: (ceil(nRows/256), 1, 1)
+// Internal accumulation in f32 for numerical stability.
+// Uses paired writes for fp16 correctness (u32 packing).
 
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
+${T_READ}
+${T_WRITE2}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
 @group(0) @binding(2) var<storage, read> _params_: array<u32>;
 
 @compute @workgroup_size(256)
@@ -13,16 +18,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (row >= nRows) { return; }
     let base = row * rowLen;
 
-    var maxVal: f32 = -1e30;
+    // Find max (f32)
+    var mx: f32 = -1e30;
     for (var i = 0u; i < rowLen; i++) {
-        maxVal = max(maxVal, X[base + i]);
+        mx = max(mx, t_read(&X, base + i));
     }
-    var sumExp: f32 = 0.0;
+    // Exp sum
+    var expSum: f32 = 0.0;
     for (var i = 0u; i < rowLen; i++) {
-        sumExp += exp(X[base + i] - maxVal);
+        expSum += exp(t_read(&X, base + i) - mx);
     }
-    let invSum = 1.0 / max(sumExp, 1e-9);
-    for (var i = 0u; i < rowLen; i++) {
-        Y[base + i] = exp(X[base + i] - maxVal) * invSum;
+    let invSum = 1.0 / max(expSum, 1e-10);
+    // Write output in pairs
+    let pairs = rowLen / 2u;
+    for (var i = 0u; i < pairs; i++) {
+        let i0 = i * 2u;
+        let v0 = exp(t_read(&X, base + i0) - mx) * invSum;
+        let v1 = exp(t_read(&X, base + i0 + 1u) - mx) * invSum;
+        t_write2(&Y, base + i0, v0, v1);
+    }
+    if ((rowLen & 1u) != 0u) {
+        let last = rowLen - 1u;
+        t_write2(&Y, base + last, exp(t_read(&X, base + last) - mx) * invSum, 0.0);
     }
 }

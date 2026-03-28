@@ -1,6 +1,8 @@
 enable subgroups;
 
-@group(0) @binding(0) var<storage, read> Logits: array<f32>;
+${T_READ}
+
+@group(0) @binding(0) var<storage, read> Logits: array<${T}>;
 @group(0) @binding(1) var<storage, read_write> Result: array<i32>;
 @group(0) @binding(2) var<storage, read> _params_: array<u32>;
 
@@ -20,7 +22,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var local_idx: i32 = 0;
     var i = tid;
     for (; i < N; i = i + 256u) {
-        let v = Logits[i];
+        let v = t_read(&Logits, i);
         if (v > local_max) {
             local_max = v;
             local_idx = i32(i);

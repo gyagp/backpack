@@ -18,6 +18,7 @@
 #include "graph_executor.h"
 #include "tokenizer.h"
 #include "onnx_tokenizer.h"
+#include "wgsl_shaders.h"
 #include "json_parser.h"
 
 #include <chrono>
@@ -141,14 +142,20 @@ struct OnnxLlmContext {
     int64_t hiddenSize = 0, numLayers = 0, vocabSize = 0;
     int64_t numKvHeads = 0, headDim = 0;
     int64_t convLCache = 3;
+    int64_t maxSeqLen = 4096;  // static KV cache max sequence length
     std::vector<std::string> layerTypes;
     std::string arch;
 
     // KV cache state
     uint32_t pos = 0;
     std::unordered_map<std::string, GpuTensor> convState;
-    std::unordered_map<std::string, GpuTensor> kvState;
+    std::unordered_map<std::string, GpuTensor> kvState;  // static f32 KV buffers
     std::vector<int> convLayerIndices, attnLayerIndices;
+
+    // Reusable buffers for fast decode
+    GPUBuffer idsBuf, maskBuf, nlkBuf, logitsBuf;
+    std::vector<GPUBuffer> convOutBufs;
+    uint32_t maskBufCapacity = 0;
 
     bool Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         gpu = &gpuCtx;
@@ -181,6 +188,9 @@ struct OnnxLlmContext {
         headDim = hiddenSize / numHeads;
         convLCache = cfg.has("conv_L_cache") ? cfg["conv_L_cache"].as_int() : 3;
         arch = cfg.has("model_type") ? cfg["model_type"].as_string() : "onnx";
+        // Cap static KV cache at 4096 for WebGPU memory, configurable later
+        int64_t modelMaxSeq = cfg.has("max_position_embeddings") ? cfg["max_position_embeddings"].as_int() : 4096;
+        maxSeqLen = std::min(modelMaxSeq, (int64_t)4096);
 
         if (cfg.has("layer_types") && cfg["layer_types"].is_array()) {
             for (int64_t i = 0; i < cfg["layer_types"].size(); i++) {
@@ -208,6 +218,7 @@ struct OnnxLlmContext {
         pos = 0;
         convState.clear();
         kvState.clear();
+        // Conv caches: [1, hiddenSize, convLCache] fp16, zero-initialized
         for (int idx : convLayerIndices) {
             std::string name = "past_conv." + std::to_string(idx);
             GpuTensor t;
@@ -219,15 +230,28 @@ struct OnnxLlmContext {
             gpu->writeBuffer(t.buffer, zeros.data(), bytes);
             convState[name] = t;
         }
+        // Static KV caches: [1, numKvHeads, maxSeqLen, headDim] f32, pre-allocated
+        size_t kvBytes = (size_t)(numKvHeads * maxSeqLen * headDim * 4);
         for (int idx : attnLayerIndices) {
             for (const char* suffix : {".key", ".value"}) {
                 std::string name = "past_key_values." + std::to_string(idx) + suffix;
                 GpuTensor t;
-                t.shape = {1, numKvHeads, 0, headDim};
-                t.dtype = TensorDtype::Float16;
-                t.buffer = gpu->createBuffer(name, 4);
+                t.shape = {1, numKvHeads, 0, headDim};  // seq_len=0 initially
+                t.dtype = TensorDtype::Float32;          // f32 for static mode
+                t.buffer = gpu->createBuffer(name, kvBytes);
                 kvState[name] = t;
             }
+        }
+        // Pre-allocate reusable decode buffers
+        idsBuf = gpu->createBuffer("ids", 8);
+        nlkBuf = gpu->createBuffer("nlk", 8);
+        logitsBuf = gpu->createBuffer("logits_out", vocabSize * 4);
+        maskBuf = gpu->createBuffer("mask", maxSeqLen * 8);
+        maskBufCapacity = (uint32_t)maxSeqLen;
+        convOutBufs.resize(convLayerIndices.size());
+        for (size_t i = 0; i < convLayerIndices.size(); i++) {
+            std::string name = "conv_out_" + std::to_string(convLayerIndices[i]);
+            convOutBufs[i] = gpu->createBuffer(name, hiddenSize * convLCache * 4);
         }
     }
 
@@ -237,41 +261,49 @@ struct OnnxLlmContext {
 
         std::unordered_map<std::string, GpuTensor*> inputs;
 
-        // input_ids: [1, 1]
+        // input_ids: [1, 1] — reuse buffer
         GpuTensor idT;
         idT.shape = {1, 1};
         idT.dtype = TensorDtype::Int64;
-        idT.buffer = gpu->createBuffer("ids", 8);
-        gpu->writeBuffer(idT.buffer, &tokenId, 8);
+        idT.buffer = idsBuf;
+        gpu->writeBuffer(idsBuf, &tokenId, 8);
         idT.cpuData.resize(8);
         memcpy(idT.cpuData.data(), &tokenId, 8);
         inputs["input_ids"] = &idT;
 
-        // attention_mask: [1, pos]
+        // attention_mask: [1, pos] — reuse buffer (grows, but pre-allocated to maxSeqLen)
         std::vector<int64_t> mask(pos, 1);
         GpuTensor maskT;
         maskT.shape = {1, (int64_t)pos};
         maskT.dtype = TensorDtype::Int64;
-        maskT.buffer = gpu->createBuffer("mask", pos * 8);
-        gpu->writeBuffer(maskT.buffer, mask.data(), pos * 8);
+        maskT.buffer = maskBuf;
+        gpu->writeBuffer(maskBuf, mask.data(), pos * 8);
         maskT.cpuData.resize(pos * 8);
         memcpy(maskT.cpuData.data(), mask.data(), pos * 8);
         inputs["attention_mask"] = &maskT;
 
-        // num_logits_to_keep
+        // num_logits_to_keep — reuse buffer, write once
+        static bool nlkWritten = false;
         int64_t nlk = 1;
         GpuTensor nlkT;
         nlkT.shape = {};
         nlkT.dtype = TensorDtype::Int64;
-        nlkT.buffer = gpu->createBuffer("nlk", 8);
-        gpu->writeBuffer(nlkT.buffer, &nlk, 8);
+        nlkT.buffer = nlkBuf;
+        if (!nlkWritten) {
+            gpu->writeBuffer(nlkBuf, &nlk, 8);
+            nlkWritten = true;
+        }
         nlkT.cpuData.resize(8);
         memcpy(nlkT.cpuData.data(), &nlk, 8);
         inputs["num_logits_to_keep"] = &nlkT;
 
-        // Caches
+        // Caches — pass static KV buffers with current seq length
         for (auto& [name, t] : convState) inputs[name] = &t;
-        for (auto& [name, t] : kvState) inputs[name] = &t;
+        for (auto& [name, t] : kvState) {
+            // Update shape to reflect current sequence length
+            t.shape = {1, numKvHeads, (int64_t)(pos - 1), headDim};
+            inputs[name] = &t;
+        }
 
         // Outputs
         std::unordered_map<std::string, GpuTensor*> outputs;
@@ -279,122 +311,91 @@ struct OnnxLlmContext {
         GpuTensor logitsOut;
         logitsOut.shape = {1, 1, vocabSize};
         logitsOut.dtype = TensorDtype::Float32;
-        logitsOut.buffer = gpu->createBuffer("logits_out", vocabSize * 4);
+        logitsOut.buffer = logitsBuf;
         outputs["logits"] = &logitsOut;
 
         std::vector<GpuTensor> convOuts(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string name = "present_conv." + std::to_string(convLayerIndices[i]);
             convOuts[i].shape = {1, hiddenSize, convLCache};
-            convOuts[i].dtype = TensorDtype::Float32;  // may be f32 after Concat conversion
-            convOuts[i].buffer = gpu->createBuffer(name + "_o", hiddenSize * convLCache * 4);
+            convOuts[i].dtype = TensorDtype::Float32;
+            convOuts[i].buffer = convOutBufs[i];
             outputs[name] = &convOuts[i];
         }
 
+        // KV outputs: point to the same static buffers (attention op detects static mode)
         std::vector<GpuTensor> kvOuts(attnLayerIndices.size() * 2);
         for (size_t i = 0; i < attnLayerIndices.size(); i++) {
             std::string kName = "present." + std::to_string(attnLayerIndices[i]) + ".key";
             std::string vName = "present." + std::to_string(attnLayerIndices[i]) + ".value";
-            size_t kvBytes = (size_t)(numKvHeads * pos * headDim * 4);
-            if (kvBytes == 0) kvBytes = 4;
+            std::string kIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".key";
+            std::string vIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".value";
+            // Output uses same static buffer — op will write in-place
             kvOuts[i*2].shape = {1, numKvHeads, (int64_t)pos, headDim};
             kvOuts[i*2].dtype = TensorDtype::Float32;
-            kvOuts[i*2].buffer = gpu->createBuffer(kName + "_o", kvBytes);
+            kvOuts[i*2].buffer = kvState[kIn].buffer;
             kvOuts[i*2+1].shape = {1, numKvHeads, (int64_t)pos, headDim};
             kvOuts[i*2+1].dtype = TensorDtype::Float32;
-            kvOuts[i*2+1].buffer = gpu->createBuffer(vName + "_o", kvBytes);
+            kvOuts[i*2+1].buffer = kvState[vIn].buffer;
             outputs[kName] = &kvOuts[i*2];
             outputs[vName] = &kvOuts[i*2+1];
         }
 
+        // Request logits readback to be folded into Execute's final CB.
+        // This must use logitsBuf (the pre-allocated output buffer) — Execute
+        // will QueueCopy the graph's logits into logitsBuf, then the readback
+        // copy appends logitsBuf → readbackBuf in the same command buffer.
+        uint64_t logitBytes = (uint64_t)vocabSize * 4;
+        auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
+        executor.RequestReadback(logitsBuf, {rbHandle, logitBytes}, logitBytes);
+
         executor.Execute(inputs, outputs);
 
-        // Update caches — conv state must be fp16 (model expects Float16 inputs)
+        // Map readback buffer — the copy was already in the CB, no second submit
+        int64_t logitNel = logitsOut.ElementCount();
+        std::vector<float> logits(logitNel);
+        auto rb = gpu->mapReadbackBuffer(logitNel * 4);
+        memcpy(logits.data(), rb.data(), logitNel * 4);
+
+        // Update conv state — cast f32→f16 (conv layers expect fp16 input)
+        auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name) {
+            if (src.dtype != TensorDtype::Float32) return;
+            int64_t nel = src.ElementCount();
+            GpuTensor dst;
+            dst.shape = src.shape;
+            dst.dtype = TensorDtype::Float16;
+            dst.buffer = gpu->createBuffer(name, nel * 2);
+            uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
+            auto paramBuf = executor.getParamBuffer(16);
+            gpu->writeBuffer(paramBuf, params, 16);
+            auto& cPl = executor.GetPipelineT("cast_f32_to_f16", 3,
+                []() { return std::string(WGSL_CAST_F32_TO_F16); });
+            auto bg = executor.MakeBindGroup(cPl, {
+                {0, src.buffer}, {1, dst.buffer}, {2, paramBuf}});
+            executor.pendingDispatches_.push_back({cPl.pipeline, bg,
+                (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16"});
+            src = dst;
+        };
+
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
             if (!convOuts[i].IsValid()) continue;
-            // The internal Concat may produce f32 output; convert back to fp16
-            if (convOuts[i].dtype == TensorDtype::Float32) {
-                int64_t nel = convOuts[i].ElementCount();
-                auto rb = gpu->readBuffer(convOuts[i].buffer, nel * 4);
-                auto* f32 = reinterpret_cast<const float*>(rb.data());
-                std::vector<uint16_t> fp16(nel);
-                for (int64_t j = 0; j < nel; j++) {
-                    // f32 → fp16 conversion
-                    uint32_t bits;
-                    memcpy(&bits, &f32[j], 4);
-                    uint32_t sign = (bits >> 16) & 0x8000;
-                    int32_t exp = ((bits >> 23) & 0xFF) - 127;
-                    uint32_t mant = bits & 0x7FFFFF;
-                    if (exp > 15) fp16[j] = (uint16_t)(sign | 0x7C00);        // inf/overflow
-                    else if (exp < -14) fp16[j] = (uint16_t)sign;              // underflow → 0
-                    else fp16[j] = (uint16_t)(sign | ((exp + 15) << 10) | (mant >> 13));
-                }
-                GpuTensor t;
-                t.shape = convOuts[i].shape;
-                t.dtype = TensorDtype::Float16;
-                t.buffer = gpu->createBuffer(inName, nel * 2);
-                gpu->writeBuffer(t.buffer, fp16.data(), nel * 2);
-                convState[inName] = t;
-            } else {
-                convState[inName] = convOuts[i];
-            }
-        }
-        // KV cache — also ensure fp16
-        for (size_t i = 0; i < attnLayerIndices.size(); i++) {
-            std::string kIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".key";
-            std::string vIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".value";
-            auto convertToFp16 = [&](GpuTensor& src, const std::string& name) {
-                if (src.dtype == TensorDtype::Float32) {
-                    int64_t nel = src.ElementCount();
-                    auto rb = gpu->readBuffer(src.buffer, nel * 4);
-                    auto* f32 = reinterpret_cast<const float*>(rb.data());
-                    std::vector<uint16_t> fp16(nel);
-                    for (int64_t j = 0; j < nel; j++) {
-                        uint32_t bits; memcpy(&bits, &f32[j], 4);
-                        uint32_t sign = (bits >> 16) & 0x8000;
-                        int32_t exp = ((bits >> 23) & 0xFF) - 127;
-                        uint32_t mant = bits & 0x7FFFFF;
-                        if (exp > 15) fp16[j] = (uint16_t)(sign | 0x7C00);
-                        else if (exp < -14) fp16[j] = (uint16_t)sign;
-                        else fp16[j] = (uint16_t)(sign | ((exp + 15) << 10) | (mant >> 13));
-                    }
-                    src.dtype = TensorDtype::Float16;
-                    src.buffer = gpu->createBuffer(name, nel * 2);
-                    gpu->writeBuffer(src.buffer, fp16.data(), nel * 2);
-                }
-            };
-            if (kvOuts[i*2].IsValid()) {
-                convertToFp16(kvOuts[i*2], kIn);
-                kvState[kIn] = kvOuts[i*2];
-            }
-            if (kvOuts[i*2+1].IsValid()) {
-                convertToFp16(kvOuts[i*2+1], vIn);
-                kvState[vIn] = kvOuts[i*2+1];
-            }
+            gpuCastF32ToF16(convOuts[i], inName);
+            convState[inName] = convOuts[i];
         }
 
-        // Read logits
-        executor.FlushPendingWork();
-        gpu->waitForQueue();
-
-        int64_t logitNel = logitsOut.ElementCount();
-        std::vector<float> logits(logitNel);
-        if (logitsOut.dtype == TensorDtype::Float32) {
-            auto rb = gpu->readBuffer(logitsOut.buffer, logitNel * 4);
-            memcpy(logits.data(), rb.data(), logitNel * 4);
-        } else {
-            auto rb = gpu->readBuffer(logitsOut.buffer, logitNel * 2);
-            auto fp16 = reinterpret_cast<const uint16_t*>(rb.data());
-            for (int64_t i = 0; i < logitNel; i++) {
-                uint32_t h = fp16[i], s = (h>>15)&1, e = (h>>10)&0x1F, m = h&0x3FF;
-                uint32_t f;
-                if (e == 0) f = (s<<31)|(m<<13);
-                else if (e == 31) f = (s<<31)|0x7F800000|(m<<13);
-                else f = (s<<31)|((e+112)<<23)|(m<<13);
-                memcpy(&logits[i], &f, 4);
-            }
+        // KV cache: static buffers already updated in-place by the attention op.
+        // Just update shapes to reflect the new sequence length.
+        for (int idx : attnLayerIndices) {
+            std::string kIn = "past_key_values." + std::to_string(idx) + ".key";
+            std::string vIn = "past_key_values." + std::to_string(idx) + ".value";
+            kvState[kIn].shape = {1, numKvHeads, (int64_t)pos, headDim};
+            kvState[vIn].shape = {1, numKvHeads, (int64_t)pos, headDim};
         }
+
+        // Submit conv cast dispatches async
+        executor.SubmitPending();
+
         return logits;
     }
 

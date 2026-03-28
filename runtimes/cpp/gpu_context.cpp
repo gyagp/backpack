@@ -307,6 +307,8 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
 
 void GPUContext::releaseBuffer(GPUBuffer buf) {
     if (!buf.handle) return;
+    // Don't release aliased buffer views — only the parent buffer is released.
+    if (buf.offset != 0) return;
     int bucket = poolBucket(buf.size);
     if (pool_[bucket].size() < 256) {
         pool_[bucket].push_back(buf);
@@ -341,7 +343,20 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
                              uint64_t offset) {
     using hrc = std::chrono::high_resolution_clock;
     auto t0 = hrc::now();
-    wgpuQueueWriteBuffer(queue, buf.handle, offset, data, size);
+    // Add buffer base offset for aliased/view buffers
+    offset += buf.offset;
+    // WebGPU requires writeBuffer size to be a multiple of 4
+    if (size > 0 && (size & 3)) {
+        uint64_t aligned = size & ~(uint64_t)3;
+        if (aligned > 0)
+            wgpuQueueWriteBuffer(queue, buf.handle, offset, data, aligned);
+        // Write remaining bytes padded to 4
+        uint8_t padded[4] = {0};
+        memcpy(padded, (const uint8_t*)data + aligned, (size_t)(size - aligned));
+        wgpuQueueWriteBuffer(queue, buf.handle, offset + aligned, padded, 4);
+    } else {
+        wgpuQueueWriteBuffer(queue, buf.handle, offset, data, size);
+    }
     auto t1 = hrc::now();
     timing.write_buf_ns += (t1 - t0).count();
 }
@@ -350,6 +365,11 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
 
 bool GPUContext::hasPipeline(const std::string& name) const {
     return pipelines_.find(name) != pipelines_.end();
+}
+
+const CompiledPipeline* GPUContext::findPipeline(const std::string& name) const {
+    auto it = pipelines_.find(name);
+    return (it != pipelines_.end()) ? &it->second : nullptr;
 }
 
 const CompiledPipeline& GPUContext::getOrCreatePipeline(
@@ -598,7 +618,7 @@ std::vector<uint8_t> GPUContext::readBuffer(GPUBuffer src, uint64_t readSize) {
 
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, 0, rb, 0, readSize);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, src.offset, rb, 0, readSize);
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
     wgpuQueueSubmit(queue, 1, &cb);
@@ -617,6 +637,28 @@ std::vector<uint8_t> GPUContext::readBuffer(GPUBuffer src, uint64_t readSize) {
     WGPUFutureWaitInfo mw{mf, 0};
     wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
 
+    std::vector<uint8_t> out(readSize);
+    if (ms.status == 1) {
+        auto ptr = wgpuBufferGetConstMappedRange(rb, 0, readSize);
+        memcpy(out.data(), ptr, readSize);
+        wgpuBufferUnmap(rb);
+    }
+    return out;
+}
+
+std::vector<uint8_t> GPUContext::mapReadbackBuffer(uint64_t readSize) {
+    auto rb = getOrCreateReadbackBuf(readSize);
+    struct { bool done; uint32_t status; } ms{false, 0};
+    WGPUBufferMapCallbackInfo mcb{};
+    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
+    mcb.callback = [](WGPUMapAsyncStatus s, WGPUStringView, void* u, void*) {
+        auto* p = static_cast<decltype(&ms)>(u);
+        p->done = true; p->status = s;
+    };
+    mcb.userdata1 = &ms;
+    auto mf = wgpuBufferMapAsync(rb, 1, 0, readSize, mcb);
+    WGPUFutureWaitInfo mw{mf, 0};
+    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
     std::vector<uint8_t> out(readSize);
     if (ms.status == 1) {
         auto ptr = wgpuBufferGetConstMappedRange(rb, 0, readSize);

@@ -4,10 +4,13 @@
 // Supports padding, stride, dilation, and groups.
 // Dispatch: (ceil(total_output/256), 1, 1)
 
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read> W: array<f32>;
-@group(0) @binding(2) var<storage, read> Bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read> W: array<${T}>;
+@group(0) @binding(2) var<storage, read> Bias: array<${T}>;
+@group(0) @binding(3) var<storage, read_write> Y: array<${T}>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
 @compute @workgroup_size(256)
@@ -50,13 +53,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let ih = i32(oh * stride_h + kh * dil_h) - i32(pad_h);
                 let iw = i32(ow * stride_w + kw * dil_w) - i32(pad_w);
                 if (ih >= 0 && ih < i32(H_in) && iw >= 0 && iw < i32(W_in)) {
-                    let x_val = X[n * C_in * H_in * W_in + ci * H_in * W_in + u32(ih) * W_in + u32(iw)];
-                    let w_val = W[co * ci_per_group * KH * KW + ci_local * KH * KW + kh * KW + kw];
+                    let x_val = t_read(&X, n * C_in * H_in * W_in + ci * H_in * W_in + u32(ih) * W_in + u32(iw));
+                    let w_val = t_read(&W, co * ci_per_group * KH * KW + ci_local * KH * KW + kh * KW + kw);
                     acc += x_val * w_val;
                 }
             }
         }
     }
 
-    Y[idx] = acc + Bias[co];
+    t_write(&Y, idx, acc + t_read(&Bias, co));
 }

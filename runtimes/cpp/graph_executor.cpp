@@ -25,101 +25,144 @@ static constexpr bool kDebugExecTrace = false;
 
 namespace {
 
-struct PipelineWarmupSpec {
-    const char* name;
-    const char* wgsl;
-    uint32_t numBindings;
-};
-
-static const PipelineWarmupSpec* warmupSpecForOp(const std::string& opType) {
-    static const PipelineWarmupSpec kBinaryElementwise{"binary_elementwise", WGSL_BINARY_ELEMENTWISE, 4};
-    static const PipelineWarmupSpec kUnaryElementwise{"unary_elementwise", WGSL_UNARY_ELEMENTWISE, 3};
-    static const PipelineWarmupSpec kWhereSelect{"where_select", WGSL_WHERE_SELECT, 5};
-    static const PipelineWarmupSpec kEqualOp{"equal_op", WGSL_EQUAL_OP, 4};
-    static const PipelineWarmupSpec kSoftmax{"softmax", WGSL_SOFTMAX, 3};
-    static const PipelineWarmupSpec kMatmulF32{"matmul_f32", WGSL_MATMUL_F32, 4};
-    static const PipelineWarmupSpec kMatmulQ4{"matmul_q4", WGSL_MATMUL_Q4, 5};
-    static const PipelineWarmupSpec kGemm{"gemm", WGSL_GEMM, 5};
-    static const PipelineWarmupSpec kConv2d{"conv2d", WGSL_CONV2D, 5};
-    static const PipelineWarmupSpec kConvTranspose2d{"conv_transpose2d", WGSL_CONV_TRANSPOSE2D, 5};
-    static const PipelineWarmupSpec kResizeNearest{"resize_nearest", WGSL_RESIZE_NEAREST, 3};
-    static const PipelineWarmupSpec kLayerNorm{"layer_norm", WGSL_LAYER_NORM, 5};
-    static const PipelineWarmupSpec kInstanceNorm{"instance_norm", WGSL_INSTANCE_NORM, 5};
-    static const PipelineWarmupSpec kGroupNorm{"group_norm", WGSL_GROUP_NORM, 5};
-    static const PipelineWarmupSpec kGather{"gather", WGSL_GATHER, 4};
-    static const PipelineWarmupSpec kTranspose{"transpose", WGSL_TRANSPOSE, 3};
-    static const PipelineWarmupSpec kSlice{"slice", WGSL_SLICE, 3};
-    static const PipelineWarmupSpec kExpand{"expand", WGSL_EXPAND, 3};
-    static const PipelineWarmupSpec kBidirectionalAttn{"bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN, 5};
-    static const PipelineWarmupSpec kRotaryEmbedding{"rotary_embedding", WGSL_ROTARY_EMBEDDING, 6};
-
-    if (opType == "Add" || opType == "Sub" || opType == "Mul" || opType == "Div") return &kBinaryElementwise;
-    if (opType == "Sigmoid" || opType == "Tanh" || opType == "Neg" || opType == "Sqrt" ||
-        opType == "Sin" || opType == "Cos" || opType == "Gelu" || opType == "Silu" ||
-        opType == "Erf" || opType == "Relu" || opType == "Exp" || opType == "Log" ||
-        opType == "Abs" || opType == "Floor" || opType == "Ceil" || opType == "Round") return &kUnaryElementwise;
-    if (opType == "Where") return &kWhereSelect;
-    if (opType == "Equal") return &kEqualOp;
-    if (opType == "Softmax") return &kSoftmax;
-    if (opType == "MatMul") return &kMatmulF32;
-    if (opType == "MatMulNBits") return &kMatmulQ4;
-    if (opType == "Gemm") return &kGemm;
-    if (opType == "Conv") return &kConv2d;
-    if (opType == "ConvTranspose") return &kConvTranspose2d;
-    if (opType == "Resize") return &kResizeNearest;
-    if (opType == "LayerNormalization") return &kLayerNorm;
-    if (opType == "InstanceNormalization") return &kInstanceNorm;
-    if (opType == "GroupNorm") return &kGroupNorm;
-    if (opType == "Gather") return &kGather;
-    if (opType == "Transpose") return &kTranspose;
-    if (opType == "Slice") return &kSlice;
-    if (opType == "Expand") return &kExpand;
-    if (opType == "MultiHeadAttention") return &kBidirectionalAttn;
-    if (opType == "RotaryEmbedding") return &kRotaryEmbedding;
-    return nullptr;
-}
-
 static size_t warmupGraphPipelines(GraphExecutor& ex) {
+    // Collect unique op types from the graph
+    std::set<std::string> opTypes;
+    for (const auto& node : ex.GetGraph().nodes)
+        opTypes.insert(node.opType);
+
     std::set<std::string> warmed;
-    for (const auto& node : ex.GetGraph().nodes) {
-        if (node.opType == "Gemm" && ex.gpu->supportsSubgroups) {
-            if (warmed.insert("fp16_gemm").second)
-                ex.GetPipeline("fp16_gemm", WGSL_FP16_GEMM, 5);
-            if (warmed.insert("fp16_gemm_wide").second)
-                ex.GetPipeline("fp16_gemm_wide", WGSL_FP16_GEMM_WIDE, 5);
-        }
-        if (ex.gpu->supportsShaderF16) {
-            if (node.opType == "MatMul" && warmed.insert("matmul_f16").second)
-                ex.GetPipeline("matmul_f16", WGSL_MATMUL_F16, 4);
-            if (node.opType == "Cast") {
-                if (warmed.insert("cast_f32_to_f16").second)
-                    ex.GetPipeline("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
-                if (warmed.insert("cast_f16_to_f32").second)
-                    ex.GetPipeline("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
-            }
-            if ((node.opType == "Add" || node.opType == "Sub" || node.opType == "Mul" || node.opType == "Div") &&
-                warmed.insert("binary_elementwise_f16").second) {
-                ex.GetPipeline("binary_elementwise_f16", WGSL_BINARY_ELEMENTWISE_F16, 4);
-            }
-            if ((node.opType == "Sigmoid" || node.opType == "Tanh" || node.opType == "Neg" || node.opType == "Sqrt" ||
-                 node.opType == "Sin" || node.opType == "Cos" || node.opType == "Gelu" || node.opType == "Silu" ||
-                 node.opType == "Erf" || node.opType == "Relu" || node.opType == "Exp" || node.opType == "Log" ||
-                 node.opType == "Abs" || node.opType == "Floor" || node.opType == "Ceil" || node.opType == "Round") &&
-                warmed.insert("unary_elementwise_f16").second) {
-                ex.GetPipeline("unary_elementwise_f16", WGSL_UNARY_ELEMENTWISE_F16, 3);
-            }
-            if (node.opType == "Conv" && warmed.insert("conv2d_f16").second) {
-                ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5);
-            }
-            if (node.opType == "ConvTranspose" && warmed.insert("conv_transpose2d_f16").second) {
-                ex.GetPipeline("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5);
-            }
-        }
-        const PipelineWarmupSpec* spec = warmupSpecForOp(node.opType);
-        if (!spec) continue;
-        if (!warmed.insert(spec->name).second) continue;
-        ex.GetPipeline(spec->name, spec->wgsl, spec->numBindings);
+    bool hasF16 = ex.gpu->supportsShaderF16;
+
+    // Helper: warm a template pipeline under the EXACT runtime name
+    auto warmT = [&](const std::string& name, const char* tmpl, uint32_t nb, TensorDtype dt) {
+        if (!warmed.insert(name).second) return;
+        ex.GetPipeline(name, instantiateTemplate(tmpl, dt), nb);
+    };
+    // Helper: warm a non-template pipeline
+    auto warmRaw = [&](const std::string& name, const char* wgsl, uint32_t nb) {
+        if (!warmed.insert(name).second) return;
+        ex.GetPipeline(name, wgsl, nb);
+    };
+
+    auto has = [&](const char* op) { return opTypes.count(op) > 0; };
+
+    bool hasBinary = has("Add") || has("Sub") || has("Mul") || has("Div");
+    bool hasUnary  = has("Sigmoid") || has("Tanh") || has("Neg") || has("Sqrt") ||
+                     has("Sin") || has("Cos") || has("Gelu") || has("Silu") ||
+                     has("Erf") || has("Relu") || has("Exp") || has("Log") ||
+                     has("Abs") || has("Floor") || has("Ceil") || has("Round");
+
+    // ── Elementwise ops (runtime uses "binary_t_f32", "unary_t_f32", etc.) ──
+    if (hasBinary) {
+        warmT("binary_t_f32", WGSL_BINARY_ELEMENTWISE_T, 4, TensorDtype::Float32);
+        if (hasF16) warmT("binary_t_f16", WGSL_BINARY_ELEMENTWISE_T, 4, TensorDtype::Float16);
     }
+    if (hasUnary) {
+        warmT("unary_t_f32", WGSL_UNARY_ELEMENTWISE_T, 3, TensorDtype::Float32);
+        if (hasF16) warmT("unary_t_f16", WGSL_UNARY_ELEMENTWISE_T, 3, TensorDtype::Float16);
+    }
+    if (has("Where"))
+        warmT("where_select", WGSL_WHERE_SELECT_T, 5, TensorDtype::Float32);
+    if (has("Equal"))
+        warmT("equal_op", WGSL_EQUAL_OP_T, 4, TensorDtype::Float32);
+    if (has("Softmax"))
+        warmT("softmax_t_f32", WGSL_SOFTMAX_T, 3, TensorDtype::Float32);
+
+    // ── Cast ops ──
+    if (has("Cast") && hasF16) {
+        warmRaw("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
+        warmRaw("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+    }
+
+    // ── MatMul / Gemm ──
+    if (has("MatMul")) {
+        warmT("matmul_f32", WGSL_MATMUL_T, 4, TensorDtype::Float32);
+        if (hasF16) warmRaw("matmul_f16", WGSL_MATMUL_F16, 4);
+    }
+    if (has("MatMulNBits"))
+        warmRaw("matmul_q4", WGSL_MATMUL_Q4, 5);
+    if (has("Gemm")) {
+        warmT("gemm", WGSL_GEMM_T, 5, TensorDtype::Float32);
+        if (ex.gpu->supportsSubgroups) {
+            warmRaw("fp16_gemm", WGSL_FP16_GEMM, 5);
+            warmRaw("fp16_gemm_wide", WGSL_FP16_GEMM_WIDE, 5);
+        }
+    }
+
+    // ── Conv / Resize ──
+    if (has("Conv")) {
+        warmT("conv2d_f32", WGSL_CONV2D_T, 5, TensorDtype::Float32);
+        if (hasF16) warmRaw("conv2d_f16", WGSL_CONV2D_F16, 5);
+    }
+    if (has("ConvTranspose")) {
+        warmT("conv_transpose2d_f32", WGSL_CONV_TRANSPOSE2D_T, 5, TensorDtype::Float32);
+        if (hasF16) warmRaw("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5);
+    }
+    if (has("Resize"))
+        warmT("resize_nearest", WGSL_RESIZE_NEAREST_T, 3, TensorDtype::Float32);
+
+    // ── Normalization ──
+    if (has("SimplifiedLayerNormalization") || has("SkipSimplifiedLayerNormalization")) {
+        warmT("rmsnorm_simple", WGSL_RMSNORM_T, 5, TensorDtype::Float32);
+        if (hasF16) warmT("rmsnorm_t_f16", WGSL_RMSNORM_T, 5, TensorDtype::Float16);
+    }
+    if (has("SkipSimplifiedLayerNormalization"))
+        warmT("skip_rmsnorm", WGSL_SKIP_RMSNORM_T, 6, TensorDtype::Float32);
+    if (has("LayerNormalization"))
+        warmT("layer_norm", WGSL_LAYER_NORM_T, 5, TensorDtype::Float32);
+    if (has("InstanceNormalization"))
+        warmT("instance_norm", WGSL_INSTANCE_NORM_T, 5, TensorDtype::Float32);
+    if (has("GroupNorm"))
+        warmT("group_norm", WGSL_GROUP_NORM_T, 5, TensorDtype::Float32);
+
+    // ── Shape ops ──
+    if (has("Gather"))
+        warmRaw("gather", WGSL_GATHER, 4);
+    if (has("Transpose")) {
+        warmRaw("transpose", WGSL_TRANSPOSE, 3);  // i64 path
+        warmT("transpose_f32", WGSL_TRANSPOSE_T, 3, TensorDtype::Float32);
+    }
+    if (has("Slice")) {
+        warmRaw("slice", WGSL_SLICE, 3);  // i64 path
+        warmT("slice_f32", WGSL_SLICE_T, 3, TensorDtype::Float32);
+    }
+    if (has("Expand"))
+        warmT("expand_t_f32", WGSL_EXPAND_T, 3, TensorDtype::Float32);
+    if (has("Concat"))
+        warmT("concat_2t_f32", WGSL_CONCAT_2INPUT_T, 4, TensorDtype::Float32);
+
+    // ── Attention ops ──
+    if (has("MultiHeadAttention") || has("GroupQueryAttention"))
+        warmT("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN_T, 5, TensorDtype::Float32);
+    if (has("RotaryEmbedding"))
+        warmT("rotary_embedding", WGSL_ROTARY_EMBEDDING_T, 6, TensorDtype::Float32);
+    if (has("GroupQueryAttention")) {
+        warmT("rope_inplace", WGSL_ROPE_INPLACE_T, 4, TensorDtype::Float32);
+        warmT("kv_cache_append", WGSL_KV_CACHE_APPEND_T, 4, TensorDtype::Float32);
+        warmT("kv_cache_write", WGSL_KV_CACHE_WRITE_T, 3, TensorDtype::Float32);
+        warmT("gqa_decode", WGSL_GQA_DECODE_T, 5, TensorDtype::Float32);
+        // GQA also needs cast pipelines for f16 models
+        if (hasF16) {
+            warmRaw("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
+            warmRaw("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+        }
+    }
+
+    // ── MoE ops ──
+    if (has("QMoE")) {
+        warmT("moe_gate", WGSL_MOE_GATE_T, 4, TensorDtype::Float32);
+        warmT("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT_T, 6, TensorDtype::Float32);
+        warmT("swiglu", WGSL_SWIGLU_T, 3, TensorDtype::Float32);
+        warmT("weighted_add_indirect", WGSL_WEIGHTED_ADD_INDIRECT_T, 4, TensorDtype::Float32);
+    }
+    if (has("TopK"))
+        warmT("topk_f32", WGSL_TOPK_T, 4, TensorDtype::Float32);
+    if (has("GatherElements"))
+        warmT("gather_elements_f32", WGSL_GATHER_ELEMENTS_T, 4, TensorDtype::Float32);
+    if (has("ScatterElements"))
+        warmT("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_T, 5, TensorDtype::Float32);
+
     return warmed.size();
 }
 
@@ -807,7 +850,9 @@ GpuTensor GraphExecutor::AllocTensor(std::vector<int64_t> shape,
         bytes = 4;  // fallback to minimal
         t.shape = {1};  // fix shape to prevent cascading corruption
     }
-    t.buffer = gpu->createBuffer("tmp", bytes);
+    // Align to 4 bytes for WebGPU
+    size_t bufBytes = (bytes + 3) & ~(size_t)3;
+    t.buffer = gpu->createBuffer("tmp", bufBytes);
     return t;
 }
 
@@ -893,6 +938,7 @@ WGPUBindGroup GraphExecutor::MakeBindGroup(
         memset(&entries[i], 0, sizeof(WGPUBindGroupEntry));
         entries[i].binding = bindings[i].first;
         entries[i].buffer = bindings[i].second.handle;
+        entries[i].offset = bindings[i].second.offset;
         entries[i].size = bindings[i].second.size;
         if (!entries[i].buffer) {
             // Create a dummy 4-byte buffer to avoid null handle crash
@@ -913,38 +959,77 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
     gpu->waitForQueue();
 }
 
-void GraphExecutor::FlushPendingWork() {
-    bool didWork = false;
+// ─── Batched submit: encode all pending work into one CB and submit ──────────
+// flushToEncoder() encodes all pending dispatches and copies into a single
+// command buffer and submits it.
+//
+// writeBuffer ordering: wgpuQueueWriteBuffer is ordered relative to
+// queueSubmit — all writeBuffer calls done before flushToEncoder() are visible
+// to the submitted command buffer.
+
+void GraphExecutor::flushToEncoder() {
+    if (pendingDispatches_.empty() && pendingCopies_.empty()) return;
+    WGPUCommandEncoderDescriptor enD{};
+    auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+
+    // Encode dispatches — separate compute passes for correct resource barriers
     if (!pendingDispatches_.empty()) {
         if (gpuProfiler && gpuProfiler->enabled()) {
-            gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
+            for (auto& d : pendingDispatches_) {
+                auto [bIdx, eIdx] = gpuProfiler->allocate(d.name);
+                auto tw = gpuProfiler->makeTimestampWrites(bIdx, eIdx);
+                WGPUComputePassDescriptor cpD{};
+                cpD.timestampWrites = &tw;
+                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+                wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+                wgpuComputePassEncoderEnd(pass);
+                wgpuComputePassEncoderRelease(pass);
+            }
         } else {
-            gpu->submitOnly(pendingDispatches_, false);
+            for (auto& d : pendingDispatches_) {
+                WGPUComputePassDescriptor cpD{};
+                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+                wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
+                wgpuComputePassEncoderEnd(pass);
+                wgpuComputePassEncoderRelease(pass);
+            }
         }
-        pendingDispatches_.clear();
-        didWork = true;
     }
-    if (!pendingCopies_.empty()) {
-        WGPUCommandEncoderDescriptor enD{};
-        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-        for (auto& c : pendingCopies_)
-            wgpuCommandEncoderCopyBufferToBuffer(enc,
-                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-        WGPUCommandBufferDescriptor cbD{};
-        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
-        wgpuCommandBufferRelease(cb);
-        wgpuCommandEncoderRelease(enc);
-        pendingCopies_.clear();
-        didWork = true;
-    }
+    // Encode copies (after dispatches — correct ordering within CB)
+    for (auto& c : pendingCopies_)
+        wgpuCommandEncoderCopyBufferToBuffer(enc,
+            c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+
+    // Finish, submit, release
+    WGPUCommandBufferDescriptor cbD{};
+    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+    wgpuQueueSubmit(gpu->queue, 1, &cb);
+    wgpuCommandEncoderRelease(enc);
+    wgpuCommandBufferRelease(cb);
+    for (auto& d : pendingDispatches_)
+        if (d.bindGroup) wgpuBindGroupRelease(d.bindGroup);
+    pendingDispatches_.clear();
+    pendingCopies_.clear();
+}
+
+void GraphExecutor::FlushPendingWork() {
+    bool hadWork = !pendingDispatches_.empty() || !pendingCopies_.empty();
+    flushToEncoder();  // submits immediately
     // Always wait (callers expect data to be ready after flush)
     gpu->waitForQueue();
-    if (didWork) {
+    if (hadWork) {
         flushCount_++;
         std::string key = g_currentOp ? g_currentOp : "(no-op-context)";
         flushSources_[key]++;
     }
+}
+
+void GraphExecutor::SubmitPending() {
+    flushToEncoder();  // submits all pending dispatches + copies, no wait
 }
 
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
@@ -955,6 +1040,9 @@ void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
 void GraphExecutor::QueueCopy(GPUBuffer src, uint64_t srcOffset,
                                GPUBuffer dst, uint64_t dstOffset, uint64_t size) {
     if (!src.handle || !dst.handle || size == 0) return;
+    // Add buffer base offsets (for aliased/view buffers)
+    srcOffset += src.offset;
+    dstOffset += dst.offset;
     // Clamp to buffer sizes
     if (srcOffset + size > src.size) size = (src.size > srcOffset) ? src.size - srcOffset : 0;
     if (dstOffset + size > dst.size) size = (dst.size > dstOffset) ? dst.size - dstOffset : 0;
@@ -1000,6 +1088,7 @@ void GraphExecutor::Execute(
             it = tensorStore_.erase(it);
     }
 
+
     // Save persistent tensor state (dtype + buffer) before execution.
     // Ops may convert persistent fp16 tensors to f32 in-place via
     // ensureTensorFloat32/ensureCpuBackedFloat32. We restore them at the end
@@ -1038,6 +1127,8 @@ void GraphExecutor::Execute(
 
     // Clear dispatch batch
     pendingDispatches_.clear();
+    pendingCopies_.clear();
+
 
     // Topological sort (cached across Execute calls)
     std::vector<size_t>& execOrder = cachedExecOrder_;
@@ -1352,35 +1443,11 @@ void GraphExecutor::Execute(
                 }
             }
 
-            // Submit pending work periodically (with sync to prevent TDR)
-            if (pendingDispatches_.size() + pendingCopies_.size() >= 64) {
+            // Flush to encoder periodically (prevent huge CB on very large graphs)
+            if (pendingDispatches_.size() + pendingCopies_.size() >= 256) {
                 totalDispatches += (int)pendingDispatches_.size();
                 totalCopies += (int)pendingCopies_.size();
-                if (!pendingDispatches_.empty()) {
-                    if (gpuProfiler && gpuProfiler->enabled())
-                        gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
-                    else
-                        gpu->submitOnly(pendingDispatches_, true);
-                }
-                if (!pendingCopies_.empty()) {
-                    WGPUCommandEncoderDescriptor enD{};
-                    auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-                    for (auto& c : pendingCopies_)
-                        wgpuCommandEncoderCopyBufferToBuffer(enc,
-                            c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-                    WGPUCommandBufferDescriptor cbD{};
-                    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-                    wgpuQueueSubmit(gpu->queue, 1, &cb);
-                    wgpuCommandBufferRelease(cb);
-                    wgpuCommandEncoderRelease(enc);
-                }
-                gpu->waitForQueue();
-                pendingDispatches_.clear();
-                pendingCopies_.clear();
-
-                // Buffer release at sync points is disabled for now — the shared
-                // handle detection needs more work to handle aliased tensors safely.
-                // TODO: implement proper buffer lifetime analysis.
+                flushToEncoder();
                 pendingReleases_.clear();
             }
         } else {
@@ -1415,12 +1482,22 @@ void GraphExecutor::Execute(
         }
     }
 
+    // Append readback copy after output copies — this ensures logits data
+    // is in the source buffer before the readback copy executes.
+    // Goes into pendingCopies_ so it's included in the final flushToEncoder CB.
+    if (readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
+        pendingCopies_.push_back({readbackSrc_, 0, readbackDst_, 0, readbackSize_});
+        readbackSize_ = 0;
+        readbackSrc_ = {}; readbackDst_ = {};
+    }
+
     totalDispatches += (int)pendingDispatches_.size();
     totalCopies += (int)pendingCopies_.size();
 
-    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (0 from int-readback), bufs=%d (pool=%d)\n",
+
+    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback), bufs=%d (pool=%d)\n",
             executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_,
-            gpu->createBufferCount, gpu->poolHitCount);
+            intReadbackSyncs_, gpu->createBufferCount, gpu->poolHitCount);
     gpu->createBufferCount = 0;
     gpu->poolHitCount = 0;
     // Print sync sources on first call
@@ -1438,26 +1515,7 @@ void GraphExecutor::Execute(
     flushSources_.clear();
 
     // Submit all remaining batched GPU work
-    if (!pendingDispatches_.empty()) {
-        if (gpuProfiler && gpuProfiler->enabled())
-            gpu->submitOnlyProfiled(pendingDispatches_, *gpuProfiler);
-        else
-            gpu->submitOnly(pendingDispatches_, true);
-        pendingDispatches_.clear();
-    }
-    if (!pendingCopies_.empty()) {
-        WGPUCommandEncoderDescriptor enD{};
-        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-        for (auto& c : pendingCopies_)
-            wgpuCommandEncoderCopyBufferToBuffer(enc,
-                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-        WGPUCommandBufferDescriptor cbD{};
-        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
-        wgpuCommandBufferRelease(cb);
-        wgpuCommandEncoderRelease(enc);
-        pendingCopies_.clear();
-    }
+    flushToEncoder();
     gpu->waitForQueue();
 
     // Release non-output, non-persistent intermediate buffers
@@ -1466,7 +1524,6 @@ void GraphExecutor::Execute(
         std::set<WGPUBuffer> keepHandles;
         for (auto& [name, tensor] : outputs)
             if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
-        // Persistent tensors (initializers, pre-store constants) must survive for re-execution
         for (auto& name : persistentTensors_) {
             auto it = tensorStore_.find(name);
             if (it != tensorStore_.end() && it->second.buffer.handle)
@@ -1476,7 +1533,7 @@ void GraphExecutor::Execute(
         std::set<WGPUBuffer> released;
         for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
             if (persistentTensors_.count(it->first)) {
-                ++it;  // keep persistent entries
+                ++it;
                 continue;
             }
             if (it->second.buffer.handle &&
@@ -1490,7 +1547,6 @@ void GraphExecutor::Execute(
     }
 
     // Restore persistent tensors that may have been modified during execution
-    // (e.g. ensureTensorFloat32 converting fp16 weights to f32 in-place)
     for (auto& [name, saved] : savedPersistent) {
         auto it = tensorStore_.find(name);
         if (it != tensorStore_.end() &&

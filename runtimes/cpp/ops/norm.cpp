@@ -17,9 +17,9 @@ static int64_t tensorNel(const GpuTensor* t) {
 }
 
 static TensorDtype computeOutDtype(TensorDtype dtype) {
-    return (dtype == TensorDtype::Float16 || dtype == TensorDtype::Float32)
-             ? TensorDtype::Float32
-             : dtype;
+    if (dtype == TensorDtype::Float16) return TensorDtype::Float16;
+    if (dtype == TensorDtype::Float32) return TensorDtype::Float32;
+    return dtype;
 }
 
 static bool isVaeDecoderNode(const std::string& nodeName) {
@@ -145,32 +145,8 @@ static bool canUseFp16NormWeights(const GraphExecutor& ex, const GpuTensor* x,
 }
 
 // ─── RMSNorm (SimplifiedLayerNormalization) ──────────────────────────────────
-// Uses the optimized rms_norm kernel from runtimes/cpp/kernels/shared/ when available,
-// falls back to a simple per-row kernel otherwise.
-
-static const char* WGSL_RMSNORM_SIMPLE = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
-@group(0) @binding(2) var<storage, read> W: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Rstd: array<f32>;
-
-struct Params { stride: i32, N: i32, eps: f32, };
-@group(0) @binding(4) var<storage, read> params: Params;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    let N = u32(params.N);
-    if (row >= u32(params.stride) / N) { return; }
-    let base = row * N;
-    var sum_sq: f32 = 0.0;
-    for (var i = 0u; i < N; i++) { let v = X[base + i]; sum_sq += v * v; }
-    let rms = sqrt(sum_sq / f32(N) + params.eps);
-    let inv_rms = 1.0 / rms;
-    for (var i = 0u; i < N; i++) { Y[base + i] = X[base + i] * inv_rms * W[i]; }
-    if (gid.x == 0u) { Rstd[row] = inv_rms; }
-}
-)WGSL";
+// Uses WGSL_RMSNORM_T template for both f32 and f16 activation paths.
+// Falls back to the f16-weight variant for mixed f32-data/f16-weight scenarios.
 
 static const char* WGSL_RMSNORM_SIMPLE_F16W = R"WGSL(
 enable f16;
@@ -183,18 +159,46 @@ enable f16;
 struct Params { stride: i32, N: i32, eps: f32, };
 @group(0) @binding(4) var<storage, read> params: Params;
 
+var<workgroup> shared_sum: array<f32, 256>;
+
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wg: vec3<u32>) {
+    let row = wg.x;
     let N = u32(params.N);
-    if (row >= u32(params.stride) / N) { return; }
+    let nRows = u32(params.stride) / N;
     let base = row * N;
-    var sum_sq: f32 = 0.0;
-    for (var i = 0u; i < N; i++) { let v = X[base + i]; sum_sq += v * v; }
-    let rms = sqrt(sum_sq / f32(N) + params.eps);
-    let inv_rms = 1.0 / rms;
-    for (var i = 0u; i < N; i++) { Y[base + i] = X[base + i] * inv_rms * f32(W[i]); }
-    if (gid.x == 0u) { Rstd[row] = inv_rms; }
+    let tid = lid.x;
+
+    // Phase 1: parallel sum_sq reduction
+    var local_sum: f32 = 0.0;
+    if (row < nRows) {
+        for (var i = tid; i < N; i += 256u) {
+            let v = X[base + i];
+            local_sum += v * v;
+        }
+    }
+    shared_sum[tid] = local_sum;
+    workgroupBarrier();
+
+    // Tree reduction
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        workgroupBarrier();
+    }
+
+    if (row >= nRows) { return; }
+
+    let inv_rms = 1.0 / sqrt(shared_sum[0] / f32(N) + params.eps);
+
+    // Phase 2: parallel normalize + scale
+    for (var i = tid; i < N; i += 256u) {
+        Y[base + i] = X[base + i] * inv_rms * f32(W[i]);
+    }
+    if (tid == 0u) { Rstd[row] = inv_rms; }
 }
 )WGSL";
 
@@ -252,7 +256,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
             {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
             {3, rstdBuf}, {4, paramBuf}});
         ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm_f16w"});
+            (uint32_t)nRows, 1, 1, "rmsnorm_f16w"});
         return;
     }
 
@@ -261,7 +265,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipelineT("rmsnorm_simple", 5, []() { return std::string(WGSL_RMSNORM_SIMPLE); });
+    auto& pl = ex.GetPipelineT("rmsnorm_simple", 5, []() { return instantiateTemplate(WGSL_RMSNORM_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
         {3, rstdBuf}, {4, paramBuf}});
@@ -270,35 +274,8 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // ─── SkipSimplifiedLayerNorm (residual add + RMSNorm) ────────────────────────
-
-static const char* WGSL_SKIP_RMSNORM = R"WGSL(
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read> Skip: array<f32>;
-@group(0) @binding(2) var<storage, read> W: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
-@group(0) @binding(4) var<storage, read_write> SkipOut: array<f32>;
-@group(0) @binding(5) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let nRows = _params_[1];
-    let eps = bitcast<f32>(_params_[2]);
-    let row = gid.x;
-    if (row >= nRows) { return; }
-    let base = row * N;
-    var sum_sq: f32 = 0.0;
-    for (var i = 0u; i < N; i++) {
-        let v = X[base + i] + Skip[base + i];
-        SkipOut[base + i] = v;
-        sum_sq += v * v;
-    }
-    let inv_rms = 1.0 / sqrt(sum_sq / f32(N) + eps);
-    for (var i = 0u; i < N; i++) {
-        Y[base + i] = SkipOut[base + i] * inv_rms * W[i];
-    }
-}
-)WGSL";
+// Uses WGSL_SKIP_RMSNORM_T from kernels/shared/skip_rmsnorm.wgsl for template path.
+// Keeps inline F16W variant for f32-data + f16-weight scenarios using `enable f16`.
 
 static const char* WGSL_SKIP_RMSNORM_F16W = R"WGSL(
 enable f16;
@@ -530,7 +507,7 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipelineT("skip_rmsnorm", 6, []() { return std::string(WGSL_SKIP_RMSNORM); });
+    auto& pl = ex.GetPipelineT("skip_rmsnorm", 6, []() { return instantiateTemplate(WGSL_SKIP_RMSNORM_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Skip->buffer}, {2, W->buffer},
         {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
@@ -588,7 +565,7 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipelineT("layer_norm", 5, []() { return std::string(WGSL_LAYER_NORM); });
+    auto& pl = ex.GetPipelineT("layer_norm", 5, []() { return instantiateTemplate(WGSL_LAYER_NORM_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -638,7 +615,7 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipelineT("instance_norm", 5, []() { return std::string(WGSL_INSTANCE_NORM); });
+    auto& pl = ex.GetPipelineT("instance_norm", 5, []() { return instantiateTemplate(WGSL_INSTANCE_NORM_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -691,7 +668,7 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipelineT("group_norm", 5, []() { return std::string(WGSL_GROUP_NORM); });
+    auto& pl = ex.GetPipelineT("group_norm", 5, []() { return instantiateTemplate(WGSL_GROUP_NORM_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});

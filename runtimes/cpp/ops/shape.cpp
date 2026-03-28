@@ -479,14 +479,6 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
         // Flush any pending cast dispatches before buffer copies
         if (needF16ToF32 && !ex.pendingDispatches_.empty())
             ex.FlushPendingWork();
-        // Debug: log when we hit axis-0 path for conv-related concat
-        if (validIn.size() == 2 && validIn[0]->shape.size() == 3 && validIn[0]->shape[2] <= 4) {
-            fprintf(stderr, "  [concat] axis=%lld ndim=%d shapes=[%lld,%lld,%lld]+[%lld,%lld,%lld] → axis0 path\n",
-                    (long long)axis, ndim,
-                    (long long)validIn[0]->shape[0], (long long)validIn[0]->shape[1], (long long)validIn[0]->shape[2],
-                    (long long)validIn[1]->shape[0], (long long)validIn[1]->shape[1], (long long)validIn[1]->shape[2]);
-            fflush(stderr);
-        }
         size_t offset = 0;
         for (auto* t : gpuIn) {
             size_t bytes = t->ByteSize();
@@ -530,48 +522,6 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
             int64_t outNel = 1;
             for (auto d : outShape) outNel *= d;
 
-            // Templated concat kernel
-            static const char* CONCAT_2INPUT_T = R"WGSL(
-${T_READ}
-${T_WRITE2}
-
-@group(0) @binding(0) var<storage, read> A: array<${T}>;
-@group(0) @binding(1) var<storage, read> B: array<${T}>;
-@group(0) @binding(2) var<storage, read_write> Out: array<${T}>;
-@group(0) @binding(3) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let a_split = _params_[1];
-    let total_split = _params_[2];
-    let inner = _params_[3];
-
-    let base = gid.x * 2u;
-    if (base >= N) { return; }
-
-    var v0: f32 = 0.0;
-    var v1: f32 = 0.0;
-    for (var k = 0u; k < 2u; k++) {
-        let idx = base + k;
-        if (idx >= N) { break; }
-        let outer = idx / (total_split * inner);
-        let rem = idx % (total_split * inner);
-        let split_pos = rem / inner;
-        let inner_pos = rem % inner;
-        var val: f32;
-        if (split_pos < a_split) {
-            val = t_read(&A, outer * a_split * inner + split_pos * inner + inner_pos);
-        } else {
-            let b_split = total_split - a_split;
-            val = t_read(&B, outer * b_split * inner + (split_pos - a_split) * inner + inner_pos);
-        }
-        if (k == 0u) { v0 = val; } else { v1 = val; }
-    }
-    t_write2(&Out, base, v0, v1);
-}
-)WGSL";
-
             uint32_t params[4] = {(uint32_t)outNel, (uint32_t)gpuIn[0]->shape[axis],
                                    (uint32_t)outShape[axis], (uint32_t)innerSize};
             auto paramBuf = ex.getParamBuffer(16);
@@ -579,7 +529,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             std::string pname = "concat_2t" + std::string(dtypeSuffix(dtype));
             auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
-                return instantiateTemplate(CONCAT_2INPUT_T, dtype);
+                return instantiateTemplate(WGSL_CONCAT_2INPUT_T, dtype);
             });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, gpuIn[0]->buffer}, {1, gpuIn[1]->buffer},
@@ -1607,20 +1557,36 @@ static void opSplit(GraphExecutor& ex, const OnnxGraphNode& n,
 
     size_t elemSize = data->DtypeSize();
     int64_t offset = 0;
+    bool usedAlias = false;
     for (size_t i = 0; i < out.size() && i < splits.size(); i++) {
         auto outShape = data->shape;
         outShape[axis] = splits[i];
         int64_t chunkElements = splits[i] * innerSize;
         int64_t chunkBytes = chunkElements * elemSize;
 
-        *out[i] = ex.AllocTensor(outShape, data->dtype);
-
-        // For contiguous splits along axis 0 or last axis, use buffer copy
+        // For contiguous splits along axis 0, use buffer alias (zero-copy)
         if (axis == 0 || outerSize == 1) {
             size_t srcOffset = (size_t)(offset * innerSize * elemSize);
-            ex.QueueCopy(data->buffer, srcOffset, out[i]->buffer, 0, (size_t)(chunkBytes * outerSize));
+            size_t viewSize = (size_t)(chunkBytes * outerSize);
+
+            // WebGPU requires 256-byte offset alignment for storage buffers
+            if ((data->buffer.offset + srcOffset) % 256 == 0) {
+                // Zero-copy alias: reference same buffer at offset
+                out[i]->shape = outShape;
+                out[i]->dtype = data->dtype;
+                out[i]->buffer.handle = data->buffer.handle;
+                out[i]->buffer.offset = data->buffer.offset + srcOffset;
+                out[i]->buffer.size = viewSize;
+                out[i]->isCpuOnly = false;
+                usedAlias = true;
+            } else {
+                // Offset not aligned — fall back to copy
+                *out[i] = ex.AllocTensor(outShape, data->dtype);
+                ex.QueueCopy(data->buffer, srcOffset, out[i]->buffer, 0, viewSize);
+            }
         } else {
             // General case: copy slabs
+            *out[i] = ex.AllocTensor(outShape, data->dtype);
             for (int64_t o = 0; o < outerSize; o++) {
                 size_t srcOff = (size_t)((o * data->shape[axis] + offset) * innerSize * elemSize);
                 size_t dstOff = (size_t)(o * chunkElements * elemSize);
@@ -1629,25 +1595,11 @@ static void opSplit(GraphExecutor& ex, const OnnxGraphNode& n,
         }
         offset += splits[i];
     }
-    // Submit pending copies so downstream dispatch-based ops see them.
-    // WebGPU guarantees ordering within the same queue, so we submit without waiting.
-    if (!ex.pendingCopies_.empty()) {
-        // First submit any pending dispatches (they must complete before copies read their outputs)
-        if (!ex.pendingDispatches_.empty()) {
-            ex.gpu->submitOnly(ex.pendingDispatches_, false);
-            ex.pendingDispatches_.clear();
-        }
-        WGPUCommandEncoderDescriptor enD{};
-        auto enc = wgpuDeviceCreateCommandEncoder(ex.gpu->device, &enD);
-        for (auto& c : ex.pendingCopies_)
-            wgpuCommandEncoderCopyBufferToBuffer(enc,
-                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-        WGPUCommandBufferDescriptor cbD{};
-        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(ex.gpu->queue, 1, &cb);
-        wgpuCommandBufferRelease(cb);
-        wgpuCommandEncoderRelease(enc);
-        ex.pendingCopies_.clear();
+    // Flush pending dispatches+copies so downstream ops see the copy results.
+    // Even when all splits used aliases (no copies), flush pending dispatches
+    // for CPU-GPU pipelining — submitting work early gives the GPU a head start.
+    if (!ex.pendingDispatches_.empty() || !ex.pendingCopies_.empty()) {
+        ex.flushToEncoder();
     }
 }
 

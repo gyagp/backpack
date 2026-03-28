@@ -5,6 +5,7 @@
 
 #include "../graph_executor.h"
 #include "../wgsl_shaders.h"
+#include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -14,9 +15,9 @@ static int64_t tensorNel(const GpuTensor* t) {
 }
 
 static TensorDtype computeOutDtype(TensorDtype dtype) {
-    return (dtype == TensorDtype::Float16 || dtype == TensorDtype::Float32)
-             ? TensorDtype::Float32
-             : dtype;
+    if (dtype == TensorDtype::Float16) return TensorDtype::Float16;
+    if (dtype == TensorDtype::Float32) return TensorDtype::Float32;
+    return dtype;
 }
 
 static float fp16ToFloat(uint16_t h) {
@@ -143,7 +144,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         auto paramBuf = ex.getParamBuffer(32);
         ex.gpu->writeBuffer(paramBuf, params, 32);
 
-        auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return std::string(WGSL_BIDIRECTIONAL_ATTN); });
+        auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return instantiateTemplate(WGSL_BIDIRECTIONAL_ATTN_T, TensorDtype::Float32); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, Q->buffer}, {1, K->buffer}, {2, V->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
@@ -153,6 +154,9 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     // ─── Full GQA with KV cache and RoPE ─────────────────────────────────
+
+    // Record original dtype for output casting (attention computes in f32 internally)
+    TensorDtype origDtype = Q->dtype;
 
     int64_t num_heads = n.GetInt("num_heads", 32);
     int64_t kv_heads = n.GetInt("kv_num_heads", num_heads);
@@ -216,7 +220,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)rotaryDim, (uint32_t)posOffset};
         auto rpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
-        auto& roPl = ex.GetPipelineT("rope_inplace", 4, []() { return std::string(WGSL_ROPE_INPLACE); });
+        auto& roPl = ex.GetPipelineT("rope_inplace", 4, []() { return instantiateTemplate(WGSL_ROPE_INPLACE_T, TensorDtype::Float32); });
         auto roBg = ex.MakeBindGroup(roPl, {
             {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
         ex.pendingDispatches_.push_back({roPl.pipeline, roBg,
@@ -233,11 +237,54 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     // Build present KV on GPU: append new K/V to past cache
-    GpuTensor presentKey = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
-    GpuTensor presentVal = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
+    // Static KV cache mode: if the past_key buffer is already f32 and large enough
+    // to hold totalSeq tokens, write the new token in-place (no full copy).
+    // The caller pre-allocates a max-sized f32 buffer and reuses it across steps.
+    size_t kvSlotBytes = (size_t)(batch * kv_heads * totalSeq * head_dim * 4);
+    bool staticKV = (pastKey && pastKey->dtype == TensorDtype::Float32 &&
+                     pastKey->buffer.handle && pastKey->buffer.size >= kvSlotBytes &&
+                     pastVal && pastVal->dtype == TensorDtype::Float32 &&
+                     pastVal->buffer.handle && pastVal->buffer.size >= kvSlotBytes);
 
-    {
-        // Need past key buffer — if pastSeq==0, create dummy
+    // Determine max_seq for static layout (from buffer size)
+    int64_t maxSeq = totalSeq;
+    if (staticKV) {
+        maxSeq = (int64_t)(pastKey->buffer.size / (batch * kv_heads * head_dim * 4));
+    }
+
+    GpuTensor presentKey, presentVal;
+    if (staticKV) {
+        // Static mode: reuse the same buffer, just write the new token at pastSeq
+        ex.EnsureGpu(*pastKey);
+        ex.EnsureGpu(*pastVal);
+        presentKey.shape = {batch, kv_heads, totalSeq, head_dim};
+        presentKey.dtype = TensorDtype::Float32;
+        presentKey.buffer = pastKey->buffer;
+        presentVal.shape = {batch, kv_heads, totalSeq, head_dim};
+        presentVal.dtype = TensorDtype::Float32;
+        presentVal.buffer = pastVal->buffer;
+
+        // Write new K/V at position pastSeq (only 1 token, no copy of past data)
+        uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
+                                 (uint32_t)pastSeq, (uint32_t)maxSeq};
+        auto kvpBuf = ex.getParamBuffer(16);
+        ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
+
+        auto& kvPl = ex.GetPipelineT("kv_cache_write", 3, []() { return instantiateTemplate(WGSL_KV_CACHE_WRITE_T, TensorDtype::Float32); });
+        auto kvBgK = ex.MakeBindGroup(kvPl, {
+            {0, K->buffer}, {1, presentKey.buffer}, {2, kvpBuf}});
+        ex.pendingDispatches_.push_back({kvPl.pipeline, kvBgK,
+            (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_write_k"});
+
+        auto kvBgV = ex.MakeBindGroup(kvPl, {
+            {0, V->buffer}, {1, presentVal.buffer}, {2, kvpBuf}});
+        ex.pendingDispatches_.push_back({kvPl.pipeline, kvBgV,
+            (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_write_v"});
+    } else {
+        // Dynamic mode: allocate new buffer and copy past + append new
+        presentKey = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
+        presentVal = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
+
         GPUBuffer pastKeyBuf, pastValBuf;
         if (pastKey && pastSeq > 0) {
             gpuCastF16ToF32(*pastKey);
@@ -259,7 +306,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         auto kvpBuf = ex.getParamBuffer(16);
         ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
 
-        auto& kvPl = ex.GetPipelineT("kv_cache_append", 4, []() { return std::string(WGSL_KV_CACHE_APPEND); });
+        auto& kvPl = ex.GetPipelineT("kv_cache_append", 4, []() { return instantiateTemplate(WGSL_KV_CACHE_APPEND_T, TensorDtype::Float32); });
         auto kvBgK = ex.MakeBindGroup(kvPl, {
             {0, K->buffer}, {1, pastKeyBuf}, {2, presentKey.buffer}, {3, kvpBuf}});
         ex.pendingDispatches_.push_back({kvPl.pipeline, kvBgK,
@@ -276,18 +323,51 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
 
     {
         uint32_t scale_u32; memcpy(&scale_u32, &scale, 4);
+        // For static KV cache, gqa_decode reads with maxSeq stride
         uint32_t attnParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                    (uint32_t)totalSeq, (uint32_t)kv_heads,
-                                   scale_u32, 0, 0, 0};
+                                   scale_u32, (uint32_t)maxSeq, 0, 0};
         auto apBuf = ex.getParamBuffer(32);
         ex.gpu->writeBuffer(apBuf, attnParams, 32);
 
-        auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return std::string(WGSL_GQA_DECODE); });
+        auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return instantiateTemplate(WGSL_GQA_DECODE_T, TensorDtype::Float32); });
         auto attnBg = ex.MakeBindGroup(attnPl, {
             {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
             {3, out[0]->buffer}, {4, apBuf}});
         ex.pendingDispatches_.push_back({attnPl.pipeline, attnBg,
             1, (uint32_t)num_heads, 1, "gqa_decode"});
+    }
+
+    // Cast f32 attention output back to f16 if input was f16
+    if (origDtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
+        int64_t nel = out[0]->ElementCount();
+        GpuTensor f16t = ex.AllocTensor(out[0]->shape, TensorDtype::Float16);
+        uint32_t cp[4] = {(uint32_t)nel, 0, 0, 0};
+        auto cpBuf = ex.getParamBuffer(16);
+        ex.gpu->writeBuffer(cpBuf, cp, 16);
+        auto& cPl = ex.GetPipelineT("cast_f32_to_f16", 3, []() { return std::string(WGSL_CAST_F32_TO_F16); });
+        auto cBg = ex.MakeBindGroup(cPl, {{0, out[0]->buffer}, {1, f16t.buffer}, {2, cpBuf}});
+        ex.pendingDispatches_.push_back({cPl.pipeline, cBg,
+            (uint32_t)((nel + 255) / 256), 1, 1, "attn_cast_f16"});
+        *out[0] = f16t;
+    }
+
+    // Output present KV — in static mode, skip f16 cast (stays f32, same buffer)
+    if (!staticKV && origDtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
+        auto castToF16 = [&](GpuTensor& t, const char* label) {
+            int64_t nel = t.ElementCount();
+            GpuTensor f16t = ex.AllocTensor(t.shape, TensorDtype::Float16);
+            uint32_t cp[4] = {(uint32_t)nel, 0, 0, 0};
+            auto cpBuf = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(cpBuf, cp, 16);
+            auto& cPl = ex.GetPipelineT("cast_f32_to_f16", 3, []() { return std::string(WGSL_CAST_F32_TO_F16); });
+            auto cBg = ex.MakeBindGroup(cPl, {{0, t.buffer}, {1, f16t.buffer}, {2, cpBuf}});
+            ex.pendingDispatches_.push_back({cPl.pipeline, cBg,
+                (uint32_t)((nel + 255) / 256), 1, 1, label});
+            t = f16t;
+        };
+        castToF16(presentKey, "kv_cast_k_f16");
+        castToF16(presentVal, "kv_cast_v_f16");
     }
 
     // Output present KV
@@ -340,7 +420,7 @@ static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return std::string(WGSL_BIDIRECTIONAL_ATTN); });
+    auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return instantiateTemplate(WGSL_BIDIRECTIONAL_ATTN_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, Q->buffer}, {1, K->buffer}, {2, V->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
@@ -419,7 +499,7 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.gpu->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipelineT("rotary_embedding", 6, []() { return std::string(WGSL_ROTARY_EMBEDDING); });
+    auto& pl = ex.GetPipelineT("rotary_embedding", 6, []() { return instantiateTemplate(WGSL_ROTARY_EMBEDDING_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, posIdsBuf}, {2, CosCache->buffer},
         {3, SinCache->buffer}, {4, out[0]->buffer}, {5, paramBuf}});

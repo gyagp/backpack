@@ -23,7 +23,8 @@
  *
  * Markers in templates:
  *   ${T}        — storage type: "f32" or "u32"
- *   ${T_READ}   — helper function for reading one element
+ *   ${T_READ}   — helper function for reading one element (read-only buffer)
+ *   ${T_READ_RW}— helper function for reading from read_write buffer
  *   ${T_WRITE}  — helper function for writing one element (with RMW for fp16)
  *   ${T_WRITE2} — helper function for writing a pair of elements (race-free)
  *   ${T_DTYPE}  — "f32" or "f16" (for metadata/comments)
@@ -78,6 +79,11 @@ fn t_read(buf: ptr<storage, array<f32>, read>, idx: u32) -> f32 {
     return (*buf)[idx];
 }
 )");
+        replaceAll(wgsl, "${T_READ_RW}", R"(
+fn t_read_rw(buf: ptr<storage, array<f32>, read_write>, idx: u32) -> f32 {
+    return (*buf)[idx];
+}
+)");
         replaceAll(wgsl, "${T_WRITE}", R"(
 fn t_write(buf: ptr<storage, array<f32>, read_write>, idx: u32, val: f32) {
     (*buf)[idx] = val;
@@ -98,6 +104,13 @@ fn t_write2(buf: ptr<storage, array<f32>, read_write>, idx: u32, v0: f32, v1: f3
         // Helper functions for fp16
         replaceAll(wgsl, "${T_READ}", R"(
 fn t_read(buf: ptr<storage, array<u32>, read>, idx: u32) -> f32 {
+    let packed = (*buf)[idx / 2u];
+    let pair = unpack2x16float(packed);
+    return select(pair.x, pair.y, (idx & 1u) != 0u);
+}
+)");
+        replaceAll(wgsl, "${T_READ_RW}", R"(
+fn t_read_rw(buf: ptr<storage, array<u32>, read_write>, idx: u32) -> f32 {
     let packed = (*buf)[idx / 2u];
     let pair = unpack2x16float(packed);
     return select(pair.x, pair.y, (idx & 1u) != 0u);

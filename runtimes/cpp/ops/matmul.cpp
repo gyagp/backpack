@@ -218,24 +218,22 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     // If the ONNX model stores scales as float32, convert them to float16.
     if (S->dtype == TensorDtype::Float32) {
         size_t count = (size_t)S->ElementCount();
-        std::vector<float> f32Scales(count);
+
+        // Try CPU-side sources first (no GPU sync needed)
         const uint8_t* src = nullptr;
-        std::vector<uint8_t> gpuReadback;
         if (!S->cpuData.empty() && S->cpuData.size() >= count * sizeof(float)) {
             src = S->cpuData.data();
         } else if (auto* init = ex.GetInitData(n.inputs.size() > 2 ? n.inputs[2] : std::string());
                    init && init->data && init->size >= count * sizeof(float)) {
             src = init->data;
-        } else if (S->buffer.handle) {
-            ex.FlushPendingWork();
-            gpuReadback = ex.gpu->readBuffer(S->buffer, count * sizeof(float));
-            src = gpuReadback.data();
         }
+
         if (src) {
+            // CPU path: convert f32→f16 and upload
+            std::vector<float> f32Scales(count);
             memcpy(f32Scales.data(), src, count * sizeof(float));
             std::vector<uint16_t> fp16Scales(count);
             for (size_t i = 0; i < count; i++) {
-                // Convert f32 to f16 (simple truncation via bit manipulation)
                 uint32_t bits;
                 memcpy(&bits, &f32Scales[i], 4);
                 uint32_t sign = (bits >> 31) & 1;
@@ -256,6 +254,18 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
             ex.gpu->writeBuffer(rebuilt.buffer, fp16Scales.data(), bytes);
             rebuilt.isCpuOnly = false;
             *S = std::move(rebuilt);
+        } else if (S->buffer.handle) {
+            // GPU path: cast f32→f16 on GPU (avoids expensive FlushPendingWork + readBuffer)
+            GpuTensor f16t = ex.AllocTensor(S->shape, TensorDtype::Float16);
+            uint32_t params[4] = {(uint32_t)count, 0, 0, 0};
+            auto pb = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(pb, params, 16);
+            auto& cpl = ex.GetPipelineT("cast_f32_to_f16", 3,
+                []() { return std::string(WGSL_CAST_F32_TO_F16); });
+            auto cbg = ex.MakeBindGroup(cpl, {{0, S->buffer}, {1, f16t.buffer}, {2, pb}});
+            ex.pendingDispatches_.push_back({cpl.pipeline, cbg,
+                (uint32_t)((count + 255) / 256), 1, 1, "mmnb_scales_cast"});
+            *S = std::move(f16t);
         }
     }
     ex.EnsureGpu(*S);
@@ -352,11 +362,11 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
         ensureTensorFloat32(ex, *B, n.inputs.size() > 1 ? n.inputs[1] : std::string());
     }
 
-    auto& pl = ex.GetPipelineT("matmul_f32", 4, []() { return std::string(WGSL_MATMUL_F32); });
+    auto& pl = ex.GetPipelineT("matmul_f32", 4, []() { return instantiateTemplate(WGSL_MATMUL_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
     ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((N_out + 15) / 16), (uint32_t)((M + 15) / 16), 1, "matmul_f32"});
+        (uint32_t)((N_out + 31) / 32), (uint32_t)((M + 15) / 16), 1, "matmul_f32"});
 }
 
 // ─── Gemm ────────────────────────────────────────────────────────────────────
@@ -438,7 +448,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         return;
     }
 
-    auto& pl = ex.GetPipelineT("gemm", 5, []() { return std::string(WGSL_GEMM); });
+    auto& pl = ex.GetPipelineT("gemm", 5, []() { return instantiateTemplate(WGSL_GEMM_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});

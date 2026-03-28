@@ -705,7 +705,7 @@ static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
 
     auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(Cond),
                                 (uint32_t)tensorNel(X), (uint32_t)tensorNel(Y));
-    auto& pl = ex.GetPipelineT("where_select", 5, []() { return std::string(WGSL_WHERE_SELECT); });
+    auto& pl = ex.GetPipelineT("where_select", 5, []() { return instantiateTemplate(WGSL_WHERE_SELECT_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, Cond->buffer}, {1, X->buffer}, {2, Y->buffer},
         {3, out[0]->buffer}, {4, params}});
@@ -736,7 +736,7 @@ static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
     *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
 
     auto params = makeParamBuf(ex, (uint32_t)N, (uint32_t)tensorNel(B));
-    auto& pl = ex.GetPipelineT("equal_op", 4, []() { return std::string(WGSL_EQUAL_OP); });
+    auto& pl = ex.GetPipelineT("equal_op", 4, []() { return instantiateTemplate(WGSL_EQUAL_OP_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, params}});
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "equal"}});
@@ -775,54 +775,10 @@ static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
 
     *out[0] = ex.AllocTensor(X->shape, dtype);
 
-    // Softmax needs internal f32 accumulation (max, exp_sum).
-    // Template handles storage access; computation is always f32.
-    static const char* SOFTMAX_T = R"WGSL(
-${T_READ}
-${T_WRITE2}
-
-@group(0) @binding(0) var<storage, read> X: array<${T}>;
-@group(0) @binding(1) var<storage, read_write> Y: array<${T}>;
-@group(0) @binding(2) var<storage, read> _params_: array<u32>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let nRows = _params_[0];
-    let rowLen = _params_[1];
-    let row = gid.x;
-    if (row >= nRows) { return; }
-    let base = row * rowLen;
-
-    // Find max (f32)
-    var mx: f32 = -1e30;
-    for (var i = 0u; i < rowLen; i++) {
-        mx = max(mx, t_read(&X, base + i));
-    }
-    // Exp sum
-    var expSum: f32 = 0.0;
-    for (var i = 0u; i < rowLen; i++) {
-        expSum += exp(t_read(&X, base + i) - mx);
-    }
-    let invSum = 1.0 / max(expSum, 1e-10);
-    // Write output in pairs
-    let pairs = rowLen / 2u;
-    for (var i = 0u; i < pairs; i++) {
-        let i0 = i * 2u;
-        let v0 = exp(t_read(&X, base + i0) - mx) * invSum;
-        let v1 = exp(t_read(&X, base + i0 + 1u) - mx) * invSum;
-        t_write2(&Y, base + i0, v0, v1);
-    }
-    if ((rowLen & 1u) != 0u) {
-        let last = rowLen - 1u;
-        t_write2(&Y, base + last, exp(t_read(&X, base + last) - mx) * invSum, 0.0);
-    }
-}
-)WGSL";
-
     auto params = makeParamBuf(ex, (uint32_t)nRows, (uint32_t)rowLen);
     std::string pname = "softmax_t" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
-        return instantiateTemplate(SOFTMAX_T, dtype);
+        return instantiateTemplate(WGSL_SOFTMAX_T, dtype);
     });
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, params}});

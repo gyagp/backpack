@@ -8,10 +8,13 @@
 //
 // Params: [C, HW, num_groups, eps_as_u32]
 
-@group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read> Scale: array<f32>;
-@group(0) @binding(2) var<storage, read> Bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> X: array<${T}>;
+@group(0) @binding(1) var<storage, read> Scale: array<${T}>;
+@group(0) @binding(2) var<storage, read> Bias: array<${T}>;
+@group(0) @binding(3) var<storage, read_write> Y: array<${T}>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
 var<workgroup> smem_sum: f32;
@@ -39,7 +42,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     for (var i = tid; i < group_size; i += 256u) {
         let c = g * cpg + i / HW;
         let hw = i % HW;
-        local_sum += X[batch * C * HW + c * HW + hw];
+        local_sum += t_read(&X, batch * C * HW + c * HW + hw);
     }
 
     // Workgroup reduction (simple sequential for now)
@@ -53,14 +56,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         for (var i = 0u; i < group_size; i++) {
             let c = g * cpg + i / HW;
             let hw = i % HW;
-            let v = X[batch * C * HW + c * HW + hw];
+            let v = t_read(&X, batch * C * HW + c * HW + hw);
             s += v;
         }
         let mean = s / f32(group_size);
         for (var i = 0u; i < group_size; i++) {
             let c = g * cpg + i / HW;
             let hw = i % HW;
-            let v = X[batch * C * HW + c * HW + hw] - mean;
+            let v = t_read(&X, batch * C * HW + c * HW + hw) - mean;
             sq += v * v;
         }
         let inv_std = 1.0 / sqrt(sq / f32(group_size) + eps);
@@ -77,7 +80,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         let c = g * cpg + i / HW;
         let hw = i % HW;
         let offset = batch * C * HW + c * HW + hw;
-        let normed = (X[offset] - mean) * inv_std;
-        Y[offset] = normed * Scale[c] + Bias[c];
+        let normed = (t_read(&X, offset) - mean) * inv_std;
+        t_write(&Y, offset, normed * t_read(&Scale, c) + t_read(&Bias, c));
     }
 }

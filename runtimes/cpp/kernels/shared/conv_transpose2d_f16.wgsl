@@ -1,21 +1,9 @@
-// ConvTranspose2D — 2D transposed convolution with bias
-// Y[n,co,oh,ow] = sum_{ci,kh,kw} X[n,ci,ih,iw] * W[ci,co,kh,kw] + bias[co]
-//
-// Note: weight layout is [C_in, C_out, KH, KW] (transposed from Conv)
-//
-// Supports padding, stride, output_padding, and groups.
-// Dispatch: (ceil(total_output/256), 1, 1)
-//
-// Params: [batch, C_in, H_in, W_in, C_out, KH, KW, pad_h,
-//          pad_w, stride_h, stride_w, H_out, W_out, group, out_pad_h, out_pad_w]
+enable f16;
 
-${T_READ}
-${T_WRITE}
-
-@group(0) @binding(0) var<storage, read> X: array<${T}>;
-@group(0) @binding(1) var<storage, read> W: array<${T}>;
-@group(0) @binding(2) var<storage, read> Bias: array<${T}>;
-@group(0) @binding(3) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(0) var<storage, read> X: array<f16>;
+@group(0) @binding(1) var<storage, read> W: array<f16>;
+@group(0) @binding(2) var<storage, read> Bias: array<f16>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
 @compute @workgroup_size(256)
@@ -54,9 +42,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ci = g * ci_per_group + ci_local;
         for (var kh = 0u; kh < KH; kh++) {
             for (var kw = 0u; kw < KW; kw++) {
-                // In transposed conv, output position (oh, ow) is related to
-                // input position by: oh = ih * stride_h - pad_h + kh
-                // So: ih = (oh + pad_h - kh) / stride_h
                 let oh_off = i32(oh) + i32(pad_h) - i32(kh);
                 let ow_off = i32(ow) + i32(pad_w) - i32(kw);
                 if (oh_off >= 0 && ow_off >= 0 &&
@@ -64,9 +49,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let ih = u32(oh_off) / stride_h;
                     let iw = u32(ow_off) / stride_w;
                     if (ih < H_in && iw < W_in) {
-                        let x_val = t_read(&X, n * C_in * H_in * W_in + ci * H_in * W_in + ih * W_in + iw);
-                        // Weight layout: [C_in, C_out_per_group, KH, KW]
-                        let w_val = t_read(&W, ci * co_per_group * KH * KW + co_local * KH * KW + kh * KW + kw);
+                        let x_val = f32(X[n * C_in * H_in * W_in + ci * H_in * W_in + ih * W_in + iw]);
+                        let w_val = f32(W[ci * co_per_group * KH * KW + co_local * KH * KW + kh * KW + kw]);
                         acc += x_val * w_val;
                     }
                 }
@@ -74,5 +58,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    t_write(&Y, idx, acc + t_read(&Bias, co));
+    Y[idx] = acc + f32(Bias[co]);
 }

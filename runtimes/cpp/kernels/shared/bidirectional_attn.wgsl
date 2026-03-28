@@ -7,10 +7,13 @@
 //
 // Dispatch: (ceil(head_dim/128), num_heads, T_q)
 
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> Q: array<${T}>;
+@group(0) @binding(1) var<storage, read> K: array<${T}>;
+@group(0) @binding(2) var<storage, read> V: array<${T}>;
+@group(0) @binding(3) var<storage, read_write> Out: array<${T}>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
 @compute @workgroup_size(128)
@@ -42,7 +45,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var score: f32 = 0.0;
         let k_base = kv * kv_hd_stride * head_dim + kv_head * head_dim;
         for (var dd = 0u; dd < head_dim; dd++) {
-            score += Q[q_base + dd] * K[k_base + dd];
+            score += t_read(&Q, q_base + dd) * t_read(&K, k_base + dd);
         }
         score *= scale;
 
@@ -55,11 +58,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Rescale accumulator and add new V contribution
         let rescale = l_prev * exp_prev / max(l_new, 1e-10);
         let w = exp_score / max(l_new, 1e-10);
-        acc = acc * rescale + w * V[k_base + d];
+        acc = acc * rescale + w * t_read(&V, k_base + d);
 
         m_prev = m_new;
         l_prev = l_new;
     }
 
-    Out[q_base + d] = acc;
+    t_write(&Out, q_base + d, acc);
 }
