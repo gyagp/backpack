@@ -524,6 +524,10 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
             }
             idxBuf = ex.gpu->createBuffer("gbq_idx32", nIdx * 4);
             ex.gpu->writeBuffer(idxBuf, i32.data(), nIdx * 4);
+            // During graph capture: register this buffer for replay update.
+            if (ex.graphCaptureState_ == GraphExecutor::GraphCaptureState::Capturing) {
+                ex.capturedTokenIdBufs_.push_back({idxBuf, nIdx});
+            }
         }
     }
 

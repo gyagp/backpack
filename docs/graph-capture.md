@@ -39,12 +39,15 @@ The model satisfies all hard requirements. The 707 ONNX nodes break down as:
 
 CPU-only ops produce metadata (shapes, positions) but have **zero** impact on GPU dispatch correctness for single-token decode — all position-dependent values are either constant (`-1`, `1` for seq_len=1) or handled by `ReplayParamUpdate` (GQA positions).
 
-## Implementation Status
+## Implementation Status: WORKING
 
-### Infrastructure (complete)
+Graph capture is fully functional for LFM2-8B decode. Enabled via `--fast-decode` flag.
+
+### Infrastructure
 - `CapturedFlush` / `CapturedCommand` structs with pipeline, bind group, dispatch size, bind entries
 - `CaptureBegin()` / `CaptureEnd()` / `Replay()` / `ReplayWrites()` / `ReplayDispatches()`
 - `RegisterReplayParam()` for GQA position tracking (24 params: posOffset, pastSeq, totalSeq)
+- `CapturedTokenIdBuf` for GatherBlockQuantized embedding token ID update during replay
 - `QueueDispatch()` wrapper that attaches bind entries for capture
 - `SubmitAsync()` modified to attach bind entries during capture
 - Self-clearing `moe_accum` kernel (slot 0: `dst = weight * src`, slot > 0: `dst += weight * src`) — eliminates MoE output zero-init `writeBuffer`
@@ -53,47 +56,40 @@ CPU-only ops produce metadata (shapes, positions) but have **zero** impact on GP
 - Conv state pre-allocation: `convCastF16Bufs` used in `ResetCaches` for stable buffer handles
 - Conv cast flush removal: last captured flush (conv casts) removed, handled manually in replay path
 
-### Approaches Tried
+### Key Fix: Embedding Token ID Update
 
-| Approach | Result | Issue |
-|---|---|---|
-| **Capture+submit, AddRef bind groups** | Replay produces different logits from same inputs | Bind groups used in capture CB then reused in replay CB — Dawn produces different results on second use |
-| **Capture-only (ORT pattern), pristine bind groups** | Same — different logits | Even pristine bind groups (never submitted before replay) produce wrong output |
-| **Rebuild bind groups from saved entries** | Same — different logits | Fresh bind groups with identical buffer handles/offsets/sizes produce wrong output |
-| **Replay all captured writes** | Overwrites idsBuf with capture-step token | Fixed via split ReplayWrites/ReplayDispatches and input writes after captured writes |
-| **Replay zero-init writes only** | MoE accumulation not cleared | Fixed via self-clearing moe_accum kernel |
-| **No write replay (GQA params only)** | Consistency test passes (replay is deterministic) | But replay output differs from normal Execute |
+The model uses `GatherBlockQuantized` for embedding lookup — a GPU dispatch that dequantizes Q4 weights on the fly. The op receives `input_ids` as int64, converts them to int32 in a temporary `gbq_idx32` buffer, then dispatches the dequantization kernel.
 
-### Key Findings
+During graph capture, the bind group for this dispatch references the `gbq_idx32` buffer. During replay, the buffer still held the capture-step's token ID. The fix:
 
-1. **Replay is deterministic** — Two replays with same inputs produce identical output (verified)
-2. **Replay differs from Execute** — Even with AddRef'd bind groups (identical WGPUBindGroup objects) or freshly rebuilt bind groups, replay produces different logit values from normal Execute
-3. **No position-dependent data in dispatches** — Cross-reference of captured writes vs dispatch bind groups shows 0 position-dependent small writes consumed by any dispatch, 0 copies reading written buffers
-4. **58 non-param writes bound in dispatches** — All are constants (conv bias zeros ×36, MoE expert_bias ×22). No stale state.
-5. **Micro-test passes** — 1-2 dispatch capture+replay produces correct output. Full model (975 dispatches, 19 flushes) does not.
+1. **Capture** (`opGatherBlockQuantized` in `matmul.cpp`): When `graphCaptureState_ == Capturing`, register the `gbq_idx32` buffer in `capturedTokenIdBufs_`
+2. **Replay** (`ReplayWrites()` in `graph_executor.cpp`): Before replaying dispatches, write the new token ID (int32) to the registered buffer
+3. **Caller** (`main.cpp`): Set `executor.replayTokenId_` before calling `ReplayWrites()`
 
-### Performance (when enabled, output degraded)
+### Per-Step Replay Updates
 
-| Mode | tok/s | ms/tok |
-|---|---|---|
-| Normal Execute | 54 | 18.5 |
-| Graph Capture Replay | 75 | 13.3 |
-| Improvement | **+39%** | |
+During each replay step, only 3 things are updated:
+1. **24 GQA param buffers** — posOffset, pastSeq, totalSeq for 6 attention layers × 4 params
+2. **1 GBQ token ID buffer** — new token ID (int32) for embedding lookup
+3. **Conv cast dispatches** — f32→f16 conv state casts run after replay (not captured)
 
-### Remaining Issue
+All other buffer contents persist from the capture step (constant initializer data, conv weights, etc.).
 
-The replay mechanism is **correct at the WebGPU API level** (bind groups, dispatch sizes, buffer contents all verified) but produces **numerically different GPU computation results** from normal Execute. This manifests as:
-- Benchmark: tokens repeat (e.g., 37009 ×10) instead of varied generation
-- Chat: first 2-3 tokens correct ("2 +") then degrades to repetition
+### Performance
 
-The discrepancy persists across all tested configurations:
-- Pristine bind groups (ORT pattern) vs AddRef'd (capture+submit) vs rebuilt from entries
-- With/without write replay, with/without zero-init replay
-- Single CB vs multi-CB replay, with/without waitForQueue between flushes
+| Mode | tok/s | ms/tok | Improvement |
+|---|---|---|---|
+| Normal Execute | 54 | 18.6 | — |
+| Graph Capture Replay | 59 | 16.9 | **+10%** |
 
-### Next Steps
+Tested with 200-token decode on LFM2-8B (RTX 5080, D3D12).
 
-1. **Test with Dawn Vulkan backend** — determine if the issue is D3D12-specific
-2. **Create minimal 10-dispatch repro** — isolate the threshold where replay diverges
-3. **Inspect Dawn's D3D12 bind group translation** — check if bind groups carry per-CB state
-4. **Alternative: partial replay** — run the CPU metadata ops normally (~12 nodes, microseconds), then replay only the GPU dispatches. This avoids full graph capture but still skips the ~10ms CPU op loop overhead.
+The modest speedup is due to Dawn/D3D12 per-submission overhead: encoding 975 dispatches into 19 command buffers takes ~5ms CPU, and the GPU fence wait adds ~10ms, despite only 0.6ms of actual GPU compute. The bottleneck is the WebGPU API call overhead and D3D12 command queue synchronization.
+
+### How It Works
+
+1. **Warmup phase**: All prompt tokens run through normal `Execute()` path (707 ONNX nodes evaluated)
+2. **Capture step**: First decode token triggers `CaptureBegin()`, runs full `Execute()` (producing valid output), and records all GPU dispatches (975 dispatches across 19 flushes). Bind groups are AddRef'd for reuse.
+3. **Replay steps**: Skip entire ONNX Execute loop. Update position params + token ID buffer, then replay captured dispatches directly via WebGPU command buffers.
+
+The speedup comes from eliminating the CPU overhead of the Execute loop (~221 CPU-only ops + op dispatch overhead) while keeping GPU work identical.

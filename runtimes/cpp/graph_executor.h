@@ -43,7 +43,11 @@ struct GpuTensor {
     }
 
     size_t DtypeSize() const {
-        switch (dtype) {
+        return DtypeSizeOf(dtype);
+    }
+
+    static size_t DtypeSizeOf(TensorDtype dt) {
+        switch (dt) {
             case TensorDtype::Float32: case TensorDtype::Int32: return 4;
             case TensorDtype::Float16: return 2;
             case TensorDtype::Int64: return 8;
@@ -365,6 +369,7 @@ public:
         capturedWrites_.clear();
         replayParamUpdates_.clear();
         replayScalarUpdates_.clear();
+        capturedTokenIdBufs_.clear();
     }
 
     /// End graph capture.
@@ -389,6 +394,18 @@ public:
 
     /// Position counter for GQA param updates during replay.
     uint32_t replayPosition_ = 0;
+
+    /// Token ID for embedding re-upload during replay.
+    int64_t replayTokenId_ = 0;
+
+    /// Buffers holding token indices that need updating during replay.
+    /// GatherBlockQuantized converts int64 input_ids to int32 and writes to a
+    /// temporary buffer. During replay, we re-write the new token ID to it.
+    struct CapturedTokenIdBuf {
+        GPUBuffer buffer;         // The gbq_idx32 buffer
+        int64_t nIdx;             // Number of indices (typically 1 for decode)
+    };
+    std::vector<CapturedTokenIdBuf> capturedTokenIdBufs_;
 
     /// Position at capture time (for detecting position-dependent scalars).
     uint32_t capturePosition_ = 0;

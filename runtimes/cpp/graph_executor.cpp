@@ -991,7 +991,7 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
 // ─── Graph Capture: Replay & Release ─────────────────────────────────────────
 
 void GraphExecutor::ReplayWrites() {
-    // Only update GQA param buffers — all other param values are constant
+    // Update GQA param buffers — all other param values are constant
     // and still in the buffers from the capture step's writeBuffer calls.
     for (auto& update : replayParamUpdates_) {
         uint32_t value = 0;
@@ -1002,27 +1002,57 @@ void GraphExecutor::ReplayWrites() {
         }
         gpu->writeBufferRaw(update.paramBuf.handle, update.offsetBytes, &value, 4);
     }
+
+    // Re-write token ID for GatherBlockQuantized embedding lookup.
+    // During capture, the op converts int64 input_ids to int32 in a temp buffer.
+    // During replay, we re-write the current token ID to that buffer.
+    for (auto& tok : capturedTokenIdBufs_) {
+        if (!tok.buffer.handle) continue;
+        std::vector<int32_t> i32((size_t)tok.nIdx);
+        for (int64_t i = 0; i < tok.nIdx; i++)
+            i32[(size_t)i] = (int32_t)replayTokenId_;
+        gpu->writeBufferRaw(tok.buffer.handle, tok.buffer.offset,
+            i32.data(), (size_t)tok.nIdx * 4);
+    }
 }
 
 void GraphExecutor::ReplayDispatches() {
     if (capturedFlushes_.empty()) return;
     graphCaptureState_ = GraphCaptureState::Replaying;
 
+    bool profiling = gpuProfiler && gpuProfiler->enabled();
+
     // Encode captured commands, respecting the original flush boundaries.
-    // Each flush becomes its own command buffer (preserves ordering).
+    // Each flush becomes its own command buffer to pipeline GPU execution
+    // (GPU starts processing flush N while CPU encodes flush N+1).
     for (auto& flush : capturedFlushes_) {
         if (flush.dispatches.empty() && flush.copies.empty()) continue;
 
         WGPUCommandEncoderDescriptor enD{};
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
 
-        for (auto& cmd : flush.dispatches) {
-            // Use AddRef'd original bind group directly (no rebuild)
+        if (profiling) {
+            for (auto& cmd : flush.dispatches) {
+                auto [bIdx, eIdx] = gpuProfiler->allocate(cmd.name);
+                auto tw = gpuProfiler->makeTimestampWrites(bIdx, eIdx);
+                WGPUComputePassDescriptor cpD{};
+                cpD.timestampWrites = &tw;
+                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+                wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
+                wgpuComputePassEncoderEnd(pass);
+                wgpuComputePassEncoderRelease(pass);
+            }
+        } else if (!flush.dispatches.empty()) {
+            // Single compute pass per flush (batched dispatches, fewer API calls)
             WGPUComputePassDescriptor cpD{};
             auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-            wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
-            wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
-            wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
+            for (auto& cmd : flush.dispatches) {
+                wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
+            }
             wgpuComputePassEncoderEnd(pass);
             wgpuComputePassEncoderRelease(pass);
         }
@@ -1065,6 +1095,7 @@ void GraphExecutor::ReleaseCaptured() {
     capturedFlushes_.clear();
     capturedWrites_.clear();
     replayParamUpdates_.clear();
+    capturedTokenIdBufs_.clear();
 }
 
 // ─── Batched submit: encode all pending work into one CB and submit ──────────

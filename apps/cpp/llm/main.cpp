@@ -160,11 +160,13 @@ struct OnnxLlmContext {
     // Graph capture state for fast decode
     bool graphCaptureEnabled = false;
     bool graphCaptured = false;
-    bool captureReady = false;
-    int warmupStepsBeforeCapture = 1;  // how many normal steps before capture
-    int warmupStepsDone = 0;
+    bool prefillDone = false;  // Capture only after prefill completes
     // Pre-allocated f16 conv cast output buffers (reused during replay)
     std::vector<GPUBuffer> convCastF16Bufs;
+    // Pre-built conv cast bind groups for replay (avoid per-step MakeBindGroup)
+    std::vector<WGPUBindGroup> convCastBindGroups;
+    const CompiledPipeline* convCastPipeline = nullptr;
+    uint32_t convCastWorkgroups = 0;
 
     bool Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         gpu = &gpuCtx;
@@ -225,6 +227,7 @@ struct OnnxLlmContext {
 
     void ResetCaches() {
         pos = 0;
+        prefillDone = false;
         convState.clear();
         kvState.clear();
         // Reset graph capture state (captured bind groups reference old buffers)
@@ -232,8 +235,6 @@ struct OnnxLlmContext {
             executor.ReleaseCaptured();
             graphCaptured = false;
         }
-        captureReady = false;
-        warmupStepsDone = 0;
         // Conv caches: [1, hiddenSize, convLCache] fp16, zero-initialized
         for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
             int idx = convLayerIndices[ci];
@@ -292,21 +293,13 @@ struct OnnxLlmContext {
             // Set position for GQA param updates
             executor.replayPosition_ = (uint32_t)(pos - 1);
 
-            // Register input buffers to skip during write replay
-            if (executor.replaySkipBuffers_.empty()) {
-                executor.replaySkipBuffers_ = {idsBuf.handle, maskBuf.handle, nlkBuf.handle};
-            }
+            // Set token ID for embedding re-upload
+            executor.replayTokenId_ = tokenId;
 
-            // Phase 1: replay captured writes (param values, zero-inits)
+            // Phase 1: replay param writes (GQA position params + token ID)
             executor.ReplayWrites();
 
-            // Phase 2: write inputs (AFTER captured writes)
-            // so they aren't overwritten by the capture step's input values)
-            gpu->writeBuffer(idsBuf, &tokenId, 8);
-            std::vector<int64_t> mask(pos, 1);
-            gpu->writeBuffer(maskBuf, mask.data(), pos * 8);
-
-            // Phase 3: encode+submit captured dispatches + readback
+            // Phase 2: encode+submit captured dispatches + readback
             uint64_t logitBytes = (uint64_t)vocabSize * 4;
             auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
             executor.RequestReadback(logitsBuf, {rbHandle, logitBytes}, logitBytes);
@@ -317,21 +310,13 @@ struct OnnxLlmContext {
             auto rb = gpu->mapReadbackBuffer(vocabSize * 4);
             memcpy(logits.data(), rb.data(), vocabSize * 4);
 
-            // Conv cast with pre-allocated f16 buffers
+            // Conv cast with pre-built bind groups
             for (size_t i = 0; i < convLayerIndices.size(); i++) {
                 std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
-                int64_t nel = hiddenSize * convLCache;
-                uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
-                auto paramBuf = executor.getParamBuffer(16);
-                gpu->writeBuffer(paramBuf, params, 16);
-                auto& cPl = executor.GetPipelineT("cast_f32_to_f16", 3,
-                    []() { return std::string(WGSL_CAST_F32_TO_F16); });
-                auto bg = executor.MakeBindGroup(cPl, {
-                    {0, {convOutBufs[i].handle, convOutBufs[i].size}},
-                    {1, convCastF16Bufs[i]},
-                    {2, paramBuf}});
-                executor.QueueDispatch(cPl.pipeline, bg,
-                    (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16");
+                // AddRef because flushToEncoder releases bind groups after submit
+                wgpuBindGroupAddRef(convCastBindGroups[i]);
+                executor.QueueDispatch(convCastPipeline->pipeline, convCastBindGroups[i],
+                    convCastWorkgroups, 1, 1, "cache_cast_f16");
                 convState[inName].buffer = convCastF16Bufs[i];
                 convState[inName].dtype = TensorDtype::Float16;
             }
@@ -350,7 +335,7 @@ struct OnnxLlmContext {
         // ── Capture Path (capture+submit: save AND execute) ──────────
         // Bind groups are AddRef'd for replay. The capture step produces
         // valid output since GPU work IS submitted.
-        if (graphCaptureEnabled && !graphCaptured && captureReady) {
+        if (graphCaptureEnabled && !graphCaptured && prefillDone) {
             executor.capturePosition_ = (uint32_t)(pos - 1);
             executor.CaptureBegin();
             auto logits = runExecutePath(tokenId);
@@ -373,17 +358,29 @@ struct OnnxLlmContext {
                         executor.capturedFlushes_.size(), nDisp, executor.replayParamUpdates_.size());
             }
 
+            // Pre-build conv cast bind groups for replay
+            if (!convLayerIndices.empty()) {
+                int64_t nel = hiddenSize * convLCache;
+                convCastWorkgroups = (uint32_t)((nel + 255) / 256);
+                uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
+                auto paramBuf = gpu->createBuffer("conv_cast_params", 16);
+                gpu->writeBuffer(paramBuf, params, 16);
+                convCastPipeline = &executor.GetPipelineT("cast_f32_to_f16", 3,
+                    []() { return std::string(WGSL_CAST_F32_TO_F16); });
+                convCastBindGroups.resize(convLayerIndices.size());
+                for (size_t i = 0; i < convLayerIndices.size(); i++) {
+                    convCastBindGroups[i] = executor.MakeBindGroup(*convCastPipeline, {
+                        {0, {convOutBufs[i].handle, convOutBufs[i].size}},
+                        {1, convCastF16Bufs[i]},
+                        {2, paramBuf}});
+                }
+            }
+
             // Logits are valid — capture+submit mode
             return logits;
         }
 
-        // ── Normal Path ─────────────────────────────────────────────────
-        // Count warmup steps before enabling capture
-        if (graphCaptureEnabled && !captureReady) {
-            warmupStepsDone++;
-            if (warmupStepsDone >= warmupStepsBeforeCapture) captureReady = true;
-        }
-
+        // ── Normal Path (graph capture disabled) ────────────────────────
         return runExecutePath(tokenId);
     }
 
@@ -797,6 +794,7 @@ int main(int argc, char* argv[]) {
                 auto logits = onnxLlm.RunStep(tok);
                 tok = onnxLlm.Argmax(logits);
             }
+            onnxLlm.prefillDone = true;
 
             // Timed decode
             auto t2 = std::chrono::steady_clock::now();
@@ -828,6 +826,7 @@ int main(int argc, char* argv[]) {
                     auto lg = onnxLlm.RunStep(tok);
                     tok = onnxLlm.Argmax(lg);
                 }
+                onnxLlm.prefillDone = true;
 
                 // Reset profiler counters to only capture timed tokens
                 if (onnxLlm.executor.gpuProfiler) {
@@ -890,14 +889,8 @@ int main(int argc, char* argv[]) {
         int32_t eos = onnxLlm.tokenizer.eos_token_id;
 
         onnxLlm.ResetCaches();
-        // For fast decode: process ALL prompt tokens normally, then capture
-        // on the last prompt token so the model state is fully set up
-        if (onnxLlm.graphCaptureEnabled) {
-            // Capture+submit: capture step produces valid output.
-            // Just need 1 warmup step before capture to stabilize buffers.
-            onnxLlm.warmupStepsBeforeCapture = (int)promptTokens.size();
-        }
         // Prefill: feed prompt tokens one at a time
+        // With graph capture: first token triggers capture, rest use replay
         int32_t next = 0;
         for (size_t i = 0; i < promptTokens.size(); i++) {
             auto logits = onnxLlm.RunStep(promptTokens[i]);
@@ -905,6 +898,7 @@ int main(int argc, char* argv[]) {
                 next = onnxLlm.Argmax(logits);
             }
         }
+        onnxLlm.prefillDone = true;
 
         // Decode loop
         for (int i = 0; i < maxTokens; i++) {
