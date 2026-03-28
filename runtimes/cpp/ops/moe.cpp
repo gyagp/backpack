@@ -506,12 +506,12 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)blocksPerCol_gu, slot};
             auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipelineT("matmul_q4_indirect", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_T, TensorDtype::Float32); });
+            auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, input->buffer}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
                 {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
             ex.QueueDispatch(pl.pipeline, bg,
-                (uint32_t)((N_gu + 255) / 256), 1, 1, "moe_gateup");
+                (uint32_t)((N_gu + 7) / 8), 1, 1, "moe_gateup");
         }
 
         // SwiGLU (interleaved layout)
@@ -532,12 +532,12 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                                    (uint32_t)blocksPerCol_dn, slot};
             auto pBuf = ex.getParamBuffer(16);
             ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipelineT("matmul_q4_indirect", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_T, TensorDtype::Float32); });
+            auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
                 {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
             ex.QueueDispatch(pl.pipeline, bg,
-                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_down");
+                (uint32_t)((N_dn + 7) / 8), 1, 1, "moe_down");
         }
 
         // Weighted accumulate (indirect weight from GPU buffer)

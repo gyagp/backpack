@@ -292,17 +292,29 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (ZP) {
-        // Use templated kernel — auto-selects f32 or fp16 I/O.
-        // Shader generated once on first cache miss.
-        std::string pname = "matmul_q4_zp_t" + std::string(dtypeSuffix(outDtype));
-        auto& pl = ex.GetPipelineT(pname, 6, [outDtype]() {
-            return instantiateTemplate(WGSL_MATMUL_Q4_ZP_T, outDtype);
-        });
-        auto bg = ex.MakeBindGroup(pl, {
-            {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
-            {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
-        ex.QueueDispatch(pl.pipeline, bg,
-            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp");
+        // Use subgroup-parallel kernel for decode (M=1)
+        if (M == 1) {
+            std::string pname = "matmul_q4_zp_sub_t" + std::string(dtypeSuffix(outDtype));
+            auto& pl = ex.GetPipelineT(pname, 6, [outDtype]() {
+                return instantiateTemplate(WGSL_MATMUL_Q4_ZP_SUB_T, outDtype);
+            });
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+                {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (N + 7) / 8, 1, 1, "matmul_q4_zp");
+        } else {
+            // Use templated kernel — auto-selects f32 or fp16 I/O.
+            std::string pname = "matmul_q4_zp_t" + std::string(dtypeSuffix(outDtype));
+            auto& pl = ex.GetPipelineT(pname, 6, [outDtype]() {
+                return instantiateTemplate(WGSL_MATMUL_Q4_ZP_T, outDtype);
+            });
+            auto bg = ex.MakeBindGroup(pl, {
+                {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+                {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp");
+        }
     } else {
         auto& pl = ex.GetPipelineT("matmul_q4", 5, []() { return std::string(WGSL_MATMUL_Q4); });
         auto bg = ex.MakeBindGroup(pl, {
