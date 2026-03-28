@@ -543,6 +543,36 @@ public:
         }
         return idx;
     }
+
+    /// Check if the model supports graph capture for fast decode.
+    /// Returns empty string if supported, or a reason string if not.
+    std::string CheckGraphCaptureSupport() const {
+        auto& graph = executor.GetGraph();
+
+        // Check for dynamic control flow ops
+        for (auto& node : graph.nodes) {
+            if (node.opType == "If" || node.opType == "Loop" || node.opType == "Scan")
+                return "model contains dynamic control flow (" + node.opType + " op: " + node.name + ")";
+        }
+
+        // Must have conv or attention layers (otherwise it's a simple model
+        // that doesn't benefit from graph capture)
+        if (convLayerIndices.empty() && attnLayerIndices.empty())
+            return "model has no conv or attention layers";
+
+        return "";
+    }
+
+    /// Enable graph capture and pre-allocate required buffers.
+    void EnableGraphCapture() {
+        graphCaptureEnabled = true;
+        convCastF16Bufs.resize(convLayerIndices.size());
+        for (size_t i = 0; i < convLayerIndices.size(); i++) {
+            size_t nel = (size_t)(hiddenSize * convLCache);
+            convCastF16Bufs[i] = gpu->createBuffer(
+                "conv_cast_f16_" + std::to_string(i), nel * 2);
+        }
+    }
 };
 
 /// Standard transformer LLM context using ModelRunner
@@ -688,7 +718,7 @@ struct LlmContext {
 int main(int argc, char* argv[]) {
     std::string modelPath, prompt, chatMessage, backendStr;
     int maxTokens = 100;
-    bool benchmark = false, profile = false, fastDecode = false;
+    bool benchmark = false, profile = false, noFastDecode = false;
     int benchPromptLen = 0, benchGenTokens = 128;
 
     for (int i = 1; i < argc; i++) {
@@ -700,7 +730,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--backend" && i+1 < argc)    backendStr = argv[++i];
         else if (arg == "--benchmark")                benchmark = true;
         else if (arg == "--profile")                  profile = true;
-        else if (arg == "--fast-decode")              fastDecode = true;
+        else if (arg == "--no-fast-decode")            noFastDecode = true;
+        else if (arg == "--fast-decode")              {} // accepted for compat, now default
         else if (arg == "--bench-prompt-len" && i+1 < argc) benchPromptLen = atoi(argv[++i]);
         else if (arg == "--bench-gen-tokens" && i+1 < argc) benchGenTokens = atoi(argv[++i]);
     }
@@ -713,6 +744,7 @@ int main(int argc, char* argv[]) {
             "  --chat <message>   Chat message (auto-template)\n"
             "  --max-tokens <n>   Max tokens (default: 100)\n"
             "  --backend <name>   vulkan / d3d12 / metal\n"
+            "  --no-fast-decode   Disable graph capture fast decode\n"
             "  --benchmark        Prefill+decode sweep\n"
             "  --profile          GPU timestamp profiling + HTML timeline\n", argv[0]);
         return 1;
@@ -746,15 +778,14 @@ int main(int argc, char* argv[]) {
         if (!onnxLlm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), resolvedPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
         }
-        // Enable fast decode (graph capture) if requested or in benchmark mode
-        if (fastDecode) {
-            onnxLlm.graphCaptureEnabled = true;
-            // Pre-allocate conv cast f16 buffers
-            onnxLlm.convCastF16Bufs.resize(onnxLlm.convLayerIndices.size());
-            for (size_t i = 0; i < onnxLlm.convLayerIndices.size(); i++) {
-                size_t nel = (size_t)(onnxLlm.hiddenSize * onnxLlm.convLCache);
-                onnxLlm.convCastF16Bufs[i] = static_cast<GPUContext*>(device.GetGPUContext())->createBuffer(
-                    "conv_cast_f16_" + std::to_string(i), nel * 2);
+        // Auto-enable fast decode (graph capture) unless disabled
+        if (!noFastDecode) {
+            std::string reason = onnxLlm.CheckGraphCaptureSupport();
+            if (reason.empty()) {
+                onnxLlm.EnableGraphCapture();
+                printf("  Fast decode: enabled (graph capture)\n");
+            } else {
+                fprintf(stderr, "  Fast decode: disabled — %s\n", reason.c_str());
             }
         }
     } else {
