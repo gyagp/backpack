@@ -282,6 +282,12 @@ struct OnnxLlmContext {
         }
     }
 
+    // Run a single prefill step (always uses normal Execute, never captures).
+    std::vector<float> RunPrefillStep(int64_t tokenId) {
+        pos++;
+        return runExecutePath(tokenId);
+    }
+
     // Run a single decode step and return logits.
     // Fast decode uses capture + replay pattern:
     //   warmup steps (normal) → capture step (save+execute) → replay steps
@@ -818,63 +824,69 @@ int main(int argc, char* argv[]) {
             int warmup = 3;
             int genTokens = benchGenTokens > 0 ? benchGenTokens : 20;
 
-            // Warmup
             onnxLlm.ResetCaches();
             int32_t tok = 1; // BOS
-            for (int i = 0; i < warmup; i++) {
-                auto logits = onnxLlm.RunStep(tok);
-                tok = onnxLlm.Argmax(logits);
-            }
+
+            // Prefill (single token, timed)
+            auto pfStart = std::chrono::steady_clock::now();
+            auto logits = onnxLlm.RunPrefillStep(tok);
+            tok = onnxLlm.Argmax(logits);
+            auto pfEnd = std::chrono::steady_clock::now();
+            double pfMs = std::chrono::duration<double, std::milli>(pfEnd - pfStart).count();
             onnxLlm.prefillDone = true;
 
-            // Timed decode
+            // Warmup decodes (capture on first, replay on rest — excluded from timing)
+            for (int i = 0; i < warmup; i++) {
+                logits = onnxLlm.RunStep(tok);
+                tok = onnxLlm.Argmax(logits);
+            }
+
+            // Timed decode (all replay)
             auto t2 = std::chrono::steady_clock::now();
             for (int i = 0; i < genTokens; i++) {
-                auto logits = onnxLlm.RunStep(tok);
+                logits = onnxLlm.RunStep(tok);
                 tok = onnxLlm.Argmax(logits);
             }
             auto t3 = std::chrono::steady_clock::now();
             double dcMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
             double dcTps = genTokens * 1000.0 / dcMs;
-            printf("  Decode: %d tokens in %.0fms (%.1f tok/s, %.1f ms/tok)\n",
+            printf("  Prefill: 1 token in %.1fms\n", pfMs);
+            printf("  Decode:  %d tokens in %.0fms (%.1f tok/s, %.1f ms/tok)\n",
                    genTokens, dcMs, dcTps, dcMs / genTokens);
 
-            // Profile run: one more step with per-op CPU profiling
-            printf("\n=== Profile (single decode step) ===\n");
+            // CPU profile: single replay step
+            printf("\n=== Profile (single replay step) ===\n");
             onnxLlm.executor.profilingEnabled = true;
-            auto logits = onnxLlm.RunStep(tok);
+            logits = onnxLlm.RunStep(tok);
             onnxLlm.executor.profilingEnabled = false;
 
             // GPU hardware timestamp profiling (if --profile)
             if (profile) {
-                printf("\n=== GPU Hardware Timestamp Profile (%d tokens) ===\n", genTokens);
+                printf("\n=== GPU Hardware Timestamp Profile (single replay step) ===\n");
                 onnxLlm.ResetCaches();
-                onnxLlm.executor.enableGpuProfiling();
                 tok = 1;
 
-                // Warmup without profiling
+                // Prefill
+                logits = onnxLlm.RunPrefillStep(tok);
+                tok = onnxLlm.Argmax(logits);
+                onnxLlm.prefillDone = true;
+
+                // Warmup decodes (capture on first, replay on rest)
                 for (int i = 0; i < warmup; i++) {
                     auto lg = onnxLlm.RunStep(tok);
                     tok = onnxLlm.Argmax(lg);
                 }
-                onnxLlm.prefillDone = true;
 
-                // Reset profiler counters to only capture timed tokens
-                if (onnxLlm.executor.gpuProfiler) {
-                    onnxLlm.executor.gpuProfiler->nextIndex = 0;
-                    onnxLlm.executor.gpuProfiler->entries.clear();
-                }
-
+                // Profile single replay step
+                onnxLlm.executor.enableGpuProfiling();
                 auto pt0 = std::chrono::steady_clock::now();
-                for (int i = 0; i < genTokens; i++) {
-                    auto lg = onnxLlm.RunStep(tok);
-                    tok = onnxLlm.Argmax(lg);
-                }
+                logits = onnxLlm.RunStep(tok);
+                tok = onnxLlm.Argmax(logits);
                 auto pt1 = std::chrono::steady_clock::now();
                 double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
 
                 std::string htmlPath = (fs::path(onnxLlm.modelDir) / "profile.html").string();
-                onnxLlm.executor.printGpuProfileReport(genTokens, profMs, htmlPath);
+                onnxLlm.executor.printGpuProfileReport(1, profMs, htmlPath);
             }
 
             printf("\n");
@@ -920,18 +932,17 @@ int main(int argc, char* argv[]) {
         int32_t eos = onnxLlm.tokenizer.eos_token_id;
 
         onnxLlm.ResetCaches();
-        // Prefill: feed prompt tokens one at a time
-        // With fast decode: first token after prefill triggers capture, rest use replay
+        // Prefill: feed prompt tokens one at a time (normal Execute, no capture)
         int32_t next = 0;
         for (size_t i = 0; i < promptTokens.size(); i++) {
-            auto logits = onnxLlm.RunStep(promptTokens[i]);
+            auto logits = onnxLlm.RunPrefillStep(promptTokens[i]);
             if (i == promptTokens.size() - 1) {
                 next = onnxLlm.Argmax(logits);
             }
         }
         onnxLlm.prefillDone = true;
 
-        // Decode loop
+        // Decode loop (first RunStep captures, rest replay)
         for (int i = 0; i < maxTokens; i++) {
             if (next == eos) break;
             std::string text = onnxLlm.tokenizer.decode_token(next);
