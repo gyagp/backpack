@@ -311,15 +311,14 @@ public:
     /// Flush pending dispatches+copies into a command encoder and submit.
     void flushToEncoder();
 
-    // ─── Graph Capture / Fast Decode ─────────────────────────────────────
-    // Follows ORT's pattern: capture step saves commands WITHOUT executing.
-    // The bind groups are never submitted during capture, so they're fresh
-    // for replay. Requires a warmup step before capture.
+    // ─── Fast Decode (Capture + Replay) ────────────────────────────────
+    // Records GPU dispatches during a capture step, then replays them on
+    // subsequent decode steps — skipping the full ONNX Execute loop.
     //
-    // Flow: warmup(normal) → capture(save only) → replay(submit saved)
+    // Flow: warmup(normal) → capture(save+execute) → replay(submit saved)
 
-    enum class GraphCaptureState { Off, Capturing, Replaying };
-    GraphCaptureState graphCaptureState_ = GraphCaptureState::Off;
+    enum class FastDecodeState { Off, Capturing, Replaying };
+    FastDecodeState fastDecodeState_ = FastDecodeState::Off;
 
     struct CapturedCommand {
         WGPUComputePipeline pipeline;
@@ -357,14 +356,14 @@ public:
 
     /// Register a param buffer for per-step replay update.
     void RegisterReplayParam(GPUBuffer buf, uint32_t offset, ReplayParamUpdate::Kind kind) {
-        if (graphCaptureState_ == GraphCaptureState::Capturing) {
+        if (fastDecodeState_ == FastDecodeState::Capturing) {
             replayParamUpdates_.push_back({buf, offset, kind});
         }
     }
 
-    /// Begin graph capture. Call before Execute().
+    /// Begin capture stage. Call before Execute().
     void CaptureBegin() {
-        graphCaptureState_ = GraphCaptureState::Capturing;
+        fastDecodeState_ = FastDecodeState::Capturing;
         capturedFlushes_.clear();
         capturedWrites_.clear();
         replayParamUpdates_.clear();
@@ -372,17 +371,17 @@ public:
         capturedTokenIdBufs_.clear();
     }
 
-    /// End graph capture.
+    /// End capture stage.
     void CaptureEnd() {
-        graphCaptureState_ = GraphCaptureState::Off;
+        fastDecodeState_ = FastDecodeState::Off;
         gpu->captureWritesCb_ = nullptr;
         gpu->captureWritesCtx_ = nullptr;
     }
 
-    /// Record a writeBuffer call for replay (during capture mode).
+    /// Record a writeBuffer call for replay (during capture stage).
     /// Call this for zero-init writes and other data that must be replayed.
     void RecordWrite(GPUBuffer buf, const void* data, uint64_t size, uint64_t offset = 0) {
-        if (graphCaptureState_ == GraphCaptureState::Capturing) {
+        if (fastDecodeState_ == FastDecodeState::Capturing) {
             CapturedWrite w;
             w.handle = buf.handle;
             w.offset = offset + buf.offset;
@@ -439,11 +438,11 @@ public:
     // Temporary storage for bind group entries during capture
     std::vector<Dispatch::BindEntry> lastCapturedBindings_;
 
-    /// Queue a dispatch. During capture, attaches bind group entries for replay.
+    /// Queue a dispatch. During capture stage, attaches bind group entries for replay.
     void QueueDispatch(WGPUComputePipeline pipeline, WGPUBindGroup bg,
                        uint32_t gx, uint32_t gy, uint32_t gz, const char* name) {
         pendingDispatches_.push_back({pipeline, bg, gx, gy, gz, name, {}});
-        if (graphCaptureState_ == GraphCaptureState::Capturing && !lastCapturedBindings_.empty()) {
+        if (fastDecodeState_ == FastDecodeState::Capturing && !lastCapturedBindings_.empty()) {
             pendingDispatches_.back().capturedBindings = std::move(lastCapturedBindings_);
             lastCapturedBindings_.clear();
         }

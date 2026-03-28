@@ -157,13 +157,13 @@ struct OnnxLlmContext {
     std::vector<GPUBuffer> convOutBufs;
     uint32_t maskBufCapacity = 0;
 
-    // Graph capture state for fast decode
-    bool graphCaptureEnabled = false;
-    bool graphCaptured = false;
+    // Fast decode state (capture + replay)
+    bool fastDecodeEnabled = false;
+    bool fastDecodeCaptured = false;
     bool prefillDone = false;  // Capture only after prefill completes
-    // Pre-allocated f16 conv cast output buffers (reused during replay)
+    // Pre-allocated f16 conv cast output buffers (reused during replay stage)
     std::vector<GPUBuffer> convCastF16Bufs;
-    // Pre-built conv cast bind groups for replay (avoid per-step MakeBindGroup)
+    // Pre-built conv cast bind groups for replay stage (avoid per-step MakeBindGroup)
     std::vector<WGPUBindGroup> convCastBindGroups;
     const CompiledPipeline* convCastPipeline = nullptr;
     uint32_t convCastWorkgroups = 0;
@@ -230,10 +230,10 @@ struct OnnxLlmContext {
         prefillDone = false;
         convState.clear();
         kvState.clear();
-        // Reset graph capture state (captured bind groups reference old buffers)
-        if (graphCaptured) {
+        // Reset fast decode state (captured bind groups reference old buffers)
+        if (fastDecodeCaptured) {
             executor.ReleaseCaptured();
-            graphCaptured = false;
+            fastDecodeCaptured = false;
         }
         // Conv caches: [1, hiddenSize, convLCache] fp16, zero-initialized
         for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
@@ -243,9 +243,9 @@ struct OnnxLlmContext {
             t.shape = {1, hiddenSize, convLCache};
             t.dtype = TensorDtype::Float16;
             size_t bytes = (size_t)(hiddenSize * convLCache * 2);
-            // For graph capture: use pre-allocated f16 buffers so the captured
+            // For fast decode: use pre-allocated f16 buffers so the captured
             // bind groups reference stable handles across steps.
-            if (graphCaptureEnabled && ci < convCastF16Bufs.size()) {
+            if (fastDecodeEnabled && ci < convCastF16Bufs.size()) {
                 t.buffer = convCastF16Bufs[ci];
                 // Zero-init the pre-allocated buffer
                 std::vector<uint16_t> zeros((size_t)(hiddenSize * convLCache), 0);
@@ -283,13 +283,13 @@ struct OnnxLlmContext {
     }
 
     // Run a single decode step and return logits.
-    // With graph capture enabled, uses ORT's pattern:
-    //   warmup step (normal) → capture step (save commands, no GPU exec) → replay steps
+    // Fast decode uses capture + replay pattern:
+    //   warmup steps (normal) → capture step (save+execute) → replay steps
     std::vector<float> RunStep(int64_t tokenId) {
         pos++;
 
         // ── Fast Decode Replay Path ──────────────────────────────────────
-        if (graphCaptureEnabled && graphCaptured) {
+        if (fastDecodeEnabled && fastDecodeCaptured) {
             // Set position for GQA param updates
             executor.replayPosition_ = (uint32_t)(pos - 1);
 
@@ -332,15 +332,15 @@ struct OnnxLlmContext {
             return logits;
         }
 
-        // ── Capture Path (capture+submit: save AND execute) ──────────
-        // Bind groups are AddRef'd for replay. The capture step produces
+        // ── Capture Stage (save AND execute) ────────────────────────
+        // Bind groups are AddRef'd for replay. The capture stage produces
         // valid output since GPU work IS submitted.
-        if (graphCaptureEnabled && !graphCaptured && prefillDone) {
+        if (fastDecodeEnabled && !fastDecodeCaptured && prefillDone) {
             executor.capturePosition_ = (uint32_t)(pos - 1);
             executor.CaptureBegin();
             auto logits = runExecutePath(tokenId);
             executor.CaptureEnd();
-            graphCaptured = true;
+            fastDecodeCaptured = true;
 
             // Remove conv cast flush if present
             if (!executor.capturedFlushes_.empty()) {
@@ -354,11 +354,11 @@ struct OnnxLlmContext {
             {
                 int nDisp = 0;
                 for (auto& f : executor.capturedFlushes_) nDisp += (int)f.dispatches.size();
-                fprintf(stderr, "  [graph capture] %zu flushes, %d dispatches, %zu param updates\n",
+                fprintf(stderr, "  [fast decode capture] %zu flushes, %d dispatches, %zu param updates\n",
                         executor.capturedFlushes_.size(), nDisp, executor.replayParamUpdates_.size());
             }
 
-            // Pre-build conv cast bind groups for replay
+            // Pre-build conv cast bind groups for replay stage
             if (!convLayerIndices.empty()) {
                 int64_t nel = hiddenSize * convLCache;
                 convCastWorkgroups = (uint32_t)((nel + 255) / 256);
@@ -376,16 +376,16 @@ struct OnnxLlmContext {
                 }
             }
 
-            // Logits are valid — capture+submit mode
+            // Logits are valid — capture stage executes GPU work
             return logits;
         }
 
-        // ── Normal Path (graph capture disabled) ────────────────────────
+        // ── Normal Path (fast decode disabled) ────────────────────────
         return runExecutePath(tokenId);
     }
 
 private:
-    // Shared implementation for the full Execute path (used by both normal and capture)
+    // Shared implementation for the full Execute path (used by normal and capture stages)
     std::vector<float> runExecutePath(int64_t tokenId) {
 
         std::unordered_map<std::string, GpuTensor*> inputs;
@@ -490,13 +490,13 @@ private:
             GpuTensor dst;
             dst.shape = src.shape;
             dst.dtype = TensorDtype::Float16;
-            // Use pre-allocated f16 buffer if we're in capture mode
-            if (graphCaptureEnabled && idx < convCastF16Bufs.size()) {
+            // Use pre-allocated f16 buffer for fast decode
+            if (fastDecodeEnabled && idx < convCastF16Bufs.size()) {
                 dst.buffer = convCastF16Bufs[idx];
             } else {
                 dst.buffer = gpu->createBuffer(name, nel * 2);
-                // Save for future replay if capturing
-                if (graphCaptureEnabled && convCastF16Bufs.size() <= idx) {
+                // Save for future replay
+                if (fastDecodeEnabled && convCastF16Bufs.size() <= idx) {
                     convCastF16Bufs.resize(idx + 1);
                     convCastF16Bufs[idx] = dst.buffer;
                 }
@@ -544,9 +544,9 @@ public:
         return idx;
     }
 
-    /// Check if the model supports graph capture for fast decode.
+    /// Check if the model supports fast decode.
     /// Returns empty string if supported, or a reason string if not.
-    std::string CheckGraphCaptureSupport() const {
+    std::string CheckFastDecodeSupport() const {
         auto& graph = executor.GetGraph();
 
         // Check for dynamic control flow ops
@@ -556,16 +556,16 @@ public:
         }
 
         // Must have conv or attention layers (otherwise it's a simple model
-        // that doesn't benefit from graph capture)
+        // that doesn't benefit from fast decode)
         if (convLayerIndices.empty() && attnLayerIndices.empty())
             return "model has no conv or attention layers";
 
         return "";
     }
 
-    /// Enable graph capture and pre-allocate required buffers.
-    void EnableGraphCapture() {
-        graphCaptureEnabled = true;
+    /// Enable fast decode and pre-allocate required buffers.
+    void EnableFastDecode() {
+        fastDecodeEnabled = true;
         convCastF16Bufs.resize(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             size_t nel = (size_t)(hiddenSize * convLCache);
@@ -744,7 +744,7 @@ int main(int argc, char* argv[]) {
             "  --chat <message>   Chat message (auto-template)\n"
             "  --max-tokens <n>   Max tokens (default: 100)\n"
             "  --backend <name>   vulkan / d3d12 / metal\n"
-            "  --no-fast-decode   Disable graph capture fast decode\n"
+            "  --no-fast-decode   Disable fast decode\n"
             "  --benchmark        Prefill+decode sweep\n"
             "  --profile          GPU timestamp profiling + HTML timeline\n", argv[0]);
         return 1;
@@ -778,12 +778,12 @@ int main(int argc, char* argv[]) {
         if (!onnxLlm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), resolvedPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
         }
-        // Auto-enable fast decode (graph capture) unless disabled
+        // Auto-enable fast decode unless disabled
         if (!noFastDecode) {
-            std::string reason = onnxLlm.CheckGraphCaptureSupport();
+            std::string reason = onnxLlm.CheckFastDecodeSupport();
             if (reason.empty()) {
-                onnxLlm.EnableGraphCapture();
-                printf("  Fast decode: enabled (graph capture)\n");
+                onnxLlm.EnableFastDecode();
+                printf("  Fast decode: enabled\n");
             } else {
                 fprintf(stderr, "  Fast decode: disabled — %s\n", reason.c_str());
             }
@@ -797,7 +797,7 @@ int main(int argc, char* argv[]) {
     auto t1 = std::chrono::steady_clock::now();
     auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
 
-    // (Micro-test removed — graph capture validated)
+    // (Micro-test removed — fast decode validated)
 
     if (isGenericOnnx) {
         printf("\nModel: %s (generic ONNX, %lldL, H=%lld, V=%lld)\n",
@@ -921,7 +921,7 @@ int main(int argc, char* argv[]) {
 
         onnxLlm.ResetCaches();
         // Prefill: feed prompt tokens one at a time
-        // With graph capture: first token triggers capture, rest use replay
+        // With fast decode: first token after prefill triggers capture, rest use replay
         int32_t next = 0;
         for (size_t i = 0; i < promptTokens.size(); i++) {
             auto logits = onnxLlm.RunStep(promptTokens[i]);

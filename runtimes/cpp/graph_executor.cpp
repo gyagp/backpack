@@ -908,9 +908,9 @@ GPUBuffer GraphExecutor::getParamBuffer(uint32_t sizeBytes) {
     else if (sizeBytes <= 48) { bucket = 2; sizeBytes = 48; }
     else { bucket = 3; sizeBytes = 64; }
 
-    // During graph capture: use a larger pool to avoid wrapping.
+    // During fast decode capture: use a larger pool to avoid wrapping.
     // Normal pool is 512; capture needs ~1000 unique slots per step.
-    if (graphCaptureState_ == GraphCaptureState::Capturing) {
+    if (fastDecodeState_ == FastDecodeState::Capturing) {
         auto& pool = paramPool_[bucket];
         // Ensure pool has enough buffers for the entire graph without cycling
         if (pool.buffers.empty() || (int)pool.buffers.size() < 2048) {
@@ -970,8 +970,8 @@ WGPUBindGroup GraphExecutor::MakeBindGroup(
     d.entries = entries;
     auto bg = wgpuDeviceCreateBindGroup(gpu->device, &d);
 
-    // During graph capture: save bindings for replay (rebuild bind groups later)
-    if (graphCaptureState_ == GraphCaptureState::Capturing) {
+    // During fast decode capture: save bindings for replay (rebuild bind groups later)
+    if (fastDecodeState_ == FastDecodeState::Capturing) {
         lastCapturedBindings_.clear();
         for (size_t i = 0; i < bindings.size() && i < 16; i++) {
             lastCapturedBindings_.push_back({
@@ -988,7 +988,7 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
     gpu->waitForQueue();
 }
 
-// ─── Graph Capture: Replay & Release ─────────────────────────────────────────
+// ─── Fast Decode: Replay & Release ──────────────────────────────────────────
 
 void GraphExecutor::ReplayWrites() {
     // Update GQA param buffers — all other param values are constant
@@ -1018,7 +1018,7 @@ void GraphExecutor::ReplayWrites() {
 
 void GraphExecutor::ReplayDispatches() {
     if (capturedFlushes_.empty()) return;
-    graphCaptureState_ = GraphCaptureState::Replaying;
+    fastDecodeState_ = FastDecodeState::Replaying;
 
     bool profiling = gpuProfiler && gpuProfiler->enabled();
 
@@ -1083,7 +1083,7 @@ void GraphExecutor::ReplayDispatches() {
         readbackSrc_ = {}; readbackDst_ = {};
     }
     gpu->waitForQueue();
-    graphCaptureState_ = GraphCaptureState::Off;
+    fastDecodeState_ = FastDecodeState::Off;
 }
 
 void GraphExecutor::ReleaseCaptured() {
@@ -1109,11 +1109,11 @@ void GraphExecutor::ReleaseCaptured() {
 void GraphExecutor::flushToEncoder() {
     if (pendingDispatches_.empty() && pendingCopies_.empty()) return;
 
-    // ── Graph Capture: save AND submit ──
+    // ── Fast Decode Capture: save AND submit ──
     // Save bind groups (with AddRef) and also submit normally.
     // This ensures intermediate buffers get valid GPU-computed data.
     // During replay, the AddRef'd bind groups are reused.
-    if (graphCaptureState_ == GraphCaptureState::Capturing) {
+    if (fastDecodeState_ == FastDecodeState::Capturing) {
         CapturedFlush flush;
         for (auto& d : pendingDispatches_) {
             CapturedCommand cmd;
@@ -1200,8 +1200,8 @@ void GraphExecutor::SubmitPending() {
 
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
     for (auto d : dispatches) {
-        // During capture, attach binding info from last MakeBindGroup call
-        if (graphCaptureState_ == GraphCaptureState::Capturing && !lastCapturedBindings_.empty()) {
+        // During capture stage, attach binding info from last MakeBindGroup call
+        if (fastDecodeState_ == FastDecodeState::Capturing && !lastCapturedBindings_.empty()) {
             d.capturedBindings = std::move(lastCapturedBindings_);
             lastCapturedBindings_.clear();
         }
@@ -1250,8 +1250,8 @@ void GraphExecutor::Execute(
         const std::unordered_map<std::string, GpuTensor*>& inputs,
         std::unordered_map<std::string, GpuTensor*>& outputs) {
 
-    // Enable writeBuffer recording for graph capture (after input setup, inside Execute)
-    if (graphCaptureState_ == GraphCaptureState::Capturing && !gpu->captureWritesCb_) {
+    // Enable writeBuffer recording for fast decode capture (after input setup, inside Execute)
+    if (fastDecodeState_ == FastDecodeState::Capturing && !gpu->captureWritesCb_) {
         gpu->captureWritesCb_ = [](WGPUBuffer handle, uint64_t offset,
                                     const void* data, uint64_t size, void* ctx) {
             auto* self = static_cast<GraphExecutor*>(ctx);
@@ -1714,8 +1714,8 @@ void GraphExecutor::Execute(
 
     // Release non-output, non-persistent intermediate buffers
     // (GPU work is done, safe to free)
-    // In graph capture mode, keep ALL buffers alive — they're referenced by captured bind groups.
-    if (graphCaptureState_ != GraphCaptureState::Capturing) {
+    // In fast decode capture, keep ALL buffers alive — they're referenced by captured bind groups.
+    if (fastDecodeState_ != FastDecodeState::Capturing) {
         std::set<WGPUBuffer> keepHandles;
         for (auto& [name, tensor] : outputs)
             if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);

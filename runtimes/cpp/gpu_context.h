@@ -37,7 +37,7 @@ struct Dispatch {
     WGPUBindGroup       bindGroup = nullptr;
     uint32_t gx = 1, gy = 1, gz = 1;
     std::string name;  // for profiling
-    // Bindings for graph capture (rebuild bind groups on replay)
+    // Bindings for fast decode capture (rebuild bind groups on replay)
     struct BindEntry { uint32_t idx; WGPUBuffer handle; uint64_t offset; uint64_t size; };
     std::vector<BindEntry> capturedBindings;
 };
@@ -116,7 +116,7 @@ struct GPUContext {
     /// Write raw bytes to a WGPUBuffer handle (no offset adjustment for views).
     void      writeBufferRaw(WGPUBuffer handle, uint64_t offset, const void* data, uint64_t size);
 
-    // Graph capture: callback to record writeBuffer calls during capture
+    // Fast decode: callback to record writeBuffer calls during capture stage
     using CaptureWritesCb = void(*)(WGPUBuffer handle, uint64_t offset,
                                      const void* data, uint64_t size, void* ctx);
     CaptureWritesCb captureWritesCb_ = nullptr;

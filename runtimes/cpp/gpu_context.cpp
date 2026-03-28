@@ -346,7 +346,7 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
     // Add buffer base offset for aliased/view buffers
     offset += buf.offset;
 
-    // Record for graph capture replay
+    // Record for fast decode replay
     if (captureWritesCb_ && size > 0) {
         captureWritesCb_(buf.handle, offset, data, size, captureWritesCtx_);
     }
