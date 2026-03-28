@@ -54,8 +54,8 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     ex.gpu->writeBuffer(pb, p, 16);
     auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
     auto bg = ex.MakeBindGroup(pl, {{0, tensor.buffer}, {1, f32t.buffer}, {2, pb}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((count + 255) / 256), 1, 1, "mmnb_cast"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((count + 255) / 256), 1, 1, "mmnb_cast");
 
     tensor = std::move(f32t);
     return tensor.buffer.handle != nullptr;
@@ -263,8 +263,8 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
             auto& cpl = ex.GetPipelineT("cast_f32_to_f16", 3,
                 []() { return std::string(WGSL_CAST_F32_TO_F16); });
             auto cbg = ex.MakeBindGroup(cpl, {{0, S->buffer}, {1, f16t.buffer}, {2, pb}});
-            ex.pendingDispatches_.push_back({cpl.pipeline, cbg,
-                (uint32_t)((count + 255) / 256), 1, 1, "mmnb_scales_cast"});
+            ex.QueueDispatch(cpl.pipeline, cbg,
+                (uint32_t)((count + 255) / 256), 1, 1, "mmnb_scales_cast");
             *S = std::move(f16t);
         }
     }
@@ -301,15 +301,15 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp");
     } else {
         auto& pl = ex.GetPipelineT("matmul_q4", 5, []() { return std::string(WGSL_MATMUL_Q4); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4");
     }
 }
 
@@ -349,8 +349,8 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
         auto& pl = ex.GetPipelineT("matmul_f16", 4, []() { return std::string(WGSL_MATMUL_F16); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((N_out + 15) / 16), (uint32_t)((M + 15) / 16), 1, "matmul_f16"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((N_out + 15) / 16), (uint32_t)((M + 15) / 16), 1, "matmul_f16");
         return;
     }
 
@@ -365,8 +365,8 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
     auto& pl = ex.GetPipelineT("matmul_f32", 4, []() { return instantiateTemplate(WGSL_MATMUL_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((N_out + 31) / 32), (uint32_t)((M + 15) / 16), 1, "matmul_f32"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((N_out + 31) / 32), (uint32_t)((M + 15) / 16), 1, "matmul_f32");
 }
 
 // ─── Gemm ────────────────────────────────────────────────────────────────────
@@ -442,9 +442,9 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, A->buffer}, {1, B->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, fp16ParamBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+        ex.QueueDispatch(pl.pipeline, bg,
             (uint32_t)M, (uint32_t)((N_out + tileN - 1) / tileN), 1,
-            useWide ? "gemm_fp16_wide" : "gemm_fp16"});
+            useWide ? "gemm_fp16_wide" : "gemm_fp16");
         return;
     }
 
@@ -452,8 +452,8 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((N_out + 15) / 16), (uint32_t)((M + 15) / 16), 1, "gemm"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((N_out + 15) / 16), (uint32_t)((M + 15) / 16), 1, "gemm");
 }
 
 // ─── GatherBlockQuantized ────────────────────────────────────────────────────
@@ -541,14 +541,14 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},
             {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq_zp"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq_zp");
     } else {
         auto bg = ex.MakeBindGroup(pl, {
             {0, W->buffer}, {1, Scales->buffer}, {2, idxBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (K + 255) / 256, (uint32_t)nIdx, 1, "gather_bq");
     }
 }
 

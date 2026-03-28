@@ -345,6 +345,11 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
     auto t0 = hrc::now();
     // Add buffer base offset for aliased/view buffers
     offset += buf.offset;
+
+    // Record for graph capture replay
+    if (captureWritesCb_ && size > 0) {
+        captureWritesCb_(buf.handle, offset, data, size, captureWritesCtx_);
+    }
     // WebGPU requires writeBuffer size to be a multiple of 4
     if (size > 0 && (size & 3)) {
         uint64_t aligned = size & ~(uint64_t)3;
@@ -359,6 +364,10 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
     }
     auto t1 = hrc::now();
     timing.write_buf_ns += (t1 - t0).count();
+}
+
+void GPUContext::writeBufferRaw(WGPUBuffer handle, uint64_t offset, const void* data, uint64_t size) {
+    wgpuQueueWriteBuffer(queue, handle, offset, data, size);
 }
 
 // ─── Pipelines ───────────────────────────────────────────────────────────────

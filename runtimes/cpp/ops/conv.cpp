@@ -302,8 +302,8 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
             {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
         int64_t total = batch * C_out * L_out;
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((total + 255) / 256), 1, 1, "conv1d"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((total + 255) / 256), 1, 1, "conv1d");
 
         // Reshape output back to 3D
         out[0]->shape = {batch, C_out, L_out};
@@ -392,8 +392,8 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
     int64_t total = batch * C_out * H_out * W_out;
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((total + 255) / 256), 1, 1, "conv2d"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((total + 255) / 256), 1, 1, "conv2d");
     if (debugVaeConvIn || debugVaeConvOut) {
         debugTensorStats(ex, debugVaeConvIn ? "vae conv output" : "vae conv_out output", *out[0]);
     }
@@ -481,8 +481,8 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
     int64_t total = batch * C_out * H_out * W_out;
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((total + 255) / 256), 1, 1, "conv_transpose"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((total + 255) / 256), 1, 1, "conv_transpose");
 }
 
 // ─── Resize ──────────────────────────────────────────────────────────────────
@@ -529,8 +529,8 @@ static void opResize(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     int64_t total = N * C * H_out * W_out;
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((total + 255) / 256), 1, 1, "resize"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((total + 255) / 256), 1, 1, "resize");
 }
 
 REGISTER_OP(Conv, opConv)

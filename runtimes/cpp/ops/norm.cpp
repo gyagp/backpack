@@ -242,8 +242,8 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
             {3, rstdBuf}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm_f16"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm_f16");
         return;
     }
 
@@ -255,8 +255,8 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
             {3, rstdBuf}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)nRows, 1, 1, "rmsnorm_f16w"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)nRows, 1, 1, "rmsnorm_f16w");
         return;
     }
 
@@ -269,8 +269,8 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, W->buffer},
         {3, rstdBuf}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((nRows + 255) / 256), 1, 1, "rmsnorm");
 }
 
 // ─── SkipSimplifiedLayerNorm (residual add + RMSNorm) ────────────────────────
@@ -496,8 +496,8 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Skip->buffer}, {2, W->buffer},
             {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((nRows + 255) / 256), 1, 1, "skip_rmsnorm_f16w"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((nRows + 255) / 256), 1, 1, "skip_rmsnorm_f16w");
         return;
     }
 
@@ -511,8 +511,8 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Skip->buffer}, {2, W->buffer},
         {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((nRows + 255) / 256), 1, 1, "skip_rmsnorm"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((nRows + 255) / 256), 1, 1, "skip_rmsnorm");
 }
 
 // ─── LayerNormalization ──────────────────────────────────────────────────────
@@ -560,8 +560,8 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((nRows + 255) / 256), 1, 1, "layernorm_f16wb"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((nRows + 255) / 256), 1, 1, "layernorm_f16wb");
         return;
     }
 
@@ -569,8 +569,8 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)((nRows + 255) / 256), 1, 1, "layernorm"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((nRows + 255) / 256), 1, 1, "layernorm");
 }
 
 // ─── InstanceNormalization ───────────────────────────────────────────────────
@@ -610,8 +610,8 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)(N_batch * C), 1, 1, "instancenorm_f16wb"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)(N_batch * C), 1, 1, "instancenorm_f16wb");
         return;
     }
 
@@ -619,8 +619,8 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)(N_batch * C), 1, 1, "instancenorm"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)(N_batch * C), 1, 1, "instancenorm");
 }
 
 // ─── GroupNormalization ───────────────────────────────────────────────────────
@@ -663,8 +663,8 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)(N_batch * numGroups), 1, 1, "groupnorm_f16wb"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)(N_batch * numGroups), 1, 1, "groupnorm_f16wb");
         return;
     }
 
@@ -672,8 +672,8 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, Scale->buffer}, {2, Bias->buffer},
         {3, out[0]->buffer}, {4, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (uint32_t)(N_batch * numGroups), 1, 1, "groupnorm"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)(N_batch * numGroups), 1, 1, "groupnorm");
 }
 
 REGISTER_OP(SimplifiedLayerNormalization, opSimplifiedLayerNorm)

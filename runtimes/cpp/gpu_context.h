@@ -37,6 +37,9 @@ struct Dispatch {
     WGPUBindGroup       bindGroup = nullptr;
     uint32_t gx = 1, gy = 1, gz = 1;
     std::string name;  // for profiling
+    // Bindings for graph capture (rebuild bind groups on replay)
+    struct BindEntry { uint32_t idx; WGPUBuffer handle; uint64_t offset; uint64_t size; };
+    std::vector<BindEntry> capturedBindings;
 };
 
 /// GPU buffer with metadata.
@@ -110,6 +113,14 @@ struct GPUContext {
     GPUBuffer getBuffer(const std::string& name) const;
     void      writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
                           uint64_t offset = 0);
+    /// Write raw bytes to a WGPUBuffer handle (no offset adjustment for views).
+    void      writeBufferRaw(WGPUBuffer handle, uint64_t offset, const void* data, uint64_t size);
+
+    // Graph capture: callback to record writeBuffer calls during capture
+    using CaptureWritesCb = void(*)(WGPUBuffer handle, uint64_t offset,
+                                     const void* data, uint64_t size, void* ctx);
+    CaptureWritesCb captureWritesCb_ = nullptr;
+    void* captureWritesCtx_ = nullptr;
     /// Return a buffer to the pool for reuse.
     void      releaseBuffer(GPUBuffer buf);
     /// Flush the buffer pool, actually freeing all pooled GPU buffers.

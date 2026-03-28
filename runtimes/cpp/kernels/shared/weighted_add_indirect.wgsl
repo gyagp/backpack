@@ -19,5 +19,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= N) { return; }
     let weight = expert_weights[slot];
-    t_write(&dst, idx, t_read_rw(&dst, idx) + weight * t_read(&src, idx));
+    // slot 0: write (clears stale data); slot > 0: accumulate
+    if (slot == 0u) {
+        t_write(&dst, idx, weight * t_read(&src, idx));
+    } else {
+        t_write(&dst, idx, t_read_rw(&dst, idx) + weight * t_read(&src, idx));
+    }
 }

@@ -307,6 +307,131 @@ public:
     /// Flush pending dispatches+copies into a command encoder and submit.
     void flushToEncoder();
 
+    // ─── Graph Capture / Fast Decode ─────────────────────────────────────
+    // Follows ORT's pattern: capture step saves commands WITHOUT executing.
+    // The bind groups are never submitted during capture, so they're fresh
+    // for replay. Requires a warmup step before capture.
+    //
+    // Flow: warmup(normal) → capture(save only) → replay(submit saved)
+
+    enum class GraphCaptureState { Off, Capturing, Replaying };
+    GraphCaptureState graphCaptureState_ = GraphCaptureState::Off;
+
+    struct CapturedCommand {
+        WGPUComputePipeline pipeline;
+        WGPUBindGroup bindGroup = nullptr;  // AddRef'd original for direct reuse
+        std::vector<Dispatch::BindEntry> bindings;  // backup for rebuilding
+        uint32_t gx, gy, gz;
+        std::string name;
+    };
+    struct CapturedCopy {
+        GPUBuffer src; uint64_t srcOff;
+        GPUBuffer dst; uint64_t dstOff;
+        uint64_t size;
+    };
+    struct CapturedFlush {
+        std::vector<CapturedCommand> dispatches;
+        std::vector<CapturedCopy> copies;
+    };
+    std::vector<CapturedFlush> capturedFlushes_;
+
+    // WriteBuffer calls to replay before dispatches (zero-init, etc.)
+    struct CapturedWrite {
+        WGPUBuffer handle;
+        uint64_t offset;
+        std::vector<uint8_t> data;
+    };
+    std::vector<CapturedWrite> capturedWrites_;
+
+    // Param buffers that need per-step updates during replay.
+    struct ReplayParamUpdate {
+        GPUBuffer paramBuf;
+        uint32_t offsetBytes;
+        enum Kind { PosOffset, PastSeq, TotalSeq } kind;
+    };
+    std::vector<ReplayParamUpdate> replayParamUpdates_;
+
+    /// Register a param buffer for per-step replay update.
+    void RegisterReplayParam(GPUBuffer buf, uint32_t offset, ReplayParamUpdate::Kind kind) {
+        if (graphCaptureState_ == GraphCaptureState::Capturing) {
+            replayParamUpdates_.push_back({buf, offset, kind});
+        }
+    }
+
+    /// Begin graph capture. Call before Execute().
+    void CaptureBegin() {
+        graphCaptureState_ = GraphCaptureState::Capturing;
+        capturedFlushes_.clear();
+        capturedWrites_.clear();
+        replayParamUpdates_.clear();
+        replayScalarUpdates_.clear();
+    }
+
+    /// End graph capture.
+    void CaptureEnd() {
+        graphCaptureState_ = GraphCaptureState::Off;
+        gpu->captureWritesCb_ = nullptr;
+        gpu->captureWritesCtx_ = nullptr;
+    }
+
+    /// Record a writeBuffer call for replay (during capture mode).
+    /// Call this for zero-init writes and other data that must be replayed.
+    void RecordWrite(GPUBuffer buf, const void* data, uint64_t size, uint64_t offset = 0) {
+        if (graphCaptureState_ == GraphCaptureState::Capturing) {
+            CapturedWrite w;
+            w.handle = buf.handle;
+            w.offset = offset + buf.offset;
+            w.data.resize((size_t)size);
+            memcpy(w.data.data(), data, (size_t)size);
+            capturedWrites_.push_back(std::move(w));
+        }
+    }
+
+    /// Position counter for GQA param updates during replay.
+    uint32_t replayPosition_ = 0;
+
+    /// Position at capture time (for detecting position-dependent scalars).
+    uint32_t capturePosition_ = 0;
+
+    /// Buffer handles to SKIP during write replay (caller updates them separately).
+    std::vector<WGPUBuffer> replaySkipBuffers_;
+
+    /// Small buffer updates detected as position-dependent during capture.
+    /// These are recomputed during replay by adding replayPosition_ delta.
+    struct ReplayScalarUpdate {
+        WGPUBuffer handle;
+        uint64_t offset;
+        uint64_t size;
+        int64_t captureValue;  // value at capture time
+        int64_t capturePos;    // position at capture time
+    };
+    std::vector<ReplayScalarUpdate> replayScalarUpdates_;
+
+    /// Replay captured commands. Encodes saved dispatches fresh.
+    void Replay() { ReplayWrites(); ReplayDispatches(); }
+
+    /// Phase 1: replay captured writes + param updates.
+    void ReplayWrites();
+
+    /// Phase 2: encode+submit captured dispatches.
+    void ReplayDispatches();
+
+    /// Release captured bind groups and clear state.
+    void ReleaseCaptured();
+
+    // Temporary storage for bind group entries during capture
+    std::vector<Dispatch::BindEntry> lastCapturedBindings_;
+
+    /// Queue a dispatch. During capture, attaches bind group entries for replay.
+    void QueueDispatch(WGPUComputePipeline pipeline, WGPUBindGroup bg,
+                       uint32_t gx, uint32_t gy, uint32_t gz, const char* name) {
+        pendingDispatches_.push_back({pipeline, bg, gx, gy, gz, name, {}});
+        if (graphCaptureState_ == GraphCaptureState::Capturing && !lastCapturedBindings_.empty()) {
+            pendingDispatches_.back().capturedBindings = std::move(lastCapturedBindings_);
+            lastCapturedBindings_.clear();
+        }
+    }
+
     /// Optional: request a readback copy at the end of the next flushToEncoder.
     /// The copy is appended to the same command buffer, avoiding a separate
     /// submission. After waitForQueue(), map readbackDst_ to read the result.

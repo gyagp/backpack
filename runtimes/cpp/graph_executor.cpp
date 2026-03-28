@@ -908,6 +908,24 @@ GPUBuffer GraphExecutor::getParamBuffer(uint32_t sizeBytes) {
     else if (sizeBytes <= 48) { bucket = 2; sizeBytes = 48; }
     else { bucket = 3; sizeBytes = 64; }
 
+    // During graph capture: use a larger pool to avoid wrapping.
+    // Normal pool is 512; capture needs ~1000 unique slots per step.
+    if (graphCaptureState_ == GraphCaptureState::Capturing) {
+        auto& pool = paramPool_[bucket];
+        // Ensure pool has enough buffers for the entire graph without cycling
+        if (pool.buffers.empty() || (int)pool.buffers.size() < 2048) {
+            int oldSize = (int)pool.buffers.size();
+            pool.buffers.resize(2048);
+            for (int i = oldSize; i < 2048; i++) {
+                pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
+            }
+        }
+        // Reset index to 0 at capture start (avoid wrapping issues)
+        GPUBuffer buf = pool.buffers[pool.nextIdx];
+        pool.nextIdx = (pool.nextIdx + 1) % (int)pool.buffers.size();
+        return buf;
+    }
+
     auto& pool = paramPool_[bucket];
     if (pool.buffers.empty()) {
         // Lazy init: pre-allocate a batch
@@ -941,7 +959,6 @@ WGPUBindGroup GraphExecutor::MakeBindGroup(
         entries[i].offset = bindings[i].second.offset;
         entries[i].size = bindings[i].second.size;
         if (!entries[i].buffer) {
-            // Create a dummy 4-byte buffer to avoid null handle crash
             auto dummy = gpu->createBuffer("dummy_bind", 4);
             entries[i].buffer = dummy.handle;
             entries[i].size = 4;
@@ -951,12 +968,103 @@ WGPUBindGroup GraphExecutor::MakeBindGroup(
     d.layout = pl.bgLayout;
     d.entryCount = (uint32_t)bindings.size();
     d.entries = entries;
-    return wgpuDeviceCreateBindGroup(gpu->device, &d);
+    auto bg = wgpuDeviceCreateBindGroup(gpu->device, &d);
+
+    // During graph capture: save bindings for replay (rebuild bind groups later)
+    if (graphCaptureState_ == GraphCaptureState::Capturing) {
+        lastCapturedBindings_.clear();
+        for (size_t i = 0; i < bindings.size() && i < 16; i++) {
+            lastCapturedBindings_.push_back({
+                entries[i].binding, entries[i].buffer,
+                entries[i].offset, entries[i].size});
+        }
+    }
+
+    return bg;
 }
 
 void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
     gpu->submitDispatches(dispatches);
     gpu->waitForQueue();
+}
+
+// ─── Graph Capture: Replay & Release ─────────────────────────────────────────
+
+void GraphExecutor::ReplayWrites() {
+    // Only update GQA param buffers — all other param values are constant
+    // and still in the buffers from the capture step's writeBuffer calls.
+    for (auto& update : replayParamUpdates_) {
+        uint32_t value = 0;
+        switch (update.kind) {
+            case ReplayParamUpdate::PosOffset: value = replayPosition_; break;
+            case ReplayParamUpdate::PastSeq:   value = replayPosition_; break;
+            case ReplayParamUpdate::TotalSeq:  value = replayPosition_ + 1; break;
+        }
+        gpu->writeBufferRaw(update.paramBuf.handle, update.offsetBytes, &value, 4);
+    }
+}
+
+void GraphExecutor::ReplayDispatches() {
+    if (capturedFlushes_.empty()) return;
+    graphCaptureState_ = GraphCaptureState::Replaying;
+
+    // Encode captured commands, respecting the original flush boundaries.
+    // Each flush becomes its own command buffer (preserves ordering).
+    for (auto& flush : capturedFlushes_) {
+        if (flush.dispatches.empty() && flush.copies.empty()) continue;
+
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+
+        for (auto& cmd : flush.dispatches) {
+            // Use AddRef'd original bind group directly (no rebuild)
+            WGPUComputePassDescriptor cpD{};
+            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+            wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+        }
+        for (auto& c : flush.copies)
+            wgpuCommandEncoderCopyBufferToBuffer(enc,
+                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
+
+        WGPUCommandBufferDescriptor cbD{};
+        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        wgpuCommandEncoderRelease(enc);
+        wgpuCommandBufferRelease(cb);
+    }
+
+    // Readback copy (logits → readback buffer) in its own CB
+    if (readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+        wgpuCommandEncoderCopyBufferToBuffer(enc,
+            readbackSrc_.handle, readbackSrc_.offset,
+            readbackDst_.handle, readbackDst_.offset, readbackSize_);
+        WGPUCommandBufferDescriptor cbD{};
+        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        wgpuCommandEncoderRelease(enc);
+        wgpuCommandBufferRelease(cb);
+        readbackSize_ = 0;
+        readbackSrc_ = {}; readbackDst_ = {};
+    }
+    gpu->waitForQueue();
+    graphCaptureState_ = GraphCaptureState::Off;
+}
+
+void GraphExecutor::ReleaseCaptured() {
+    for (auto& flush : capturedFlushes_) {
+        for (auto& cmd : flush.dispatches) {
+            if (cmd.bindGroup) { wgpuBindGroupRelease(cmd.bindGroup); cmd.bindGroup = nullptr; }
+        }
+    }
+    capturedFlushes_.clear();
+    capturedWrites_.clear();
+    replayParamUpdates_.clear();
 }
 
 // ─── Batched submit: encode all pending work into one CB and submit ──────────
@@ -969,6 +1077,33 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
 
 void GraphExecutor::flushToEncoder() {
     if (pendingDispatches_.empty() && pendingCopies_.empty()) return;
+
+    // ── Graph Capture: save AND submit ──
+    // Save bind groups (with AddRef) and also submit normally.
+    // This ensures intermediate buffers get valid GPU-computed data.
+    // During replay, the AddRef'd bind groups are reused.
+    if (graphCaptureState_ == GraphCaptureState::Capturing) {
+        CapturedFlush flush;
+        for (auto& d : pendingDispatches_) {
+            CapturedCommand cmd;
+            cmd.pipeline = d.pipeline;
+            cmd.gx = d.gx; cmd.gy = d.gy; cmd.gz = d.gz;
+            cmd.name = d.name;
+            cmd.bindings = std::move(d.capturedBindings);
+            // AddRef for replay — the original is used+released below
+            if (d.bindGroup) {
+                wgpuBindGroupAddRef(d.bindGroup);
+                cmd.bindGroup = d.bindGroup;
+            }
+            flush.dispatches.push_back(std::move(cmd));
+        }
+        for (auto& c : pendingCopies_) {
+            flush.copies.push_back({c.src, c.srcOff, c.dst, c.dstOff, c.size});
+        }
+        capturedFlushes_.push_back(std::move(flush));
+        // Fall through to normal encode+submit
+    }
+
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
 
@@ -999,7 +1134,7 @@ void GraphExecutor::flushToEncoder() {
             }
         }
     }
-    // Encode copies (after dispatches — correct ordering within CB)
+    // Encode copies
     for (auto& c : pendingCopies_)
         wgpuCommandEncoderCopyBufferToBuffer(enc,
             c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
@@ -1033,8 +1168,14 @@ void GraphExecutor::SubmitPending() {
 }
 
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
-    pendingDispatches_.insert(pendingDispatches_.end(),
-                              dispatches.begin(), dispatches.end());
+    for (auto d : dispatches) {
+        // During capture, attach binding info from last MakeBindGroup call
+        if (graphCaptureState_ == GraphCaptureState::Capturing && !lastCapturedBindings_.empty()) {
+            d.capturedBindings = std::move(lastCapturedBindings_);
+            lastCapturedBindings_.clear();
+        }
+        pendingDispatches_.push_back(std::move(d));
+    }
 }
 
 void GraphExecutor::QueueCopy(GPUBuffer src, uint64_t srcOffset,
@@ -1077,6 +1218,28 @@ void GraphExecutor::Sync() {
 void GraphExecutor::Execute(
         const std::unordered_map<std::string, GpuTensor*>& inputs,
         std::unordered_map<std::string, GpuTensor*>& outputs) {
+
+    // Enable writeBuffer recording for graph capture (after input setup, inside Execute)
+    if (graphCaptureState_ == GraphCaptureState::Capturing && !gpu->captureWritesCb_) {
+        gpu->captureWritesCb_ = [](WGPUBuffer handle, uint64_t offset,
+                                    const void* data, uint64_t size, void* ctx) {
+            auto* self = static_cast<GraphExecutor*>(ctx);
+            CapturedWrite w;
+            w.handle = handle;
+            w.offset = offset;
+            w.data.resize((size_t)size);
+            memcpy(w.data.data(), data, (size_t)size);
+            self->capturedWrites_.push_back(std::move(w));
+
+            // Log non-trivial writes for debugging
+            if (size > 64) {
+                fprintf(stderr, "    [capture-write] %zu bytes to %p (op=%s)\n",
+                        (size_t)size, (void*)handle,
+                        g_currentOp ? g_currentOp : "?");
+            }
+        };
+        gpu->captureWritesCtx_ = this;
+    }
 
     // Bind graph inputs into tensor store
     // Clear stale intermediate tensors from any previous Execute() call.
@@ -1348,8 +1511,8 @@ void GraphExecutor::Execute(
 
                 auto bg = MakeBindGroup(pl, bindings);
                 uint32_t nwg = (uint32_t)(((N + 1) / 2 + 255) / 256);
-                pendingDispatches_.push_back({pl.pipeline, bg,
-                    nwg, 1, 1, group.pipelineName.c_str()});
+                QueueDispatch(pl.pipeline, bg,
+                    nwg, 1, 1, group.pipelineName.c_str());
                 continue;
             }
             // If !ok, fall through to regular dispatch
@@ -1520,7 +1683,8 @@ void GraphExecutor::Execute(
 
     // Release non-output, non-persistent intermediate buffers
     // (GPU work is done, safe to free)
-    {
+    // In graph capture mode, keep ALL buffers alive — they're referenced by captured bind groups.
+    if (graphCaptureState_ != GraphCaptureState::Capturing) {
         std::set<WGPUBuffer> keepHandles;
         for (auto& [name, tensor] : outputs)
             if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
@@ -1543,6 +1707,14 @@ void GraphExecutor::Execute(
                 gpu->releaseBuffer(it->second.buffer);
             }
             it = tensorStore_.erase(it);
+        }
+    } else {
+        // Capture mode: just erase tensor store entries but DON'T release buffers
+        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+            if (persistentTensors_.count(it->first))
+                ++it;
+            else
+                it = tensorStore_.erase(it);
         }
     }
 

@@ -200,8 +200,8 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, data->buffer}, {1, out[0]->buffer},
             {2, idxTensor.buffer}, {3, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)totalSlices, 1, 1, pname.c_str()});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)totalSlices, 1, 1, pname.c_str());
 
         *out[1] = idxTensor;
         out[1]->dtype = TensorDtype::Int32;
@@ -283,8 +283,8 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, data->buffer}, {1, indices->buffer},
             {2, out[0]->buffer}, {3, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            (uint32_t)((outNel + 255) / 256), 1, 1, pname.c_str()});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((outNel + 255) / 256), 1, 1, pname.c_str());
         return;
     }
 
@@ -363,8 +363,8 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
             auto bg = ex.MakeBindGroup(pl, {
                 {0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                (uint32_t)((dataNel + 255) / 256), 1, 1, "scatter_copy"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (uint32_t)((dataNel + 255) / 256), 1, 1, "scatter_copy");
         }
         // Pass 2: scatter updates at indexed positions
         {
@@ -379,8 +379,8 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
             auto bg = ex.MakeBindGroup(pl, {
                 {0, data->buffer}, {1, indices->buffer}, {2, updates->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                (uint32_t)((idxNel + 255) / 256), 1, 1, "scatter_write"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (uint32_t)((idxNel + 255) / 256), 1, 1, "scatter_write");
         }
         return;
     }
@@ -473,14 +473,11 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.EnsureGpu(*downW);
     ex.EnsureGpu(*downS);
 
-    // Allocate output (zero-filled)
+    // Allocate output — no zero-init needed because moe_accum uses
+    // write (=) for slot 0 and accumulate (+=) for slot > 0.
     auto outShape = input->shape;
     outShape.back() = hiddenSize;
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
-    {
-        std::vector<float> zeros(hiddenSize, 0.0f);
-        ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), zeros.size() * sizeof(float));
-    }
 
     // GPU expert selection: gate kernel produces indices + weights on GPU
     auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)k * 4);
@@ -493,7 +490,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         auto& pl = ex.GetPipelineT("moe_gate", 4, []() { return instantiateTemplate(WGSL_MOE_GATE_T, TensorDtype::Float32); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, routerWeights->buffer}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg, 1, 1, 1, "moe_gate"});
+        ex.QueueDispatch(pl.pipeline, bg, 1, 1, 1, "moe_gate");
     }
 
     // Scratch buffers (reused across expert slots)
@@ -513,8 +510,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             auto bg = ex.MakeBindGroup(pl, {
                 {0, input->buffer}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
                 {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                (uint32_t)((N_gu + 255) / 256), 1, 1, "moe_gateup"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (uint32_t)((N_gu + 255) / 256), 1, 1, "moe_gateup");
         }
 
         // SwiGLU (interleaved layout)
@@ -525,8 +522,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             auto& pl = ex.GetPipelineT("swiglu", 3, []() { return instantiateTemplate(WGSL_SWIGLU_T, TensorDtype::Float32); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "moe_swiglu"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "moe_swiglu");
         }
 
         // Down Q4 matmul (indirect expert index)
@@ -539,8 +536,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             auto bg = ex.MakeBindGroup(pl, {
                 {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
                 {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_down"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_down");
         }
 
         // Weighted accumulate (indirect weight from GPU buffer)
@@ -551,8 +548,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             auto& pl = ex.GetPipelineT("weighted_add_indirect", 4, []() { return instantiateTemplate(WGSL_WEIGHTED_ADD_INDIRECT_T, TensorDtype::Float32); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, downBuf.buffer}, {1, out[0]->buffer}, {2, pBuf}, {3, expertWtBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_accum"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_accum");
         }
     }
 }

@@ -157,6 +157,15 @@ struct OnnxLlmContext {
     std::vector<GPUBuffer> convOutBufs;
     uint32_t maskBufCapacity = 0;
 
+    // Graph capture state for fast decode
+    bool graphCaptureEnabled = false;
+    bool graphCaptured = false;
+    bool captureReady = false;
+    int warmupStepsBeforeCapture = 1;  // how many normal steps before capture
+    int warmupStepsDone = 0;
+    // Pre-allocated f16 conv cast output buffers (reused during replay)
+    std::vector<GPUBuffer> convCastF16Bufs;
+
     bool Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         gpu = &gpuCtx;
         modelPath = onnxPath;
@@ -218,16 +227,33 @@ struct OnnxLlmContext {
         pos = 0;
         convState.clear();
         kvState.clear();
+        // Reset graph capture state (captured bind groups reference old buffers)
+        if (graphCaptured) {
+            executor.ReleaseCaptured();
+            graphCaptured = false;
+        }
+        captureReady = false;
+        warmupStepsDone = 0;
         // Conv caches: [1, hiddenSize, convLCache] fp16, zero-initialized
-        for (int idx : convLayerIndices) {
+        for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
+            int idx = convLayerIndices[ci];
             std::string name = "past_conv." + std::to_string(idx);
             GpuTensor t;
             t.shape = {1, hiddenSize, convLCache};
             t.dtype = TensorDtype::Float16;
             size_t bytes = (size_t)(hiddenSize * convLCache * 2);
-            t.buffer = gpu->createBuffer(name, bytes);
-            std::vector<uint16_t> zeros((size_t)(hiddenSize * convLCache), 0);
-            gpu->writeBuffer(t.buffer, zeros.data(), bytes);
+            // For graph capture: use pre-allocated f16 buffers so the captured
+            // bind groups reference stable handles across steps.
+            if (graphCaptureEnabled && ci < convCastF16Bufs.size()) {
+                t.buffer = convCastF16Bufs[ci];
+                // Zero-init the pre-allocated buffer
+                std::vector<uint16_t> zeros((size_t)(hiddenSize * convLCache), 0);
+                gpu->writeBuffer(t.buffer, zeros.data(), bytes);
+            } else {
+                t.buffer = gpu->createBuffer(name, bytes);
+                std::vector<uint16_t> zeros((size_t)(hiddenSize * convLCache), 0);
+                gpu->writeBuffer(t.buffer, zeros.data(), bytes);
+            }
             convState[name] = t;
         }
         // Static KV caches: [1, numKvHeads, maxSeqLen, headDim] f32, pre-allocated
@@ -255,9 +281,115 @@ struct OnnxLlmContext {
         }
     }
 
-    // Run a single decode step and return logits
+    // Run a single decode step and return logits.
+    // With graph capture enabled, uses ORT's pattern:
+    //   warmup step (normal) → capture step (save commands, no GPU exec) → replay steps
     std::vector<float> RunStep(int64_t tokenId) {
         pos++;
+
+        // ── Fast Decode Replay Path ──────────────────────────────────────
+        if (graphCaptureEnabled && graphCaptured) {
+            // Set position for GQA param updates
+            executor.replayPosition_ = (uint32_t)(pos - 1);
+
+            // Register input buffers to skip during write replay
+            if (executor.replaySkipBuffers_.empty()) {
+                executor.replaySkipBuffers_ = {idsBuf.handle, maskBuf.handle, nlkBuf.handle};
+            }
+
+            // Phase 1: replay captured writes (param values, zero-inits)
+            executor.ReplayWrites();
+
+            // Phase 2: write inputs (AFTER captured writes)
+            // so they aren't overwritten by the capture step's input values)
+            gpu->writeBuffer(idsBuf, &tokenId, 8);
+            std::vector<int64_t> mask(pos, 1);
+            gpu->writeBuffer(maskBuf, mask.data(), pos * 8);
+
+            // Phase 3: encode+submit captured dispatches + readback
+            uint64_t logitBytes = (uint64_t)vocabSize * 4;
+            auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
+            executor.RequestReadback(logitsBuf, {rbHandle, logitBytes}, logitBytes);
+            executor.ReplayDispatches();
+
+            // Map readback buffer
+            std::vector<float> logits(vocabSize);
+            auto rb = gpu->mapReadbackBuffer(vocabSize * 4);
+            memcpy(logits.data(), rb.data(), vocabSize * 4);
+
+            // Conv cast with pre-allocated f16 buffers
+            for (size_t i = 0; i < convLayerIndices.size(); i++) {
+                std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
+                int64_t nel = hiddenSize * convLCache;
+                uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
+                auto paramBuf = executor.getParamBuffer(16);
+                gpu->writeBuffer(paramBuf, params, 16);
+                auto& cPl = executor.GetPipelineT("cast_f32_to_f16", 3,
+                    []() { return std::string(WGSL_CAST_F32_TO_F16); });
+                auto bg = executor.MakeBindGroup(cPl, {
+                    {0, {convOutBufs[i].handle, convOutBufs[i].size}},
+                    {1, convCastF16Bufs[i]},
+                    {2, paramBuf}});
+                executor.QueueDispatch(cPl.pipeline, bg,
+                    (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16");
+                convState[inName].buffer = convCastF16Bufs[i];
+                convState[inName].dtype = TensorDtype::Float16;
+            }
+            executor.SubmitPending();
+
+            // Update KV shapes
+            for (int idx : attnLayerIndices) {
+                kvState["past_key_values." + std::to_string(idx) + ".key"].shape
+                    = {1, numKvHeads, (int64_t)pos, headDim};
+                kvState["past_key_values." + std::to_string(idx) + ".value"].shape
+                    = {1, numKvHeads, (int64_t)pos, headDim};
+            }
+            return logits;
+        }
+
+        // ── Capture Path (capture+submit: save AND execute) ──────────
+        // Bind groups are AddRef'd for replay. The capture step produces
+        // valid output since GPU work IS submitted.
+        if (graphCaptureEnabled && !graphCaptured && captureReady) {
+            executor.capturePosition_ = (uint32_t)(pos - 1);
+            executor.CaptureBegin();
+            auto logits = runExecutePath(tokenId);
+            executor.CaptureEnd();
+            graphCaptured = true;
+
+            // Remove conv cast flush if present
+            if (!executor.capturedFlushes_.empty()) {
+                auto& lastF = executor.capturedFlushes_.back();
+                if (!lastF.dispatches.empty() &&
+                    lastF.dispatches[0].name.find("cache_cast") != std::string::npos) {
+                    executor.capturedFlushes_.pop_back();
+                }
+            }
+
+            {
+                int nDisp = 0;
+                for (auto& f : executor.capturedFlushes_) nDisp += (int)f.dispatches.size();
+                fprintf(stderr, "  [graph capture] %zu flushes, %d dispatches, %zu param updates\n",
+                        executor.capturedFlushes_.size(), nDisp, executor.replayParamUpdates_.size());
+            }
+
+            // Logits are valid — capture+submit mode
+            return logits;
+        }
+
+        // ── Normal Path ─────────────────────────────────────────────────
+        // Count warmup steps before enabling capture
+        if (graphCaptureEnabled && !captureReady) {
+            warmupStepsDone++;
+            if (warmupStepsDone >= warmupStepsBeforeCapture) captureReady = true;
+        }
+
+        return runExecutePath(tokenId);
+    }
+
+private:
+    // Shared implementation for the full Execute path (used by both normal and capture)
+    std::vector<float> runExecutePath(int64_t tokenId) {
 
         std::unordered_map<std::string, GpuTensor*> inputs;
 
@@ -342,9 +474,6 @@ struct OnnxLlmContext {
         }
 
         // Request logits readback to be folded into Execute's final CB.
-        // This must use logitsBuf (the pre-allocated output buffer) — Execute
-        // will QueueCopy the graph's logits into logitsBuf, then the readback
-        // copy appends logitsBuf → readbackBuf in the same command buffer.
         uint64_t logitBytes = (uint64_t)vocabSize * 4;
         auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
         executor.RequestReadback(logitsBuf, {rbHandle, logitBytes}, logitBytes);
@@ -358,13 +487,23 @@ struct OnnxLlmContext {
         memcpy(logits.data(), rb.data(), logitNel * 4);
 
         // Update conv state — cast f32→f16 (conv layers expect fp16 input)
-        auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name) {
+        auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name, size_t idx) {
             if (src.dtype != TensorDtype::Float32) return;
             int64_t nel = src.ElementCount();
             GpuTensor dst;
             dst.shape = src.shape;
             dst.dtype = TensorDtype::Float16;
-            dst.buffer = gpu->createBuffer(name, nel * 2);
+            // Use pre-allocated f16 buffer if we're in capture mode
+            if (graphCaptureEnabled && idx < convCastF16Bufs.size()) {
+                dst.buffer = convCastF16Bufs[idx];
+            } else {
+                dst.buffer = gpu->createBuffer(name, nel * 2);
+                // Save for future replay if capturing
+                if (graphCaptureEnabled && convCastF16Bufs.size() <= idx) {
+                    convCastF16Bufs.resize(idx + 1);
+                    convCastF16Bufs[idx] = dst.buffer;
+                }
+            }
             uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
             auto paramBuf = executor.getParamBuffer(16);
             gpu->writeBuffer(paramBuf, params, 16);
@@ -372,20 +511,19 @@ struct OnnxLlmContext {
                 []() { return std::string(WGSL_CAST_F32_TO_F16); });
             auto bg = executor.MakeBindGroup(cPl, {
                 {0, src.buffer}, {1, dst.buffer}, {2, paramBuf}});
-            executor.pendingDispatches_.push_back({cPl.pipeline, bg,
-                (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16"});
+            executor.QueueDispatch(cPl.pipeline, bg,
+                (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16");
             src = dst;
         };
 
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
             if (!convOuts[i].IsValid()) continue;
-            gpuCastF32ToF16(convOuts[i], inName);
+            gpuCastF32ToF16(convOuts[i], inName, i);
             convState[inName] = convOuts[i];
         }
 
         // KV cache: static buffers already updated in-place by the attention op.
-        // Just update shapes to reflect the new sequence length.
         for (int idx : attnLayerIndices) {
             std::string kIn = "past_key_values." + std::to_string(idx) + ".key";
             std::string vIn = "past_key_values." + std::to_string(idx) + ".value";
@@ -399,6 +537,7 @@ struct OnnxLlmContext {
         return logits;
     }
 
+public:
     int32_t Argmax(const std::vector<float>& logits) {
         float mx = -1e30f;
         int32_t idx = 0;
@@ -552,7 +691,7 @@ struct LlmContext {
 int main(int argc, char* argv[]) {
     std::string modelPath, prompt, chatMessage, backendStr;
     int maxTokens = 100;
-    bool benchmark = false, profile = false;
+    bool benchmark = false, profile = false, fastDecode = false;
     int benchPromptLen = 0, benchGenTokens = 128;
 
     for (int i = 1; i < argc; i++) {
@@ -564,6 +703,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--backend" && i+1 < argc)    backendStr = argv[++i];
         else if (arg == "--benchmark")                benchmark = true;
         else if (arg == "--profile")                  profile = true;
+        else if (arg == "--fast-decode")              fastDecode = true;
         else if (arg == "--bench-prompt-len" && i+1 < argc) benchPromptLen = atoi(argv[++i]);
         else if (arg == "--bench-gen-tokens" && i+1 < argc) benchGenTokens = atoi(argv[++i]);
     }
@@ -609,6 +749,17 @@ int main(int argc, char* argv[]) {
         if (!onnxLlm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), resolvedPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
         }
+        // Enable fast decode (graph capture) if requested or in benchmark mode
+        if (fastDecode) {
+            onnxLlm.graphCaptureEnabled = true;
+            // Pre-allocate conv cast f16 buffers
+            onnxLlm.convCastF16Bufs.resize(onnxLlm.convLayerIndices.size());
+            for (size_t i = 0; i < onnxLlm.convLayerIndices.size(); i++) {
+                size_t nel = (size_t)(onnxLlm.hiddenSize * onnxLlm.convLCache);
+                onnxLlm.convCastF16Bufs[i] = static_cast<GPUContext*>(device.GetGPUContext())->createBuffer(
+                    "conv_cast_f16_" + std::to_string(i), nel * 2);
+            }
+        }
     } else {
         if (!llm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), modelPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
@@ -617,6 +768,8 @@ int main(int argc, char* argv[]) {
 
     auto t1 = std::chrono::steady_clock::now();
     auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
+
+    // (Micro-test removed — graph capture validated)
 
     if (isGenericOnnx) {
         printf("\nModel: %s (generic ONNX, %lldL, H=%lld, V=%lld)\n",
@@ -737,6 +890,13 @@ int main(int argc, char* argv[]) {
         int32_t eos = onnxLlm.tokenizer.eos_token_id;
 
         onnxLlm.ResetCaches();
+        // For fast decode: process ALL prompt tokens normally, then capture
+        // on the last prompt token so the model state is fully set up
+        if (onnxLlm.graphCaptureEnabled) {
+            // Capture+submit: capture step produces valid output.
+            // Just need 1 warmup step before capture to stabilize buffers.
+            onnxLlm.warmupStepsBeforeCapture = (int)promptTokens.size();
+        }
         // Prefill: feed prompt tokens one at a time
         int32_t next = 0;
         for (size_t i = 0; i < promptTokens.size(); i++) {

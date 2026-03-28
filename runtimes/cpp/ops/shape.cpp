@@ -367,8 +367,8 @@ static void opGather(GraphExecutor& ex, const OnnxGraphNode& n,
     auto& pl = ex.GetPipelineT("gather", 4, []() { return std::string(WGSL_GATHER); });
     auto bg = ex.MakeBindGroup(pl, {
         {0, data->buffer}, {1, idxBuf}, {2, out[0]->buffer}, {3, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (total + 255) / 256, 1, 1, "gather"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (total + 255) / 256, 1, 1, "gather");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -535,8 +535,8 @@ static void opConcat(GraphExecutor& ex, const OnnxGraphNode& n,
                 {0, gpuIn[0]->buffer}, {1, gpuIn[1]->buffer},
                 {2, out[0]->buffer}, {3, paramBuf}});
             uint32_t nwg = (uint32_t)(((outNel + 1) / 2 + 255) / 256);
-            ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                nwg, 1, 1, "concat"});
+            ex.QueueDispatch(pl.pipeline, bg,
+                nwg, 1, 1, "concat");
             return;
         }
         // CPU fallback for non-axis-0 concat
@@ -697,7 +697,7 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
             auto& pl = ex.GetPipelineT("transpose" + std::string(dtypeSuffix(data->dtype)), 3,
                 [&]() { return instantiateTemplate(WGSL_TRANSPOSE_T, data->dtype); });
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg, (nelU + 255) / 256, 1, 1, "transpose"});
+            ex.QueueDispatch(pl.pipeline, bg, (nelU + 255) / 256, 1, 1, "transpose");
         } else {
             // i64: existing u32-level kernel (2 u32 per i64 element)
             uint32_t elemsU32 = (uint32_t)(nel * 2);
@@ -713,7 +713,7 @@ static void opTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
 
             auto& pl = ex.GetPipelineT("transpose", 3, []() { return std::string(WGSL_TRANSPOSE); });
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
-            ex.pendingDispatches_.push_back({pl.pipeline, bg, (elemsU32 + 255) / 256, 1, 1, "transpose"});
+            ex.QueueDispatch(pl.pipeline, bg, (elemsU32 + 255) / 256, 1, 1, "transpose");
         }
         return;
     }
@@ -1065,8 +1065,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     });
                     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, pBuf}});
                     uint32_t nwg = (uint32_t)(((outN + 1) / 2 + 255) / 256);
-                    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-                        nwg, 1, 1, "slice_3d"});
+                    ex.QueueDispatch(pl.pipeline, bg,
+                        nwg, 1, 1, "slice_3d");
                     return;
                 }
             }
@@ -1177,8 +1177,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         auto& pl = ex.GetPipelineT("slice" + std::string(dtypeSuffix(data->dtype)), 3,
             [&]() { return instantiateTemplate(WGSL_SLICE_T, data->dtype); });
         auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
-            ((uint32_t)totalOut + 255) / 256, 1, 1, "slice"});
+        ex.QueueDispatch(pl.pipeline, bg,
+            ((uint32_t)totalOut + 255) / 256, 1, 1, "slice");
         return;
     }
 
@@ -1223,8 +1223,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     auto& pl = ex.GetPipelineT("slice", 3, []() { return std::string(WGSL_SLICE); });
     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        (totalU32 + 255) / 256, 1, 1, "slice"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (totalU32 + 255) / 256, 1, 1, "slice");
 }
 
 static void opConstantOfShape(GraphExecutor& ex, const OnnxGraphNode& n,
@@ -1413,8 +1413,8 @@ static void opExpand(GraphExecutor& ex, const OnnxGraphNode& n,
     auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     // Each thread handles 2 elements
     uint32_t numWorkgroups = (uint32_t)(((totalOut + 1) / 2 + 255) / 256);
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
-        numWorkgroups, 1, 1, "expand"});
+    ex.QueueDispatch(pl.pipeline, bg,
+        numWorkgroups, 1, 1, "expand");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
