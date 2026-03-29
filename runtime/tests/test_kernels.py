@@ -5,15 +5,15 @@ Dispatches each kernel on the GPU via DawnRunner and validates output
 against numpy reference.
 
 Usage:
-    python -m pytest tests/test_kernels.py -v
-    python -m pytest tests/test_kernels.py -k "test_softmax" -v
-    python tests/test_kernels.py          # standalone
+    python -m pytest runtime/tests/test_kernels.py -v
+    python -m pytest runtime/tests/test_kernels.py -k "test_softmax" -v
+    python runtime/tests/test_kernels.py          # standalone
 """
 import os, sys, struct, math
 import numpy as np
 import pytest
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
 from triton.backends.webgpu.dawn_runner import DawnRunner, BufferBinding

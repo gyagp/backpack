@@ -7,15 +7,15 @@ f16 tests validate that the packed u32 storage path produces correct results
 with relaxed tolerance (fp16 precision).
 
 Usage:
-    python -m pytest tests/test_template_kernels.py -v
-    python -m pytest tests/test_template_kernels.py -k "test_binary" -v
-    python -m pytest tests/test_template_kernels.py -k "f16" -v
+    python -m pytest runtime/tests/test_template_kernels.py -v
+    python -m pytest runtime/tests/test_template_kernels.py -k "test_binary" -v
+    python -m pytest runtime/tests/test_template_kernels.py -k "f16" -v
 """
 import os, sys, math
 import numpy as np
 import pytest
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
 from triton.backends.webgpu.dawn_runner import DawnRunner, BufferBinding
