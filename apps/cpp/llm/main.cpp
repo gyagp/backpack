@@ -21,12 +21,16 @@
 #include "wgsl_shaders.h"
 #include "json_parser.h"
 
+// Shared app utilities
+#include "../common/app_common.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -74,7 +78,31 @@ static std::string findOnnxFile(const std::string& dir) {
     return best;
 }
 
-static std::string resolvePath(const std::string& path, std::string& format) {
+static std::string resolvePath(const std::string& path, std::string& format,
+                               const std::string& formatOverride = "") {
+    // Format override: force gguf or onnx
+    if (!formatOverride.empty()) {
+        if (formatOverride == "gguf") {
+            format = "gguf";
+            if (fs::is_directory(path)) {
+                for (auto& e : fs::recursive_directory_iterator(path))
+                    if (e.is_regular_file() && e.path().extension() == ".gguf")
+                        return e.path().string();
+            }
+            return path;
+        }
+        if (formatOverride == "onnx") {
+            if (fs::is_directory(path)) {
+                format = isNonStandardArch(path) ? "onnx_generic" : "onnx";
+                if (format == "onnx_generic") return findOnnxFile(path);
+                return path;
+            }
+            std::string dir = fs::path(path).parent_path().string();
+            format = isNonStandardArch(dir) ? "onnx_generic" : "onnx";
+            return format == "onnx" ? dir : path;
+        }
+    }
+
     // Direct GGUF file
     if (path.size() > 5 && path.substr(path.size() - 5) == ".gguf") {
         if (fs::exists(path)) { format = "gguf"; return path; }
@@ -116,17 +144,7 @@ static std::string resolvePath(const std::string& path, std::string& format) {
     return path;
 }
 
-// ─── Chat template ───────────────────────────────────────────────────────────
-
-static std::string applyChatTemplate(const std::string& message,
-                                      const std::string& arch) {
-    if (arch.find("qwen3") != std::string::npos)
-        return "<|im_start|>user\n" + message + "<|im_end|>\n"
-               "<|im_start|>assistant\n<think>\n</think>\n";
-    if (arch.find("lfm2") != std::string::npos)
-        return "<|startoftext|><|im_start|>user\n" + message + "<|im_end|>\n<|im_start|>assistant\n";
-    return "<|im_start|>user\n" + message + "<|im_end|>\n<|im_start|>assistant\n";
-}
+// Chat template: use app::applyChatTemplate from app_common.h
 
 // ─── LLM Context (all LLM logic lives here, in the app) ─────────────────────
 
@@ -140,9 +158,14 @@ struct OnnxLlmContext {
 
     // Model config (parsed from config.json)
     int64_t hiddenSize = 0, numLayers = 0, vocabSize = 0;
-    int64_t numKvHeads = 0, headDim = 0;
+    int64_t numHeads = 0, numKvHeads = 0, headDim = 0;
     int64_t convLCache = 3;
-    int64_t maxSeqLen = 4096;  // static KV cache max sequence length
+    int64_t maxSeqLen = 0;  // static KV cache max sequence length (0 = auto)
+    int64_t intermediateSize = 0;     // dense MLP hidden dim (layers 0,1)
+    int64_t moeIntermediateSize = 0;  // MoE expert hidden dim
+    int64_t numExperts = 0, numExpertsPerTok = 0;
+    float normEps = 1e-5f;
+    float ropeTheta = 1000000.0f;
     std::vector<std::string> layerTypes;
     std::string arch;
 
@@ -161,6 +184,7 @@ struct OnnxLlmContext {
     bool fastDecodeEnabled = false;
     bool fastDecodeCaptured = false;
     bool prefillDone = false;  // Capture only after prefill completes
+    bool nlkWritten = false;   // Tracks whether nlkBuf has been initialized
     // Pre-allocated f16 conv cast output buffers (reused during replay stage)
     std::vector<GPUBuffer> convCastF16Bufs;
     // Pre-built conv cast bind groups for replay stage (avoid per-step MakeBindGroup)
@@ -195,13 +219,22 @@ struct OnnxLlmContext {
         numLayers = cfg.has("num_hidden_layers") ? cfg["num_hidden_layers"].as_int() : 24;
         vocabSize = cfg.has("vocab_size") ? cfg["vocab_size"].as_int() : 65536;
         numKvHeads = cfg.has("num_key_value_heads") ? cfg["num_key_value_heads"].as_int() : 8;
-        int64_t numHeads = cfg.has("num_attention_heads") ? cfg["num_attention_heads"].as_int() : 32;
+        numHeads = cfg.has("num_attention_heads") ? cfg["num_attention_heads"].as_int() : 32;
         headDim = hiddenSize / numHeads;
         convLCache = cfg.has("conv_L_cache") ? cfg["conv_L_cache"].as_int() : 3;
+        intermediateSize = cfg.has("intermediate_size") ? cfg["intermediate_size"].as_int() : 7168;
+        moeIntermediateSize = cfg.has("moe_intermediate_size") ? cfg["moe_intermediate_size"].as_int() : 1792;
+        numExperts = cfg.has("num_experts") ? cfg["num_experts"].as_int() : 32;
+        numExpertsPerTok = cfg.has("num_experts_per_tok") ? cfg["num_experts_per_tok"].as_int() : 4;
+        if (cfg.has("norm_eps")) normEps = (float)cfg["norm_eps"].as_number();
+        else if (cfg.has("rms_norm_eps")) normEps = (float)cfg["rms_norm_eps"].as_number();
+        if (cfg.has("rope_parameters")) {
+            auto& rp = cfg["rope_parameters"];
+            if (rp.has("rope_theta")) ropeTheta = (float)rp["rope_theta"].as_number();
+        }
         arch = cfg.has("model_type") ? cfg["model_type"].as_string() : "onnx";
-        // Cap static KV cache at 4096 for WebGPU memory, configurable later
+
         int64_t modelMaxSeq = cfg.has("max_position_embeddings") ? cfg["max_position_embeddings"].as_int() : 4096;
-        maxSeqLen = std::min(modelMaxSeq, (int64_t)4096);
 
         if (cfg.has("layer_types") && cfg["layer_types"].is_array()) {
             for (int64_t i = 0; i < cfg["layer_types"].size(); i++) {
@@ -210,6 +243,27 @@ struct OnnxLlmContext {
                 if (lt == "conv") convLayerIndices.push_back((int)i);
                 else if (lt == "full_attention") attnLayerIndices.push_back((int)i);
             }
+        }
+
+        // Compute maxSeqLen based on GPU memory if not set by caller (--max-seq-len)
+        if (maxSeqLen <= 0) {
+            // Each KV buffer: [1, numKvHeads, seqLen, headDim] in f32
+            // Budget: use at most 25% of maxBufferSize for total KV cache, leaving
+            // room for model weights and intermediate buffers.
+            int64_t nAttn = std::max((int64_t)1, (int64_t)attnLayerIndices.size());
+            uint64_t maxBuf = gpuCtx.adapterLimits.maxBufferSize;
+            // Per-buffer limit: each KV buffer must fit in maxBufferSize
+            int64_t perBufLimit = (int64_t)(maxBuf / (numKvHeads * headDim * 4));
+            // Total budget limit: nAttn * 2 (key+value) buffers, 25% of maxBufferSize
+            int64_t budgetBytes = (int64_t)(maxBuf / 4);
+            int64_t perBufFromBudget = budgetBytes / (nAttn * 2 * numKvHeads * headDim * 4);
+            int64_t computed = std::min(perBufLimit, perBufFromBudget);
+            // Round down to power of 2 for cleanliness
+            int64_t rounded = 1;
+            while (rounded * 2 <= computed) rounded *= 2;
+            maxSeqLen = std::min(modelMaxSeq, std::max(rounded, (int64_t)4096));
+        } else {
+            maxSeqLen = std::min(modelMaxSeq, maxSeqLen);
         }
 
         printf("Model: %s (%lldL, H=%lld, V=%lld, conv=%zu, attn=%zu)\n",
@@ -228,6 +282,7 @@ struct OnnxLlmContext {
     void ResetCaches() {
         pos = 0;
         prefillDone = false;
+        nlkWritten = false;
         convState.clear();
         kvState.clear();
         // Reset fast decode state (captured bind groups reference old buffers)
@@ -235,6 +290,8 @@ struct OnnxLlmContext {
             executor.ReleaseCaptured();
             fastDecodeCaptured = false;
         }
+        // Invalidate warm execute caches (tensor plan buffers reference old state)
+        executor.InvalidateWarmCaches();
         // Conv caches: [1, hiddenSize, convLCache] fp16, zero-initialized
         for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
             int idx = convLayerIndices[ci];
@@ -286,6 +343,155 @@ struct OnnxLlmContext {
     std::vector<float> RunPrefillStep(int64_t tokenId) {
         pos++;
         return runExecutePath(tokenId);
+    }
+
+    // Batched prefill: process T tokens in a single Execute call.
+    // Returns argmax of the last token's logits.
+    int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
+        if (T == 0) return -1;
+        if (T == 1) {
+            auto logits = RunPrefillStep(tokenIds[0]);
+            return Argmax(logits);
+        }
+
+        pos += T;
+
+        std::unordered_map<std::string, GpuTensor*> inputs;
+
+        // input_ids: [1, T] as int64
+        std::vector<int64_t> ids64(T);
+        for (uint32_t i = 0; i < T; i++) ids64[i] = tokenIds[i];
+        GpuTensor idT;
+        idT.shape = {1, (int64_t)T};
+        idT.dtype = TensorDtype::Int64;
+        idT.buffer = gpu->createBuffer("pf_ids", T * 8);
+        gpu->writeBuffer(idT.buffer, ids64.data(), T * 8);
+        idT.cpuData.resize(T * 8);
+        memcpy(idT.cpuData.data(), ids64.data(), T * 8);
+        inputs["input_ids"] = &idT;
+
+        // attention_mask: [1, T] — all ones (no past context for initial prefill)
+        std::vector<int64_t> mask(pos, 1);
+        GpuTensor maskT;
+        maskT.shape = {1, (int64_t)pos};
+        maskT.dtype = TensorDtype::Int64;
+        maskT.buffer = maskBuf;
+        gpu->writeBuffer(maskBuf, mask.data(), pos * 8);
+        maskT.cpuData.resize(pos * 8);
+        memcpy(maskT.cpuData.data(), mask.data(), pos * 8);
+        inputs["attention_mask"] = &maskT;
+
+        // num_logits_to_keep = 1 (only last token logits)
+        int64_t nlk = 1;
+        GpuTensor nlkT;
+        nlkT.shape = {};
+        nlkT.dtype = TensorDtype::Int64;
+        nlkT.buffer = nlkBuf;
+        if (!nlkWritten) {
+            gpu->writeBuffer(nlkBuf, &nlk, 8);
+            nlkWritten = true;
+        }
+        nlkT.cpuData.resize(8);
+        memcpy(nlkT.cpuData.data(), &nlk, 8);
+        inputs["num_logits_to_keep"] = &nlkT;
+
+        // Caches — pass static KV buffers with 0 past sequence length
+        for (auto& [name, t] : convState) inputs[name] = &t;
+        for (auto& [name, t] : kvState) {
+            t.shape = {1, numKvHeads, (int64_t)(pos - T), headDim};
+            inputs[name] = &t;
+        }
+
+        // Outputs
+        std::unordered_map<std::string, GpuTensor*> outputs;
+
+        GpuTensor logitsOut;
+        logitsOut.shape = {1, 1, vocabSize};
+        logitsOut.dtype = TensorDtype::Float32;
+        logitsOut.buffer = logitsBuf;
+        outputs["logits"] = &logitsOut;
+
+        std::vector<GpuTensor> convOuts(convLayerIndices.size());
+        for (size_t i = 0; i < convLayerIndices.size(); i++) {
+            std::string name = "present_conv." + std::to_string(convLayerIndices[i]);
+            convOuts[i].shape = {1, hiddenSize, convLCache};
+            convOuts[i].dtype = TensorDtype::Float32;
+            convOuts[i].buffer = convOutBufs[i];
+            outputs[name] = &convOuts[i];
+        }
+
+        std::vector<GpuTensor> kvOuts(attnLayerIndices.size() * 2);
+        for (size_t i = 0; i < attnLayerIndices.size(); i++) {
+            std::string kName = "present." + std::to_string(attnLayerIndices[i]) + ".key";
+            std::string vName = "present." + std::to_string(attnLayerIndices[i]) + ".value";
+            std::string kIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".key";
+            std::string vIn = "past_key_values." + std::to_string(attnLayerIndices[i]) + ".value";
+            kvOuts[i*2].shape = {1, numKvHeads, (int64_t)pos, headDim};
+            kvOuts[i*2].dtype = TensorDtype::Float32;
+            kvOuts[i*2].buffer = kvState[kIn].buffer;
+            kvOuts[i*2+1].shape = {1, numKvHeads, (int64_t)pos, headDim};
+            kvOuts[i*2+1].dtype = TensorDtype::Float32;
+            kvOuts[i*2+1].buffer = kvState[vIn].buffer;
+            outputs[kName] = &kvOuts[i*2];
+            outputs[vName] = &kvOuts[i*2+1];
+        }
+
+        // Execute the full graph with T-wide inputs
+        executor.Execute(inputs, outputs);
+
+        // Map readback buffer
+        int64_t logitNel = logitsOut.ElementCount();
+        std::vector<float> logits(logitNel);
+        auto rb = gpu->mapReadbackBuffer(logitNel * 4);
+        memcpy(logits.data(), rb.data(), logitNel * 4);
+
+        // Update conv state (f32→f16 cast for conv layers)
+        auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name, size_t idx) {
+            if (src.dtype != TensorDtype::Float32) return;
+            int64_t nel = src.ElementCount();
+            GpuTensor dst;
+            dst.shape = src.shape;
+            dst.dtype = TensorDtype::Float16;
+            if (fastDecodeEnabled && idx < convCastF16Bufs.size()) {
+                dst.buffer = convCastF16Bufs[idx];
+            } else {
+                dst.buffer = gpu->createBuffer(name, nel * 2);
+                if (fastDecodeEnabled && convCastF16Bufs.size() <= idx) {
+                    convCastF16Bufs.resize(idx + 1);
+                    convCastF16Bufs[idx] = dst.buffer;
+                }
+            }
+            uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
+            auto paramBuf = executor.getParamBuffer(16);
+            gpu->writeBuffer(paramBuf, params, 16);
+            auto& cPl = executor.GetPipelineT("cast_f32_to_f16", 3,
+                []() { return std::string(WGSL_CAST_F32_TO_F16); });
+            auto bg = executor.MakeBindGroup(cPl, {
+                {0, src.buffer}, {1, dst.buffer}, {2, paramBuf}});
+            executor.QueueDispatch(cPl.pipeline, bg,
+                (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16");
+            src = dst;
+        };
+
+        for (size_t i = 0; i < convLayerIndices.size(); i++) {
+            std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
+            if (!convOuts[i].IsValid()) continue;
+            gpuCastF32ToF16(convOuts[i], inName, i);
+            convState[inName] = convOuts[i];
+        }
+
+        for (int idx : attnLayerIndices) {
+            std::string kIn = "past_key_values." + std::to_string(idx) + ".key";
+            std::string vIn = "past_key_values." + std::to_string(idx) + ".value";
+            kvState[kIn].shape = {1, numKvHeads, (int64_t)pos, headDim};
+            kvState[vIn].shape = {1, numKvHeads, (int64_t)pos, headDim};
+        }
+
+        executor.SubmitPending();
+
+        gpu->releaseBuffer(idT.buffer);
+
+        return Argmax(logits);
     }
 
     // Run a single decode step and return logits.
@@ -417,8 +623,7 @@ private:
         memcpy(maskT.cpuData.data(), mask.data(), pos * 8);
         inputs["attention_mask"] = &maskT;
 
-        // num_logits_to_keep — reuse buffer, write once
-        static bool nlkWritten = false;
+        // num_logits_to_keep — reuse buffer, write once per cache reset
         int64_t nlk = 1;
         GpuTensor nlkT;
         nlkT.shape = {};
@@ -579,6 +784,105 @@ public:
                 "conv_cast_f16_" + std::to_string(i), nel * 2);
         }
     }
+
+    /// Pre-compile GPU pipelines in parallel to reduce time-to-first-token.
+    /// Walks the ONNX graph to identify needed kernels and compiles them ahead of time.
+    void WarmupPipelines() {
+        auto t0 = std::chrono::steady_clock::now();
+        auto& kernels = getEmbeddedKernels();
+
+        // Collect kernel specs needed by this model's ops
+        std::vector<std::tuple<std::string, std::string, uint32_t>> specs;
+        std::set<std::string> added;
+
+        auto addKernel = [&](const std::string& name) {
+            if (added.count(name)) return;
+            auto it = kernels.find(name);
+            if (it != kernels.end()) {
+                specs.emplace_back(name, std::string(it->second.source), it->second.numBindings);
+                added.insert(name);
+            }
+        };
+
+        // Walk graph ops and map to kernel names
+        for (auto& node : executor.GetGraph().nodes) {
+            if (node.opType == "MatMul" || node.opType == "Gemm") {
+                addKernel("gemm");
+                addKernel("fp16_gemm");
+            } else if (node.opType == "Conv") {
+                addKernel("conv2d");
+            } else if (node.opType == "ConvTranspose") {
+                addKernel("conv_transpose2d");
+            } else if (node.opType == "SimplifiedLayerNormalization" ||
+                       node.opType == "SkipSimplifiedLayerNormalization") {
+                addKernel("rms_norm");
+                addKernel("rms_norm_batched");
+                addKernel("add_rms_norm");
+                addKernel("add_rms_norm_batched");
+            } else if (node.opType == "LayerNormalization") {
+                addKernel("layer_norm");
+            } else if (node.opType == "Add" || node.opType == "Sub" ||
+                       node.opType == "Mul" || node.opType == "Div") {
+                addKernel("binary_elementwise");
+            } else if (node.opType == "Relu" || node.opType == "Sigmoid" ||
+                       node.opType == "Tanh" || node.opType == "Neg" ||
+                       node.opType == "Cast" || node.opType == "Exp" ||
+                       node.opType == "Sqrt" || node.opType == "Erf") {
+                addKernel("unary_elementwise");
+            } else if (node.opType == "Softmax") {
+                addKernel("softmax");
+            } else if (node.opType == "Gather") {
+                addKernel("gather");
+            } else if (node.opType == "Transpose") {
+                addKernel("transpose");
+            } else if (node.opType == "Where") {
+                addKernel("where_select");
+            } else if (node.opType == "Equal") {
+                addKernel("equal_op");
+            } else if (node.opType == "Expand") {
+                addKernel("expand");
+            } else if (node.opType == "Slice") {
+                addKernel("slice");
+            }
+        }
+
+        // Add attention + rope kernels if model has attention layers
+        if (!attnLayerIndices.empty()) {
+            addKernel("gqa_fused_attn");
+            addKernel("gqa_prefill");
+            addKernel("rotary_embedding");
+            addKernel("fused_qknorm_rope");
+            addKernel("fused_qknorm_rope_batched");
+            addKernel("rope_batched_simple");
+        }
+
+        // Add MoE-related kernels if model has MoE
+        if (numExperts > 0) {
+            addKernel("silu_mul_fused");
+        }
+
+        // Add argmax + embed gather
+        addKernel("argmax");
+        addKernel("embed_gather");
+
+        if (!specs.empty()) {
+            int compiled = gpu->warmupPipelines(specs);
+            auto t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            printf("  Warmed %d/%zu GPU pipelines in %.0fms\n",
+                   compiled, specs.size(), ms);
+        }
+    }
+
+    // ─── Batched Prefill ──────────────────────────────────────────────
+    // Processes all T prompt tokens in a single Execute() call with
+    // T-wide tensor shapes. Most ops (norms, matmuls, conv) natively
+    // handle T>1. MoE and attention use per-token loops internally.
+
+    /// Prefill all T tokens at once. Returns argmax of last token's logits.
+    int32_t prefillBatched(const int32_t* tokenIds, uint32_t T) {
+        return RunPrefillBatch(tokenIds, T);
+    }
 };
 
 /// Standard transformer LLM context using ModelRunner
@@ -680,6 +984,36 @@ struct LlmContext {
         return result;
     }
 
+    // Generate with temperature/top-k sampling (synchronous decode for logits access)
+    std::string GenerateSampled(const std::string& prompt, int maxTokens,
+                                const app::SamplingParams& sp, std::mt19937& rng,
+                                StreamCB onToken) {
+        Reset();
+        auto tokens = Tokenize(prompt);
+        if (tokens.empty()) return "";
+        int32_t next = Prefill(tokens.data(), (uint32_t)tokens.size());
+        // Re-sample from prefill logits if sampling enabled
+        if (sp.temperature > 0.0f) {
+            auto logits = runner.decode(next, pos);
+            next = app::sampleToken(logits.data(), (uint32_t)logits.size(), sp, rng);
+            pos++;
+        }
+        int32_t eos = Eos();
+        std::string result;
+        for (int i = 0; i < maxTokens; i++) {
+            if (next == eos) break;
+            std::string text = Detokenize(next);
+            if (!(text.size() >= 2 && text[0] == '<' && text.back() == '>')) {
+                result += text;
+                if (onToken && !onToken(text)) break;
+            }
+            auto logits = runner.decode(next, pos);
+            next = app::sampleToken(logits.data(), (uint32_t)logits.size(), sp, rng);
+            pos++;
+        }
+        return result;
+    }
+
     // Benchmark
     struct BenchResult { double pfMs, pfTps, dcMs, dcTps; int nPf, nDc; };
     BenchResult Benchmark(int promptLen, int genTokens) {
@@ -723,9 +1057,16 @@ struct LlmContext {
 
 int main(int argc, char* argv[]) {
     std::string modelPath, prompt, chatMessage, backendStr;
+    std::string formatOverride;  // --format gguf|onnx
     int maxTokens = 100;
     bool benchmark = false, profile = false, noFastDecode = false;
+    bool saveBaseline = false;
+    std::string baselinePath;
     int benchPromptLen = 0, benchGenTokens = 128;
+    int maxSeqLenOverride = 0;  // --max-seq-len, 0 = auto
+    float temperature = 0.0f;
+    int topK = 0;
+    uint64_t samplerSeed = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -734,13 +1075,24 @@ int main(int argc, char* argv[]) {
         else if (arg == "--chat" && i+1 < argc)       chatMessage = argv[++i];
         else if (arg == "--max-tokens" && i+1 < argc) maxTokens = atoi(argv[++i]);
         else if (arg == "--backend" && i+1 < argc)    backendStr = argv[++i];
+        else if (arg == "--format" && i+1 < argc)     formatOverride = argv[++i];
         else if (arg == "--benchmark")                benchmark = true;
         else if (arg == "--profile")                  profile = true;
         else if (arg == "--no-fast-decode")            noFastDecode = true;
         else if (arg == "--fast-decode")              {} // accepted for compat, now default
         else if (arg == "--bench-prompt-len" && i+1 < argc) benchPromptLen = atoi(argv[++i]);
         else if (arg == "--bench-gen-tokens" && i+1 < argc) benchGenTokens = atoi(argv[++i]);
+        else if (arg == "--max-seq-len" && i+1 < argc)    maxSeqLenOverride = atoi(argv[++i]);
+        else if (arg == "--temperature" && i+1 < argc)   temperature = (float)atof(argv[++i]);
+        else if (arg == "--top-k" && i+1 < argc)         topK = atoi(argv[++i]);
+        else if (arg == "--seed" && i+1 < argc)           samplerSeed = (uint64_t)atoll(argv[++i]);
+        else if (arg == "--save-baseline") {
+            saveBaseline = true;
+            if (i+1 < argc && argv[i+1][0] != '-') baselinePath = argv[++i];
+        }
     }
+
+    if (saveBaseline) benchmark = true;
 
     if (modelPath.empty()) {
         fprintf(stderr,
@@ -750,27 +1102,31 @@ int main(int argc, char* argv[]) {
             "  --chat <message>   Chat message (auto-template)\n"
             "  --max-tokens <n>   Max tokens (default: 100)\n"
             "  --backend <name>   vulkan / d3d12 / metal\n"
+            "  --format <fmt>     Force model format: gguf / onnx\n"
             "  --no-fast-decode   Disable fast decode\n"
+            "  --temperature <f>  Sampling temperature (0 = greedy)\n"
+            "  --top-k <n>       Top-k sampling (0 = disabled)\n"
+            "  --seed <n>        Random seed for sampling\n"
             "  --benchmark        Prefill+decode sweep\n"
-            "  --profile          GPU timestamp profiling + HTML timeline\n", argv[0]);
+            "  --profile          GPU timestamp profiling + HTML timeline\n"
+            "  --save-baseline [path]  Save benchmark results to JSON\n"
+            "  --max-seq-len <n>  Max context length (default: auto from GPU memory)\n", argv[0]);
         return 1;
     }
+
+    // Model auto-discovery (BACKPACK_MODELS env var support)
+    modelPath = app::discoverModelPath(modelPath);
 
     if (prompt.empty() && chatMessage.empty() && !benchmark)
         prompt = "Hello";
 
     // 1. Create device via runtime API
-    bp::Backend backend = bp::Backend::Default;
-    if (backendStr == "d3d12")       backend = bp::Backend::D3D12;
-    else if (backendStr == "vulkan") backend = bp::Backend::Vulkan;
-    else if (backendStr == "metal")  backend = bp::Backend::Metal;
-
-    auto device = bp::Device::Create(backend);
+    auto device = app::createDevice(backendStr);
     if (!device.IsValid()) { fprintf(stderr, "GPU init failed\n"); return 1; }
 
     // 2. Load LLM
     std::string modelFormat;
-    std::string resolvedPath = resolvePath(modelPath, modelFormat);
+    std::string resolvedPath = resolvePath(modelPath, modelFormat, formatOverride);
     printf("Loading model: %s (%s)\n", resolvedPath.c_str(), modelFormat.c_str()); fflush(stdout);
     auto t0 = std::chrono::steady_clock::now();
 
@@ -781,6 +1137,7 @@ int main(int argc, char* argv[]) {
     bool isGenericOnnx = (modelFormat == "onnx_generic");
 
     if (isGenericOnnx) {
+        if (maxSeqLenOverride > 0) onnxLlm.maxSeqLen = maxSeqLenOverride;
         if (!onnxLlm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), resolvedPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
         }
@@ -794,6 +1151,8 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "  Fast decode: disabled — %s\n", reason.c_str());
             }
         }
+        // Pre-compile GPU pipelines in parallel
+        onnxLlm.WarmupPipelines();
     } else {
         if (!llm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), modelPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
@@ -806,9 +1165,10 @@ int main(int argc, char* argv[]) {
     // (Micro-test removed — fast decode validated)
 
     if (isGenericOnnx) {
-        printf("\nModel: %s (generic ONNX, %lldL, H=%lld, V=%lld)\n",
+        printf("\nModel: %s (generic ONNX, %lldL, H=%lld, V=%lld, ctx=%lld)\n",
                onnxLlm.arch.c_str(), (long long)onnxLlm.numLayers,
-               (long long)onnxLlm.hiddenSize, (long long)onnxLlm.vocabSize);
+               (long long)onnxLlm.hiddenSize, (long long)onnxLlm.vocabSize,
+               (long long)onnxLlm.maxSeqLen);
     } else {
         printf("\nModel: %s (%s, %uL, E=%u, HD=%u, V=%u)\n",
                llm.arch.c_str(), llm.format.c_str(),
@@ -817,95 +1177,154 @@ int main(int argc, char* argv[]) {
     printf("GPU:   %s (%s)\n", device.GetName().c_str(), device.GetBackendName().c_str());
     printf("Ready: %lldms\n\n", (long long)loadMs);
 
+    // Resolve baseline output path (default: apps/cpp/baseline.json)
+    if (saveBaseline && baselinePath.empty()) {
+        baselinePath = (fs::path(__FILE__).parent_path().parent_path() / "baseline.json").string();
+    }
+
     // 3. Benchmark
     if (benchmark) {
+        auto* gpuCtx = static_cast<GPUContext*>(device.GetGPUContext());
+        std::vector<app::BenchResultEntry> benchResults;
+        std::vector<int> lens;
+        if (benchPromptLen > 0) lens.push_back(benchPromptLen);
+        else lens = {128, 256, 512, 1024, 2048, 4096};
+
         if (isGenericOnnx) {
             printf("=== Benchmark: %s (generic ONNX) ===\n", onnxLlm.arch.c_str());
-            int warmup = 3;
-            int genTokens = benchGenTokens > 0 ? benchGenTokens : 20;
+            printf("%-12s %10s %10s %10s %10s\n",
+                   "prompt_len", "prefill_ms", "pf_tok/s", "decode_ms", "dc_tok/s");
+            printf("%-12s %10s %10s %10s %10s\n",
+                   "----------", "----------", "--------", "---------", "--------");
 
-            onnxLlm.ResetCaches();
-            int32_t tok = 1; // BOS
+            int genTokens = benchGenTokens > 0 ? benchGenTokens : 128;
 
-            // Prefill (single token, timed)
-            auto pfStart = std::chrono::steady_clock::now();
-            auto logits = onnxLlm.RunPrefillStep(tok);
-            tok = onnxLlm.Argmax(logits);
-            auto pfEnd = std::chrono::steady_clock::now();
-            double pfMs = std::chrono::duration<double, std::milli>(pfEnd - pfStart).count();
-            onnxLlm.prefillDone = true;
+            for (int pl : lens) {
+                // Check if total tokens fit in maxSeqLen
+                int totalNeeded = pl + 3 + genTokens;  // prefill + warmup + decode
+                if (totalNeeded > (int)onnxLlm.maxSeqLen) {
+                    printf("%-12d   (skipped — %d tokens exceeds maxSeqLen %lld)\n",
+                           pl, totalNeeded, (long long)onnxLlm.maxSeqLen);
+                    continue;
+                }
 
-            // Warmup decodes (capture on first, replay on rest — excluded from timing)
-            for (int i = 0; i < warmup; i++) {
-                logits = onnxLlm.RunStep(tok);
-                tok = onnxLlm.Argmax(logits);
+                onnxLlm.ResetCaches();
+                int32_t tok = 1;  // BOS
+
+                // Prefill: batched capture+replay
+                std::vector<int32_t> prefillTokens(pl, 1);  // BOS fill
+                auto pfStart = std::chrono::steady_clock::now();
+                tok = onnxLlm.prefillBatched(prefillTokens.data(), (uint32_t)pl);
+                auto pfEnd = std::chrono::steady_clock::now();
+                double pfMs = std::chrono::duration<double, std::milli>(pfEnd - pfStart).count();
+                onnxLlm.prefillDone = true;
+
+                // Warmup 3 decode steps (capture on first, replay on rest)
+                for (int i = 0; i < 3; i++) {
+                    auto logits = onnxLlm.RunStep(tok);
+                    tok = onnxLlm.Argmax(logits);
+                }
+
+                // Timed decode
+                auto dcStart = std::chrono::steady_clock::now();
+                for (int i = 0; i < genTokens; i++) {
+                    auto logits = onnxLlm.RunStep(tok);
+                    tok = onnxLlm.Argmax(logits);
+                }
+                auto dcEnd = std::chrono::steady_clock::now();
+                double dcMs = std::chrono::duration<double, std::milli>(dcEnd - dcStart).count();
+
+                double pfTps = pl * 1000.0 / pfMs;
+                double dcTps = genTokens * 1000.0 / dcMs;
+
+                printf("%-12d %10.1f %10.1f %10.1f %10.1f\n",
+                       pl, pfMs, pfTps, dcMs, dcTps);
+                fflush(stdout);
+
+                benchResults.push_back({pl, pfMs, pfTps, dcMs, dcTps});
             }
 
-            // Timed decode (all replay)
-            auto t2 = std::chrono::steady_clock::now();
-            for (int i = 0; i < genTokens; i++) {
-                logits = onnxLlm.RunStep(tok);
+            // CPU profile: single replay step (skip for now — hangs)
+            if (false && !benchResults.empty()) {
+                onnxLlm.ResetCaches();
+                int32_t tok = 1;
+                auto logits = onnxLlm.RunPrefillStep(tok);
                 tok = onnxLlm.Argmax(logits);
+                onnxLlm.prefillDone = true;
+                for (int i = 0; i < 3; i++) {
+                    logits = onnxLlm.RunStep(tok);
+                    tok = onnxLlm.Argmax(logits);
+                }
+                printf("\n=== Profile (single replay step) ===\n");
+                onnxLlm.executor.profilingEnabled = true;
+                logits = onnxLlm.RunStep(tok);
+                onnxLlm.executor.profilingEnabled = false;
             }
-            auto t3 = std::chrono::steady_clock::now();
-            double dcMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
-            double dcTps = genTokens * 1000.0 / dcMs;
-            printf("  Prefill: 1 token in %.1fms\n", pfMs);
-            printf("  Decode:  %d tokens in %.0fms (%.1f tok/s, %.1f ms/tok)\n",
-                   genTokens, dcMs, dcTps, dcMs / genTokens);
-
-            // CPU profile: single replay step
-            printf("\n=== Profile (single replay step) ===\n");
-            onnxLlm.executor.profilingEnabled = true;
-            logits = onnxLlm.RunStep(tok);
-            onnxLlm.executor.profilingEnabled = false;
 
             // GPU hardware timestamp profiling (if --profile)
             if (profile) {
                 printf("\n=== GPU Hardware Timestamp Profile (single replay step) ===\n");
                 onnxLlm.ResetCaches();
-                tok = 1;
-
-                // Prefill
-                logits = onnxLlm.RunPrefillStep(tok);
+                int32_t tok = 1;
+                auto logits = onnxLlm.RunPrefillStep(tok);
                 tok = onnxLlm.Argmax(logits);
                 onnxLlm.prefillDone = true;
-
-                // Warmup decodes (capture on first, replay on rest)
-                for (int i = 0; i < warmup; i++) {
+                for (int i = 0; i < 3; i++) {
                     auto lg = onnxLlm.RunStep(tok);
                     tok = onnxLlm.Argmax(lg);
                 }
-
-                // Profile single replay step
                 onnxLlm.executor.enableGpuProfiling();
                 auto pt0 = std::chrono::steady_clock::now();
                 logits = onnxLlm.RunStep(tok);
                 tok = onnxLlm.Argmax(logits);
                 auto pt1 = std::chrono::steady_clock::now();
                 double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
-
                 std::string htmlPath = (fs::path(onnxLlm.modelDir) / "profile.html").string();
                 onnxLlm.executor.printGpuProfileReport(1, profMs, htmlPath);
+            }
+
+            // Save baseline JSON
+            if (saveBaseline) {
+                auto sysInfo = app::getSystemInfo();
+                app::writeBaselineJson(baselinePath, sysInfo,
+                    device.GetName(), device.GetBackendName(),
+                    gpuCtx->adapterDescription,
+                    onnxLlm.arch, onnxLlm.modelPath, "onnx_generic",
+                    (int)onnxLlm.numLayers, (int)onnxLlm.hiddenSize,
+                    (int)onnxLlm.vocabSize,
+                    benchGenTokens, benchResults);
             }
 
             printf("\n");
             return 0;
         }
+
+        // Standard model benchmark
         printf("=== Benchmark: %s ===\n", llm.arch.c_str());
         printf("%-12s %10s %10s %10s %10s\n",
                "prompt_len", "prefill_ms", "pf_tok/s", "decode_ms", "dc_tok/s");
         printf("%-12s %10s %10s %10s %10s\n",
                "----------", "----------", "--------", "---------", "--------");
-        std::vector<int> lens;
-        if (benchPromptLen > 0) lens.push_back(benchPromptLen);
-        else lens = {128, 256, 512, 1024, 2048, 4096};
         for (int pl : lens) {
             auto r = llm.Benchmark(pl, benchGenTokens);
             printf("%-12d %10.1f %10.1f %10.1f %10.1f\n",
                    pl, r.pfMs, r.pfTps, r.dcMs, r.dcTps);
             fflush(stdout);
+            benchResults.push_back({pl, r.pfMs, r.pfTps, r.dcMs, r.dcTps});
         }
+
+        // Save baseline JSON
+        if (saveBaseline) {
+            auto sysInfo = app::getSystemInfo();
+            std::string mDir = fs::path(modelPath).parent_path().string();
+            app::writeBaselineJson(baselinePath, sysInfo,
+                device.GetName(), device.GetBackendName(),
+                gpuCtx->adapterDescription,
+                llm.arch, modelPath, llm.format,
+                (int)llm.nLayer, (int)llm.nEmbd, (int)llm.nVocab,
+                benchGenTokens, benchResults);
+        }
+
         printf("\n");
         return 0;
     }
@@ -915,7 +1334,7 @@ int main(int argc, char* argv[]) {
     bool chat = !chatMessage.empty();
     if (chat) {
         std::string arch_str = isGenericOnnx ? onnxLlm.arch : llm.arch;
-        finalPrompt = applyChatTemplate(chatMessage, arch_str);
+        finalPrompt = app::applyChatTemplate(chatMessage, arch_str);
         printf("Chat: %s\n", chatMessage.c_str());
     } else {
         finalPrompt = prompt;
@@ -923,26 +1342,34 @@ int main(int argc, char* argv[]) {
 
     if (isGenericOnnx) {
         auto promptTokens = onnxLlm.tokenizer.encode(finalPrompt);
-        printf("Prompt: %zu tokens\n\n--- Output ---\n", promptTokens.size());
+        printf("Prompt: %zu tokens\n", promptTokens.size());
+        if (temperature > 0)
+            printf("Sampling: temperature=%.2f, top_k=%d, seed=%llu\n",
+                   temperature, topK, (unsigned long long)samplerSeed);
+        printf("\n--- Output ---\n");
         if (!chat) printf("%s", finalPrompt.c_str());
         fflush(stdout);
+
+        // Set up sampler
+        app::SamplingParams sp{temperature, topK, samplerSeed};
+        std::mt19937 rng(samplerSeed ? samplerSeed : std::random_device{}());
 
         auto genStart = std::chrono::steady_clock::now();
         int tokenCount = 0;
         int32_t eos = onnxLlm.tokenizer.eos_token_id;
 
         onnxLlm.ResetCaches();
-        // Prefill: feed prompt tokens one at a time (normal Execute, no capture)
-        int32_t next = 0;
-        for (size_t i = 0; i < promptTokens.size(); i++) {
-            auto logits = onnxLlm.RunPrefillStep(promptTokens[i]);
-            if (i == promptTokens.size() - 1) {
-                next = onnxLlm.Argmax(logits);
-            }
-        }
+        // Prefill: batched capture+replay
+        int32_t next = onnxLlm.prefillBatched(promptTokens.data(), (uint32_t)promptTokens.size());
         onnxLlm.prefillDone = true;
 
-        // Decode loop (first RunStep captures, rest replay)
+        // When sampling, re-sample the last prefill logits too
+        if (temperature > 0.0f) {
+            auto logits = onnxLlm.RunStep(next);
+            next = app::sampleToken(logits.data(), (uint32_t)onnxLlm.vocabSize, sp, rng);
+        }
+
+        // Decode loop
         for (int i = 0; i < maxTokens; i++) {
             if (next == eos) break;
             std::string text = onnxLlm.tokenizer.decode_token(next);
@@ -951,7 +1378,11 @@ int main(int argc, char* argv[]) {
                 tokenCount++;
             }
             auto logits = onnxLlm.RunStep(next);
-            next = onnxLlm.Argmax(logits);
+            if (temperature > 0.0f) {
+                next = app::sampleToken(logits.data(), (uint32_t)onnxLlm.vocabSize, sp, rng);
+            } else {
+                next = onnxLlm.Argmax(logits);
+            }
         }
 
         auto genMs = std::chrono::duration<double,std::milli>(
@@ -966,18 +1397,33 @@ int main(int argc, char* argv[]) {
 
     // Standard model path
     auto promptTokens = llm.Tokenize(finalPrompt);
-    printf("Prompt: %zu tokens\n\n--- Output ---\n", promptTokens.size());
+    printf("Prompt: %zu tokens\n", promptTokens.size());
+    if (temperature > 0)
+        printf("Sampling: temperature=%.2f, top_k=%d, seed=%llu\n",
+               temperature, topK, (unsigned long long)samplerSeed);
+    printf("\n--- Output ---\n");
     if (!chat) printf("%s", finalPrompt.c_str());
     fflush(stdout);
 
     auto genStart = std::chrono::steady_clock::now();
     int tokenCount = 0;
 
-    llm.Generate(finalPrompt, maxTokens, [&](const std::string& text) {
-        printf("%s", text.c_str()); fflush(stdout);
-        tokenCount++;
-        return true;
-    });
+    if (temperature > 0.0f) {
+        app::SamplingParams sp{temperature, topK, samplerSeed};
+        std::mt19937 rng(samplerSeed ? samplerSeed : std::random_device{}());
+        llm.GenerateSampled(finalPrompt, maxTokens, sp, rng,
+            [&](const std::string& text) {
+                printf("%s", text.c_str()); fflush(stdout);
+                tokenCount++;
+                return true;
+            });
+    } else {
+        llm.Generate(finalPrompt, maxTokens, [&](const std::string& text) {
+            printf("%s", text.c_str()); fflush(stdout);
+            tokenCount++;
+            return true;
+        });
+    }
 
     auto genMs = std::chrono::duration<double,std::milli>(
         std::chrono::steady_clock::now() - genStart).count();

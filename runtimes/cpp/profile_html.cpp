@@ -72,7 +72,8 @@ void generateProfileHTML(
         const ClockCalibration* cal, const uint64_t* ptr,
         int nDecodeTokens, int nPrefillTokens,
         double prefillMs, double decodeMs,
-        const std::string& outputPath) {
+        const std::string& outputPath,
+        const CPUProfiler* cpuProfiler) {
 
     // Count dispatches per token
     int dispatchesPerToken = 0;
@@ -138,6 +139,56 @@ void generateProfileHTML(
                 << ",\"gpu_hw\":" << summaryToJson(gpuAgg, totalGpuMs)
                 << ",\"cpu\":[],\"gpu\":[],\"steps\":[]}";
 
+    // Build CPU events if available
+    std::vector<JsonEvent> cpuEvents;
+    std::vector<int> cpuDepths;
+    std::string cpuEventsJson = "[]";
+    std::string cpuSummaryJson = "[]";
+    int maxCpuDepth = 0;
+    if (cpuProfiler && !cpuProfiler->events.empty()) {
+        // Find earliest CPU event timestamp
+        uint64_t cpuT0 = UINT64_MAX;
+        for (auto& e : cpuProfiler->events) {
+            if (e.beginNs < cpuT0) cpuT0 = e.beginNs;
+        }
+        // Use GPU t0 as reference if available, else CPU t0
+        uint64_t refT0 = t0Cpu < cpuT0 ? t0Cpu : cpuT0;
+
+        for (auto& e : cpuProfiler->events) {
+            double startUs = (double)(e.beginNs - refT0) / 1000.0;
+            double durUs = e.endNs > e.beginNs ? (double)(e.endNs - e.beginNs) / 1000.0 : 0;
+            cpuEvents.push_back({e.name, startUs, durUs});
+            cpuDepths.push_back(e.depth);
+            if (e.depth > maxCpuDepth) maxCpuDepth = e.depth;
+        }
+
+        // Build JSON with depth info
+        std::ostringstream cs;
+        cs << "[";
+        for (size_t i = 0; i < cpuEvents.size(); i++) {
+            if (i) cs << ",";
+            cs << "{\"name\":\"" << jsonEscape(cpuEvents[i].name)
+               << "\",\"start_us\":" << cpuEvents[i].startUs
+               << ",\"dur_us\":" << cpuEvents[i].durUs
+               << ",\"depth\":" << cpuDepths[i] << "}";
+        }
+        cs << "]";
+        cpuEventsJson = cs.str();
+
+        // CPU summary
+        std::map<std::string, AggEntry> cpuAgg;
+        double totalCpuMs = 0;
+        for (auto& ev : cpuProfiler->events) {
+            if (ev.depth == 0 && ev.endNs > ev.beginNs) {
+                double ms = (double)(ev.endNs - ev.beginNs) / 1e6;
+                cpuAgg[ev.name].totalMs += ms;
+                cpuAgg[ev.name].count++;
+                totalCpuMs += ms;
+            }
+        }
+        cpuSummaryJson = summaryToJson(cpuAgg, totalCpuMs);
+    }
+
     std::string backendName = gpu.backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan";
     char timeBuf[64];
     time_t now = time(nullptr);
@@ -185,43 +236,58 @@ canvas{display:block}
 <div id="controls"><button onclick="resetZoom()">Reset</button><button onclick="zoomIn()">+ Zoom</button><button onclick="zoomOut()">- Zoom</button><span class="range" id="range-label"></span></div>
 <div id="timeline-wrap"><canvas id="c"></canvas></div>
 <div id="tooltip"></div>
-<div id="summary"><div class="panel"><h2>GPU Kernels (Hardware Timestamps)</h2><table id="gpu-tbl"><thead><tr><th>Kernel</th><th>Total</th><th>#</th><th>Avg</th><th>%</th><th></th></tr></thead><tbody></tbody></table></div></div>
+<div id="summary"><div class="panel"><h2>GPU Kernels (Hardware Timestamps)</h2><table id="gpu-tbl"><thead><tr><th>Kernel</th><th>Total</th><th>#</th><th>Avg</th><th>%</th><th></th></tr></thead><tbody></tbody></table></div><div class="panel" id="cpu-panel" style="display:none"><h2>CPU Scopes</h2><table id="cpu-tbl"><thead><tr><th>Scope</th><th>Total</th><th>#</th><th>Avg</th><th>%</th><th></th></tr></thead><tbody></tbody></table></div></div>
 <script>
 const C=document.getElementById('c'),X=C.getContext('2d'),W=document.getElementById('timeline-wrap'),TT=document.getElementById('tooltip');
 const gpuHW={{GPU_HW_EVENTS}};
+const cpuEV={{CPU_EVENTS}};
+const cpuSum={{CPU_SUMMARY}};
 const steps={{STEPS}};
 const S={{SUMMARY}};
 const dpr=devicePixelRatio||1;
+const hasCPU=cpuEV.length>0;
+let showCPU=hasCPU,showGPU=true;
+const maxCpuDepth={{MAX_CPU_DEPTH}};
 const OC={q8_gateup:'#f7768e',q8_down_add:'#9ece6a',lm_head:'#bb9af7',q8_qkv:'#7aa2f7',q8_oproj:'#ff9e64',attn_p1:'#7dcfff',attn_p2:'#73daca',add_rms:'#e0af68',rms_next:'#e0af68',rms_norm:'#e0af68',final_rms:'#e0af68',fused_rope:'#73daca',silu_mul:'#73daca',argmax:'#414868'};
 function oc(n){if(OC[n])return OC[n];let h=0;for(let i=0;i<n.length;i++)h=(h*31+n.charCodeAt(i))&0xffffff;return'hsl('+h%360+',55%,60%)';}
-const LW=80,TH=16,GPU_Y=6,CH=GPU_Y+TH+20;
-let allS=gpuHW.map(e=>e.start_us).concat(steps.map(e=>e.start_us));
-let allE=gpuHW.map(e=>e.start_us+e.dur_us).concat(steps.map(e=>e.start_us+e.dur_us));
+const LW=80,TH=16,GPU_Y=6;
+const CPU_TH=14;
+function cpuLaneH(){return hasCPU&&showCPU?(maxCpuDepth+1)*CPU_TH+4:0;}
+function gpuY(){return showCPU&&hasCPU?cpuLaneH()+4:6;}
+function CH(){return gpuY()+(showGPU?TH:0)+20;}
+let allS=gpuHW.map(e=>e.start_us).concat(steps.map(e=>e.start_us)).concat(cpuEV.map(e=>e.start_us));
+let allE=gpuHW.map(e=>e.start_us+e.dur_us).concat(steps.map(e=>e.start_us+e.dur_us)).concat(cpuEV.map(e=>e.start_us+e.dur_us));
 let gMin=allS.length?Math.min(...allS):0,gMax=allE.length?Math.max(...allE):1000;
 let vS=gMin,vE=gMax,drag=false,dX=0,dVS=0;
-function resize(){const w=W.clientWidth;C.width=w*dpr;C.height=CH*dpr;C.style.width=w+'px';C.style.height=CH+'px';X.setTransform(dpr,0,0,dpr,0,0);draw();}
+function resize(){const w=W.clientWidth,ch=CH();C.width=w*dpr;C.height=ch*dpr;C.style.width=w+'px';C.style.height=ch+'px';X.setTransform(dpr,0,0,dpr,0,0);draw();}
 function t2x(t){return LW+(t-vS)/(vE-vS)*(C.clientWidth-LW);}
 function x2t(x){return vS+(x-LW)/(C.clientWidth-LW)*(vE-vS);}
 function niceStep(r,mx){const rg=r/mx,p=Math.pow(10,Math.floor(Math.log10(rg))),n=rg/p;return(n<=1.5?1:n<=3.5?2:n<=7.5?5:10)*p;}
 function draw(){
-const w=C.clientWidth,range=vE-vS;X.clearRect(0,0,w,CH);X.fillStyle='#1a1b26';X.fillRect(0,0,w,CH);
+const w=C.clientWidth,ch=CH(),range=vE-vS;X.clearRect(0,0,w,ch);X.fillStyle='#1a1b26';X.fillRect(0,0,w,ch);
 const ts=niceStep(range,(w-LW)/80);X.font='9px system-ui';
-for(let t=Math.ceil(vS/ts)*ts;t<=vE;t+=ts){const x=t2x(t);X.fillStyle='#292e42';X.fillRect(x,0,1,CH);X.fillStyle='#565f89';const lb=t>=1e6?(t/1e6).toFixed(1)+'s':t>=1e3?(t/1e3).toFixed(1)+'ms':t.toFixed(0)+'us';X.fillText(lb,x+2,CH-3);}
-X.fillStyle='#565f89';X.font='10px system-ui';X.fillText('GPU',4,GPU_Y+14);
-X.fillStyle='#1f2335';X.fillRect(LW,GPU_Y,w-LW,TH);
-for(const s of steps){const x1=t2x(s.start_us),x2=t2x(s.start_us+s.dur_us),bw=Math.max(x2-x1,1);if(x2<LW||x1>w)continue;const isPf=s.name==='prefill';X.fillStyle=isPf?'rgba(158,206,106,0.08)':'rgba(122,162,247,0.05)';X.fillRect(x1,GPU_Y,bw,TH);X.strokeStyle=isPf?'rgba(158,206,106,0.35)':'rgba(122,162,247,0.15)';X.lineWidth=1;X.beginPath();X.moveTo(x1,GPU_Y);X.lineTo(x1,GPU_Y+TH);X.stroke();}
-for(const e of gpuHW){const n=e.name.split('/').pop();const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);if(x2<LW||x1>w)continue;X.fillStyle=oc(n);X.fillRect(x1,GPU_Y+1,bw,TH-2);if(bw>24){X.fillStyle='#1a1b26';X.font='8px system-ui';X.save();X.beginPath();X.rect(x1,GPU_Y,bw,TH);X.clip();X.fillText(n,x1+2,GPU_Y+12);X.restore();}}
+for(let t=Math.ceil(vS/ts)*ts;t<=vE;t+=ts){const x=t2x(t);X.fillStyle='#292e42';X.fillRect(x,0,1,ch);X.fillStyle='#565f89';const lb=t>=1e6?(t/1e6).toFixed(1)+'s':t>=1e3?(t/1e3).toFixed(1)+'ms':t.toFixed(0)+'us';X.fillText(lb,x+2,ch-3);}
+if(showCPU&&hasCPU){X.fillStyle='#565f89';X.font='10px system-ui';X.fillText('CPU',4,14);X.fillStyle='#1f2335';X.fillRect(LW,2,w-LW,cpuLaneH());
+const CC=['#bb9af7','#7aa2f7','#9ece6a','#ff9e64','#7dcfff','#e0af68','#f7768e','#73daca'];
+for(const e of cpuEV){const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);if(x2<LW||x1>w)continue;const y=2+e.depth*CPU_TH;X.fillStyle=CC[e.depth%CC.length];X.globalAlpha=0.85;X.fillRect(x1,y+1,bw,CPU_TH-2);X.globalAlpha=1;if(bw>20){X.fillStyle='#1a1b26';X.font='8px system-ui';X.save();X.beginPath();X.rect(x1,y,bw,CPU_TH);X.clip();X.fillText(e.name,x1+2,y+10);X.restore();}}}
+if(showGPU){const gy=gpuY();X.fillStyle='#565f89';X.font='10px system-ui';X.fillText('GPU',4,gy+14);X.fillStyle='#1f2335';X.fillRect(LW,gy,w-LW,TH);
+for(const s of steps){const x1=t2x(s.start_us),x2=t2x(s.start_us+s.dur_us),bw=Math.max(x2-x1,1);if(x2<LW||x1>w)continue;const isPf=s.name==='prefill';X.fillStyle=isPf?'rgba(158,206,106,0.08)':'rgba(122,162,247,0.05)';X.fillRect(x1,gy,bw,TH);X.strokeStyle=isPf?'rgba(158,206,106,0.35)':'rgba(122,162,247,0.15)';X.lineWidth=1;X.beginPath();X.moveTo(x1,gy);X.lineTo(x1,gy+TH);X.stroke();}
+for(const e of gpuHW){const n=e.name.split('/').pop();const x1=t2x(e.start_us),x2=t2x(e.start_us+e.dur_us),bw=Math.max(x2-x1,1);if(x2<LW||x1>w)continue;X.fillStyle=oc(n);X.fillRect(x1,gy+1,bw,TH-2);if(bw>24){X.fillStyle='#1a1b26';X.font='8px system-ui';X.save();X.beginPath();X.rect(x1,gy,bw,TH);X.clip();X.fillText(n,x1+2,gy+12);X.restore();}}}
 document.getElementById('range-label').textContent=range>=1e6?(range/1e6).toFixed(2)+'s':(range/1e3).toFixed(1)+'ms';
 }
 C.addEventListener('wheel',ev=>{ev.preventDefault();const f=ev.deltaY>0?1.25:0.8,mx=ev.offsetX,t=x2t(mx);const nr=(vE-vS)*f,fr=(mx-LW)/(C.clientWidth-LW);vS=t-fr*nr;vE=vS+nr;draw();});
 C.addEventListener('mousedown',ev=>{drag=true;dX=ev.clientX;dVS=vS;W.classList.add('dragging');});
-addEventListener('mousemove',ev=>{if(drag){const dx=ev.clientX-dX,r=vE-vS;vS=dVS-dx/(C.clientWidth-LW)*r;vE=vS+r;draw();}const rc=C.getBoundingClientRect(),mx=ev.clientX-rc.left,my=ev.clientY-rc.top,t=x2t(mx);let hit=null;if(my>=GPU_Y&&my<GPU_Y+TH){for(const e of gpuHW)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,start_us:e.start_us,dur_us:e.dur_us};break;}}if(hit){function fmt(us){return us>=1e6?(us/1e6).toFixed(3)+' s':us>=1000?(us/1000).toFixed(2)+' ms':us.toFixed(1)+' us';}TT.innerHTML='<b>'+hit.name+'</b><br><span class="dim">'+hit.scope+'</span><br>GPU: '+fmt(hit.dur_us)+'<br><span class="dim">'+fmt(hit.start_us)+'</span>';TT.style.display='block';TT.style.left=(ev.clientX+12)+'px';TT.style.top=(ev.clientY-10)+'px';}else TT.style.display='none';});
+addEventListener('mousemove',ev=>{if(drag){const dx=ev.clientX-dX,r=vE-vS;vS=dVS-dx/(C.clientWidth-LW)*r;vE=vS+r;draw();}const rc=C.getBoundingClientRect(),mx=ev.clientX-rc.left,my=ev.clientY-rc.top,t=x2t(mx);let hit=null;const gy=gpuY();if(showGPU&&my>=gy&&my<gy+TH){for(const e of gpuHW)if(t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name.split('/').pop(),scope:e.name,start_us:e.start_us,dur_us:e.dur_us,lane:'GPU'};break;}}if(!hit&&showCPU&&hasCPU&&my>=2&&my<2+cpuLaneH()){for(const e of cpuEV){const y=2+e.depth*CPU_TH;if(my>=y&&my<y+CPU_TH&&t>=e.start_us&&t<=e.start_us+e.dur_us){hit={name:e.name,scope:e.name,start_us:e.start_us,dur_us:e.dur_us,lane:'CPU (depth '+e.depth+')'};break;}}}if(hit){function fmt(us){return us>=1e6?(us/1e6).toFixed(3)+' s':us>=1000?(us/1000).toFixed(2)+' ms':us.toFixed(1)+' us';}TT.innerHTML='<b>'+hit.name+'</b><br><span class="dim">'+hit.lane+'</span><br>'+fmt(hit.dur_us)+'<br><span class="dim">'+fmt(hit.start_us)+'</span>';TT.style.display='block';TT.style.left=(ev.clientX+12)+'px';TT.style.top=(ev.clientY-10)+'px';}else TT.style.display='none';});
 addEventListener('mouseup',function(){drag=false;W.classList.remove('dragging');});
 function resetZoom(){vS=gMin;vE=gMax;draw();}
 function zoomIn(){const m=(vS+vE)/2,r=(vE-vS)/2;vS=m-r/2;vE=m+r/2;draw();}
 function zoomOut(){const m=(vS+vE)/2,r=(vE-vS)*2;vS=m-r/2;vE=m+r/2;draw();}
+function toggleCPU(){showCPU=!showCPU;resize();}
+function toggleGPU(){showGPU=!showGPU;resize();}
+if(hasCPU){const ctrl=document.getElementById('controls');const b1=document.createElement('button');b1.textContent='Toggle CPU';b1.onclick=toggleCPU;ctrl.insertBefore(b1,ctrl.firstChild);const b2=document.createElement('button');b2.textContent='Toggle GPU';b2.onclick=toggleGPU;ctrl.insertBefore(b2,ctrl.children[1]);}
 const tb=document.querySelector('#gpu-tbl tbody');const data=S.gpu_hw||[];
 if(data.length){tb.innerHTML=data.map(function(d){return'<tr><td>'+d.name+'</td><td class="r">'+(d.total_ms>=1?d.total_ms.toFixed(1):d.total_ms.toFixed(2))+' ms</td><td class="r">'+d.count+'x</td><td class="r">'+(d.avg_ms>=1?d.avg_ms.toFixed(2):d.avg_ms.toFixed(3))+' ms</td><td class="r">'+d.pct.toFixed(1)+'%</td><td><div class="bar" style="width:'+Math.max(d.pct,1)+'%;background:'+oc(d.name)+'"></div></td></tr>';}).join('');}
+if(cpuSum.length){document.getElementById('cpu-panel').style.display='';const ct=document.querySelector('#cpu-tbl tbody');ct.innerHTML=cpuSum.map(function(d){return'<tr><td>'+d.name+'</td><td class="r">'+(d.total_ms>=1?d.total_ms.toFixed(1):d.total_ms.toFixed(2))+' ms</td><td class="r">'+d.count+'x</td><td class="r">'+(d.avg_ms>=1?d.avg_ms.toFixed(2):d.avg_ms.toFixed(3))+' ms</td><td class="r">'+d.pct.toFixed(1)+'%</td><td><div class="bar" style="width:'+Math.max(d.pct,1)+'%;background:#bb9af7"></div></td></tr>';}).join('');}
 addEventListener('resize',resize);resize();
 </script></body></html>)TMPL";
 
@@ -241,6 +307,10 @@ addEventListener('resize',resize);resize();
     replaceAll(html, "{{GPU_HW_EVENTS}}", eventsToJson(gpuHwEvents));
     replaceAll(html, "{{STEPS}}", eventsToJson(steps));
     replaceAll(html, "{{SUMMARY}}", summaryJson.str());
+    replaceAll(html, "{{CPU_EVENTS}}", cpuEventsJson);
+    replaceAll(html, "{{CPU_SUMMARY}}", cpuSummaryJson);
+    snprintf(buf, sizeof(buf), "%d", maxCpuDepth);
+    replaceAll(html, "{{MAX_CPU_DEPTH}}", buf);
 
     std::ofstream out(outputPath);
     if (!out) {

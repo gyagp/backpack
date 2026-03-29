@@ -1719,3 +1719,77 @@ REGISTER_OP(Pad, opPad)
 REGISTER_OP(Split, opSplit)
 REGISTER_OP(ScatterND, opScatterND)
 REGISTER_OP(Mod, opMod)
+
+// ─── Concat2D: Flat GPU concatenation of two buffers ─────────────────────────
+// Out = [A; B]. Simple 1D concat via compute shader.
+
+static void opConcat2D(GraphExecutor& ex, const OnnxGraphNode& n,
+                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* A = in[0];
+    auto* B = in[1];
+    if (!A || !A->IsValid() || !B || !B->IsValid()) return;
+
+    TensorDtype dtype = A->dtype;
+    if (dtype != TensorDtype::Float16) dtype = TensorDtype::Float32;
+    ex.EnsureGpu(*A);
+    ex.EnsureGpu(*B);
+
+    int64_t N_a = tensorNel(A);
+    int64_t N_b = tensorNel(B);
+    int64_t N_total = N_a + N_b;
+
+    *out[0] = ex.AllocTensor({N_total}, dtype);
+
+    uint32_t params[4] = {(uint32_t)N_a, (uint32_t)N_total, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "concat_2d" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
+        return instantiateTemplate(WGSL_CONCAT_2D_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N_total + 255) / 256), 1, 1, "concat_2d"}});
+}
+
+REGISTER_OP(Concat2D, opConcat2D)
+
+// ─── SplitCopy: GPU slice-copy without host readback ─────────────────────────
+// Dst = Src[offset:offset+N].
+
+static void opSplitCopy(GraphExecutor& ex, const OnnxGraphNode& n,
+                         const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* Src = in[0];
+    if (!Src || !Src->IsValid()) return;
+
+    TensorDtype dtype = Src->dtype;
+    if (dtype != TensorDtype::Float16) dtype = TensorDtype::Float32;
+    ex.EnsureGpu(*Src);
+
+    int64_t offset = n.GetInt("offset", 0);
+    int64_t count = n.GetInt("count", 0);
+    if (count <= 0) {
+        // Infer from output shape if available
+        count = tensorNel(out[0]);
+        if (count <= 0) count = tensorNel(Src) - offset;
+    }
+
+    *out[0] = ex.AllocTensor({count}, dtype);
+
+    uint32_t params[4] = {(uint32_t)offset, (uint32_t)count, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "split_copy" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+        return instantiateTemplate(WGSL_SPLIT_COPY_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, Src->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((count + 255) / 256), 1, 1, "split_copy"}});
+}
+
+REGISTER_OP(SplitCopy, opSplitCopy)

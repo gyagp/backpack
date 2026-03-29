@@ -140,6 +140,12 @@ struct GPUContext {
     /// Find a cached pipeline by name. Returns nullptr on cache miss.
     const CompiledPipeline* findPipeline(const std::string& name) const;
 
+    /// Pre-compile a batch of pipelines. Each spec is (name, wgsl, numBindings).
+    /// Compiles shaders in parallel using std::async, then creates pipelines serially.
+    /// Returns the number of newly compiled pipelines (already-cached ones are skipped).
+    int warmupPipelines(
+        const std::vector<std::tuple<std::string, std::string, uint32_t>>& specs);
+
     // --- Bind groups ---
     /// Create a bind group from a list of (binding_index, GPUBuffer) pairs.
     WGPUBindGroup createBindGroup(

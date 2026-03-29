@@ -84,6 +84,32 @@ struct Q8Repacked {
 
 Q8Repacked repack_q8_0(const void* raw_data, uint32_t N, uint32_t K);
 
+// ─── K-quant raw block data ─────────────────────────────────────────────────
+// Q4_K/Q5_K/Q6_K weights are uploaded as raw u32 words (no repacking needed).
+// The WGSL kernels read block data in-place.
+
+struct KQuantPacked {
+    std::vector<uint32_t> data;      // raw block data as u32 words
+    uint32_t N, K;                   // output rows, input cols
+    uint32_t rowStrideWords;         // words per row (padded to alignment)
+    uint32_t nBlocks;                // blocks per row
+};
+
+/// Pack Q4_K raw data (144-byte blocks) for GPU upload.
+/// raw_data: pointer to N rows of Q4_K blocks; K = elements per row.
+KQuantPacked pack_q4k(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Pack Q5_K raw data (176-byte blocks) for GPU upload.
+KQuantPacked pack_q5k(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Pack Q6_K raw data (210-byte blocks) for GPU upload.
+/// Pads row stride to 4-byte alignment since 210 is not word-aligned.
+KQuantPacked pack_q6k(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Dequantize K-quant block data to fp32 for CPU-side use (e.g., embedding lookup).
+/// Supports Q4_K, Q5_K, Q6_K. Returns N*K floats.
+void dequant_kquant(const void* raw_data, float* out, uint32_t N, uint32_t K, GGUFType type);
+
 struct ModelConfig {
     std::string arch;
     uint32_t nLayer = 0;

@@ -1,7 +1,8 @@
 # C++ LLM Application
 #
 # End-to-end text generation using the Backpack public API (backpack.h).
-# Supports all architectures (Phi-4, Qwen, LLaMA, etc.) in GGUF and ONNX.
+# Supports all architectures (Phi-4, Qwen, LLaMA, etc.) in GGUF and ONNX,
+# plus non-standard architectures (LFM2 conv+MoE) via generic ONNX.
 #
 # ─── Build ────────────────────────────────────────────────────────────────
 #
@@ -25,14 +26,20 @@
 # Benchmark:
 #   ./Release/backpack_llm --model models/phi-4/ --benchmark
 #
+# Save baseline performance:
+#   ./Release/backpack_llm --model models/phi-4/ --save-baseline
+#   ./Release/backpack_llm --model models/phi-4/ --save-baseline results.json
+#
 # All options:
 #   --model <path>       Model path (GGUF file, GGUF dir, or ONNX dir)
 #   --prompt <text>      Raw text prompt
 #   --chat <message>     Chat message (auto-wrapped in ChatML template)
 #   --max-tokens <n>     Max tokens to generate (default: 100)
 #   --backend <name>     GPU backend: vulkan, d3d12, metal
+#   --format <fmt>       Force model format: gguf / onnx
 #   --benchmark          Run prefill+decode benchmark
 #   --profile            Enable GPU timestamp profiling
+#   --save-baseline [path]  Save benchmark to JSON (default: baseline.json)
 #
 # ─── API Quick Start ──────────────────────────────────────────────────────
 #

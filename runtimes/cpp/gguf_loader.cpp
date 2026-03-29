@@ -219,3 +219,199 @@ Q8Repacked repack_q8_0(const void* raw_data, uint32_t N, uint32_t K) {
 
     return result;
 }
+
+// ─── K-quant packing ────────────────────────────────────────────────────────
+
+KQuantPacked pack_q4k(const void* raw_data, uint32_t N, uint32_t K) {
+    KQuantPacked result;
+    result.N = N;
+    result.K = K;
+    const uint32_t QK_K = 256;
+    const uint32_t BLOCK_SIZE = 144;  // bytes per Q4_K block
+    const uint32_t BLOCK_WORDS = BLOCK_SIZE / 4;  // 36
+    result.nBlocks = (K + QK_K - 1) / QK_K;
+    result.rowStrideWords = result.nBlocks * BLOCK_WORDS;
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(raw_data);
+    uint64_t rowBytes = (uint64_t)result.nBlocks * BLOCK_SIZE;
+
+    result.data.resize((uint64_t)N * result.rowStrideWords);
+    for (uint32_t row = 0; row < N; row++) {
+        const uint8_t* rowSrc = src + row * rowBytes;
+        uint32_t* rowDst = result.data.data() + row * result.rowStrideWords;
+        memcpy(rowDst, rowSrc, rowBytes);
+    }
+    return result;
+}
+
+KQuantPacked pack_q5k(const void* raw_data, uint32_t N, uint32_t K) {
+    KQuantPacked result;
+    result.N = N;
+    result.K = K;
+    const uint32_t QK_K = 256;
+    const uint32_t BLOCK_SIZE = 176;  // bytes per Q5_K block
+    const uint32_t BLOCK_WORDS = BLOCK_SIZE / 4;  // 44
+    result.nBlocks = (K + QK_K - 1) / QK_K;
+    result.rowStrideWords = result.nBlocks * BLOCK_WORDS;
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(raw_data);
+    uint64_t rowBytes = (uint64_t)result.nBlocks * BLOCK_SIZE;
+
+    result.data.resize((uint64_t)N * result.rowStrideWords);
+    for (uint32_t row = 0; row < N; row++) {
+        const uint8_t* rowSrc = src + row * rowBytes;
+        uint32_t* rowDst = result.data.data() + row * result.rowStrideWords;
+        memcpy(rowDst, rowSrc, rowBytes);
+    }
+    return result;
+}
+
+KQuantPacked pack_q6k(const void* raw_data, uint32_t N, uint32_t K) {
+    KQuantPacked result;
+    result.N = N;
+    result.K = K;
+    const uint32_t QK_K = 256;
+    const uint32_t BLOCK_SIZE = 210;  // bytes per Q6_K block (not word-aligned!)
+    result.nBlocks = (K + QK_K - 1) / QK_K;
+    // Pad row stride to 4-byte alignment
+    uint32_t rowBytes = result.nBlocks * BLOCK_SIZE;
+    uint32_t rowBytesPadded = (rowBytes + 3) & ~3u;
+    result.rowStrideWords = rowBytesPadded / 4;
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(raw_data);
+
+    result.data.resize((uint64_t)N * result.rowStrideWords, 0);
+    for (uint32_t row = 0; row < N; row++) {
+        const uint8_t* rowSrc = src + (uint64_t)row * (uint64_t)result.nBlocks * BLOCK_SIZE;
+        uint8_t* rowDst = reinterpret_cast<uint8_t*>(result.data.data() + row * result.rowStrideWords);
+        memcpy(rowDst, rowSrc, rowBytes);
+    }
+    return result;
+}
+
+// ─── K-quant dequantization ─────────────────────────────────────────────────
+
+static float kq_fp16_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0)       f = (sign << 31) | (mant << 13);
+    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
+    else                f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    float v;
+    memcpy(&v, &f, sizeof(v));
+    return v;
+}
+
+void dequant_kquant(const void* raw_data, float* out, uint32_t N, uint32_t K, GGUFType type) {
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(raw_data);
+    const uint32_t QK_K = 256;
+    uint32_t nBlocks = K / QK_K;
+
+    if (type == GGUF_TYPE_Q4_K) {
+        const uint32_t BLOCK_SIZE = 144;
+        for (uint32_t row = 0; row < N; row++) {
+            for (uint32_t b = 0; b < nBlocks; b++) {
+                const uint8_t* blk = src + ((uint64_t)row * nBlocks + b) * BLOCK_SIZE;
+                uint16_t d_u16; memcpy(&d_u16, blk, 2);
+                uint16_t dmin_u16; memcpy(&dmin_u16, blk + 2, 2);
+                float d = kq_fp16_to_f32(d_u16);
+                float dmin = kq_fp16_to_f32(dmin_u16);
+                uint8_t scales[12];
+                memcpy(scales, blk + 4, 12);
+
+                for (uint32_t sb = 0; sb < 8; sb++) {
+                    uint32_t sc_u, mn_u;
+                    if (sb < 4) {
+                        sc_u = scales[sb] & 0x3F;
+                        mn_u = scales[sb + 4] & 0x3F;
+                    } else {
+                        uint32_t j = sb - 4;
+                        sc_u = (scales[j + 8] & 0x0F) | ((scales[j] >> 2) & 0x30);
+                        mn_u = (scales[j + 8] >> 4) | ((scales[j + 4] >> 2) & 0x30);
+                    }
+                    float sc = d * (float)sc_u;
+                    float mn = dmin * (float)mn_u;
+                    uint32_t g = sb / 2;
+                    bool hi = (sb & 1) == 1;
+                    for (uint32_t i = 0; i < 32; i++) {
+                        uint32_t kidx = b * QK_K + sb * 32 + i;
+                        if (kidx < K) {
+                            uint8_t qb = blk[16 + g * 32 + i];
+                            uint8_t q = hi ? ((qb >> 4) & 0x0F) : (qb & 0x0F);
+                            out[row * K + kidx] = sc * (float)q - mn;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (type == GGUF_TYPE_Q5_K) {
+        const uint32_t BLOCK_SIZE = 176;
+        for (uint32_t row = 0; row < N; row++) {
+            for (uint32_t b = 0; b < nBlocks; b++) {
+                const uint8_t* blk = src + ((uint64_t)row * nBlocks + b) * BLOCK_SIZE;
+                uint16_t d_u16; memcpy(&d_u16, blk, 2);
+                uint16_t dmin_u16; memcpy(&dmin_u16, blk + 2, 2);
+                float d = kq_fp16_to_f32(d_u16);
+                float dmin = kq_fp16_to_f32(dmin_u16);
+                uint8_t scales[12];
+                memcpy(scales, blk + 4, 12);
+
+                for (uint32_t sb = 0; sb < 8; sb++) {
+                    uint32_t sc_u, mn_u;
+                    if (sb < 4) {
+                        sc_u = scales[sb] & 0x3F;
+                        mn_u = scales[sb + 4] & 0x3F;
+                    } else {
+                        uint32_t j = sb - 4;
+                        sc_u = (scales[j + 8] & 0x0F) | ((scales[j] >> 2) & 0x30);
+                        mn_u = (scales[j + 8] >> 4) | ((scales[j + 4] >> 2) & 0x30);
+                    }
+                    float sc = d * (float)sc_u;
+                    float mn = dmin * (float)mn_u;
+                    uint32_t g = sb / 2;
+                    bool hi = (sb & 1) == 1;
+                    for (uint32_t i = 0; i < 32; i++) {
+                        uint32_t kidx = b * QK_K + sb * 32 + i;
+                        if (kidx < K) {
+                            uint8_t qb = blk[48 + g * 32 + i];
+                            uint8_t q_lo = hi ? ((qb >> 4) & 0x0F) : (qb & 0x0F);
+                            uint8_t qh_byte = blk[16 + i];
+                            uint8_t q_hi = (qh_byte >> sb) & 1;
+                            uint8_t q = q_lo | (q_hi << 4);
+                            out[row * K + kidx] = sc * (float)q - mn;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (type == GGUF_TYPE_Q6_K) {
+        const uint32_t BLOCK_SIZE = 210;
+        for (uint32_t row = 0; row < N; row++) {
+            for (uint32_t b = 0; b < nBlocks; b++) {
+                const uint8_t* blk = src + ((uint64_t)row * nBlocks + b) * BLOCK_SIZE;
+                uint16_t d_u16; memcpy(&d_u16, blk, 2);
+                float d = kq_fp16_to_f32(d_u16);
+
+                for (uint32_t sb = 0; sb < 8; sb++) {
+                    int8_t sc_i8 = (int8_t)blk[194 + sb];
+                    float sc = (float)sc_i8;
+                    for (uint32_t i = 0; i < 32; i++) {
+                        uint32_t kidx = b * QK_K + sb * 32 + i;
+                        if (kidx < K) {
+                            uint32_t ql_idx = sb * 32 + i;
+                            uint8_t ql_byte = blk[2 + ql_idx / 2];
+                            uint8_t ql = (ql_idx & 1) ? ((ql_byte >> 4) & 0x0F) : (ql_byte & 0x0F);
+                            uint8_t qh_byte = blk[130 + (sb * 32 + i) / 4];
+                            uint32_t qh_shift = ((sb * 32 + i) % 4) * 2;
+                            uint8_t qh = (qh_byte >> qh_shift) & 0x03;
+                            int q6 = (int)(ql | (qh << 4)) - 32;
+                            out[row * K + kidx] = d * sc * (float)q6;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

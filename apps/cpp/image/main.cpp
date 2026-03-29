@@ -19,6 +19,9 @@
 // Internal headers for tokenizer (shared with LLM app)
 #include "onnx_tokenizer.h"
 
+// Shared app utilities
+#include "../common/app_common.h"
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -74,18 +77,7 @@ static void printTensorStats(const char* label, const std::vector<float>& data) 
            label, minV, maxV, avg, nanCount, data.size());
 }
 
-static float fp16ToFloat(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1;
-    uint32_t exp = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    uint32_t f;
-    if (exp == 0) f = (sign << 31) | (mant << 13);
-    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
-    else f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-    float v;
-    memcpy(&v, &f, sizeof(v));
-    return v;
-}
+// app::fp16ToFloat: use app::app::fp16ToFloat from app_common.h
 
 static void printRuntimeTensorStats(const char* label, bp::Tensor& tensor) {
     auto shape = tensor.GetShape();
@@ -98,7 +90,7 @@ static void printRuntimeTensorStats(const char* label, bp::Tensor& tensor) {
     } else {
         std::vector<uint16_t> fp16((size_t)count);
         tensor.GetData(fp16.data(), fp16.size() * sizeof(uint16_t));
-        for (int64_t i = 0; i < count; i++) values[(size_t)i] = fp16ToFloat(fp16[(size_t)i]);
+        for (int64_t i = 0; i < count; i++) values[(size_t)i] = app::fp16ToFloat(fp16[(size_t)i]);
     }
     printTensorStats(label, values);
 }
@@ -179,13 +171,7 @@ static void scaleTransformerInput(const std::vector<float>& latents,
     }
 }
 
-static std::string applyQwenUserChatTemplate(const std::string& prompt) {
-    // Match the Qwen3 chat template path used by the diffusers reference for
-    // a plain user message with add_generation_prompt=True and enable_thinking=True.
-    return std::string("<|im_start|>user\n") +
-           prompt +
-           "<|im_end|>\n<|im_start|>assistant\n";
-}
+// Chat template: use app::applyChatTemplate from app_common.h
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -238,15 +224,10 @@ int main(int argc, char* argv[]) {
 
     // ─── 1. Create device ────────────────────────────────────────────────
 
-    bp::Backend backend = bp::Backend::Default;
-    if (backendStr == "d3d12")       backend = bp::Backend::D3D12;
-    else if (backendStr == "vulkan") backend = bp::Backend::Vulkan;
-    else if (backendStr == "metal")  backend = bp::Backend::Metal;
-
-    auto device = bp::Device::Create(backend);
+    auto device = app::createDevice(backendStr);
     if (!device.IsValid()) { fprintf(stderr, "GPU init failed\n"); return 1; }
-    printf("GPU: %s (%s)\n\n", device.GetName().c_str(),
-           device.GetBackendName().c_str());
+    app::printGpuInfo(device);
+    printf("\n");
 
     // ─── 2. Load models ──────────────────────────────────────────────────
 
@@ -269,7 +250,7 @@ int main(int argc, char* argv[]) {
 
     auto encodePromptHidden = [&](const std::string& promptText,
                                   bool printDebugStats) -> std::pair<bp::Tensor, int> {
-        std::string chatPrompt = applyQwenUserChatTemplate(promptText);
+        std::string chatPrompt = app::applyChatTemplate(promptText, "");
         auto inputIds = tokenizer.encode(chatPrompt);
         int seqLen = (int)inputIds.size();
 
@@ -699,7 +680,7 @@ int main(int argc, char* argv[]) {
             } else {
                 std::vector<uint16_t> debugNoisePreCastFp16(latentSize);
                 noisePredPreCastTensor.GetData(debugNoisePreCastFp16.data(), latentSize * sizeof(uint16_t));
-                for (int i = 0; i < latentSize; i++) debugNoisePreCast[i] = fp16ToFloat(debugNoisePreCastFp16[i]);
+                for (int i = 0; i < latentSize; i++) debugNoisePreCast[i] = app::fp16ToFloat(debugNoisePreCastFp16[i]);
             }
             char noisePreLabel[64];
             snprintf(noisePreLabel, sizeof(noisePreLabel), "Noise pre-cast step %d", step + 1);
@@ -719,7 +700,7 @@ int main(int argc, char* argv[]) {
                         std::vector<uint16_t> fp16Data((size_t)sliceCount);
                         noisePredSliceTensor.GetData(fp16Data.data(), fp16Data.size() * sizeof(uint16_t));
                         sliceData.resize((size_t)sliceCount);
-                        for (int64_t i = 0; i < sliceCount; i++) sliceData[(size_t)i] = fp16ToFloat(fp16Data[(size_t)i]);
+                        for (int64_t i = 0; i < sliceCount; i++) sliceData[(size_t)i] = app::fp16ToFloat(fp16Data[(size_t)i]);
                     }
                     auto dumpDir = fs::path(outputPath).parent_path();
                     auto dumpSlice = dumpDir / "debug_slice4.bin";

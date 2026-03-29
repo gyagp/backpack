@@ -162,6 +162,26 @@ static size_t warmupGraphPipelines(GraphExecutor& ex) {
         warmT("gather_elements_f32", WGSL_GATHER_ELEMENTS_T, 4, TensorDtype::Float32);
     if (has("ScatterElements"))
         warmT("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_T, 5, TensorDtype::Float32);
+    if (has("LinearMxfp4"))
+        warmRaw("mxfp4_matmul", WGSL_MXFP4_MATMUL, 6);
+    if (has("GptOssGate"))
+        warmT("gptoss_gate_f32", WGSL_GPTOSS_GATE_T, 3, TensorDtype::Float32);
+    if (has("GQAAttnSink"))
+        warmRaw("gqa_decode_attn_sink", WGSL_GQA_DECODE_ATTN_SINK, 6);
+    if (has("GeluMul"))
+        warmT("gelu_mul_f32", WGSL_GELU_MUL_T, 4, TensorDtype::Float32);
+    if (has("AddScaled"))
+        warmT("add_scaled_f32", WGSL_ADD_SCALED_T, 3, TensorDtype::Float32);
+    if (has("ModScaleShift"))
+        warmT("mod_scale_shift_f32", WGSL_MOD_SCALE_SHIFT_T, 5, TensorDtype::Float32);
+    if (has("GateResidualAdd"))
+        warmT("gate_residual_add_f32", WGSL_GATE_RESIDUAL_ADD_T, 4, TensorDtype::Float32);
+    if (has("SigmoidGateInterleaved"))
+        warmT("sigmoid_gate_interleaved_f32", WGSL_SIGMOID_GATE_INTERLEAVED_T, 3, TensorDtype::Float32);
+    if (has("Concat2D"))
+        warmT("concat_2d_f32", WGSL_CONCAT_2D_T, 4, TensorDtype::Float32);
+    if (has("SplitCopy"))
+        warmT("split_copy_f32", WGSL_SPLIT_COPY_T, 3, TensorDtype::Float32);
 
     return warmed.size();
 }
@@ -1016,7 +1036,7 @@ void GraphExecutor::ReplayWrites() {
     }
 }
 
-void GraphExecutor::ReplayDispatches() {
+void GraphExecutor::ReplayDispatches(bool skipFence) {
     if (capturedFlushes_.empty()) return;
     fastDecodeState_ = FastDecodeState::Replaying;
 
@@ -1068,7 +1088,7 @@ void GraphExecutor::ReplayDispatches() {
     }
 
     // Readback copy (logits → readback buffer) in its own CB
-    if (readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
+    if (!skipFence && readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
         WGPUCommandEncoderDescriptor enD{};
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
         wgpuCommandEncoderCopyBufferToBuffer(enc,
@@ -1082,7 +1102,7 @@ void GraphExecutor::ReplayDispatches() {
         readbackSize_ = 0;
         readbackSrc_ = {}; readbackDst_ = {};
     }
-    gpu->waitForQueue();
+    if (!skipFence) gpu->waitForQueue();
     fastDecodeState_ = FastDecodeState::Off;
 }
 
@@ -1138,7 +1158,7 @@ void GraphExecutor::flushToEncoder() {
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
 
-    // Encode dispatches — separate compute passes for correct resource barriers
+    // Encode dispatches
     if (!pendingDispatches_.empty()) {
         if (gpuProfiler && gpuProfiler->enabled()) {
             for (auto& d : pendingDispatches_) {
@@ -1154,15 +1174,17 @@ void GraphExecutor::flushToEncoder() {
                 wgpuComputePassEncoderRelease(pass);
             }
         } else {
+            // Single compute pass for all dispatches — avoids per-dispatch
+            // resource barriers (D3D12) and reduces CB encoding overhead.
+            WGPUComputePassDescriptor cpD{};
+            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
             for (auto& d : pendingDispatches_) {
-                WGPUComputePassDescriptor cpD{};
-                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
                 wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
                 wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
-                wgpuComputePassEncoderEnd(pass);
-                wgpuComputePassEncoderRelease(pass);
             }
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
         }
     }
     // Encode copies
@@ -1273,13 +1295,38 @@ void GraphExecutor::Execute(
     }
 
     // Bind graph inputs into tensor store
-    // Clear stale intermediate tensors from any previous Execute() call.
-    // Persistent entries (initializers + pre-store constants) are preserved.
-    for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-        if (persistentTensors_.count(it->first))
-            ++it;
-        else
-            it = tensorStore_.erase(it);
+    // With tensor plan: reuse intermediate buffers from previous Execute().
+    // Without: clear stale intermediates (persistent entries preserved).
+    if (tensorPlanValid_) {
+        // Tensor plan active: restore planned intermediate buffers instead of erasing.
+        // First, remove non-persistent, non-planned entries.
+        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+            if (persistentTensors_.count(it->first) || tensorPlan_.count(it->first))
+                ++it;
+            else
+                it = tensorStore_.erase(it);
+        }
+        // Restore planned buffers (shape/dtype will be updated by ops)
+        for (auto& [name, alloc] : tensorPlan_) {
+            auto& t = tensorStore_[name];
+            t.buffer = alloc.buffer;
+            t.shape = alloc.shape;
+            t.dtype = alloc.dtype;
+            t.cpuData.clear();
+            t.isCpuOnly = false;
+        }
+    } else {
+        // First Execute or plan invalidated: clear intermediates normally
+        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+            if (persistentTensors_.count(it->first))
+                ++it;
+            else
+                it = tensorStore_.erase(it);
+        }
+        // Start populating tensor plan and shape cache
+        shapeCachePopulating_ = true;
+        tensorPlan_.clear();
+        nodeShapeCache_.clear();
     }
 
 
@@ -1581,30 +1628,62 @@ void GraphExecutor::Execute(
             }
 
             // Cache small int outputs to CPU for downstream metadata ops.
-            // Skip for ops whose int outputs are consumed purely by GPU kernels.
+            // With shape cache: inject cached cpuData instead of GPU readback.
             {
                 bool isCpuIntConsumer = true;
-                // TopK indices go to GPU GatherElements/ScatterElements — skip readback
                 if (node.opType == "TopK") isCpuIntConsumer = false;
 
                 if (isCpuIntConsumer) {
-                    bool flushed = false;
-                    for (auto* outTensor : outTensors) {
-                        if (!outTensor || !outTensor->buffer.handle || !outTensor->cpuData.empty()) continue;
+                    for (size_t oi = 0; oi < outTensors.size() && oi < node.outputs.size(); oi++) {
+                        auto* outTensor = outTensors[oi];
+                        if (!outTensor || node.outputs[oi].empty()) continue;
                         if (outTensor->dtype != TensorDtype::Int64 && outTensor->dtype != TensorDtype::Int32) continue;
+                        if (!outTensor->cpuData.empty()) continue;
                         int64_t nel = outTensor->ElementCount();
                         if (nel <= 0 || nel > 1024) continue;
-                        if (!flushed) {
-                            FlushPendingWork();
-                            flushed = true;
-                            intReadbackSyncs_++;
+
+                        if (shapeCacheValid_ && !shapeCachePopulating_) {
+                            // Use cached CPU data — skip GPU readback entirely
+                            auto cIt = nodeShapeCache_.find(node.outputs[oi]);
+                            if (cIt != nodeShapeCache_.end() && cIt->second.hasCpuData) {
+                                outTensor->cpuData = cIt->second.cpuData;
+                                continue;
+                            }
                         }
+
+                        // Cold path: read from GPU (first Execute or cache miss)
+                        if (!outTensor->buffer.handle) continue;
+                        FlushPendingWork();
+                        intReadbackSyncs_++;
                         size_t bytes = (size_t)nel * outTensor->DtypeSize();
                         auto rb = gpu->readBuffer(outTensor->buffer, bytes);
                         if (rb.size() >= bytes) {
                             outTensor->cpuData.resize(bytes);
                             memcpy(outTensor->cpuData.data(), rb.data(), bytes);
                         }
+
+                        // Populate shape cache
+                        if (shapeCachePopulating_) {
+                            auto& cached = nodeShapeCache_[node.outputs[oi]];
+                            cached.shape = outTensor->shape;
+                            cached.dtype = outTensor->dtype;
+                            cached.cpuData = outTensor->cpuData;
+                            cached.hasCpuData = true;
+                        }
+                    }
+                }
+
+                // Also cache non-int output shapes/dtypes for tensor plan
+                if (shapeCachePopulating_) {
+                    for (size_t oi = 0; oi < outTensors.size() && oi < node.outputs.size(); oi++) {
+                        auto* outTensor = outTensors[oi];
+                        if (!outTensor || node.outputs[oi].empty()) continue;
+                        if (!outTensor->IsValid()) continue;
+                        if (nodeShapeCache_.count(node.outputs[oi])) continue;
+                        auto& cached = nodeShapeCache_[node.outputs[oi]];
+                        cached.shape = outTensor->shape;
+                        cached.dtype = outTensor->dtype;
+                        cached.hasCpuData = false;
                     }
                 }
             }
@@ -1714,30 +1793,78 @@ void GraphExecutor::Execute(
 
     // Release non-output, non-persistent intermediate buffers
     // (GPU work is done, safe to free)
+    // With tensor plan: keep buffers alive for reuse. Without: release normally.
     // In fast decode capture, keep ALL buffers alive — they're referenced by captured bind groups.
     if (fastDecodeState_ != FastDecodeState::Capturing) {
-        std::set<WGPUBuffer> keepHandles;
-        for (auto& [name, tensor] : outputs)
-            if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
-        for (auto& name : persistentTensors_) {
-            auto it = tensorStore_.find(name);
-            if (it != tensorStore_.end() && it->second.buffer.handle)
-                keepHandles.insert(it->second.buffer.handle);
-        }
+        if (tensorPlanValid_) {
+            // Tensor plan active: DON'T release planned buffers — they'll be reused.
+            // Just clear non-persistent, non-planned entries from tensorStore_.
+            for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+                if (persistentTensors_.count(it->first) || tensorPlan_.count(it->first))
+                    ++it;
+                else
+                    it = tensorStore_.erase(it);
+            }
+        } else if (shapeCachePopulating_) {
+            // First Execute: record the tensor plan, then keep buffers alive.
+            std::set<WGPUBuffer> keepHandles;
+            for (auto& [name, tensor] : outputs)
+                if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
+            for (auto& name : persistentTensors_) {
+                auto it = tensorStore_.find(name);
+                if (it != tensorStore_.end() && it->second.buffer.handle)
+                    keepHandles.insert(it->second.buffer.handle);
+            }
 
-        std::set<WGPUBuffer> released;
-        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-            if (persistentTensors_.count(it->first)) {
-                ++it;
-                continue;
+            // Record non-persistent intermediate buffers into tensor plan
+            for (auto& [name, tensor] : tensorStore_) {
+                if (persistentTensors_.count(name)) continue;
+                if (!tensor.buffer.handle) continue;
+                if (keepHandles.count(tensor.buffer.handle)) continue;
+                tensorPlan_[name] = {tensor.buffer, tensor.buffer.size,
+                                     tensor.shape, tensor.dtype};
             }
-            if (it->second.buffer.handle &&
-                keepHandles.find(it->second.buffer.handle) == keepHandles.end() &&
-                released.find(it->second.buffer.handle) == released.end()) {
-                released.insert(it->second.buffer.handle);
-                gpu->releaseBuffer(it->second.buffer);
+
+            // Mark caches as valid for next Execute
+            shapeCacheValid_ = true;
+            shapeCachePopulating_ = false;
+            tensorPlanValid_ = true;
+
+            fprintf(stderr, "  [warm-exec] shape cache: %zu entries, tensor plan: %zu buffers\n",
+                    nodeShapeCache_.size(), tensorPlan_.size());
+
+            // Don't release any buffers — keep them for reuse
+            for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+                if (persistentTensors_.count(it->first) || tensorPlan_.count(it->first))
+                    ++it;
+                else
+                    it = tensorStore_.erase(it);
             }
-            it = tensorStore_.erase(it);
+        } else {
+            // No tensor plan, not populating: normal cleanup
+            std::set<WGPUBuffer> keepHandles;
+            for (auto& [name, tensor] : outputs)
+                if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
+            for (auto& name : persistentTensors_) {
+                auto it = tensorStore_.find(name);
+                if (it != tensorStore_.end() && it->second.buffer.handle)
+                    keepHandles.insert(it->second.buffer.handle);
+            }
+
+            std::set<WGPUBuffer> released;
+            for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
+                if (persistentTensors_.count(it->first)) {
+                    ++it;
+                    continue;
+                }
+                if (it->second.buffer.handle &&
+                    keepHandles.find(it->second.buffer.handle) == keepHandles.end() &&
+                    released.find(it->second.buffer.handle) == released.end()) {
+                    released.insert(it->second.buffer.handle);
+                    gpu->releaseBuffer(it->second.buffer);
+                }
+                it = tensorStore_.erase(it);
+            }
         }
     } else {
         // Capture mode: just erase tensor store entries but DON'T release buffers

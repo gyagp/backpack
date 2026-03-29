@@ -284,6 +284,12 @@ public:
         return graph_.initializers.count(name) > 0;
     }
 
+    /// Access a tensor by name (weights, intermediates, etc.).
+    GpuTensor* GetTensor(const std::string& name) {
+        auto it = tensorStore_.find(name);
+        return (it != tensorStore_.end()) ? &it->second : nullptr;
+    }
+
 private:
     // Tensor store: all intermediate and initializer tensors by name
     // Using std::map for pointer stability (unordered_map rehashes invalidate references)
@@ -430,10 +436,31 @@ public:
     void ReplayWrites();
 
     /// Phase 2: encode+submit captured dispatches.
-    void ReplayDispatches();
+    /// If skipFence=true, don't wait for GPU completion (for pipelining multiple replays).
+    void ReplayDispatches(bool skipFence = false);
 
     /// Release captured bind groups and clear state.
     void ReleaseCaptured();
+
+    /// Invalidate warm execute caches (shape cache + tensor plan).
+    /// Call when external buffers (KV cache, conv cache) are recreated.
+    void InvalidateWarmCaches() {
+        if (tensorPlanValid_) {
+            // Release tensor plan buffers
+            std::set<WGPUBuffer> released;
+            for (auto& [name, alloc] : tensorPlan_) {
+                if (alloc.buffer.handle && released.find(alloc.buffer.handle) == released.end()) {
+                    released.insert(alloc.buffer.handle);
+                    gpu->releaseBuffer(alloc.buffer);
+                }
+            }
+            tensorPlan_.clear();
+        }
+        tensorPlanValid_ = false;
+        shapeCacheValid_ = false;
+        shapeCachePopulating_ = false;
+        nodeShapeCache_.clear();
+    }
 
     // Temporary storage for bind group entries during capture
     std::vector<Dispatch::BindEntry> lastCapturedBindings_;
@@ -477,6 +504,34 @@ public:
         int nextIdx = 0;
     };
     ParamPool paramPool_[PARAM_POOL_BUCKETS];
+
+    // ─── Shape Cache (Warm Execute) ─────────────────────────────────────
+    // After the first Execute() call, cache output shapes and small CPU
+    // data for each node. On subsequent calls with identical input shapes,
+    // skip GPU readbacks (FlushPendingWork) and use cached values.
+    struct CachedNodeOutput {
+        std::vector<int64_t> shape;
+        TensorDtype dtype;
+        std::vector<uint8_t> cpuData;  // small int data (avoids GPU readback)
+        bool hasCpuData = false;
+    };
+    // Key = output tensor name
+    std::unordered_map<std::string, CachedNodeOutput> nodeShapeCache_;
+    bool shapeCacheValid_ = false;
+    bool shapeCachePopulating_ = false;  // true during first Execute (recording)
+
+    // ─── Tensor Plan (Buffer Reuse) ──────────────────────────────────
+    // After the first Execute(), record intermediate buffer allocations.
+    // On subsequent calls, reuse existing GPU buffers instead of
+    // creating/destroying ~400 buffers per Execute().
+    struct TensorAlloc {
+        GPUBuffer buffer;
+        uint64_t size;
+        std::vector<int64_t> shape;
+        TensorDtype dtype;
+    };
+    std::unordered_map<std::string, TensorAlloc> tensorPlan_;
+    bool tensorPlanValid_ = false;
 
     // Profiling accumulators (per op-type, in ms)
     std::unordered_map<std::string, double> profileData_;

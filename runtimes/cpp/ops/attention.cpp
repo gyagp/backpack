@@ -215,29 +215,53 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
 
         if (cosCache->shape.size() >= 2) rotaryDim = cosCache->shape.back() * 2;
 
-        // RoPE on Q
-        uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
-                                   (uint32_t)rotaryDim, (uint32_t)posOffset};
-        auto rpBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
-        // Register for replay: posOffset is at byte offset 12 (params[3])
-        ex.RegisterReplayParam(rpBuf, 12, GraphExecutor::ReplayParamUpdate::PosOffset);
         auto& roPl = ex.GetPipelineT("rope_inplace", 4, []() { return instantiateTemplate(WGSL_ROPE_INPLACE_T, TensorDtype::Float32); });
-        auto roBg = ex.MakeBindGroup(roPl, {
-            {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
-        ex.QueueDispatch(roPl.pipeline, roBg,
-            (uint32_t)((num_heads + 63) / 64), 1, 1, "rope_q");
 
-        // RoPE on K
-        ropeParams[0] = (uint32_t)kv_heads;
-        auto rpBufK = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
-        // Register for replay: posOffset is at byte offset 12 (params[3])
-        ex.RegisterReplayParam(rpBufK, 12, GraphExecutor::ReplayParamUpdate::PosOffset);
-        auto roBgK = ex.MakeBindGroup(roPl, {
-            {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
-        ex.QueueDispatch(roPl.pipeline, roBgK,
-            (uint32_t)((kv_heads + 63) / 64), 1, 1, "rope_k");
+        if (seqQ > 1) {
+            // Batched RoPE: all T tokens at once
+            auto& roBatchPl = ex.GetPipelineT("rope_inplace_batched", 4, []() {
+                return std::string(WGSL_ROPE_INPLACE_BATCHED);
+            });
+
+            // RoPE on Q for all tokens
+            uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
+                                       (uint32_t)rotaryDim, (uint32_t)posOffset};
+            auto rpBuf = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
+            auto roBg = ex.MakeBindGroup(roBatchPl, {
+                {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
+            ex.QueueDispatch(roBatchPl.pipeline, roBg,
+                (uint32_t)((num_heads + 63) / 64), (uint32_t)seqQ, 1, "rope_q_b");
+
+            // RoPE on K for all tokens
+            ropeParams[0] = (uint32_t)kv_heads;
+            auto rpBufK = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
+            auto roBgK = ex.MakeBindGroup(roBatchPl, {
+                {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
+            ex.QueueDispatch(roBatchPl.pipeline, roBgK,
+                (uint32_t)((kv_heads + 63) / 64), (uint32_t)seqQ, 1, "rope_k_b");
+        } else {
+            // Single-token RoPE (decode path)
+            uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
+                                       (uint32_t)rotaryDim, (uint32_t)posOffset};
+            auto rpBuf = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
+            ex.RegisterReplayParam(rpBuf, 12, GraphExecutor::ReplayParamUpdate::PosOffset);
+            auto roBg = ex.MakeBindGroup(roPl, {
+                {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
+            ex.QueueDispatch(roPl.pipeline, roBg,
+                (uint32_t)((num_heads + 63) / 64), 1, 1, "rope_q");
+
+            ropeParams[0] = (uint32_t)kv_heads;
+            auto rpBufK = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
+            ex.RegisterReplayParam(rpBufK, 12, GraphExecutor::ReplayParamUpdate::PosOffset);
+            auto roBgK = ex.MakeBindGroup(roPl, {
+                {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
+            ex.QueueDispatch(roPl.pipeline, roBgK,
+                (uint32_t)((kv_heads + 63) / 64), 1, 1, "rope_k");
+        }
     }
 
     // Build present KV on GPU: append new K/V to past cache
@@ -268,24 +292,47 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         presentVal.dtype = TensorDtype::Float32;
         presentVal.buffer = pastVal->buffer;
 
-        // Write new K/V at position pastSeq (only 1 token, no copy of past data)
-        uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
-                                 (uint32_t)pastSeq, (uint32_t)maxSeq};
-        auto kvpBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
-        // Register for replay: pastSeq is at byte offset 8 (params[2])
-        ex.RegisterReplayParam(kvpBuf, 8, GraphExecutor::ReplayParamUpdate::PastSeq);
-
+        // Write new K/V at positions [pastSeq, pastSeq+seqQ)
         auto& kvPl = ex.GetPipelineT("kv_cache_write", 3, []() { return instantiateTemplate(WGSL_KV_CACHE_WRITE_T, TensorDtype::Float32); });
-        auto kvBgK = ex.MakeBindGroup(kvPl, {
-            {0, K->buffer}, {1, presentKey.buffer}, {2, kvpBuf}});
-        ex.QueueDispatch(kvPl.pipeline, kvBgK,
-            (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_write_k");
 
-        auto kvBgV = ex.MakeBindGroup(kvPl, {
-            {0, V->buffer}, {1, presentVal.buffer}, {2, kvpBuf}});
-        ex.QueueDispatch(kvPl.pipeline, kvBgV,
-            (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_write_v");
+        if (seqQ > 1) {
+            // Batched KV write: all T tokens at once
+            auto& kvBatchPl = ex.GetPipelineT("kv_cache_write_batched", 3, []() {
+                return std::string(WGSL_KV_CACHE_WRITE_BATCHED);
+            });
+
+            uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
+                                     (uint32_t)pastSeq, (uint32_t)maxSeq};
+            auto kvpBuf = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
+
+            auto kvBgK = ex.MakeBindGroup(kvBatchPl, {
+                {0, K->buffer}, {1, presentKey.buffer}, {2, kvpBuf}});
+            ex.QueueDispatch(kvBatchPl.pipeline, kvBgK,
+                (uint32_t)((kv_heads * head_dim + 255) / 256), (uint32_t)seqQ, 1, "kv_write_k_b");
+
+            auto kvBgV = ex.MakeBindGroup(kvBatchPl, {
+                {0, V->buffer}, {1, presentVal.buffer}, {2, kvpBuf}});
+            ex.QueueDispatch(kvBatchPl.pipeline, kvBgV,
+                (uint32_t)((kv_heads * head_dim + 255) / 256), (uint32_t)seqQ, 1, "kv_write_v_b");
+        } else {
+            // Single-token KV write (decode path)
+            uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
+                                     (uint32_t)pastSeq, (uint32_t)maxSeq};
+            auto kvpBuf = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
+            ex.RegisterReplayParam(kvpBuf, 8, GraphExecutor::ReplayParamUpdate::PastSeq);
+
+            auto kvBgK = ex.MakeBindGroup(kvPl, {
+                {0, K->buffer}, {1, presentKey.buffer}, {2, kvpBuf}});
+            ex.QueueDispatch(kvPl.pipeline, kvBgK,
+                (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_write_k");
+
+            auto kvBgV = ex.MakeBindGroup(kvPl, {
+                {0, V->buffer}, {1, presentVal.buffer}, {2, kvpBuf}});
+            ex.QueueDispatch(kvPl.pipeline, kvBgV,
+                (uint32_t)((kv_heads * head_dim + 255) / 256), 1, 1, "kv_write_v");
+        }
     } else {
         // Dynamic mode: allocate new buffer and copy past + append new
         presentKey = ex.AllocTensor({batch, kv_heads, totalSeq, head_dim}, TensorDtype::Float32);
@@ -329,21 +376,41 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
 
     {
         uint32_t scale_u32; memcpy(&scale_u32, &scale, 4);
-        // For static KV cache, gqa_decode reads with maxSeq stride
-        uint32_t attnParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
-                                   (uint32_t)totalSeq, (uint32_t)kv_heads,
-                                   scale_u32, (uint32_t)maxSeq, 0, 0};
-        auto apBuf = ex.getParamBuffer(32);
-        ex.gpu->writeBuffer(apBuf, attnParams, 32);
-        // Register for replay: totalSeq is at byte offset 8 (params[2])
-        ex.RegisterReplayParam(apBuf, 8, GraphExecutor::ReplayParamUpdate::TotalSeq);
 
-        auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return instantiateTemplate(WGSL_GQA_DECODE_T, TensorDtype::Float32); });
-        auto attnBg = ex.MakeBindGroup(attnPl, {
-            {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
-            {3, out[0]->buffer}, {4, apBuf}});
-        ex.QueueDispatch(attnPl.pipeline, attnBg,
-            1, (uint32_t)num_heads, 1, "gqa_decode");
+        if (seqQ > 1) {
+            // Batched prefill: single dispatch for all T query tokens
+            auto& prefillPl = ex.GetPipelineT("gqa_prefill", 5, []() {
+                return std::string(WGSL_GQA_PREFILL);
+            });
+
+            uint32_t prefillParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
+                                          (uint32_t)pastSeq, (uint32_t)kv_heads,
+                                          scale_u32, (uint32_t)maxSeq, (uint32_t)seqQ, 0};
+            auto ppBuf = ex.getParamBuffer(32);
+            ex.gpu->writeBuffer(ppBuf, prefillParams, 32);
+
+            auto prefillBg = ex.MakeBindGroup(prefillPl, {
+                {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
+                {3, out[0]->buffer}, {4, ppBuf}});
+            ex.QueueDispatch(prefillPl.pipeline, prefillBg,
+                (uint32_t)num_heads, (uint32_t)((seqQ + 3) / 4), 1, "gqa_prefill");
+        } else {
+            // Single-token decode path
+            auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return instantiateTemplate(WGSL_GQA_DECODE_T, TensorDtype::Float32); });
+
+            uint32_t attnParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
+                                       (uint32_t)totalSeq, (uint32_t)kv_heads,
+                                       scale_u32, (uint32_t)maxSeq, 0, 0};
+            auto apBuf = ex.getParamBuffer(32);
+            ex.gpu->writeBuffer(apBuf, attnParams, 32);
+            ex.RegisterReplayParam(apBuf, 8, GraphExecutor::ReplayParamUpdate::TotalSeq);
+
+            auto attnBg = ex.MakeBindGroup(attnPl, {
+                {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
+                {3, out[0]->buffer}, {4, apBuf}});
+            ex.QueueDispatch(attnPl.pipeline, attnBg,
+                1, (uint32_t)num_heads, 1, "gqa_decode");
+        }
     }
 
     // Cast f32 attention output back to f16 if input was f16
@@ -519,3 +586,61 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
 REGISTER_OP(GroupQueryAttention, opGQA)
 REGISTER_OP(MultiHeadAttention, opMHA)
 REGISTER_OP(RotaryEmbedding, opRotaryEmbedding)
+
+// ─── GQA with Attention Sink + Sliding Window ──────────────────────────────
+// Custom op for models with attention sinks (learnable logits that absorb
+// probability mass) and sliding window attention.
+//
+// Inputs: Q (f32), K_cache (f32), V_cache (f32), Sinks (f32, per-head logits)
+// Attrs: num_heads, kv_heads, head_dim, kv_stride, kv_start, T_win
+//
+// KV cache management (circular buffer, eviction) must be handled by the
+// caller before dispatching this op.
+
+static void opGQAAttnSink(GraphExecutor& ex, const OnnxGraphNode& n,
+    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* Q_in = in[0];
+    auto* K_cache = in.size() > 1 ? in[1] : nullptr;
+    auto* V_cache = in.size() > 2 ? in[2] : nullptr;
+    auto* Sinks = in.size() > 3 ? in[3] : nullptr;
+
+    if (!Q_in || !K_cache || !V_cache || !Sinks ||
+        !Q_in->IsValid() || !K_cache->IsValid() || !V_cache->IsValid() || !Sinks->IsValid()) {
+        fprintf(stderr, "GQAAttnSink: missing inputs\n");
+        return;
+    }
+
+    ensureFloat32(ex, *Q_in);
+    ensureFloat32(ex, *K_cache);
+    ensureFloat32(ex, *V_cache);
+    ensureFloat32(ex, *Sinks);
+
+    uint32_t num_heads = (uint32_t)n.GetInt("num_heads", 32);
+    uint32_t kv_heads = (uint32_t)n.GetInt("kv_heads", num_heads);
+    uint32_t head_dim = (uint32_t)n.GetInt("head_dim", 64);
+    uint32_t kv_stride = (uint32_t)n.GetInt("kv_stride", 0);
+    uint32_t kv_start = (uint32_t)n.GetInt("kv_start", 0);
+    uint32_t T_win = (uint32_t)n.GetInt("window_size", 0);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    auto outShape = Q_in->shape;
+    *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
+
+    uint32_t params[8] = {num_heads, head_dim, T_win, kv_heads,
+                           0, kv_stride, kv_start, 0};
+    memcpy(&params[4], &scale, sizeof(float));  // bitcast f32 → u32
+
+    auto paramBuf = ex.getParamBuffer(32);
+    ex.gpu->writeBuffer(paramBuf, params, 28);
+
+    auto& pl = ex.GetPipelineT("gqa_decode_attn_sink", 6, []() {
+        return std::string(WGSL_GQA_DECODE_ATTN_SINK);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, Q_in->buffer}, {1, K_cache->buffer}, {2, V_cache->buffer},
+        {3, Sinks->buffer}, {4, out[0]->buffer}, {5, paramBuf}});
+    ex.QueueDispatch(pl.pipeline, bg, 1, num_heads, 1, "gqa_attn_sink");
+}
+
+REGISTER_OP(GQAAttnSink, opGQAAttnSink)

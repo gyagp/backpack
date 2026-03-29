@@ -555,6 +555,50 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         gpu->writeBuffer(buf, fp32.data(), nel * 4);
     };
 
+    // Helper: upload K-quant weight buffer
+    auto uploadKQWeight = [&](const std::string& name, const KQuantPacked& kq,
+                              GPUBuffer& buf) {
+        uint64_t bytes = (uint64_t)kq.data.size() * 4;
+        buf = gpu->createBuffer(name, bytes);
+        gpu->writeBuffer(buf, kq.data.data(), bytes);
+    };
+
+    // Helper: fuse multiple K-quant tensors vertically (concat rows)
+    auto fuseKQ = [](const KQuantPacked& a, const KQuantPacked& b) -> KQuantPacked {
+        KQuantPacked fused;
+        fused.N = a.N + b.N;
+        fused.K = a.K;
+        fused.rowStrideWords = a.rowStrideWords;
+        fused.nBlocks = a.nBlocks;
+        fused.data.reserve(a.data.size() + b.data.size());
+        fused.data.insert(fused.data.end(), a.data.begin(), a.data.end());
+        fused.data.insert(fused.data.end(), b.data.begin(), b.data.end());
+        return fused;
+    };
+
+    // Detect weight quantization type from first weight tensor
+    {
+        auto it = gguf.tensor_index.find("blk.0.attn_q.weight");
+        if (it != gguf.tensor_index.end()) {
+            weightQuantType = (GGUFType)gguf.tensors[it->second].type;
+        }
+    }
+    bool isKQuant = (weightQuantType == GGUF_TYPE_Q4_K ||
+                     weightQuantType == GGUF_TYPE_Q5_K ||
+                     weightQuantType == GGUF_TYPE_Q6_K);
+    auto packKQ = [&](const void* data, uint32_t N, uint32_t K) -> KQuantPacked {
+        switch (weightQuantType) {
+            case GGUF_TYPE_Q4_K: return pack_q4k(data, N, K);
+            case GGUF_TYPE_Q5_K: return pack_q5k(data, N, K);
+            case GGUF_TYPE_Q6_K: return pack_q6k(data, N, K);
+            default: return {};
+        }
+    };
+    const char* kqName = (weightQuantType == GGUF_TYPE_Q4_K) ? "Q4_K" :
+                         (weightQuantType == GGUF_TYPE_Q5_K) ? "Q5_K" :
+                         (weightQuantType == GGUF_TYPE_Q6_K) ? "Q6_K" : "Q8_0";
+    printf("  Weight format: %s\n", kqName);
+
     // Per-layer weights
     layerWeights.resize(cfg.nLayer);
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
@@ -570,20 +614,29 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& qt = gguf.tensors[qi->second];
                 auto& kt = gguf.tensors[ki->second];
                 auto& vt = gguf.tensors[vi->second];
-                auto qr = repack_q8_0(fileData.data() + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
-                auto kr = repack_q8_0(fileData.data() + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
-                auto vr = repack_q8_0(fileData.data() + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
-                Q8Repacked fused;
-                fused.N = qkvOut; fused.K = cfg.nEmbd;
-                fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
-                fused.weights.insert(fused.weights.end(), qr.weights.begin(), qr.weights.end());
-                fused.weights.insert(fused.weights.end(), kr.weights.begin(), kr.weights.end());
-                fused.weights.insert(fused.weights.end(), vr.weights.begin(), vr.weights.end());
-                fused.scales.reserve(qr.scales.size() + kr.scales.size() + vr.scales.size());
-                fused.scales.insert(fused.scales.end(), qr.scales.begin(), qr.scales.end());
-                fused.scales.insert(fused.scales.end(), kr.scales.begin(), kr.scales.end());
-                fused.scales.insert(fused.scales.end(), vr.scales.begin(), vr.scales.end());
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
+                if (isKQuant) {
+                    auto qp = packKQ(fileData.data() + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
+                    auto kp = packKQ(fileData.data() + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
+                    auto vp = packKQ(fileData.data() + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
+                    auto fused = fuseKQ(fuseKQ(qp, kp), vp);
+                    if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
+                    uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
+                } else {
+                    auto qr = repack_q8_0(fileData.data() + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
+                    auto kr = repack_q8_0(fileData.data() + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
+                    auto vr = repack_q8_0(fileData.data() + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
+                    Q8Repacked fused;
+                    fused.N = qkvOut; fused.K = cfg.nEmbd;
+                    fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
+                    fused.weights.insert(fused.weights.end(), qr.weights.begin(), qr.weights.end());
+                    fused.weights.insert(fused.weights.end(), kr.weights.begin(), kr.weights.end());
+                    fused.weights.insert(fused.weights.end(), vr.weights.begin(), vr.weights.end());
+                    fused.scales.reserve(qr.scales.size() + kr.scales.size() + vr.scales.size());
+                    fused.scales.insert(fused.scales.end(), qr.scales.begin(), qr.scales.end());
+                    fused.scales.insert(fused.scales.end(), kr.scales.begin(), kr.scales.end());
+                    fused.scales.insert(fused.scales.end(), vr.scales.begin(), vr.scales.end());
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
+                }
             }
         }
 
@@ -592,9 +645,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "attn_output.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                auto rep = repack_q8_0(fileData.data() + gguf.data_offset + ti.offset,
-                                        cfg.nEmbd, qDim);
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
+                if (isKQuant) {
+                    auto kq = packKQ(fileData.data() + gguf.data_offset + ti.offset, cfg.nEmbd, qDim);
+                    if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
+                    uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
+                } else {
+                    auto rep = repack_q8_0(fileData.data() + gguf.data_offset + ti.offset,
+                                            cfg.nEmbd, qDim);
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
+                }
             }
         }
 
@@ -605,19 +664,27 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (gi != gguf.tensor_index.end() && ui != gguf.tensor_index.end()) {
                 auto& gt = gguf.tensors[gi->second];
                 auto& ut = gguf.tensors[ui->second];
-                auto gr = repack_q8_0(fileData.data() + gguf.data_offset + gt.offset,
-                                       cfg.intermediateSize, cfg.nEmbd);
-                auto ur = repack_q8_0(fileData.data() + gguf.data_offset + ut.offset,
-                                       cfg.intermediateSize, cfg.nEmbd);
-                Q8Repacked fused;
-                fused.N = 2 * cfg.intermediateSize; fused.K = cfg.nEmbd;
-                fused.weights.reserve(gr.weights.size() + ur.weights.size());
-                fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
-                fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
-                fused.scales.reserve(gr.scales.size() + ur.scales.size());
-                fused.scales.insert(fused.scales.end(), gr.scales.begin(), gr.scales.end());
-                fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
+                if (isKQuant) {
+                    auto gp = packKQ(fileData.data() + gguf.data_offset + gt.offset, cfg.intermediateSize, cfg.nEmbd);
+                    auto up = packKQ(fileData.data() + gguf.data_offset + ut.offset, cfg.intermediateSize, cfg.nEmbd);
+                    auto fused = fuseKQ(gp, up);
+                    if (i == 0) { kqGuNBlocks = fused.nBlocks; kqGuRowStride = fused.rowStrideWords; }
+                    uploadKQWeight("L" + std::to_string(i) + ".gu_kq", fused, lw.guKQ);
+                } else {
+                    auto gr = repack_q8_0(fileData.data() + gguf.data_offset + gt.offset,
+                                           cfg.intermediateSize, cfg.nEmbd);
+                    auto ur = repack_q8_0(fileData.data() + gguf.data_offset + ut.offset,
+                                           cfg.intermediateSize, cfg.nEmbd);
+                    Q8Repacked fused;
+                    fused.N = 2 * cfg.intermediateSize; fused.K = cfg.nEmbd;
+                    fused.weights.reserve(gr.weights.size() + ur.weights.size());
+                    fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
+                    fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
+                    fused.scales.reserve(gr.scales.size() + ur.scales.size());
+                    fused.scales.insert(fused.scales.end(), gr.scales.begin(), gr.scales.end());
+                    fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
+                }
             }
         }
 
@@ -626,9 +693,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "ffn_down.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                auto rep = repack_q8_0(fileData.data() + gguf.data_offset + ti.offset,
-                                        cfg.nEmbd, cfg.intermediateSize);
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
+                if (isKQuant) {
+                    auto kq = packKQ(fileData.data() + gguf.data_offset + ti.offset, cfg.nEmbd, cfg.intermediateSize);
+                    if (i == 0) { kqDnNBlocks = kq.nBlocks; kqDnRowStride = kq.rowStrideWords; }
+                    uploadKQWeight("L" + std::to_string(i) + ".dn_kq", kq, lw.dnKQ);
+                } else {
+                    auto rep = repack_q8_0(fileData.data() + gguf.data_offset + ti.offset,
+                                            cfg.nEmbd, cfg.intermediateSize);
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
+                }
             }
         }
 
@@ -671,16 +744,34 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                             embeddingCPU[r * cols + b * 32 + q] = (float)blk.qs[q] * scale;
                     }
                 }
+            } else if (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K ||
+                       ti.type == GGUF_TYPE_Q6_K) {
+                uint32_t rows = (uint32_t)ti.shape[1];
+                uint32_t cols = (uint32_t)ti.shape[0];
+                dequant_kquant(data, embeddingCPU.data(), rows, cols, (GGUFType)ti.type);
             } else {
                 memcpy(embeddingCPU.data(), data, nel * 4);
             }
             printf("  Embedding: %u × %u (%s)\n", cfg.nVocab, cfg.nEmbd,
                    ti.type == GGUF_TYPE_Q8_0 ? "Q8_0→f32" :
+                   ti.type == GGUF_TYPE_Q4_K ? "Q4_K→f32" :
+                   ti.type == GGUF_TYPE_Q5_K ? "Q5_K→f32" :
+                   ti.type == GGUF_TYPE_Q6_K ? "Q6_K→f32" :
                    ti.type == GGUF_TYPE_F16 ? "f16→f32" : "f32");
 
-            // LM head: use Q8 format if embedding is Q8_0 (halves bandwidth)
+            // LM head: use quantized format if embedding is quantized
             if (cfg.tieWordEmbeddings) {
-                if (ti.type == GGUF_TYPE_Q8_0) {
+                if (isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K ||
+                                 ti.type == GGUF_TYPE_Q6_K)) {
+                    // Upload as K-quant on GPU
+                    auto kq = packKQ(data, cfg.nVocab, cfg.nEmbd);
+                    kqLmNBlocks = kq.nBlocks;
+                    kqLmRowStride = kq.rowStrideWords;
+                    uploadKQWeight("lm_head_kq", kq, lmHeadKQ);
+                    lmHeadIsKQ = true;
+                    printf("  LM head: tied embeddings (%s, %llu MB)\n", kqName,
+                           (unsigned long long)(kq.data.size() * 4 / 1048576));
+                } else if (ti.type == GGUF_TYPE_Q8_0) {
                     // Keep as Q8 on GPU — no dequant needed
                     auto rep = repack_q8_0(data, cfg.nVocab, cfg.nEmbd);
                     uploadQ8Weight(*gpu, "lm_head_q8", rep,
@@ -765,6 +856,18 @@ void ModelRunner::buildDecodePipeline() {
     auto& plAddRmsNorm = getKernel("add_rms_norm");
     auto& plQ8Matmul   = getKernel("q8_matmul");
 
+    // K-quant kernel selection
+    bool useKQ = (weightQuantType == GGUF_TYPE_Q4_K ||
+                  weightQuantType == GGUF_TYPE_Q5_K ||
+                  weightQuantType == GGUF_TYPE_Q6_K);
+    const char* kqKernelName = (weightQuantType == GGUF_TYPE_Q4_K) ? "q4k_matmul" :
+                               (weightQuantType == GGUF_TYPE_Q5_K) ? "q5k_matmul" :
+                               (weightQuantType == GGUF_TYPE_Q6_K) ? "q6k_matmul" : nullptr;
+    const CompiledPipeline* plKQ = nullptr;
+    if (useKQ && kqKernelName) {
+        plKQ = &getKernel(kqKernelName);
+    }
+
     const bool subgroupMatrixKernelReady =
         gpu->supportsSubgroupMatrix &&
         canUse512ThreadKernels &&
@@ -820,6 +923,24 @@ void ModelRunner::buildDecodePipeline() {
         uint32_t data[4] = {cfg.intermediateSize, cfg.nEmbd, cfg.intermediateSize, 0};
         q8DnSiluParams = gpu->createBuffer("p_dn_silu", 16);
         gpu->writeBuffer(q8DnSiluParams, data, 16);
+    }
+
+    // K-quant param buffers: [K, N, n_blocks, row_stride_words]
+    auto makeKQParams = [&](const std::string& name, uint32_t K, uint32_t N,
+                            uint32_t nBlocks, uint32_t rowStride) -> GPUBuffer {
+        uint32_t data[4] = {K, N, nBlocks, rowStride};
+        auto buf = gpu->createBuffer(name, 16);
+        gpu->writeBuffer(buf, data, 16);
+        return buf;
+    };
+    GPUBuffer kqQkvParams, kqOprojParams, kqGuParams, kqDnParams, kqLmParams;
+    if (useKQ) {
+        kqQkvParams   = makeKQParams("p_kq_qkv", cfg.nEmbd, qkvOut, kqQkvNBlocks, kqQkvRowStride);
+        kqOprojParams = makeKQParams("p_kq_oproj", qDim, cfg.nEmbd, kqONBlocks, kqORowStride);
+        kqGuParams    = makeKQParams("p_kq_gu", cfg.nEmbd, 2 * cfg.intermediateSize, kqGuNBlocks, kqGuRowStride);
+        kqDnParams    = makeKQParams("p_kq_dn", cfg.intermediateSize, cfg.nEmbd, kqDnNBlocks, kqDnRowStride);
+        if (lmHeadIsKQ)
+            kqLmParams = makeKQParams("p_kq_lm", cfg.nEmbd, cfg.nVocab, kqLmNBlocks, kqLmRowStride);
     }
 
     GPUBuffer rmsParams;
@@ -917,6 +1038,12 @@ void ModelRunner::buildDecodePipeline() {
     projOutBuf    = gpu->createBuffer("proj_out", cfg.nEmbd * 4);
     gateUpBuf     = gpu->createBuffer("gate_up", 2 * cfg.intermediateSize * 4);
 
+    // K-quant needs a separate SiLU-mul output buffer (used for down proj input)
+    GPUBuffer siluMulOutBuf;
+    if (useKQ) {
+        siluMulOutBuf = gpu->createBuffer("silu_mul_out", cfg.intermediateSize * 4);
+    }
+
     rstdBuf       = gpu->createBuffer("rstd", 16);
     logitsBuf     = gpu->createBuffer("logits", cfg.nVocab * 4);
     attnPartialsBuf = gpu->createBuffer("attn_partials",
@@ -949,19 +1076,28 @@ void ModelRunner::buildDecodePipeline() {
 
         // 2. QKV matmul
         {
-            vbg.qkvBase = makeBG(plQ8Matmul, {
-                {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
-                {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
-            if (decodeFastVariantsAvailable) {
-                vbg.qkvFast = makeBG(plQ8Fast, {
+            if (useKQ) {
+                auto bg = makeBG(*plKQ, {
+                    {0, normOutBuf}, {1, lw.qkvKQ}, {2, zeroBiasQKV},
+                    {3, qkvBuf}, {4, kqQkvParams}});
+                di.qkv = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plKQ->pipeline, bg,
+                    1, (qkvOut + 7) / 8, 1, L+"kq_qkv"});
+            } else {
+                vbg.qkvBase = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
                     {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
+                if (decodeFastVariantsAvailable) {
+                    vbg.qkvFast = makeBG(plQ8Fast, {
+                        {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
+                        {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
+                }
+                auto bg = tuning.decodeUseFastQkv && vbg.qkvFast ? vbg.qkvFast : vbg.qkvBase;
+                auto pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
+                di.qkv = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({pipeline, bg,
+                    1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_qkv"});
             }
-            auto bg = tuning.decodeUseFastQkv && vbg.qkvFast ? vbg.qkvFast : vbg.qkvBase;
-            auto pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
-            di.qkv = (int)allDecodeDispatches.size();
-            allDecodeDispatches.push_back({pipeline, bg,
-                1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_qkv"});
         }
 
         {
@@ -992,19 +1128,28 @@ void ModelRunner::buildDecodePipeline() {
         }
 
         {
-            vbg.oprojBase = makeBG(plQ8Matmul, {
-                {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
-                {3, zeroBiasE}, {4, projOutBuf}, {5, q8OprojParams}});
-            if (decodeFastVariantsAvailable) {
-                vbg.oprojFast = makeBG(plQ8Fast, {
+            if (useKQ) {
+                auto bg = makeBG(*plKQ, {
+                    {0, attnOutBuf}, {1, lw.oKQ}, {2, zeroBiasE},
+                    {3, projOutBuf}, {4, kqOprojParams}});
+                di.oproj = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plKQ->pipeline, bg,
+                    1, (cfg.nEmbd + 7) / 8, 1, L+"kq_oproj"});
+            } else {
+                vbg.oprojBase = makeBG(plQ8Matmul, {
                     {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
                     {3, zeroBiasE}, {4, projOutBuf}, {5, q8OprojParams}});
+                if (decodeFastVariantsAvailable) {
+                    vbg.oprojFast = makeBG(plQ8Fast, {
+                        {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
+                        {3, zeroBiasE}, {4, projOutBuf}, {5, q8OprojParams}});
+                }
+                auto bg = tuning.decodeUseFastOproj && vbg.oprojFast ? vbg.oprojFast : vbg.oprojBase;
+                auto pipeline = tuning.decodeUseFastOproj && vbg.oprojFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
+                di.oproj = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({pipeline, bg,
+                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_oproj"});
             }
-            auto bg = tuning.decodeUseFastOproj && vbg.oprojFast ? vbg.oprojFast : vbg.oprojBase;
-            auto pipeline = tuning.decodeUseFastOproj && vbg.oprojFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
-            di.oproj = (int)allDecodeDispatches.size();
-            allDecodeDispatches.push_back({pipeline, bg,
-                1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_oproj"});
         }
 
         {
@@ -1015,29 +1160,83 @@ void ModelRunner::buildDecodePipeline() {
         }
 
         {
-            vbg.gateupBase = makeBG(plQ8Matmul, {
-                {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
-                {3, zeroBiasGU}, {4, gateUpBuf}, {5, q8GuParams}});
-            if (decodeFastVariantsAvailable) {
-                vbg.gateupFast = makeBG(plQ8Fast, {
+            if (useKQ) {
+                auto bg = makeBG(*plKQ, {
+                    {0, normOutBuf}, {1, lw.guKQ}, {2, zeroBiasGU},
+                    {3, gateUpBuf}, {4, kqGuParams}});
+                di.gateup = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plKQ->pipeline, bg,
+                    1, (2 * cfg.intermediateSize + 7) / 8, 1, L+"kq_gateup"});
+            } else {
+                vbg.gateupBase = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
                     {3, zeroBiasGU}, {4, gateUpBuf}, {5, q8GuParams}});
+                if (decodeFastVariantsAvailable) {
+                    vbg.gateupFast = makeBG(plQ8Fast, {
+                        {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
+                        {3, zeroBiasGU}, {4, gateUpBuf}, {5, q8GuParams}});
+                }
+                auto bg = tuning.decodeUseFastGateup && vbg.gateupFast ? vbg.gateupFast : vbg.gateupBase;
+                auto pipeline = tuning.decodeUseFastGateup && vbg.gateupFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
+                di.gateup = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({pipeline, bg,
+                    1, (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_gateup"});
             }
-            auto bg = tuning.decodeUseFastGateup && vbg.gateupFast ? vbg.gateupFast : vbg.gateupBase;
-            auto pipeline = tuning.decodeUseFastGateup && vbg.gateupFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
-            di.gateup = (int)allDecodeDispatches.size();
-            allDecodeDispatches.push_back({pipeline, bg,
-                1, (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_gateup"});
         }
 
-        // 9. Fused: SiLU·mul + down projection + residual add
-        //    Reads gateUpBuf, applies silu(gate)*up on-the-fly, matmul with W_down, adds to xBuf
+        // 9. Down projection + SiLU + residual add
         {
-            auto bg = makeBG(plDnSilu, {
-                {0, gateUpBuf}, {1, lw.dnW}, {2, lw.dnS},
-                {3, zeroBiasE}, {4, xBuf}, {5, q8DnSiluParams}});
-            allDecodeDispatches.push_back({plDnSilu.pipeline, bg,
-                1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_silu_add"});
+            if (useKQ) {
+                // K-quant: SiLU+mul → K-quant matmul → add residual (3 dispatches)
+                auto& plSiluMul = getKernel("silu_mul_fused");
+                GPUBuffer siluParams;
+                {
+                    uint32_t data[4] = {cfg.intermediateSize, 0, 0, 0};
+                    siluParams = gpu->createBuffer("p_silu_" + std::to_string(i), 16);
+                    gpu->writeBuffer(siluParams, data, 16);
+                }
+                auto bgSilu = makeBG(plSiluMul, {
+                    {0, gateUpBuf}, {1, siluMulOutBuf}, {2, siluParams}});
+                allDecodeDispatches.push_back({plSiluMul.pipeline, bgSilu,
+                    (cfg.intermediateSize + 255) / 256, 1, 1, L+"silu_mul"});
+
+                auto bgDn = makeBG(*plKQ, {
+                    {0, siluMulOutBuf}, {1, lw.dnKQ}, {2, zeroBiasE},
+                    {3, projOutBuf}, {4, kqDnParams}});
+                allDecodeDispatches.push_back({plKQ->pipeline, bgDn,
+                    1, (cfg.nEmbd + 7) / 8, 1, L+"kq_down"});
+
+                // Add residual: xBuf[i] += projOutBuf[i] using inline add_inplace kernel
+                static const char* ADD_INPLACE_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0];
+    let i = gid.x;
+    if (i < N) { dst[i] = dst[i] + src[i]; }
+}
+)";
+                auto& plAddIP = gpu->getOrCreatePipeline("add_inplace",
+                    std::string(ADD_INPLACE_WGSL), 3);
+                GPUBuffer addIPParams;
+                {
+                    uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                    addIPParams = gpu->createBuffer("p_addip_" + std::to_string(i), 16);
+                    gpu->writeBuffer(addIPParams, data, 16);
+                }
+                auto bgAdd = makeBG(plAddIP, {
+                    {0, xBuf}, {1, projOutBuf}, {2, addIPParams}});
+                allDecodeDispatches.push_back({plAddIP.pipeline, bgAdd,
+                    (cfg.nEmbd + 255) / 256, 1, 1, L+"residual_add"});
+            } else {
+                auto bg = makeBG(plDnSilu, {
+                    {0, gateUpBuf}, {1, lw.dnW}, {2, lw.dnS},
+                    {3, zeroBiasE}, {4, xBuf}, {5, q8DnSiluParams}});
+                allDecodeDispatches.push_back({plDnSilu.pipeline, bg,
+                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_silu_add"});
+            }
         }
 
         // 10. RMSNorm for next layer
@@ -1058,7 +1257,13 @@ void ModelRunner::buildDecodePipeline() {
     }
 
     // LM head
-    if (lmHeadIsQ8) {
+    if (lmHeadIsKQ && plKQ) {
+        auto bg = makeBG(*plKQ, {
+            {0, normOutBuf}, {1, lmHeadKQ}, {2, zeroBiasV},
+            {3, logitsBuf}, {4, kqLmParams}});
+        allDecodeDispatches.push_back({plKQ->pipeline, bg,
+            1, (cfg.nVocab + 7) / 8, 1, "lm_head"});
+    } else if (lmHeadIsQ8) {
         auto q8LmParams = makeQ8Params("p_lmhead_q8", cfg.nEmbd, cfg.nVocab);
         auto bg = makeBG(plQ8Matmul, {
             {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},

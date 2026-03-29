@@ -457,6 +457,11 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
     int64_t blocksPerCol_gu = hiddenSize / blockSize;
     int64_t blocksPerCol_dn = moeIntermediate / blockSize;
 
+    // Compute number of tokens (product of all dims except last)
+    int64_t nTokens = 1;
+    for (size_t d = 0; d + 1 < input->shape.size(); d++)
+        nTokens *= input->shape[d];
+
     // Ensure input is f32 on GPU
     if (!ensureTensorFloat32(ex, *input, n.inputs[0])) {
         fprintf(stderr, "QMoE: cannot convert input to f32\n");
@@ -473,83 +478,206 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.EnsureGpu(*downW);
     ex.EnsureGpu(*downS);
 
-    // Allocate output — no zero-init needed because moe_accum uses
-    // write (=) for slot 0 and accumulate (+=) for slot > 0.
+    // Allocate output
     auto outShape = input->shape;
     outShape.back() = hiddenSize;
     *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
 
-    // GPU expert selection: gate kernel produces indices + weights on GPU
-    auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)k * 4);
-    auto expertWtBuf = ex.gpu->createBuffer("moe_expert_wt", (size_t)k * 4);
+    // ─── Batched path (T > 1): process in chunks ───
+    if (nTokens > 1) {
+        // Chunk size: balance between dispatch count reduction and memory efficiency
+        const int64_t CHUNK = 64;  // Process 64 tokens at a time
 
-    {
-        uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, 0};
-        auto gpBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(gpBuf, gateParams, 16);
-        auto& pl = ex.GetPipelineT("moe_gate", 4, []() { return instantiateTemplate(WGSL_MOE_GATE_T, TensorDtype::Float32); });
-        auto bg = ex.MakeBindGroup(pl, {
-            {0, routerWeights->buffer}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
-        ex.QueueDispatch(pl.pipeline, bg, 1, 1, 1, "moe_gate");
+        // Allocate chunk-sized scratch buffers
+        int64_t chunkTokens = std::min(nTokens, CHUNK);
+        GpuTensor gateUpBuf = ex.AllocTensor({chunkTokens * N_gu}, TensorDtype::Float32);
+        GpuTensor intermediateBuf = ex.AllocTensor({chunkTokens * moeIntermediate}, TensorDtype::Float32);
+        GpuTensor downBuf = ex.AllocTensor({chunkTokens * N_dn}, TensorDtype::Float32);
+        auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)(chunkTokens * k * 4));
+        auto expertWtBuf = ex.gpu->createBuffer("moe_expert_wt", (size_t)(chunkTokens * k * 4));
+
+        for (int64_t chunkStart = 0; chunkStart < nTokens; chunkStart += CHUNK) {
+            int64_t cT = std::min(CHUNK, nTokens - chunkStart);
+            uint64_t inputOffset = (uint64_t)(chunkStart * hiddenSize * 4);
+            uint64_t routerOffset = (uint64_t)(chunkStart * numExperts * 4);
+            uint64_t outOffset = (uint64_t)(chunkStart * hiddenSize * 4);
+
+            GPUBuffer inputChunk = input->buffer;
+            inputChunk.offset += inputOffset;
+            inputChunk.size = (uint64_t)(cT * hiddenSize * 4);
+
+            GPUBuffer routerChunk = routerWeights->buffer;
+            routerChunk.offset += routerOffset;
+            routerChunk.size = (uint64_t)(cT * numExperts * 4);
+
+            GPUBuffer outChunk = out[0]->buffer;
+            outChunk.offset += outOffset;
+            outChunk.size = (uint64_t)(cT * hiddenSize * 4);
+
+            // 1. Gate: select top-k experts for cT tokens
+            {
+                uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, (uint32_t)cT};
+                auto gpBuf = ex.getParamBuffer(16);
+                ex.gpu->writeBuffer(gpBuf, gateParams, 16);
+                auto& pl = ex.GetPipelineT("moe_gate_batched", 4, []() {
+                    return std::string(WGSL_MOE_GATE_BATCHED);
+                });
+                auto bg = ex.MakeBindGroup(pl, {
+                    {0, routerChunk}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
+                ex.QueueDispatch(pl.pipeline, bg, 1, (uint32_t)cT, 1, "moe_gate_b");
+            }
+
+            // 2. For each expert slot: batched matmul + swiglu + down + accum
+            for (uint32_t slot = 0; slot < (uint32_t)k; slot++) {
+                {
+                    uint32_t params[8] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
+                                           (uint32_t)blocksPerCol_gu, slot, (uint32_t)k};
+                    auto pBuf = ex.getParamBuffer(32);
+                    ex.gpu->writeBuffer(pBuf, params, 20);
+                    auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub_batched", 6, []() {
+                        return std::string(WGSL_MATMUL_Q4_INDIRECT_SUB_BATCHED);
+                    });
+                    auto bg = ex.MakeBindGroup(pl, {
+                        {0, inputChunk}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
+                        {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
+                    ex.QueueDispatch(pl.pipeline, bg,
+                        (uint32_t)((N_gu + 7) / 8), (uint32_t)cT, 1, "moe_gateup_b");
+                }
+                {
+                    uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
+                    auto pBuf = ex.getParamBuffer(16);
+                    ex.gpu->writeBuffer(pBuf, params, 16);
+                    auto& pl = ex.GetPipelineT("swiglu_batched", 3, []() {
+                        return std::string(WGSL_SWIGLU_BATCHED);
+                    });
+                    auto bg = ex.MakeBindGroup(pl, {
+                        {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
+                    ex.QueueDispatch(pl.pipeline, bg,
+                        (uint32_t)((moeIntermediate + 255) / 256), (uint32_t)cT, 1, "moe_swiglu_b");
+                }
+                {
+                    uint32_t params[8] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
+                                           (uint32_t)blocksPerCol_dn, slot, (uint32_t)k};
+                    auto pBuf = ex.getParamBuffer(32);
+                    ex.gpu->writeBuffer(pBuf, params, 20);
+                    auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub_batched", 6, []() {
+                        return std::string(WGSL_MATMUL_Q4_INDIRECT_SUB_BATCHED);
+                    });
+                    auto bg = ex.MakeBindGroup(pl, {
+                        {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
+                        {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
+                    ex.QueueDispatch(pl.pipeline, bg,
+                        (uint32_t)((N_dn + 7) / 8), (uint32_t)cT, 1, "moe_down_b");
+                }
+                {
+                    uint32_t params[4] = {(uint32_t)N_dn, slot, (uint32_t)k, 0};
+                    auto pBuf = ex.getParamBuffer(16);
+                    ex.gpu->writeBuffer(pBuf, params, 16);
+                    auto& pl = ex.GetPipelineT("weighted_add_indirect_batched", 4, []() {
+                        return std::string(WGSL_WEIGHTED_ADD_INDIRECT_BATCHED);
+                    });
+                    auto bg = ex.MakeBindGroup(pl, {
+                        {0, downBuf.buffer}, {1, outChunk}, {2, pBuf}, {3, expertWtBuf}});
+                    ex.QueueDispatch(pl.pipeline, bg,
+                        (uint32_t)((N_dn + 255) / 256), (uint32_t)cT, 1, "moe_accum_b");
+                }
+            }
+        }
+
+        ex.gpu->releaseBuffer(expertIdxBuf);
+        ex.gpu->releaseBuffer(expertWtBuf);
+        return;
     }
 
+    // ─── Single-token path (T == 1): original per-token logic ───
     // Scratch buffers (reused across expert slots)
     GpuTensor gateUpBuf = ex.AllocTensor({N_gu}, TensorDtype::Float32);
     GpuTensor intermediateBuf = ex.AllocTensor({moeIntermediate}, TensorDtype::Float32);
     GpuTensor downBuf = ex.AllocTensor({N_dn}, TensorDtype::Float32);
 
-    // Dispatch k expert pipelines — each reads its expert index from GPU buffer
-    for (uint32_t slot = 0; slot < (uint32_t)k; slot++) {
-        // Gate-up Q4 matmul (indirect expert index)
+    // Per-token expert selection buffers
+    auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)k * 4);
+    auto expertWtBuf = ex.gpu->createBuffer("moe_expert_wt", (size_t)k * 4);
+
+    // Process each token (MoE routing is inherently per-token)
+    for (int64_t tok = 0; tok < nTokens; tok++) {
+        // Create aliased views into input/output/router at token offset
+        GPUBuffer inputSlice = input->buffer;
+        inputSlice.offset += (uint64_t)(tok * hiddenSize * 4);
+        inputSlice.size = (uint64_t)(hiddenSize * 4);
+
+        GPUBuffer routerSlice = routerWeights->buffer;
+        routerSlice.offset += (uint64_t)(tok * numExperts * 4);
+        routerSlice.size = (uint64_t)(numExperts * 4);
+
+        GPUBuffer outSlice = out[0]->buffer;
+        outSlice.offset += (uint64_t)(tok * hiddenSize * 4);
+        outSlice.size = (uint64_t)(hiddenSize * 4);
+
+        // Gate: select top-k experts for this token
         {
-            uint32_t params[4] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
-                                   (uint32_t)blocksPerCol_gu, slot};
-            auto pBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
+            uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, 0};
+            auto gpBuf = ex.getParamBuffer(16);
+            ex.gpu->writeBuffer(gpBuf, gateParams, 16);
+            auto& pl = ex.GetPipelineT("moe_gate", 4, []() { return instantiateTemplate(WGSL_MOE_GATE_T, TensorDtype::Float32); });
             auto bg = ex.MakeBindGroup(pl, {
-                {0, input->buffer}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
-                {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
-            ex.QueueDispatch(pl.pipeline, bg,
-                (uint32_t)((N_gu + 7) / 8), 1, 1, "moe_gateup");
+                {0, routerSlice}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
+            ex.QueueDispatch(pl.pipeline, bg, 1, 1, 1, "moe_gate");
         }
 
-        // SwiGLU (interleaved layout)
-        {
-            uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
-            auto pBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipelineT("swiglu", 3, []() { return instantiateTemplate(WGSL_SWIGLU_T, TensorDtype::Float32); });
-            auto bg = ex.MakeBindGroup(pl, {
-                {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
-            ex.QueueDispatch(pl.pipeline, bg,
-                (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "moe_swiglu");
-        }
+        // Dispatch k expert pipelines
+        for (uint32_t slot = 0; slot < (uint32_t)k; slot++) {
+            // Gate-up Q4 matmul (indirect expert index)
+            {
+                uint32_t params[4] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
+                                       (uint32_t)blocksPerCol_gu, slot};
+                auto pBuf = ex.getParamBuffer(16);
+                ex.gpu->writeBuffer(pBuf, params, 16);
+                auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
+                auto bg = ex.MakeBindGroup(pl, {
+                    {0, inputSlice}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
+                    {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
+                ex.QueueDispatch(pl.pipeline, bg,
+                    (uint32_t)((N_gu + 7) / 8), 1, 1, "moe_gateup");
+            }
 
-        // Down Q4 matmul (indirect expert index)
-        {
-            uint32_t params[4] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
-                                   (uint32_t)blocksPerCol_dn, slot};
-            auto pBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
-            auto bg = ex.MakeBindGroup(pl, {
-                {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
-                {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
-            ex.QueueDispatch(pl.pipeline, bg,
-                (uint32_t)((N_dn + 7) / 8), 1, 1, "moe_down");
-        }
+            // SwiGLU (interleaved layout)
+            {
+                uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
+                auto pBuf = ex.getParamBuffer(16);
+                ex.gpu->writeBuffer(pBuf, params, 16);
+                auto& pl = ex.GetPipelineT("swiglu", 3, []() { return instantiateTemplate(WGSL_SWIGLU_T, TensorDtype::Float32); });
+                auto bg = ex.MakeBindGroup(pl, {
+                    {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
+                ex.QueueDispatch(pl.pipeline, bg,
+                    (uint32_t)((moeIntermediate + 255) / 256), 1, 1, "moe_swiglu");
+            }
 
-        // Weighted accumulate (indirect weight from GPU buffer)
-        {
-            uint32_t params[4] = {(uint32_t)N_dn, slot, 0, 0};
-            auto pBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(pBuf, params, 16);
-            auto& pl = ex.GetPipelineT("weighted_add_indirect", 4, []() { return instantiateTemplate(WGSL_WEIGHTED_ADD_INDIRECT_T, TensorDtype::Float32); });
-            auto bg = ex.MakeBindGroup(pl, {
-                {0, downBuf.buffer}, {1, out[0]->buffer}, {2, pBuf}, {3, expertWtBuf}});
-            ex.QueueDispatch(pl.pipeline, bg,
-                (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_accum");
+            // Down Q4 matmul (indirect expert index)
+            {
+                uint32_t params[4] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
+                                       (uint32_t)blocksPerCol_dn, slot};
+                auto pBuf = ex.getParamBuffer(16);
+                ex.gpu->writeBuffer(pBuf, params, 16);
+                auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
+                auto bg = ex.MakeBindGroup(pl, {
+                    {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
+                    {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
+                ex.QueueDispatch(pl.pipeline, bg,
+                    (uint32_t)((N_dn + 7) / 8), 1, 1, "moe_down");
+            }
+
+            // Weighted accumulate (indirect weight from GPU buffer)
+            {
+                uint32_t params[4] = {(uint32_t)N_dn, slot, 0, 0};
+                auto pBuf = ex.getParamBuffer(16);
+                ex.gpu->writeBuffer(pBuf, params, 16);
+                auto& pl = ex.GetPipelineT("weighted_add_indirect", 4, []() { return instantiateTemplate(WGSL_WEIGHTED_ADD_INDIRECT_T, TensorDtype::Float32); });
+                auto bg = ex.MakeBindGroup(pl, {
+                    {0, downBuf.buffer}, {1, outSlice}, {2, pBuf}, {3, expertWtBuf}});
+                ex.QueueDispatch(pl.pipeline, bg,
+                    (uint32_t)((N_dn + 255) / 256), 1, 1, "moe_accum");
+            }
         }
     }
 }
@@ -560,3 +688,68 @@ REGISTER_OP(TopK, opTopK)
 REGISTER_OP(GatherElements, opGatherElements)
 REGISTER_OP(ScatterElements, opScatterElements)
 REGISTER_OP(QMoE, opQMoE)
+
+// ─── LinearMxfp4 (GPU) ──────────────────────────────────────────────────────
+// MXFP4 fused dequant+matmul for GPT-OSS MoE expert layers.
+// Inputs: X (f32), W_blocks (i32, packed FP4), W_scales (i32, packed E8M0), Bias (f32)
+// Attrs: K (input features), N (output features)
+
+static void opLinearMxfp4(GraphExecutor& ex, const OnnxGraphNode& n,
+    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* X = in[0];
+    auto* W_blocks = in.size() > 1 ? in[1] : nullptr;
+    auto* W_scales = in.size() > 2 ? in[2] : nullptr;
+    auto* bias = in.size() > 3 ? in[3] : nullptr;
+
+    if (!X || !W_blocks || !W_scales || !bias ||
+        !X->IsValid() || !W_blocks->IsValid() || !W_scales->IsValid() || !bias->IsValid()) {
+        fprintf(stderr, "LinearMxfp4: missing inputs\n");
+        return;
+    }
+
+    if (!ensureTensorFloat32(ex, *X, n.inputs[0])) {
+        fprintf(stderr, "LinearMxfp4: cannot convert input to f32\n");
+        return;
+    }
+    ex.EnsureGpu(*X);
+    ex.EnsureGpu(*W_blocks);
+    ex.EnsureGpu(*W_scales);
+    ex.EnsureGpu(*bias);
+
+    int64_t K = n.GetInt("K", 0);
+    int64_t N = n.GetInt("N", 0);
+
+    // Infer K and N from weight shapes if not in attributes
+    if (K == 0 && W_blocks->shape.size() >= 2)
+        K = W_blocks->shape.back() * 8;  // K/8 packed words
+    if (N == 0 && W_blocks->shape.size() >= 1)
+        N = W_blocks->shape[W_blocks->shape.size() >= 2 ? W_blocks->shape.size() - 2 : 0];
+    if (N == 0) N = bias->ElementCount();
+
+    int64_t nTokens = 1;
+    for (size_t d = 0; d + 1 < X->shape.size(); d++)
+        nTokens *= X->shape[d];
+
+    auto outShape = X->shape;
+    if (!outShape.empty()) outShape.back() = N;
+    *out[0] = ex.AllocTensor(outShape, TensorDtype::Float32);
+
+    uint32_t stride_blocks = (uint32_t)(K / 8);
+    uint32_t n_mxblocks = (uint32_t)(K / 32);
+    uint32_t stride_scales = (n_mxblocks + 3) / 4;
+
+    uint32_t params[4] = {(uint32_t)K, (uint32_t)N, stride_blocks, stride_scales};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    auto& pl = ex.GetPipelineT("mxfp4_matmul", 6, []() {
+        return std::string(WGSL_MXFP4_MATMUL);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, X->buffer}, {1, W_blocks->buffer}, {2, W_scales->buffer},
+        {3, bias->buffer}, {4, out[0]->buffer}, {5, paramBuf}});
+    ex.QueueDispatch(pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), (uint32_t)nTokens, 1, "mxfp4_matmul");
+}
+
+REGISTER_OP(LinearMxfp4, opLinearMxfp4)

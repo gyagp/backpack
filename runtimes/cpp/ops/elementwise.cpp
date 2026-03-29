@@ -952,3 +952,251 @@ REGISTER_OP(Floor, opFloor)
 REGISTER_OP(Ceil, opCeil)
 REGISTER_OP(Round, opRound)
 REGISTER_OP(Softplus, opSoftplus)
+
+// ─── GPT-OSS Gated Activation ──────────────────────────────────────────────
+// y = (up + 1.0) * gate * sigmoid(gate * 1.702)
+// Input: interleaved [gate, up] of shape (T, 2*N), output (T, N).
+
+static void opGptOssGate(GraphExecutor& ex, const OnnxGraphNode& n,
+                          const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* X = in[0];
+    if (!X || !X->IsValid()) return;
+
+    TensorDtype dtype = X->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *X, n.inputs.empty() ? std::string() : n.inputs[0])) return;
+    }
+    ex.EnsureGpu(*X);
+
+    // Input shape is (..., 2*N), output is (..., N)
+    auto outShape = X->shape;
+    if (!outShape.empty()) outShape.back() /= 2;
+    int64_t N = outShape.empty() ? 0 : outShape.back();
+    int64_t nTokens = 1;
+    for (size_t d = 0; d + 1 < outShape.size(); d++) nTokens *= outShape[d];
+
+    *out[0] = ex.AllocTensor(outShape, dtype);
+
+    uint32_t params[4] = {(uint32_t)N, 0, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "gptoss_gate" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+        return instantiateTemplate(WGSL_GPTOSS_GATE_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, X->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), (uint32_t)nTokens, 1, "gptoss_gate"}});
+}
+
+REGISTER_OP(GptOssGate, opGptOssGate)
+
+// ─── GeluMul: Out = GELU(gate) * up ─────────────────────────────────────────
+// Separate Gate and Up buffers. GELU uses tanh approximation.
+
+static void opGeluMul(GraphExecutor& ex, const OnnxGraphNode& n,
+                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* Gate = in[0];
+    auto* Up = in[1];
+    if (!Gate || !Gate->IsValid() || !Up || !Up->IsValid()) return;
+
+    TensorDtype dtype = Gate->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *Gate, n.inputs.size() > 0 ? n.inputs[0] : std::string())) return;
+        if (!ensureCpuBackedFloat32(ex, *Up, n.inputs.size() > 1 ? n.inputs[1] : std::string())) return;
+    }
+    ex.EnsureGpu(*Gate);
+    ex.EnsureGpu(*Up);
+
+    int64_t N = tensorNel(Gate);
+    *out[0] = ex.AllocTensor(Gate->shape, dtype);
+
+    uint32_t params[4] = {(uint32_t)N, 0, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "gelu_mul" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
+        return instantiateTemplate(WGSL_GELU_MUL_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, Gate->buffer}, {1, Up->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), 1, 1, "gelu_mul"}});
+}
+
+REGISTER_OP(GeluMul, opGeluMul)
+
+// ─── AddScaled: Acc += alpha * X (AXPY) ──────────────────────────────────────
+// In-place on Acc. Alpha from node attribute.
+
+static void opAddScaled(GraphExecutor& ex, const OnnxGraphNode& n,
+                         const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* Acc = in[0];
+    auto* X = in[1];
+    if (!Acc || !Acc->IsValid() || !X || !X->IsValid()) return;
+
+    TensorDtype dtype = Acc->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *Acc, n.inputs.size() > 0 ? n.inputs[0] : std::string())) return;
+        if (!ensureCpuBackedFloat32(ex, *X, n.inputs.size() > 1 ? n.inputs[1] : std::string())) return;
+    }
+    ex.EnsureGpu(*Acc);
+    ex.EnsureGpu(*X);
+
+    int64_t N = tensorNel(Acc);
+
+    float alpha = n.GetFloat("alpha", 1.0f);
+    uint32_t alpha_u32;
+    memcpy(&alpha_u32, &alpha, sizeof(float));
+
+    uint32_t params[4] = {(uint32_t)N, alpha_u32, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "add_scaled" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+        return instantiateTemplate(WGSL_ADD_SCALED_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, Acc->buffer}, {1, X->buffer}, {2, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), 1, 1, "add_scaled"}});
+
+    // In-place: output is the same tensor as Acc
+    *out[0] = *Acc;
+}
+
+REGISTER_OP(AddScaled, opAddScaled)
+
+// ─── ModScaleShift: Out = (1 + Scale[i%D]) * X + Shift[i%D] ─────────────────
+// DiT-style adaptive layer norm modulation.
+
+static void opModScaleShift(GraphExecutor& ex, const OnnxGraphNode& n,
+                             const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* X = in[0];
+    auto* Scale = in[1];
+    auto* Shift = in[2];
+    if (!X || !X->IsValid() || !Scale || !Scale->IsValid() || !Shift || !Shift->IsValid()) return;
+
+    TensorDtype dtype = X->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *X, n.inputs.size() > 0 ? n.inputs[0] : std::string())) return;
+        if (!ensureCpuBackedFloat32(ex, *Scale, n.inputs.size() > 1 ? n.inputs[1] : std::string())) return;
+        if (!ensureCpuBackedFloat32(ex, *Shift, n.inputs.size() > 2 ? n.inputs[2] : std::string())) return;
+    }
+    ex.EnsureGpu(*X);
+    ex.EnsureGpu(*Scale);
+    ex.EnsureGpu(*Shift);
+
+    int64_t N = tensorNel(X);
+    int64_t D = Scale->shape.empty() ? 1 : Scale->shape[0];
+
+    *out[0] = ex.AllocTensor(X->shape, dtype);
+
+    uint32_t params[4] = {(uint32_t)D, (uint32_t)N, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "mod_scale_shift" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 5, [dtype]() {
+        return instantiateTemplate(WGSL_MOD_SCALE_SHIFT_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, X->buffer}, {1, Scale->buffer}, {2, Shift->buffer},
+        {3, out[0]->buffer}, {4, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), 1, 1, "mod_scale_shift"}});
+}
+
+REGISTER_OP(ModScaleShift, opModScaleShift)
+
+// ─── GateResidualAdd: Residual += Gate[i%D] * X ─────────────────────────────
+// DiT-style gated residual. In-place on Residual.
+
+static void opGateResidualAdd(GraphExecutor& ex, const OnnxGraphNode& n,
+                               const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* Residual = in[0];
+    auto* Gate = in[1];
+    auto* X = in[2];
+    if (!Residual || !Residual->IsValid() || !Gate || !Gate->IsValid() || !X || !X->IsValid()) return;
+
+    TensorDtype dtype = Residual->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *Residual, n.inputs.size() > 0 ? n.inputs[0] : std::string())) return;
+        if (!ensureCpuBackedFloat32(ex, *Gate, n.inputs.size() > 1 ? n.inputs[1] : std::string())) return;
+        if (!ensureCpuBackedFloat32(ex, *X, n.inputs.size() > 2 ? n.inputs[2] : std::string())) return;
+    }
+    ex.EnsureGpu(*Residual);
+    ex.EnsureGpu(*Gate);
+    ex.EnsureGpu(*X);
+
+    int64_t N = tensorNel(Residual);
+    int64_t D = Gate->shape.empty() ? 1 : Gate->shape[0];
+
+    uint32_t params[4] = {(uint32_t)D, (uint32_t)N, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "gate_residual_add" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
+        return instantiateTemplate(WGSL_GATE_RESIDUAL_ADD_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, Residual->buffer}, {1, Gate->buffer}, {2, X->buffer}, {3, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), 1, 1, "gate_residual_add"}});
+
+    // In-place: output is the same tensor as Residual
+    *out[0] = *Residual;
+}
+
+REGISTER_OP(GateResidualAdd, opGateResidualAdd)
+
+// ─── SigmoidGateInterleaved: Out = sigmoid(gate) * val ──────────────────────
+// Input has interleaved layout per head: [gate(HD), val(HD), gate(HD), val(HD), ...]
+
+static void opSigmoidGateInterleaved(GraphExecutor& ex, const OnnxGraphNode& n,
+                                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto* X = in[0];
+    if (!X || !X->IsValid()) return;
+
+    TensorDtype dtype = X->dtype;
+    if (dtype != TensorDtype::Float16) {
+        dtype = TensorDtype::Float32;
+        if (!ensureCpuBackedFloat32(ex, *X, n.inputs.empty() ? std::string() : n.inputs[0])) return;
+    }
+    ex.EnsureGpu(*X);
+
+    // Input shape is (..., 2*HD), output is (..., HD)
+    auto outShape = X->shape;
+    int64_t HD = outShape.empty() ? 1 : outShape.back() / 2;
+    if (!outShape.empty()) outShape.back() = HD;
+
+    int64_t N = 1;
+    for (auto d : outShape) N *= d;
+
+    *out[0] = ex.AllocTensor(outShape, dtype);
+
+    uint32_t params[4] = {(uint32_t)N, (uint32_t)HD, 0, 0};
+    auto paramBuf = ex.getParamBuffer(16);
+    ex.gpu->writeBuffer(paramBuf, params, 16);
+
+    std::string pname = "sigmoid_gate_interleaved" + std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
+        return instantiateTemplate(WGSL_SIGMOID_GATE_INTERLEAVED_T, dtype);
+    });
+    auto bg = ex.MakeBindGroup(pl, {
+        {0, X->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
+    ex.SubmitAsync({{pl.pipeline, bg,
+        (uint32_t)((N + 255) / 256), 1, 1, "sigmoid_gate_interleaved"}});
+}
+
+REGISTER_OP(SigmoidGateInterleaved, opSigmoidGateInterleaved)

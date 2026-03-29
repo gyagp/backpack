@@ -69,18 +69,29 @@ struct ModelRunner {
 
     // Per-layer weight buffers (read-only, shared)
     struct LayerWeights {
-        GPUBuffer qkvW, qkvS;
+        GPUBuffer qkvW, qkvS;       // Q8_0: weight + scale buffers
         GPUBuffer oW, oS;
         GPUBuffer guW, guS;
         GPUBuffer dnW, dnS;
         GPUBuffer inputNorm, postAttnNorm;
         GPUBuffer qNorm, kNorm;
+        // K-quant: single buffer per weight (raw block data as u32)
+        GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
     };
     std::vector<LayerWeights> layerWeights;
     GPUBuffer finalNormW;
     GPUBuffer lmHeadW;           // fp16 LM head (fallback)
     GPUBuffer lmHeadQ8W, lmHeadQ8S;  // Q8 LM head (preferred)
+    GPUBuffer lmHeadKQ;          // K-quant LM head
     bool lmHeadIsQ8 = false;
+    bool lmHeadIsKQ = false;
+    GGUFType weightQuantType = GGUF_TYPE_Q8_0;  // detected from first weight tensor
+    // K-quant params per projection type (shared across layers)
+    uint32_t kqQkvNBlocks = 0, kqQkvRowStride = 0;
+    uint32_t kqONBlocks = 0, kqORowStride = 0;
+    uint32_t kqGuNBlocks = 0, kqGuRowStride = 0;
+    uint32_t kqDnNBlocks = 0, kqDnRowStride = 0;
+    uint32_t kqLmNBlocks = 0, kqLmRowStride = 0;
     GPUBuffer zeroBiasE, zeroBiasQKV, zeroBiasGU, zeroBiasV;
 
     // Embedding (CPU-side for prefill, GPU-side for decode)

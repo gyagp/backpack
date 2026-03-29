@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <future>
+#include <thread>
 #include <chrono>
 
 // ─── GPUProfiler ─────────────────────────────────────────────────────────────
@@ -420,6 +422,60 @@ const CompiledPipeline& GPUContext::getOrCreatePipeline(
 
     pipelines_[name] = p;
     return pipelines_[name];
+}
+
+int GPUContext::warmupPipelines(
+        const std::vector<std::tuple<std::string, std::string, uint32_t>>& specs) {
+    // Filter to only uncached specs
+    std::vector<size_t> uncached;
+    for (size_t i = 0; i < specs.size(); i++) {
+        if (!hasPipeline(std::get<0>(specs[i])))
+            uncached.push_back(i);
+    }
+    if (uncached.empty()) return 0;
+
+    // Step 1: Compile shaders in parallel (wgpuDeviceCreateShaderModule is thread-safe in Dawn)
+    std::vector<std::future<WGPUShaderModule>> futures(uncached.size());
+    for (size_t j = 0; j < uncached.size(); j++) {
+        auto& [name, wgsl, nb] = specs[uncached[j]];
+        futures[j] = std::async(std::launch::async, [this, &wgsl]() {
+            WGPUShaderSourceWGSL src{};
+            src.chain.sType = WGPUSType_ShaderSourceWGSL;
+            src.code = {wgsl.c_str(), wgsl.size()};
+            WGPUShaderModuleDescriptor smD{};
+            smD.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&src);
+            return wgpuDeviceCreateShaderModule(device, &smD);
+        });
+    }
+
+    // Step 2: Collect compiled shaders and create pipelines serially
+    for (size_t j = 0; j < uncached.size(); j++) {
+        auto& [name, wgsl, numBindings] = specs[uncached[j]];
+        WGPUShaderModule shader = futures[j].get();
+        if (!shader) {
+            fprintf(stderr, "warmup: shader compilation failed: %s\n", name.c_str());
+            continue;
+        }
+        CompiledPipeline p{};
+        p.numBindings = numBindings;
+        p.shader = shader;
+
+        WGPUComputePipelineDescriptor cpD{};
+        memset(&cpD, 0, sizeof(cpD));
+        cpD.label = {name.c_str(), name.size()};
+        cpD.layout = nullptr;
+        cpD.compute.module = shader;
+        cpD.compute.entryPoint = {"main", 4};
+        p.pipeline = wgpuDeviceCreateComputePipeline(device, &cpD);
+        if (!p.pipeline) {
+            fprintf(stderr, "warmup: pipeline creation failed: %s\n", name.c_str());
+            continue;
+        }
+        p.bgLayout = wgpuComputePipelineGetBindGroupLayout(p.pipeline, 0);
+        p.pplLayout = nullptr;
+        pipelines_[name] = p;
+    }
+    return (int)uncached.size();
 }
 
 // ─── Bind groups ─────────────────────────────────────────────────────────────
