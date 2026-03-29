@@ -5,8 +5,8 @@ For each op: creates a mini ONNX model → runs through ORT for reference →
 runs through our C++ op_test_runner → compares outputs.
 
 Usage:
-    python -m pytest runtimes/tests/test_ops.py -v
-    python -m pytest runtimes/tests/test_ops.py -k "test_add" -v
+    python -m pytest tests/test_ops.py -v
+    python -m pytest tests/test_ops.py -k "test_add" -v
 """
 # Workaround: Python 3.13's platform._wmi_query() can hang on Windows when WMI
 # service is stuck.  ORT calls platform.system() during import.  Monkeypatch
@@ -23,10 +23,10 @@ from onnx import TensorProto, helper, numpy_helper
 import onnxruntime as ort
 import pytest
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Find the C++ op_test_runner binary
-_BUILD_DIR = os.path.join(_ROOT, "runtimes", "cpp", "build", "Release")
+_BUILD_DIR = os.path.join(_ROOT, "runtime", "build", "Release")
 _RUNNER = os.path.join(_BUILD_DIR, "op_test_runner.exe")
 if not os.path.exists(_RUNNER):
     _RUNNER = os.path.join(_BUILD_DIR, "op_test_runner")
