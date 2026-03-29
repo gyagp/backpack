@@ -99,7 +99,7 @@ target_include_directories(backpack_runtime PRIVATE
 
 # ─── LLM application (uses runtime API + internal LLM logic) ─────────────────
 
-set(BACKPACK_LLM_APP "${CMAKE_SOURCE_DIR}/../app/llm/main.cpp")
+set(BACKPACK_LLM_APP "${CMAKE_SOURCE_DIR}/../apps/llm/main.cpp")
 if(EXISTS ${BACKPACK_LLM_APP})
     add_executable(backpack_llm ${BACKPACK_LLM_APP} $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_llm PRIVATE backpack)
@@ -113,7 +113,7 @@ endif()
 
 # ─── Image generation application ────────────────────────────────────────────
 
-set(BACKPACK_IMAGE_APP "${CMAKE_SOURCE_DIR}/../app/image/main.cpp")
+set(BACKPACK_IMAGE_APP "${CMAKE_SOURCE_DIR}/../apps/image/main.cpp")
 if(EXISTS ${BACKPACK_IMAGE_APP})
     add_executable(backpack_image ${BACKPACK_IMAGE_APP} $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_image PRIVATE backpack)
@@ -130,6 +130,28 @@ endif()
 add_executable(op_test_runner op_test_runner.cpp $<TARGET_OBJECTS:backpack_core>)
 target_link_libraries(op_test_runner PRIVATE backpack)
 target_include_directories(op_test_runner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${DAWN_SRC}/include
+    ${DAWN_BUILD}/gen/include
+    ${DAWN_SRC}/include/dawn/native
+)
+
+# ─── Kernel test runner ─────────────────────────────────────────────────────
+
+add_executable(backpack_kernel_test tests/kernel_test.cpp $<TARGET_OBJECTS:backpack_core>)
+target_link_libraries(backpack_kernel_test PRIVATE backpack)
+target_include_directories(backpack_kernel_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${DAWN_SRC}/include
+    ${DAWN_BUILD}/gen/include
+    ${DAWN_SRC}/include/dawn/native
+)
+
+# ─── Op test runner (C++ ONNX-level tests) ─────────────────────────────────
+
+add_executable(backpack_op_test tests/op_test.cpp $<TARGET_OBJECTS:backpack_core>)
+target_link_libraries(backpack_op_test PRIVATE backpack)
+target_include_directories(backpack_op_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${DAWN_SRC}/include
     ${DAWN_BUILD}/gen/include
@@ -156,8 +178,12 @@ if(WIN32)
     endif()
     target_link_libraries(op_test_runner PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    target_link_libraries(backpack_kernel_test PRIVATE
+        ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    target_link_libraries(backpack_op_test PRIVATE
+        ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     # Copy DLLs next to executables
-    foreach(_target backpack_runtime backpack_llm backpack_image op_test_runner)
+    foreach(_target backpack_runtime backpack_llm backpack_image op_test_runner backpack_kernel_test backpack_op_test)
         if(TARGET ${_target})
             add_custom_command(TARGET ${_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -177,4 +203,6 @@ else()
         target_link_libraries(backpack_image PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     endif()
     target_link_libraries(op_test_runner PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    target_link_libraries(backpack_kernel_test PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    target_link_libraries(backpack_op_test PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
 endif()

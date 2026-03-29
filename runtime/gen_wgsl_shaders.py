@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-"""Update wgsl_shaders.h in-place from runtime/kernels/*.wgsl.
+"""Generate wgsl_shaders.h from runtime/kernels/**/*.wgsl.
 
-Reads the existing wgsl_shaders.h and patches only the constants that
-correspond to .wgsl files.  Manual entries (Q8, Q4, _F16, etc.) are
-preserved untouched.
+Reads every .wgsl file under runtime/kernels/, generates C++ string constants,
+and emits a complete wgsl_shaders.h with:
+  - ShaderInfo struct
+  - All WGSL_* constants (sorted by category then name)
+  - getEmbeddedKernels() registry function
 
 Template kernels (containing ${T} markers) produce two constants:
-  - WGSL_<NAME>   : f32-instantiated version (valid WGSL, backward compat)
+  - WGSL_<NAME>   : f32-instantiated version (valid WGSL)
   - WGSL_<NAME>_T : raw template with ${T} markers (for instantiateTemplate())
 
-Non-template .wgsl files produce just WGSL_<NAME> as before.
+Non-template .wgsl files produce just WGSL_<NAME>.
+
+Metadata can be specified in .wgsl files via a comment on the first line:
+  // @meta bindings=6 triton=true registry=custom_name noregistry=true
+
+If 'bindings' is not specified, it is auto-counted from @binding(N) annotations.
+If 'triton' is not specified, defaults to false.
+If 'registry' is specified, the kernel uses that name as the registry key.
+If 'noregistry=true', the kernel is excluded from getEmbeddedKernels().
 
 Run this whenever kernel .wgsl files change:
     python runtime/gen_wgsl_shaders.py
@@ -67,152 +77,173 @@ def is_template(src: str) -> bool:
     return "${T}" in src
 
 
-def replace_constant(content: str, var_name: str, new_src: str) -> str:
-    """Replace a WGSL constant's content in wgsl_shaders.h."""
-    pattern = (
-        r'(//[^\n]*\n)?'                       # optional comment line
-        r'static const char\* ' + re.escape(var_name) +
-        r' = R"WGSL\(' +
-        r'.*?' +                                # old content (non-greedy)
-        r'\)WGSL";'
-    )
-    match = re.search(pattern, content, re.DOTALL)
-    if not match:
-        return None  # not found
-    replacement = f'static const char* {var_name} = R"WGSL(\n{new_src.rstrip()}\n)WGSL";'
-    return content[:match.start()] + replacement + content[match.end():]
+def count_bindings(src: str) -> int:
+    """Count bindings by finding max @binding(N) + 1."""
+    bindings = re.findall(r'@binding\((\d+)\)', src)
+    if not bindings:
+        return 0
+    return max(int(b) for b in bindings) + 1
 
 
-def insert_after_constant(content: str, after_var: str, var_name: str,
-                          src: str, comment: str = "") -> str:
-    """Insert a new constant right after an existing one."""
-    # Find end of the 'after_var' constant
-    pattern = (
-        r'static const char\* ' + re.escape(after_var) +
-        r' = R"WGSL\(.*?\)WGSL";'
-    )
-    match = re.search(pattern, content, re.DOTALL)
-    if not match:
-        return None
-    insert_pos = match.end()
+def parse_meta(src: str):
+    """Parse // @meta key=value from first few lines."""
+    meta = {"bindings": None, "triton": False, "registry": None, "noregistry": False}
+    for line in src.split("\n")[:5]:
+        m = re.match(r'//\s*@meta\s+(.*)', line)
+        if m:
+            for token in m.group(1).split():
+                if "=" in token:
+                    k, v = token.split("=", 1)
+                    if k == "bindings":
+                        meta["bindings"] = int(v)
+                    elif k == "triton":
+                        meta["triton"] = v.lower() == "true"
+                    elif k == "registry":
+                        meta["registry"] = v
+                    elif k == "noregistry":
+                        meta["noregistry"] = v.lower() == "true"
+    return meta
 
-    block = "\n\n"
-    if comment:
-        block += f"// {comment}\n"
-    block += f'static const char* {var_name} = R"WGSL(\n{src.rstrip()}\n)WGSL";'
-    return content[:insert_pos] + block + content[insert_pos:]
+
+# Patterns that are excluded from the registry by default
+NOREGISTRY_SUFFIXES = ("_f16", "_f16w", "_f16wb")
 
 
-def insert_at_end(content: str, var_name: str, src: str,
-                  comment: str = "") -> str:
-    """Insert a new constant before getEmbeddedKernels or #endif."""
-    # Try to insert before getEmbeddedKernels function
-    marker = "inline const std::unordered_map"
-    pos = content.find(marker)
-    if pos < 0:
-        # fallback: before last #endif
-        pos = content.rfind("#endif")
-    if pos < 0:
-        return None
-    block = ""
-    if comment:
-        block += f"// {comment}\n"
-    block += f'static const char* {var_name} = R"WGSL(\n{src.rstrip()}\n)WGSL";\n\n'
-    return content[:pos] + block + content[pos:]
+def should_register(filename_base: str, meta: dict, is_tmpl: bool) -> bool:
+    """Determine if a kernel should be in getEmbeddedKernels()."""
+    if meta.get("noregistry"):
+        return False
+    # Template-only files that end with _t are explicitly named template variants
+    # (like slice_t.wgsl) — they produce WGSL_SLICE_T but shouldn't be registered
+    # since the non-template WGSL_SLICE is already registered
+    if filename_base.endswith("_t") and is_tmpl:
+        return False
+    # Exclude f16/f16w variants (used via direct constant reference)
+    for suffix in NOREGISTRY_SUFFIXES:
+        if filename_base.endswith(suffix):
+            return False
+    return True
 
 
 def main():
-    if not os.path.exists(OUTPUT):
-        print(f"Error: {OUTPUT} not found. Cannot update in-place.", file=sys.stderr)
+    if not os.path.isdir(KERNEL_DIR):
+        print(f"Error: {KERNEL_DIR} not found.", file=sys.stderr)
         sys.exit(1)
 
-    with open(OUTPUT, "r") as f:
-        content = f.read()
-
-    original_len = len(content)
-
-    # Collect template .wgsl files
-    updated = 0
-    added = 0
-
-    for category in sorted(os.listdir(KERNEL_DIR)):
-        cat_dir = os.path.join(KERNEL_DIR, category)
+    # Collect all kernels grouped by category
+    categories = {}
+    for cat_name in sorted(os.listdir(KERNEL_DIR)):
+        cat_dir = os.path.join(KERNEL_DIR, cat_name)
         if not os.path.isdir(cat_dir):
             continue
+        kernels = []
         for fname in sorted(os.listdir(cat_dir)):
             if not fname.endswith(".wgsl"):
                 continue
-            name = fname[:-5]
-            var_name = "WGSL_" + name.upper()
-            with open(os.path.join(cat_dir, fname)) as f:
+            fpath = os.path.join(cat_dir, fname)
+            with open(fpath) as f:
                 src = f.read()
+            kernels.append((fname, src))
+        if kernels:
+            categories[cat_name] = kernels
 
-            if not is_template(src):
-                # Non-template: update WGSL_<NAME> with latest .wgsl content
-                result = replace_constant(content, var_name, src)
-                if result:
-                    content = result
-                    updated += 1
-                else:
-                    # New non-template — insert at end
-                    comment = f"[{category}] {name} (auto-generated from {fname})"
-                    result = insert_at_end(content, var_name, src, comment)
-                    if result:
-                        content = result
-                        added += 1
-                        print(f"  Added {var_name}")
-                    else:
-                        print(f"  WARNING: could not insert {var_name}")
-                continue
+    # Build output
+    lines = []
+    lines.append('#pragma once')
+    lines.append('// wgsl_shaders.h -- Auto-generated from runtime/kernels/')
+    lines.append('// Do not edit manually.  Regenerate with:')
+    lines.append('//     python runtime/gen_wgsl_shaders.py')
+    lines.append('')
+    lines.append('#include <string>')
+    lines.append('#include <unordered_map>')
+    lines.append('')
+    lines.append('struct ShaderInfo {')
+    lines.append('    const char* source;')
+    lines.append('    uint32_t numBindings;')
+    lines.append('    bool isTritonGenerated;  // true = Triton-compiled, false = hand-written WGSL')
+    lines.append('};')
+    lines.append('')
 
-            # Template kernel: update WGSL_<NAME> with f32-instantiated version
-            f32_src = instantiate_f32(src)
-            result = replace_constant(content, var_name, f32_src)
-            if result:
-                content = result
-                updated += 1
+    # Track registry entries
+    registry_entries = []  # (key, var_name, bindings, triton)
+
+    total_constants = 0
+
+    for cat_name, kernels in categories.items():
+        lines.append(f'// {"─" * 3} [{cat_name}] {"─" * (60 - len(cat_name))}')
+        lines.append('')
+
+        for fname, src in kernels:
+            name = fname[:-5]  # strip .wgsl
+            var_name = "WGSL_" + name.upper()
+            meta = parse_meta(src)
+            tmpl = is_template(src)
+
+            # Determine binding count
+            bindings = meta["bindings"]
+            if bindings is None:
+                bindings = count_bindings(src)
+
+            if tmpl:
+                # Template kernel: emit f32-instantiated WGSL_NAME + raw WGSL_NAME_T
+                f32_src = instantiate_f32(src)
+
+                # Remove @meta line from emitted source
+                f32_clean = re.sub(r'//\s*@meta\s+.*\n', '', f32_src)
+                src_clean = re.sub(r'//\s*@meta\s+.*\n', '', src)
+
+                lines.append(f'// [{cat_name}] {name} — f32 instantiated')
+                lines.append(f'static const char* {var_name} = R"WGSL(')
+                lines.append(f32_clean.strip())
+                lines.append(')WGSL";')
+                lines.append('')
+                total_constants += 1
+
+                t_var = var_name + "_T"
+                lines.append(f'// [{cat_name}] {name} — dtype template')
+                lines.append(f'static const char* {t_var} = R"WGSL(')
+                lines.append(src_clean.strip())
+                lines.append(')WGSL";')
+                lines.append('')
+                total_constants += 1
             else:
-                # New template base — insert at end
-                comment = f"[{category}] {name} — f32 instantiated (auto-generated from {fname})"
-                result = insert_at_end(content, var_name, f32_src, comment)
-                if result:
-                    content = result
-                    added += 1
-                    print(f"  Added {var_name}")
-                else:
-                    print(f"  WARNING: could not insert {var_name}")
+                # Non-template: emit WGSL_NAME
+                src_clean = re.sub(r'//\s*@meta\s+.*\n', '', src)
+                lines.append(f'// [{cat_name}] {name}')
+                lines.append(f'static const char* {var_name} = R"WGSL(')
+                lines.append(src_clean.strip())
+                lines.append(')WGSL";')
+                lines.append('')
+                total_constants += 1
 
-            # Add or update WGSL_<NAME>_T with raw template
-            t_var = var_name + "_T"
-            result = replace_constant(content, t_var, src)
-            if result:
-                content = result
-                updated += 1
-                print(f"  Updated {t_var}")
-            else:
-                # _T doesn't exist yet — insert after WGSL_<NAME>
-                comment = f"[{category}] {name} — dtype template (use instantiateTemplate())"
-                result = insert_after_constant(content, var_name, t_var, src, comment)
-                if result:
-                    content = result
-                    added += 1
-                    print(f"  Added {t_var}")
-                else:
-                    # Fallback: insert at end
-                    result = insert_at_end(content, t_var, src, comment)
-                    if result:
-                        content = result
-                        added += 1
-                        print(f"  Added {t_var} (at end)")
-                    else:
-                        print(f"  WARNING: could not insert {t_var}")
+            # Registry entry
+            if should_register(name, meta, tmpl):
+                reg_key = meta.get("registry") or name
+                reg_var = var_name  # always point to the base constant (not _T)
+                registry_entries.append((reg_key, reg_var, bindings, meta["triton"]))
+
+    # Sort registry entries by key for stable output
+    registry_entries.sort(key=lambda e: e[0])
+
+    # Emit getEmbeddedKernels()
+    lines.append('// ─── Registry ────────────────────────────────────────────────────────────')
+    lines.append('')
+    lines.append('inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {')
+    lines.append('    static const std::unordered_map<std::string, ShaderInfo> kernels = {')
+    for reg_key, reg_var, bindings, triton in registry_entries:
+        triton_str = "true" if triton else "false"
+        lines.append(f'        {{"{reg_key}", {{{reg_var}, {bindings}, {triton_str}}}}},')
+    lines.append('    };')
+    lines.append('    return kernels;')
+    lines.append('}')
+    lines.append('')
 
     with open(OUTPUT, "w", newline="\n") as f:
-        f.write(content)
+        f.write("\n".join(lines))
 
-    print(f"\nUpdated {OUTPUT}")
-    print(f"  {updated} constants updated, {added} new _T constants added")
-    print(f"  File size: {original_len} -> {len(content)} bytes")
+    print(f"Generated {OUTPUT}")
+    print(f"  {len(categories)} categories, {total_constants} constants, {len(registry_entries)} registry entries")
+    print(f"  File size: {os.path.getsize(OUTPUT)} bytes")
 
 
 if __name__ == "__main__":

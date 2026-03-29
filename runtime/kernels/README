@@ -1,21 +1,38 @@
-# C++ Runtime Kernel Organization
+# WGSL Kernel Organization
 #
-# All WGSL kernels are embedded in wgsl_shaders.h as C++ string constants.
-# They are organized by format:
+# All WGSL shaders live as .wgsl source files under runtime/kernels/,
+# organized by functional category. They are embedded into C++ via
+# gen_wgsl_shaders.py, which generates wgsl_shaders.h.
 #
-# Shared (all formats):
-#   WGSL_RMS_NORM, WGSL_ADD_RMS_NORM       -- normalization
-#   WGSL_FUSED_QKNORM_ROPE                 -- QK-norm + RoPE + KV scatter
-#   WGSL_GQA_CHUNKED_PASS1/PASS2           -- chunked GQA attention
-#   WGSL_SILU_MUL_FUSED                    -- SiLU activation
-#   WGSL_FP16_GEMM, WGSL_FP16_GEMM_WIDE   -- FP16 weight GEMM (LM head)
-#   WGSL_ARGMAX                            -- GPU-side argmax
+# Categories:
 #
-# GGUF Q8_0 specific:
-#   WGSL_Q8_MATMUL                         -- Q8_0 matvec (store)
-#   WGSL_Q8_MATMUL_ADD                     -- Q8_0 matvec + residual add
+#   attention/     GQA decode/prefill, RoPE, KV cache, causal/bidirectional attention
+#   conv/          Conv2D, ConvTranspose2D, ResizeNearest
+#   elementwise/   Binary/unary ops, cast, where, scale, equal
+#   fused/         SiLU*mul, SwiGLU, GELU*mul, gate+residual, concat2d, split
+#   matmul/        f32/f16 matmul, GEMM, fp16_gemm
+#   moe/           MoE gate, TopK, GatherElements, ScatterElements, indirect matmul
+#   norm/          RMSNorm, LayerNorm, InstanceNorm, GroupNorm, SkipRMSNorm
+#   onnx_q4/       ONNX Q4 matmul, GatherBlockQuantized (Q4/Q8)
+#   quant_q8/      GGUF Q8_0 matmul (all variants), quantization helpers
+#   quant_kq/      K-quant matmul (Q4K, Q5K, Q6K), MXFP4
+#   shape/         Transpose, Slice, Expand, Gather, Concat, Softmax, TopK, Argmax
 #
-# To add new format support (e.g., ONNX Q4):
-#   1. Add kernel string to wgsl_shaders.h
-#   2. Register in getEmbeddedKernels()
-#   3. Use in model_runner.cpp's buildDecodePipeline()
+# Template kernels:
+#   Files containing ${T} markers are dtype-polymorphic templates.
+#   gen_wgsl_shaders.py generates two constants per template file:
+#     WGSL_<NAME>   : f32-instantiated version (valid WGSL)
+#     WGSL_<NAME>_T : raw template for runtime instantiateTemplate()
+#
+# Metadata:
+#   Optional first-line comment for codegen hints:
+#     // @meta bindings=6 triton=true registry=custom_name noregistry=true
+#   If omitted, bindings are auto-counted from @binding(N) annotations.
+#
+# To add a new kernel:
+#   1. Create <name>.wgsl in the appropriate category directory
+#   2. Run: python runtime/gen_wgsl_shaders.py
+#   3. Reference WGSL_<NAME> in C++ code (via wgsl_shaders.h)
+#
+# To regenerate after editing any .wgsl file:
+#   python runtime/gen_wgsl_shaders.py

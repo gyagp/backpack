@@ -3,7 +3,7 @@
 ## Project structure
 
 - `runtime/` — C++ runtime (WebGPU inference engine, WGSL kernels, ops, profiling, tests)
-- `app/` — C++ applications (LLM chat/benchmark, image generation)
+- `apps/` — C++ applications (LLM chat/benchmark, image generation)
 - `compiler/` — Python compiler (Triton kernels, ONNX graph compilation)
 - `third_party/` — External dependencies (Dawn, Triton)
 
