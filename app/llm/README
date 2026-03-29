@@ -6,8 +6,8 @@
 #
 # ─── Build ────────────────────────────────────────────────────────────────
 #
-#   cd gitignore/runtimes/cpp/build
-#   cmake ../../../../runtimes/cpp
+#   cd gitignore/runtime/build
+#   cmake ../../../runtime
 #   cmake --build . --config Release
 #
 # This produces:

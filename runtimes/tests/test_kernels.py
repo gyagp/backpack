@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for all WGSL kernels in runtimes/cpp/kernels/.
+"""Unit tests for all WGSL kernels in runtime/kernels/.
 
 Dispatches each kernel on the GPU via DawnRunner and validates output
 against numpy reference.

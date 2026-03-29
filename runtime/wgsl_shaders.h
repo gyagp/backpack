@@ -1,6 +1,6 @@
 #pragma once
 /**
- * wgsl_shaders.h -- Auto-generated from runtimes/cpp/kernels/*.wgsl
+ * wgsl_shaders.h -- Auto-generated from runtime/kernels/*.wgsl
  * Do not edit manually. Regenerate with: python compiler/gen_wgsl_shaders.py
  */
 

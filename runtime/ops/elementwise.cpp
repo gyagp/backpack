@@ -4,7 +4,7 @@
  * Covers: Add, Sub, Mul, Div, Neg, Sqrt, Sigmoid, Tanh, Sin, Cos,
  *         Cast, Equal, GreaterOrEqual, Where, Softmax, ReduceSum.
  *
- * Uses embedded kernels from runtimes/cpp/kernels/shared/.
+ * Uses embedded kernels from runtime/kernels/shared/.
  */
 
 #include "../graph_executor.h"
@@ -17,7 +17,7 @@
 #include <set>
 
 // Binary and unary elementwise ops now use embedded kernels from
-// runtimes/cpp/kernels/shared/binary_elementwise.wgsl and unary_elementwise.wgsl
+// runtime/kernels/shared/binary_elementwise.wgsl and unary_elementwise.wgsl
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

@@ -1177,7 +1177,7 @@ int main(int argc, char* argv[]) {
     printf("GPU:   %s (%s)\n", device.GetName().c_str(), device.GetBackendName().c_str());
     printf("Ready: %lldms\n\n", (long long)loadMs);
 
-    // Resolve baseline output path (default: apps/cpp/baseline.json)
+    // Resolve baseline output path (default: app/baseline.json)
     if (saveBaseline && baselinePath.empty()) {
         baselinePath = (fs::path(__FILE__).parent_path().parent_path() / "baseline.json").string();
     }

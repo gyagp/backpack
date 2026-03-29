@@ -1,6 +1,6 @@
 /**
  * ops/shape.cpp — Shape manipulation ONNX ops.
- * Uses embedded WGSL kernels from runtimes/cpp/kernels/shared/.
+ * Uses embedded WGSL kernels from runtime/kernels/shared/.
  */
 
 #include "../graph_executor.h"

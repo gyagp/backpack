@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update wgsl_shaders.h in-place from runtimes/cpp/kernels/*.wgsl.
+"""Update wgsl_shaders.h in-place from runtime/kernels/*.wgsl.
 
 Reads the existing wgsl_shaders.h and patches only the constants that
 correspond to .wgsl files.  Manual entries (Q8, Q4, _F16, etc.) are
@@ -12,7 +12,7 @@ Template kernels (containing ${T} markers) produce two constants:
 Non-template .wgsl files produce just WGSL_<NAME> as before.
 
 Run this whenever kernel .wgsl files change:
-    python runtimes/cpp/gen_wgsl_shaders.py
+    python runtime/gen_wgsl_shaders.py
 """
 import os
 import re
