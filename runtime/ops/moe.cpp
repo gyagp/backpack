@@ -485,8 +485,10 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
 
     // ─── Batched path (T > 1): process in chunks ───
     if (nTokens > 1) {
-        // Chunk size: balance between dispatch count reduction and memory efficiency
-        const int64_t CHUNK = 64;  // Process 64 tokens at a time
+        // Chunk size: process all tokens at once when feasible to minimize dispatch count.
+        // Scratch memory per chunk ≈ chunkTokens × (N_gu + moeIntermediate + N_dn) × 4 bytes.
+        // For typical MoE dims: ~40 bytes/token × dim, safe up to ~1024 tokens on most GPUs.
+        const int64_t CHUNK = nTokens;  // Process all tokens in one chunk
 
         // Allocate chunk-sized scratch buffers
         int64_t chunkTokens = std::min(nTokens, CHUNK);
@@ -534,14 +536,14 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                                            (uint32_t)blocksPerCol_gu, slot, (uint32_t)k};
                     auto pBuf = ex.getParamBuffer(32);
                     ex.gpu->writeBuffer(pBuf, params, 20);
-                    auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub_batched", 6, []() {
-                        return std::string(WGSL_MATMUL_Q4_INDIRECT_SUB_BATCHED);
+                    auto& pl = ex.GetPipelineT("matmul_q4_indirect_wide_batched", 6, []() {
+                        return std::string(WGSL_MATMUL_Q4_INDIRECT_WIDE_BATCHED);
                     });
                     auto bg = ex.MakeBindGroup(pl, {
                         {0, inputChunk}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
                         {3, gateUpBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
                     ex.QueueDispatch(pl.pipeline, bg,
-                        (uint32_t)((N_gu + 7) / 8), (uint32_t)cT, 1, "moe_gateup_b");
+                        (uint32_t)((N_gu + 127) / 128), (uint32_t)cT, 1, "moe_gateup_b");
                 }
                 {
                     uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
@@ -560,14 +562,14 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                                            (uint32_t)blocksPerCol_dn, slot, (uint32_t)k};
                     auto pBuf = ex.getParamBuffer(32);
                     ex.gpu->writeBuffer(pBuf, params, 20);
-                    auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub_batched", 6, []() {
-                        return std::string(WGSL_MATMUL_Q4_INDIRECT_SUB_BATCHED);
+                    auto& pl = ex.GetPipelineT("matmul_q4_indirect_wide_batched", 6, []() {
+                        return std::string(WGSL_MATMUL_Q4_INDIRECT_WIDE_BATCHED);
                     });
                     auto bg = ex.MakeBindGroup(pl, {
                         {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
                         {3, downBuf.buffer}, {4, pBuf}, {5, expertIdxBuf}});
                     ex.QueueDispatch(pl.pipeline, bg,
-                        (uint32_t)((N_dn + 7) / 8), (uint32_t)cT, 1, "moe_down_b");
+                        (uint32_t)((N_dn + 127) / 128), (uint32_t)cT, 1, "moe_down_b");
                 }
                 {
                     uint32_t params[4] = {(uint32_t)N_dn, slot, (uint32_t)k, 0};

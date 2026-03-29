@@ -292,7 +292,8 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.gpu->writeBuffer(paramBuf, params, 16);
 
     if (ZP) {
-        // Use subgroup-parallel kernel for decode (M=1)
+        // Decode: K-parallel subgroup kernel (8 warps × 32 lanes, TILE_N=8).
+        // Prefill: wide-tile kernel with shared-memory A reuse (TILE_M=8, TILE_N=128).
         if (M == 1) {
             std::string pname = "matmul_q4_zp_sub_t" + std::string(dtypeSuffix(outDtype));
             auto& pl = ex.GetPipelineT(pname, 6, [outDtype]() {
@@ -304,16 +305,15 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
             ex.QueueDispatch(pl.pipeline, bg,
                 (N + 7) / 8, 1, 1, "matmul_q4_zp");
         } else {
-            // Use templated kernel — auto-selects f32 or fp16 I/O.
-            std::string pname = "matmul_q4_zp_t" + std::string(dtypeSuffix(outDtype));
+            std::string pname = "matmul_q4_zp_wide_t" + std::string(dtypeSuffix(outDtype));
             auto& pl = ex.GetPipelineT(pname, 6, [outDtype]() {
-                return instantiateTemplate(WGSL_MATMUL_Q4_ZP_T, outDtype);
+                return instantiateTemplate(WGSL_MATMUL_Q4_ZP_WIDE_T, outDtype);
             });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}, {5, ZP->buffer}});
             ex.QueueDispatch(pl.pipeline, bg,
-                (N + 255) / 256, (uint32_t)M, 1, "matmul_q4_zp");
+                (N + 127) / 128, ((uint32_t)M + 7) / 8, 1, "matmul_q4_zp_wide");
         }
     } else {
         auto& pl = ex.GetPipelineT("matmul_q4", 5, []() { return std::string(WGSL_MATMUL_Q4); });

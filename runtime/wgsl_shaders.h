@@ -4195,6 +4195,93 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
+// [moe] matmul_q4_indirect_wide_batched
+static const char* WGSL_MATMUL_Q4_INDIRECT_WIDE_BATCHED = R"WGSL(
+// Wide-tile batched Q4 matmul with expert indirection and shared-memory X reuse.
+// 128 threads, TILE_N=128. Each thread owns one N-column.
+// X tile [1 x 32] is cooperatively loaded into shared memory per Q4 block,
+// then reused by all 128 threads for different N-column weight-activation dot products.
+// Params: [0]=N, [1]=K, [2]=blocks_per_col, [3]=slot, [4]=k_val (topk k)
+// Dispatch: (ceil(N/128), nTokens, 1)
+
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> expert_indices: array<u32>;
+
+var<workgroup> smem_x: array<f32, 32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let N = _params_[0];
+    let K = _params_[1];
+    let blocks_per_col = _params_[2];
+    let slot = _params_[3];
+    let k_val = _params_[4];
+    let tok = wid.y;
+
+    let tid = lid.x;
+    let n = wid.x * 128u + tid;
+    let valid = n < N;
+
+    let expert = expert_indices[tok * k_val + slot];
+    let expert_w_offset = expert * N * (K / 2u);
+    let expert_s_offset = expert * N * blocks_per_col;
+    let w_base = select(0u, expert_w_offset + n * (K / 2u), valid);
+    let x_base = tok * K;
+
+    var acc: f32 = 0.0;
+
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let k_off = blk * 32u;
+
+        // Cooperative X load: 128 threads load 32 elements
+        if (tid < 32u) {
+            smem_x[tid] = X[x_base + k_off + tid];
+        }
+        workgroupBarrier();
+
+        if (valid) {
+            let scale_flat = expert_s_offset + n * blocks_per_col + blk;
+            let scale_u32 = Scales[scale_flat / 2u];
+            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+            let w_blk_base = w_base + k_off / 2u;
+
+            for (var j = 0u; j < 4u; j++) {
+                let packed = W[w_blk_base / 4u + j];
+                let kl = j * 8u;
+                let b0 = packed & 0xFFu;
+                let b1 = (packed >> 8u) & 0xFFu;
+                let b2 = (packed >> 16u) & 0xFFu;
+                let b3 = (packed >> 24u) & 0xFFu;
+
+                acc += smem_x[kl]      * (f32(b0 & 0xFu) - 8.0) * scale
+                     + smem_x[kl + 1u] * (f32(b0 >> 4u)  - 8.0) * scale
+                     + smem_x[kl + 2u] * (f32(b1 & 0xFu) - 8.0) * scale
+                     + smem_x[kl + 3u] * (f32(b1 >> 4u)  - 8.0) * scale
+                     + smem_x[kl + 4u] * (f32(b2 & 0xFu) - 8.0) * scale
+                     + smem_x[kl + 5u] * (f32(b2 >> 4u)  - 8.0) * scale
+                     + smem_x[kl + 6u] * (f32(b3 & 0xFu) - 8.0) * scale
+                     + smem_x[kl + 7u] * (f32(b3 >> 4u)  - 8.0) * scale;
+            }
+        }
+
+        workgroupBarrier();
+    }
+
+    if (valid) {
+        Y[tok * N + n] = acc;
+    }
+}
+)WGSL";
+
 // [moe] moe_gate — f32 instantiated
 static const char* WGSL_MOE_GATE = R"WGSL(
 // MoE gate — GPU expert selection for MoE.
@@ -5168,7 +5255,7 @@ enable subgroups;
 @group(0) @binding(5) var<storage, read> Sin: array<f32>;
 @group(0) @binding(6) var<storage, read> QNormW: array<f32>;
 @group(0) @binding(7) var<storage, read> KNormW: array<f32>;
-@group(0) @binding(8) var<storage, read_write> _params_: array<u32>;
+@group(0) @binding(8) var<storage, read> _params_: array<u32>;
 
 const HD: u32 = 128u;
 
@@ -6848,6 +6935,582 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let warp_sum = subgroupAdd(acc);
     if (lane == 0u && valid) {
         t_write(&Y, n, warp_sum);
+    }
+}
+)WGSL";
+
+// [onnx_q4] matmul_q4_zp_sub_prefill — f32 instantiated
+static const char* WGSL_MATMUL_Q4_ZP_SUB_PREFILL = R"WGSL(
+// K-parallel subgroup Q4+ZP matmul for prefill with weight reuse.
+// 256 threads = 8 warps x 32 lanes. TILE_N=8, TILE_M=4.
+// Each warp computes 1 output N × TILE_M rows, reusing weights across rows.
+// 32 lanes split blocks_per_col for K-parallel reduction.
+// Dispatch: (ceil(N/8), ceil(M/TILE_M), 1)
+
+enable subgroups;
+
+
+fn t_read(buf: ptr<storage, array<f32>, read>, idx: u32) -> f32 {
+    return (*buf)[idx];
+}
+
+
+fn t_write(buf: ptr<storage, array<f32>, read_write>, idx: u32, val: f32) {
+    (*buf)[idx] = val;
+}
+
+
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
+
+const TILE_M: u32 = 4u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let blocks_per_col = K / 32u;
+
+    let warp_id = lid.x / 32u;     // 0..7
+    let lane = lid.x % 32u;        // 0..31
+    let n = wid.x * 8u + warp_id;
+    let m_base = wid.y * TILE_M;
+    let n_valid = n < N;
+
+    let w_base = n * (K / 2u);
+
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0;
+    var acc3: f32 = 0.0;
+
+    if (n_valid) {
+        for (var blk = lane; blk < blocks_per_col; blk += 32u) {
+            let scale_flat = n * blocks_per_col + blk;
+            let scale_u32 = Scales[scale_flat / 2u];
+            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+            let zp_byte_idx = scale_flat / 2u;
+            let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+            let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+
+            let k_base = blk * 32u;
+            let w_blk_base = w_base + k_base / 2u;
+
+            for (var j = 0u; j < 4u; j++) {
+                let packed = B[w_blk_base / 4u + j];
+                let k0 = k_base + j * 8u;
+                let b0 = packed & 0xFFu;
+                let b1 = (packed >> 8u) & 0xFFu;
+                let b2 = (packed >> 16u) & 0xFFu;
+                let b3 = (packed >> 24u) & 0xFFu;
+
+                let w0 = (f32(b0 & 0xFu) - zp) * scale;
+                let w1 = (f32(b0 >> 4u)  - zp) * scale;
+                let w2 = (f32(b1 & 0xFu) - zp) * scale;
+                let w3 = (f32(b1 >> 4u)  - zp) * scale;
+                let w4 = (f32(b2 & 0xFu) - zp) * scale;
+                let w5 = (f32(b2 >> 4u)  - zp) * scale;
+                let w6 = (f32(b3 & 0xFu) - zp) * scale;
+                let w7 = (f32(b3 >> 4u)  - zp) * scale;
+
+                // Row 0
+                if (m_base < M) {
+                    let ab = m_base * K;
+                    acc0 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+                // Row 1
+                if (m_base + 1u < M) {
+                    let ab = (m_base + 1u) * K;
+                    acc1 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+                // Row 2
+                if (m_base + 2u < M) {
+                    let ab = (m_base + 2u) * K;
+                    acc2 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+                // Row 3
+                if (m_base + 3u < M) {
+                    let ab = (m_base + 3u) * K;
+                    acc3 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+            }
+        }
+    }
+
+    // Subgroup reduction across 32 K-parallel lanes
+    let sum0 = subgroupAdd(acc0);
+    let sum1 = subgroupAdd(acc1);
+    let sum2 = subgroupAdd(acc2);
+    let sum3 = subgroupAdd(acc3);
+
+    if (lane == 0u && n_valid) {
+        if (m_base < M)      { t_write(&Y, m_base * N + n, sum0); }
+        if (m_base + 1u < M) { t_write(&Y, (m_base + 1u) * N + n, sum1); }
+        if (m_base + 2u < M) { t_write(&Y, (m_base + 2u) * N + n, sum2); }
+        if (m_base + 3u < M) { t_write(&Y, (m_base + 3u) * N + n, sum3); }
+    }
+}
+)WGSL";
+
+// [onnx_q4] matmul_q4_zp_sub_prefill — dtype template
+static const char* WGSL_MATMUL_Q4_ZP_SUB_PREFILL_T = R"WGSL(
+// K-parallel subgroup Q4+ZP matmul for prefill with weight reuse.
+// 256 threads = 8 warps x 32 lanes. TILE_N=8, TILE_M=4.
+// Each warp computes 1 output N × TILE_M rows, reusing weights across rows.
+// 32 lanes split blocks_per_col for K-parallel reduction.
+// Dispatch: (ceil(N/8), ceil(M/TILE_M), 1)
+
+enable subgroups;
+
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> A: array<${T}>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
+
+const TILE_M: u32 = 4u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let blocks_per_col = K / 32u;
+
+    let warp_id = lid.x / 32u;     // 0..7
+    let lane = lid.x % 32u;        // 0..31
+    let n = wid.x * 8u + warp_id;
+    let m_base = wid.y * TILE_M;
+    let n_valid = n < N;
+
+    let w_base = n * (K / 2u);
+
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0;
+    var acc3: f32 = 0.0;
+
+    if (n_valid) {
+        for (var blk = lane; blk < blocks_per_col; blk += 32u) {
+            let scale_flat = n * blocks_per_col + blk;
+            let scale_u32 = Scales[scale_flat / 2u];
+            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+            let zp_byte_idx = scale_flat / 2u;
+            let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+            let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+
+            let k_base = blk * 32u;
+            let w_blk_base = w_base + k_base / 2u;
+
+            for (var j = 0u; j < 4u; j++) {
+                let packed = B[w_blk_base / 4u + j];
+                let k0 = k_base + j * 8u;
+                let b0 = packed & 0xFFu;
+                let b1 = (packed >> 8u) & 0xFFu;
+                let b2 = (packed >> 16u) & 0xFFu;
+                let b3 = (packed >> 24u) & 0xFFu;
+
+                let w0 = (f32(b0 & 0xFu) - zp) * scale;
+                let w1 = (f32(b0 >> 4u)  - zp) * scale;
+                let w2 = (f32(b1 & 0xFu) - zp) * scale;
+                let w3 = (f32(b1 >> 4u)  - zp) * scale;
+                let w4 = (f32(b2 & 0xFu) - zp) * scale;
+                let w5 = (f32(b2 >> 4u)  - zp) * scale;
+                let w6 = (f32(b3 & 0xFu) - zp) * scale;
+                let w7 = (f32(b3 >> 4u)  - zp) * scale;
+
+                // Row 0
+                if (m_base < M) {
+                    let ab = m_base * K;
+                    acc0 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+                // Row 1
+                if (m_base + 1u < M) {
+                    let ab = (m_base + 1u) * K;
+                    acc1 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+                // Row 2
+                if (m_base + 2u < M) {
+                    let ab = (m_base + 2u) * K;
+                    acc2 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+                // Row 3
+                if (m_base + 3u < M) {
+                    let ab = (m_base + 3u) * K;
+                    acc3 += t_read(&A, ab + k0)      * w0 + t_read(&A, ab + k0 + 1u) * w1
+                          + t_read(&A, ab + k0 + 2u) * w2 + t_read(&A, ab + k0 + 3u) * w3
+                          + t_read(&A, ab + k0 + 4u) * w4 + t_read(&A, ab + k0 + 5u) * w5
+                          + t_read(&A, ab + k0 + 6u) * w6 + t_read(&A, ab + k0 + 7u) * w7;
+                }
+            }
+        }
+    }
+
+    // Subgroup reduction across 32 K-parallel lanes
+    let sum0 = subgroupAdd(acc0);
+    let sum1 = subgroupAdd(acc1);
+    let sum2 = subgroupAdd(acc2);
+    let sum3 = subgroupAdd(acc3);
+
+    if (lane == 0u && n_valid) {
+        if (m_base < M)      { t_write(&Y, m_base * N + n, sum0); }
+        if (m_base + 1u < M) { t_write(&Y, (m_base + 1u) * N + n, sum1); }
+        if (m_base + 2u < M) { t_write(&Y, (m_base + 2u) * N + n, sum2); }
+        if (m_base + 3u < M) { t_write(&Y, (m_base + 3u) * N + n, sum3); }
+    }
+}
+)WGSL";
+
+// [onnx_q4] matmul_q4_zp_wide — f32 instantiated
+static const char* WGSL_MATMUL_Q4_ZP_WIDE = R"WGSL(
+// Wide-tile Q4+ZP matmul for prefill with shared-memory A reuse.
+// 128 threads, TILE_M=8, TILE_N=128. Each thread owns one N-column.
+// A tile [8 x 32] is cooperatively loaded into shared memory per Q4 block,
+// then reused by all 128 threads for weight-activation dot products.
+// Dispatch: (ceil(N/128), ceil(M/8), 1)
+
+
+fn t_read(buf: ptr<storage, array<f32>, read>, idx: u32) -> f32 {
+    return (*buf)[idx];
+}
+
+
+fn t_write(buf: ptr<storage, array<f32>, read_write>, idx: u32, val: f32) {
+    (*buf)[idx] = val;
+}
+
+
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
+
+const TILE_M: u32 = 8u;
+
+var<workgroup> smem_a: array<f32, 256>;  // TILE_M(8) * 32
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let blocks_per_col = K / 32u;
+
+    let tid = lid.x;
+    let n = wid.x * 128u + tid;
+    let m_base = wid.y * TILE_M;
+    let n_valid = n < N;
+
+    let w_base = select(0u, n * (K / 2u), n_valid);
+
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0;
+    var acc3: f32 = 0.0;
+    var acc4: f32 = 0.0;
+    var acc5: f32 = 0.0;
+    var acc6: f32 = 0.0;
+    var acc7: f32 = 0.0;
+
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let k_off = blk * 32u;
+
+        // Cooperative A load: 128 threads load 256 elements (8 rows x 32 cols)
+        {
+            let idx0 = tid;           // 0..127
+            let row0 = idx0 / 32u;    // 0..3
+            let col0 = idx0 % 32u;
+            let g_row0 = m_base + row0;
+            smem_a[idx0] = select(0.0, t_read(&A, g_row0 * K + k_off + col0), g_row0 < M);
+        }
+        {
+            let idx1 = tid + 128u;    // 128..255
+            let row1 = idx1 / 32u;    // 4..7
+            let col1 = idx1 % 32u;
+            let g_row1 = m_base + row1;
+            smem_a[idx1] = select(0.0, t_read(&A, g_row1 * K + k_off + col1), g_row1 < M);
+        }
+
+        workgroupBarrier();
+
+        if (n_valid) {
+            let scale_flat = n * blocks_per_col + blk;
+            let scale_u32 = Scales[scale_flat / 2u];
+            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+            let zp_byte_idx = scale_flat / 2u;
+            let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+            let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+
+            let w_blk_base = w_base + k_off / 2u;
+
+            for (var j = 0u; j < 4u; j++) {
+                let packed = B[w_blk_base / 4u + j];
+                let kl = j * 8u;
+                let b0 = packed & 0xFFu;
+                let b1 = (packed >> 8u) & 0xFFu;
+                let b2 = (packed >> 16u) & 0xFFu;
+                let b3 = (packed >> 24u) & 0xFFu;
+
+                let w0 = (f32(b0 & 0xFu) - zp) * scale;
+                let w1 = (f32(b0 >> 4u)  - zp) * scale;
+                let w2 = (f32(b1 & 0xFu) - zp) * scale;
+                let w3 = (f32(b1 >> 4u)  - zp) * scale;
+                let w4 = (f32(b2 & 0xFu) - zp) * scale;
+                let w5 = (f32(b2 >> 4u)  - zp) * scale;
+                let w6 = (f32(b3 & 0xFu) - zp) * scale;
+                let w7 = (f32(b3 >> 4u)  - zp) * scale;
+
+                // Row 0
+                acc0 += smem_a[kl]      * w0 + smem_a[kl + 1u] * w1
+                      + smem_a[kl + 2u] * w2 + smem_a[kl + 3u] * w3
+                      + smem_a[kl + 4u] * w4 + smem_a[kl + 5u] * w5
+                      + smem_a[kl + 6u] * w6 + smem_a[kl + 7u] * w7;
+                // Row 1
+                acc1 += smem_a[32u + kl]      * w0 + smem_a[32u + kl + 1u] * w1
+                      + smem_a[32u + kl + 2u] * w2 + smem_a[32u + kl + 3u] * w3
+                      + smem_a[32u + kl + 4u] * w4 + smem_a[32u + kl + 5u] * w5
+                      + smem_a[32u + kl + 6u] * w6 + smem_a[32u + kl + 7u] * w7;
+                // Row 2
+                acc2 += smem_a[64u + kl]      * w0 + smem_a[64u + kl + 1u] * w1
+                      + smem_a[64u + kl + 2u] * w2 + smem_a[64u + kl + 3u] * w3
+                      + smem_a[64u + kl + 4u] * w4 + smem_a[64u + kl + 5u] * w5
+                      + smem_a[64u + kl + 6u] * w6 + smem_a[64u + kl + 7u] * w7;
+                // Row 3
+                acc3 += smem_a[96u + kl]      * w0 + smem_a[96u + kl + 1u] * w1
+                      + smem_a[96u + kl + 2u] * w2 + smem_a[96u + kl + 3u] * w3
+                      + smem_a[96u + kl + 4u] * w4 + smem_a[96u + kl + 5u] * w5
+                      + smem_a[96u + kl + 6u] * w6 + smem_a[96u + kl + 7u] * w7;
+                // Row 4
+                acc4 += smem_a[128u + kl]      * w0 + smem_a[128u + kl + 1u] * w1
+                      + smem_a[128u + kl + 2u] * w2 + smem_a[128u + kl + 3u] * w3
+                      + smem_a[128u + kl + 4u] * w4 + smem_a[128u + kl + 5u] * w5
+                      + smem_a[128u + kl + 6u] * w6 + smem_a[128u + kl + 7u] * w7;
+                // Row 5
+                acc5 += smem_a[160u + kl]      * w0 + smem_a[160u + kl + 1u] * w1
+                      + smem_a[160u + kl + 2u] * w2 + smem_a[160u + kl + 3u] * w3
+                      + smem_a[160u + kl + 4u] * w4 + smem_a[160u + kl + 5u] * w5
+                      + smem_a[160u + kl + 6u] * w6 + smem_a[160u + kl + 7u] * w7;
+                // Row 6
+                acc6 += smem_a[192u + kl]      * w0 + smem_a[192u + kl + 1u] * w1
+                      + smem_a[192u + kl + 2u] * w2 + smem_a[192u + kl + 3u] * w3
+                      + smem_a[192u + kl + 4u] * w4 + smem_a[192u + kl + 5u] * w5
+                      + smem_a[192u + kl + 6u] * w6 + smem_a[192u + kl + 7u] * w7;
+                // Row 7
+                acc7 += smem_a[224u + kl]      * w0 + smem_a[224u + kl + 1u] * w1
+                      + smem_a[224u + kl + 2u] * w2 + smem_a[224u + kl + 3u] * w3
+                      + smem_a[224u + kl + 4u] * w4 + smem_a[224u + kl + 5u] * w5
+                      + smem_a[224u + kl + 6u] * w6 + smem_a[224u + kl + 7u] * w7;
+            }
+        }
+
+        workgroupBarrier();
+    }
+
+    if (n_valid) {
+        if (m_base < M)      { t_write(&Y, m_base * N + n, acc0); }
+        if (m_base + 1u < M) { t_write(&Y, (m_base + 1u) * N + n, acc1); }
+        if (m_base + 2u < M) { t_write(&Y, (m_base + 2u) * N + n, acc2); }
+        if (m_base + 3u < M) { t_write(&Y, (m_base + 3u) * N + n, acc3); }
+        if (m_base + 4u < M) { t_write(&Y, (m_base + 4u) * N + n, acc4); }
+        if (m_base + 5u < M) { t_write(&Y, (m_base + 5u) * N + n, acc5); }
+        if (m_base + 6u < M) { t_write(&Y, (m_base + 6u) * N + n, acc6); }
+        if (m_base + 7u < M) { t_write(&Y, (m_base + 7u) * N + n, acc7); }
+    }
+}
+)WGSL";
+
+// [onnx_q4] matmul_q4_zp_wide — dtype template
+static const char* WGSL_MATMUL_Q4_ZP_WIDE_T = R"WGSL(
+// Wide-tile Q4+ZP matmul for prefill with shared-memory A reuse.
+// 128 threads, TILE_M=8, TILE_N=128. Each thread owns one N-column.
+// A tile [8 x 32] is cooperatively loaded into shared memory per Q4 block,
+// then reused by all 128 threads for weight-activation dot products.
+// Dispatch: (ceil(N/128), ceil(M/8), 1)
+
+${T_READ}
+${T_WRITE}
+
+@group(0) @binding(0) var<storage, read> A: array<${T}>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> Scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<${T}>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;
+
+const TILE_M: u32 = 8u;
+
+var<workgroup> smem_a: array<f32, 256>;  // TILE_M(8) * 32
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let blocks_per_col = K / 32u;
+
+    let tid = lid.x;
+    let n = wid.x * 128u + tid;
+    let m_base = wid.y * TILE_M;
+    let n_valid = n < N;
+
+    let w_base = select(0u, n * (K / 2u), n_valid);
+
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0;
+    var acc3: f32 = 0.0;
+    var acc4: f32 = 0.0;
+    var acc5: f32 = 0.0;
+    var acc6: f32 = 0.0;
+    var acc7: f32 = 0.0;
+
+    for (var blk = 0u; blk < blocks_per_col; blk++) {
+        let k_off = blk * 32u;
+
+        // Cooperative A load: 128 threads load 256 elements (8 rows x 32 cols)
+        {
+            let idx0 = tid;           // 0..127
+            let row0 = idx0 / 32u;    // 0..3
+            let col0 = idx0 % 32u;
+            let g_row0 = m_base + row0;
+            smem_a[idx0] = select(0.0, t_read(&A, g_row0 * K + k_off + col0), g_row0 < M);
+        }
+        {
+            let idx1 = tid + 128u;    // 128..255
+            let row1 = idx1 / 32u;    // 4..7
+            let col1 = idx1 % 32u;
+            let g_row1 = m_base + row1;
+            smem_a[idx1] = select(0.0, t_read(&A, g_row1 * K + k_off + col1), g_row1 < M);
+        }
+
+        workgroupBarrier();
+
+        if (n_valid) {
+            let scale_flat = n * blocks_per_col + blk;
+            let scale_u32 = Scales[scale_flat / 2u];
+            let scale_half = select(scale_u32 & 0xFFFFu, (scale_u32 >> 16u) & 0xFFFFu, (scale_flat & 1u) != 0u);
+            let scale = unpack2x16float(scale_half | (scale_half << 16u)).x;
+
+            let zp_byte_idx = scale_flat / 2u;
+            let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;
+            let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));
+
+            let w_blk_base = w_base + k_off / 2u;
+
+            for (var j = 0u; j < 4u; j++) {
+                let packed = B[w_blk_base / 4u + j];
+                let kl = j * 8u;
+                let b0 = packed & 0xFFu;
+                let b1 = (packed >> 8u) & 0xFFu;
+                let b2 = (packed >> 16u) & 0xFFu;
+                let b3 = (packed >> 24u) & 0xFFu;
+
+                let w0 = (f32(b0 & 0xFu) - zp) * scale;
+                let w1 = (f32(b0 >> 4u)  - zp) * scale;
+                let w2 = (f32(b1 & 0xFu) - zp) * scale;
+                let w3 = (f32(b1 >> 4u)  - zp) * scale;
+                let w4 = (f32(b2 & 0xFu) - zp) * scale;
+                let w5 = (f32(b2 >> 4u)  - zp) * scale;
+                let w6 = (f32(b3 & 0xFu) - zp) * scale;
+                let w7 = (f32(b3 >> 4u)  - zp) * scale;
+
+                // Row 0
+                acc0 += smem_a[kl]      * w0 + smem_a[kl + 1u] * w1
+                      + smem_a[kl + 2u] * w2 + smem_a[kl + 3u] * w3
+                      + smem_a[kl + 4u] * w4 + smem_a[kl + 5u] * w5
+                      + smem_a[kl + 6u] * w6 + smem_a[kl + 7u] * w7;
+                // Row 1
+                acc1 += smem_a[32u + kl]      * w0 + smem_a[32u + kl + 1u] * w1
+                      + smem_a[32u + kl + 2u] * w2 + smem_a[32u + kl + 3u] * w3
+                      + smem_a[32u + kl + 4u] * w4 + smem_a[32u + kl + 5u] * w5
+                      + smem_a[32u + kl + 6u] * w6 + smem_a[32u + kl + 7u] * w7;
+                // Row 2
+                acc2 += smem_a[64u + kl]      * w0 + smem_a[64u + kl + 1u] * w1
+                      + smem_a[64u + kl + 2u] * w2 + smem_a[64u + kl + 3u] * w3
+                      + smem_a[64u + kl + 4u] * w4 + smem_a[64u + kl + 5u] * w5
+                      + smem_a[64u + kl + 6u] * w6 + smem_a[64u + kl + 7u] * w7;
+                // Row 3
+                acc3 += smem_a[96u + kl]      * w0 + smem_a[96u + kl + 1u] * w1
+                      + smem_a[96u + kl + 2u] * w2 + smem_a[96u + kl + 3u] * w3
+                      + smem_a[96u + kl + 4u] * w4 + smem_a[96u + kl + 5u] * w5
+                      + smem_a[96u + kl + 6u] * w6 + smem_a[96u + kl + 7u] * w7;
+                // Row 4
+                acc4 += smem_a[128u + kl]      * w0 + smem_a[128u + kl + 1u] * w1
+                      + smem_a[128u + kl + 2u] * w2 + smem_a[128u + kl + 3u] * w3
+                      + smem_a[128u + kl + 4u] * w4 + smem_a[128u + kl + 5u] * w5
+                      + smem_a[128u + kl + 6u] * w6 + smem_a[128u + kl + 7u] * w7;
+                // Row 5
+                acc5 += smem_a[160u + kl]      * w0 + smem_a[160u + kl + 1u] * w1
+                      + smem_a[160u + kl + 2u] * w2 + smem_a[160u + kl + 3u] * w3
+                      + smem_a[160u + kl + 4u] * w4 + smem_a[160u + kl + 5u] * w5
+                      + smem_a[160u + kl + 6u] * w6 + smem_a[160u + kl + 7u] * w7;
+                // Row 6
+                acc6 += smem_a[192u + kl]      * w0 + smem_a[192u + kl + 1u] * w1
+                      + smem_a[192u + kl + 2u] * w2 + smem_a[192u + kl + 3u] * w3
+                      + smem_a[192u + kl + 4u] * w4 + smem_a[192u + kl + 5u] * w5
+                      + smem_a[192u + kl + 6u] * w6 + smem_a[192u + kl + 7u] * w7;
+                // Row 7
+                acc7 += smem_a[224u + kl]      * w0 + smem_a[224u + kl + 1u] * w1
+                      + smem_a[224u + kl + 2u] * w2 + smem_a[224u + kl + 3u] * w3
+                      + smem_a[224u + kl + 4u] * w4 + smem_a[224u + kl + 5u] * w5
+                      + smem_a[224u + kl + 6u] * w6 + smem_a[224u + kl + 7u] * w7;
+            }
+        }
+
+        workgroupBarrier();
+    }
+
+    if (n_valid) {
+        if (m_base < M)      { t_write(&Y, m_base * N + n, acc0); }
+        if (m_base + 1u < M) { t_write(&Y, (m_base + 1u) * N + n, acc1); }
+        if (m_base + 2u < M) { t_write(&Y, (m_base + 2u) * N + n, acc2); }
+        if (m_base + 3u < M) { t_write(&Y, (m_base + 3u) * N + n, acc3); }
+        if (m_base + 4u < M) { t_write(&Y, (m_base + 4u) * N + n, acc4); }
+        if (m_base + 5u < M) { t_write(&Y, (m_base + 5u) * N + n, acc5); }
+        if (m_base + 6u < M) { t_write(&Y, (m_base + 6u) * N + n, acc6); }
+        if (m_base + 7u < M) { t_write(&Y, (m_base + 7u) * N + n, acc7); }
     }
 }
 )WGSL";
@@ -11743,8 +12406,11 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"matmul_q4_indirect", {WGSL_MATMUL_Q4_INDIRECT, 6, false}},
         {"matmul_q4_indirect_sub", {WGSL_MATMUL_Q4_INDIRECT_SUB, 6, false}},
         {"matmul_q4_indirect_sub_batched", {WGSL_MATMUL_Q4_INDIRECT_SUB_BATCHED, 6, false}},
+        {"matmul_q4_indirect_wide_batched", {WGSL_MATMUL_Q4_INDIRECT_WIDE_BATCHED, 6, false}},
         {"matmul_q4_zp", {WGSL_MATMUL_Q4_ZP, 6, false}},
         {"matmul_q4_zp_sub", {WGSL_MATMUL_Q4_ZP_SUB, 6, false}},
+        {"matmul_q4_zp_sub_prefill", {WGSL_MATMUL_Q4_ZP_SUB_PREFILL, 6, false}},
+        {"matmul_q4_zp_wide", {WGSL_MATMUL_Q4_ZP_WIDE, 6, false}},
         {"mod_scale_shift", {WGSL_MOD_SCALE_SHIFT, 5, false}},
         {"moe_gate", {WGSL_MOE_GATE, 4, false}},
         {"moe_gate_batched", {WGSL_MOE_GATE_BATCHED, 4, false}},

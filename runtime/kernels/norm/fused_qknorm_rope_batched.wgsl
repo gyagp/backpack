@@ -20,7 +20,7 @@ enable subgroups;
 @group(0) @binding(5) var<storage, read> Sin: array<f32>;
 @group(0) @binding(6) var<storage, read> QNormW: array<f32>;
 @group(0) @binding(7) var<storage, read> KNormW: array<f32>;
-@group(0) @binding(8) var<storage, read_write> _params_: array<u32>;
+@group(0) @binding(8) var<storage, read> _params_: array<u32>;
 
 const HD: u32 = 128u;
 

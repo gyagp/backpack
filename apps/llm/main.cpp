@@ -1177,9 +1177,12 @@ int main(int argc, char* argv[]) {
     printf("GPU:   %s (%s)\n", device.GetName().c_str(), device.GetBackendName().c_str());
     printf("Ready: %lldms\n\n", (long long)loadMs);
 
-    // Resolve baseline output path (default: apps/baseline.json)
+    // Resolve baseline output path (default: apps/baseline/<model_name>.json)
     if (saveBaseline && baselinePath.empty()) {
-        baselinePath = (fs::path(__FILE__).parent_path().parent_path() / "baseline.json").string();
+        std::string arch = isGenericOnnx ? onnxLlm.arch : llm.arch;
+        auto baselineDir = fs::path(__FILE__).parent_path().parent_path() / "baseline";
+        fs::create_directories(baselineDir);
+        baselinePath = (baselineDir / (arch + ".json")).string();
     }
 
     // 3. Benchmark
