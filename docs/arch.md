@@ -253,7 +253,7 @@ KV caches, zero shader recompilation).
 | Category | Lifetime | Size | Release trigger |
 |----------|----------|------|-----------------|
 | **Weights** | Model lifetime | Large (entire model) | `model.Release()` |
-| **KV cache** | Session / conversation | Large (scales with context) | `session.Release()` or context resize |
+| **KV cache** | Session / conversation | Large (scales with context) | `session.Release()` |
 | **Fast decode bind groups** | Between prefills | Medium (~400 intermediate buffers held) | `ReleaseCaptured()` on shape change |
 | **Tensor plan intermediates** | Between shape changes | Medium (~350-380 buffers) | `InvalidateWarmCaches()` or memory pressure |
 | **Param pool** | Executor lifetime | Small (~80-320 KB) | Never (fixed, round-robin) |
@@ -281,12 +281,6 @@ Buffer operations:
 
 KV cache buffers can be **reused** (same size) — just reset `pos=0`. No need to
 reallocate. Only release captured bind groups and warm caches.
-
-### Scenario: Context Size Change
-
-KV cache must be **reallocated** (new size). Old buffers returned to pool. Fast
-decode and warm caches invalidated. Compiled shaders unchanged (all shapes are
-runtime params).
 
 ### Scenario: Multiple Concurrent Sessions
 
@@ -338,7 +332,6 @@ During replay:
 | Abort mid-generation | Nothing (cooperative; state stays valid) | 0 |
 | New user prompt (keep KV) | `ReleaseCaptured()` + `InvalidateWarmCaches()` | Captured + tensor plan → pool |
 | New conversation | Above + reset pos=0 | Same (KV reused, not released) |
-| Context size change | Above + reallocate KV | Old KV + captured + plan → pool |
 | Session eviction | `session.Release()` | All: KV, captured, plan, params → pool |
 | Model unload | `model.Release()` | Weights → pool → `flushPool()` |
 | Device lost | Full teardown — all GPU resources invalid | Everything (forced) |
@@ -592,15 +585,7 @@ identified in the Buffer Lifecycle section.
 | **KV buffer reuse** | Caller controls — can reuse same buffer with zeroed content | KV buffer is pre-allocated to `n_ctx`, always reused | KV buffer reused (same size), no reallocation |
 | **Limitation** | None — stateless design makes reset trivial | None | No `Session::Reset()` API yet — must create new session or manage manually |
 
-### 4. Context Size Change
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **Dynamic resize** | **Yes** — same `Ort::Session` accepts differently-sized KV tensors across runs (dynamic ONNX shapes) | **No** — `n_ctx` fixed at `llama_context` creation. Must destroy and recreate. | **Yes** — KV is app-managed I/O. Same session, different-sized tensors. Shaders are shape-independent. |
-| **Graph capture** | Incompatible with variable sizes — graph capture requires static shapes | N/A (no graph capture in Vulkan/WebGPU backends) | Fast decode must be re-captured after resize (bind groups reference old buffers) |
-| **Limitation** | Must choose: dynamic sizes OR graph capture, not both | Hard limitation — full context teardown + rebuild for size change | None — but fast decode re-capture has warmup cost |
-
-### 5. Abort Mid-Generation
+### 4. Abort Mid-Generation
 
 | | ORT WebGPU Native | llama.cpp | Backpack |
 |---|---|---|---|
@@ -610,7 +595,7 @@ identified in the Buffer Lifecycle section.
 | **Return value** | Error status from `Run()` | `llama_decode` returns `2` (aborted). Processed ubatches remain in KV cache. | N/A |
 | **Limitation** | GPU work already submitted still completes | No GPU cancellation. App must check between `llama_decode` calls. | **Gap**: No abort API. Must be added (cooperative `Session::RequestStop()` + atomic flag). |
 
-### 6. WebGPU Device Lost / GPU Recovery
+### 5. WebGPU Device Lost / GPU Recovery
 
 | | ORT WebGPU Native | llama.cpp | Backpack |
 |---|---|---|---|
@@ -618,7 +603,7 @@ identified in the Buffer Lifecycle section.
 | **Recovery** | None — must destroy `Ort::Session` and `Ort::Env`, recreate everything | None — process terminates on GPU error | None — full teardown + reload required |
 | **Limitation** | Device-lost is detected but not recoverable. Marked as TODO. | Fatal — any GPU error kills the process | **Gap**: No device-lost callback. Need `deviceLostCallbackInfo` in `GPUContext::init()` + `Device::IsLost()`. |
 
-### 7. Session Eviction / Memory Pressure
+### 6. Session Eviction / Memory Pressure
 
 | | ORT WebGPU Native | llama.cpp | Backpack |
 |---|---|---|---|
@@ -627,7 +612,7 @@ identified in the Buffer Lifecycle section.
 | **KV defragmentation** | N/A (caller-managed KV) | `llama_memory_defrag()` compacts KV cache in-place | N/A (caller-managed KV; no internal KV fragmentation) |
 | **Limitation** | No GPU memory visibility. Cannot make informed eviction decisions. | Pre-allocated KV to `n_ctx` — no dynamic growth/shrink. Defrag only within fixed allocation. | **Gap**: No memory tracking (planned). Eviction strategy designed but requires per-session ExecutionContext. |
 
-### 8. Multi-Model on Same Device
+### 7. Multi-Model on Same Device
 
 | | ORT WebGPU Native | llama.cpp | Backpack |
 |---|---|---|---|
@@ -665,6 +650,7 @@ The following scenarios were considered and explicitly excluded from the roadmap
 
 | Scenario | Why not supported |
 |---|---|
+| **Context size change** | Changing KV cache size mid-session. KV cache size is fixed at session creation. To use a different context size, create a new session. Shaders are already shape-independent so no recompilation needed — only KV reallocation and fast decode re-capture. Not worth the complexity of dynamic resize + bind group invalidation. |
 | **Speculative decoding** | Requires two models (draft + verifier) running coordinated inference with token acceptance/rejection logic. Significant complexity for a niche optimization. Can revisit if multi-model concurrent execution is needed. |
 | **Model hot-swap** | Loading a new model version while sessions are active. Would require ref-counting Model lifetime via `shared_ptr`. Current design requires releasing all sessions before releasing a model — this ordering constraint is simple and sufficient. |
 | **Batch inference (batch size > 1)** | Processing multiple independent prompts in a single `Execute()` call. Requires reworking matmul dispatch dimensions and KV cache indexing for multi-sequence batching. Listed in `docs/todo.md` as future work. |
