@@ -89,6 +89,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 let s = Sin[sin_base + i];
                 QRot[dst_base + i] = normed * c - nj * s;
                 QRot[dst_base + j] = nj * c + normed * s;
+            } else if (i >= 2u * half_dim) {
+                // Non-rotary dimensions: apply norm only
+                QRot[dst_base + i] = normed;
             }
         }
     } else {
@@ -127,27 +130,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
         // Apply K-norm + RoPE + scatter to cache
         let pos = pos_offset + t;
-        let cos_base = pos * (HD / 2u);
-        let sin_base = pos * (HD / 2u);
+        let cos_base = pos * half_dim;
+        let sin_base = pos * half_dim;
         let kv_stride = _params_[5];   // cache_offset * n_kv * HD (not used, derive from pos)
         // KV cache layout: [T_total × n_kv × HD]
         let cache_pos = pos;
         let k_dst = cache_pos * n_kv * HD + kv_head * HD;
         let v_dst = cache_pos * n_kv * HD + kv_head * HD;
-        let half = HD / 2u;
 
         for (var i = tid; i < HD; i += 128u) {
             let normed = k[i] * rstd * KNormW[i];
-            if (i < half) {
-                let j = i + half;
+            if (i < half_dim) {
+                let j = i + half_dim;
                 let nj = k[j] * rstd * KNormW[j];
                 let c = Cos[cos_base + i];
                 let s = Sin[sin_base + i];
                 K_cache[k_dst + i] = normed * c - nj * s;
                 K_cache[k_dst + j] = nj * c + normed * s;
+            } else if (i >= 2u * half_dim) {
+                // Non-rotary dimensions: apply norm only
+                K_cache[k_dst + i] = normed;
             }
             // V: just copy to cache (no RoPE)
             V_cache[v_dst + i] = QKV[v_src + i];
+        }
         }
     }
 }

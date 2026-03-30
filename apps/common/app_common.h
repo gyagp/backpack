@@ -62,9 +62,17 @@ inline void printGpuInfo(const bp::Device& device) {
 
 inline std::string applyChatTemplate(const std::string& message,
                                      const std::string& arch) {
-    if (arch.find("qwen3") != std::string::npos)
+    // Qwen3 (ONNX reports "qwen3", GGUF reports "qwen2" since llama.cpp
+    // treats Qwen3 as architecturally identical to Qwen2).
+    // Empty <think></think> block disables thinking mode.
+    if (arch.find("qwen3") != std::string::npos ||
+        arch.find("qwen2") != std::string::npos)
         return "<|im_start|>user\n" + message + "<|im_end|>\n"
                "<|im_start|>assistant\n<think>\n</think>\n";
+    // Phi-3/Phi-4-mini: uses <|user|>/<|end|>/<|assistant|> tokens
+    if (arch.find("phi3") != std::string::npos ||
+        arch.find("phi4") != std::string::npos)
+        return "<|user|>" + message + "<|end|><|assistant|>";
     if (arch.find("lfm2") != std::string::npos)
         return "<|startoftext|><|im_start|>user\n" + message +
                "<|im_end|>\n<|im_start|>assistant\n";

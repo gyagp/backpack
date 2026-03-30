@@ -16,7 +16,7 @@ enable subgroups;
 
 const TILE_N: u32 = 8u;
 const TILE_M: u32 = 8u;
-const MAX_STRIDES: u32 = 24u;
+const MAX_STRIDES: u32 = 64u;  // supports up to K=16384
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,

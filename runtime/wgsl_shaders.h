@@ -1337,6 +1337,107 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 }
 )WGSL";
 
+// [attention] rope_batched
+static const char* WGSL_ROPE_BATCHED = R"WGSL(
+enable f16;
+enable subgroups;
+
+// Batched RoPE + KV cache scatter for prefill (NO QK-norm).
+// Each workgroup handles ONE head for ONE token.
+// Grid: (n_heads_total, T, 1) where n_heads_total = n_head + n_kv
+//   WG (head < n_head, t): processes Q head
+//   WG (head >= n_head, t): processes K head + V scatter
+//
+// QKV layout: [T × (qDim + 2*kvDim)] row-major
+// Output Q: QRot[T × qDim] row-major (T × n_head × HD)
+// Output K/V: scattered into KV cache at positions pos_offset..pos_offset+T-1
+//
+// Params: [n_head, qDim, kvDim, pos_offset, half_dim, cache_len, eps_u32, n_kv]
+// Bindings 6,7 (NormQ/NormK) are unused but bound for compatibility.
+
+@group(0) @binding(0) var<storage, read> QKV: array<f32>;
+@group(0) @binding(1) var<storage, read_write> QRot: array<f32>;
+@group(0) @binding(2) var<storage, read_write> K_cache: array<f16>;
+@group(0) @binding(3) var<storage, read_write> V_cache: array<f16>;
+@group(0) @binding(4) var<storage, read> Cos: array<f32>;
+@group(0) @binding(5) var<storage, read> Sin: array<f32>;
+@group(0) @binding(6) var<storage, read> _unused_normQ: array<f32>;
+@group(0) @binding(7) var<storage, read> _unused_normK: array<f32>;
+@group(0) @binding(8) var<storage, read> _params_: array<u32>;
+
+const HD: u32 = 128u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head_idx = wid.x;
+    let t = wid.y;
+    let tid = lid.x;
+
+    let n_head = _params_[0];
+    let qDim   = _params_[1];
+    let kvDim  = _params_[2];
+    let pos_offset = _params_[3];
+    let half_dim = _params_[4];
+    let cache_len = _params_[5];
+    let n_kv = _params_[7];
+
+    let qkv_stride = qDim + 2u * kvDim;
+    let pos = pos_offset + t;
+
+    if (head_idx < n_head) {
+        // ── Q head: RoPE only, no norm ──────────────────────────────
+        let src_base = t * qkv_stride + head_idx * HD;
+        let dst_base = t * n_head * HD + head_idx * HD;
+        let cos_base = pos * half_dim;
+
+        for (var i = tid; i < half_dim; i += 128u) {
+            let j = i + half_dim;
+            let qi = QKV[src_base + i];
+            let qj = QKV[src_base + j];
+            let c = Cos[cos_base + i];
+            let s = Sin[cos_base + i];
+            QRot[dst_base + i] = qi * c - qj * s;
+            QRot[dst_base + j] = qj * c + qi * s;
+        }
+        // Non-rotary dimensions: pass through unchanged
+        let rot_dim = 2u * half_dim;
+        for (var i = rot_dim + tid; i < HD; i += 128u) {
+            QRot[dst_base + i] = QKV[src_base + i];
+        }
+    } else {
+        // ── KV head: RoPE + cache scatter, no norm ──────────────────
+        let kv_head = head_idx - n_head;
+        let k_src = t * qkv_stride + qDim + kv_head * HD;
+        let v_src = t * qkv_stride + qDim + kvDim + kv_head * HD;
+
+        let cache_pos = cache_len + t;
+        let k_dst = cache_pos * n_kv * HD + kv_head * HD;
+        let v_dst = cache_pos * n_kv * HD + kv_head * HD;
+
+        for (var i = tid; i < half_dim; i += 128u) {
+            let j = i + half_dim;
+            let ki = QKV[k_src + i];
+            let kj = QKV[k_src + j];
+            let c = Cos[pos * half_dim + i];
+            let s = Sin[pos * half_dim + i];
+            K_cache[k_dst + i] = f16(ki * c - kj * s);
+            K_cache[k_dst + j] = f16(kj * c + ki * s);
+        }
+        // Non-rotary dimensions: pass through unchanged
+        let rot_dim_k = 2u * half_dim;
+        for (var i = rot_dim_k + tid; i < HD; i += 128u) {
+            K_cache[k_dst + i] = f16(QKV[k_src + i]);
+        }
+
+        // V: just copy to cache
+        for (var i = tid; i < HD; i += 128u) {
+            V_cache[v_dst + i] = f16(QKV[v_src + i]);
+        }
+    }
+}
+)WGSL";
+
 // [attention] rope_batched_simple
 static const char* WGSL_ROPE_BATCHED_SIMPLE = R"WGSL(
 enable f16;
@@ -1420,6 +1521,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             QRot[dst_base + i] = qi * c - qj * s;
             QRot[dst_base + j] = qj * c + qi * s;
         }
+        // Non-rotary dimensions: apply norm only (no rotation)
+        let rot_dim = 2u * half_dim;
+        for (var i = rot_dim + tid; i < HD; i += 128u) {
+            QRot[dst_base + i] = QKV[src_base + i] * rstd * QNormW[i];
+        }
     } else {
         // ── KV head processing ───────────────────────────────────────
         let kv_head = head_idx - n_head;
@@ -1456,6 +1562,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let s = Sin[pos * half_dim + i];
             K_cache[k_dst + i] = f16(ki * c - kj * s);
             K_cache[k_dst + j] = f16(kj * c + ki * s);
+        }
+        // Non-rotary dimensions: apply norm only (no rotation)
+        let rot_dim_k = 2u * half_dim;
+        for (var i = rot_dim_k + tid; i < HD; i += 128u) {
+            K_cache[k_dst + i] = f16(QKV[k_src + i] * rstd * KNormW[i]);
         }
 
         // V: just copy to cache (no RoPE, no norm)
@@ -5324,6 +5435,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 let s = Sin[sin_base + i];
                 QRot[dst_base + i] = normed * c - nj * s;
                 QRot[dst_base + j] = nj * c + normed * s;
+            } else if (i >= 2u * half_dim) {
+                // Non-rotary dimensions: apply norm only
+                QRot[dst_base + i] = normed;
             }
         }
     } else {
@@ -5362,28 +5476,128 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
         // Apply K-norm + RoPE + scatter to cache
         let pos = pos_offset + t;
-        let cos_base = pos * (HD / 2u);
-        let sin_base = pos * (HD / 2u);
+        let cos_base = pos * half_dim;
+        let sin_base = pos * half_dim;
         let kv_stride = _params_[5];   // cache_offset * n_kv * HD (not used, derive from pos)
         // KV cache layout: [T_total × n_kv × HD]
         let cache_pos = pos;
         let k_dst = cache_pos * n_kv * HD + kv_head * HD;
         let v_dst = cache_pos * n_kv * HD + kv_head * HD;
-        let half = HD / 2u;
 
         for (var i = tid; i < HD; i += 128u) {
             let normed = k[i] * rstd * KNormW[i];
-            if (i < half) {
-                let j = i + half;
+            if (i < half_dim) {
+                let j = i + half_dim;
                 let nj = k[j] * rstd * KNormW[j];
                 let c = Cos[cos_base + i];
                 let s = Sin[sin_base + i];
                 K_cache[k_dst + i] = normed * c - nj * s;
                 K_cache[k_dst + j] = nj * c + normed * s;
+            } else if (i >= 2u * half_dim) {
+                // Non-rotary dimensions: apply norm only
+                K_cache[k_dst + i] = normed;
             }
             // V: just copy to cache (no RoPE)
             V_cache[v_dst + i] = QKV[v_src + i];
         }
+        }
+    }
+}
+)WGSL";
+
+// [norm] fused_rope
+static const char* WGSL_FUSED_ROPE = R"WGSL(
+enable f16;
+enable subgroups;
+
+// Hand-written fused RoPE kernel for single-token decode.
+// Applies RoPE to Q and K heads, scatters K/V into cache.
+// No QK-norm is applied (norm weight buffers are identity=1.0).
+//
+// Grid: (n_head + n_kv, 1, 1)
+//   WG x < n_head  → Q head
+//   WG x >= n_head  → K head + V scatter
+//
+// Must declare all 9 bindings to match bind group layout (auto-layout).
+
+@group(0) @binding(0) var<storage, read> buf0: array<f32>;       // QKV
+@group(0) @binding(1) var<storage, read_write> buf1: array<f32>; // Q_out
+@group(0) @binding(2) var<storage, read_write> buf2: array<f16>; // K_cache
+@group(0) @binding(3) var<storage, read_write> buf3: array<f16>; // V_cache
+@group(0) @binding(4) var<storage, read> buf4: array<f32>;       // CosTable
+@group(0) @binding(5) var<storage, read> buf5: array<f32>;       // SinTable
+@group(0) @binding(6) var<storage, read> buf6: array<f32>;       // NormQ (identity)
+@group(0) @binding(7) var<storage, read> buf7: array<f32>;       // NormK (identity)
+
+struct Params {
+    n_head: i32,
+    q_size: i32,
+    kv_size: i32,
+    pos: i32,
+    half_rot: i32,
+    cache_offset: i32,
+    eps: f32,
+};
+@group(0) @binding(8) var<storage, read> params: Params;
+
+const HD: u32 = 128u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head_idx = i32(wid.x);
+    let d = i32(lid.x);  // 0..127 = element within head
+
+    let is_q = head_idx < params.n_head;
+    let kv_head = head_idx - params.n_head;
+
+    // Source offset into QKV buffer
+    let q_off = head_idx * 128;
+    let k_off = params.q_size + kv_head * 128;
+    let src_off = select(k_off, q_off, is_q);
+
+    // Load value
+    let val = buf0[u32(src_off + d)];
+
+    // Read norm weight (identity=1.0 for non-QK-norm models)
+    let norm_w = select(buf7[u32(d)], buf6[u32(d)], is_q);
+    // Apply identity norm weight (no-op multiply by 1.0)
+    let normed = val * norm_w;
+
+    // RoPE parameters
+    let half_rot = params.half_rot;
+    let rot_dim = half_rot * 2;
+    let in_rot = d < rot_dim;
+
+    // Cos/sin lookup
+    let d_mod = d % half_rot;
+    let cos_sin_idx = params.pos * half_rot + d_mod;
+    let c = select(f32(1.0), buf4[u32(cos_sin_idx)], in_rot);
+    let s = select(f32(0.0), buf5[u32(cos_sin_idx)], in_rot);
+
+    // Pair element for rotation
+    let in_first_half = d < half_rot;
+    let pair_d = select(d - half_rot, d + half_rot, in_first_half);
+    let pair_d_final = select(d, pair_d, in_rot);
+    let pair_val = buf0[u32(src_off + pair_d_final)];
+    let pair_norm_w = select(buf7[u32(pair_d_final)], buf6[u32(pair_d_final)], is_q);
+    let pair_normed = pair_val * pair_norm_w;
+
+    // Apply rotation: first half uses -sin, second half uses +sin
+    let sign = select(f32(1.0), f32(-1.0), in_first_half);
+    let rotated = select(normed, normed * c + sign * pair_normed * s, in_rot);
+
+    // Write Q output
+    if (is_q) {
+        buf1[u32(head_idx * 128 + d)] = rotated;
+    }
+
+    // Write K/V to cache
+    if (!is_q) {
+        buf2[u32(params.cache_offset + kv_head * 128 + d)] = f16(rotated);
+        // V: straight copy, no RoPE
+        let v_off = params.q_size + params.kv_size + kv_head * 128 + d;
+        buf3[u32(params.cache_offset + kv_head * 128 + d)] = f16(buf0[u32(v_off)]);
     }
 }
 )WGSL";
@@ -7900,7 +8114,7 @@ enable subgroups;
 
 const TILE_N: u32 = 8u;
 const STRIDE: u32 = 256u;
-const MAX_STRIDES: u32 = 24u;  // ceil(6144 / 256)
+const MAX_STRIDES: u32 = 64u;  // supports up to K=16384
 
 var<workgroup> smem_x: array<f32, 256>;
 
@@ -7994,7 +8208,7 @@ enable subgroups;
 
 const TILE_N: u32 = 8u;
 const TILE_M: u32 = 8u;
-const MAX_STRIDES: u32 = 24u;
+const MAX_STRIDES: u32 = 64u;  // supports up to K=16384
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -8111,7 +8325,7 @@ const TILE_M: u32 = 8u;
 const COLS_PER_WARP: u32 = 4u;
 const BK: u32 = 256u;
 const WG: u32 = 256u;
-const MAX_ITERS: u32 = 24u;
+const MAX_ITERS: u32 = 64u;  // supports up to K=16384
 
 var<workgroup> smem_s: array<array<f32, 2048>, 2>;
 
@@ -8459,7 +8673,7 @@ const TILE_N: u32 = 32u;
 const TILE_M: u32 = 8u;
 const COLS_PER_WARP: u32 = 4u;
 const BK_LOAD: u32 = 256u;
-const MAX_ITERS: u32 = 24u;  // ceil(6144/256)
+const MAX_ITERS: u32 = 64u;  // supports up to K=16384
 
 // Shared memory: SiLU-activated values [TILE_M × BK_LOAD]
 var<workgroup> smem_s: array<f32, 2048>;  // 8 × 256
@@ -12379,6 +12593,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"fp16_gemm_wide", {WGSL_FP16_GEMM_WIDE, 5, false}},
         {"fused_qknorm_rope", {WGSL_FUSED_QKNORM_ROPE, 9, true}},
         {"fused_qknorm_rope_batched", {WGSL_FUSED_QKNORM_ROPE_BATCHED, 9, false}},
+        {"fused_rope", {WGSL_FUSED_ROPE, 9, true}},
         {"gate_residual_add", {WGSL_GATE_RESIDUAL_ADD, 4, false}},
         {"gather", {WGSL_GATHER, 4, false}},
         {"gather_bq_q4", {WGSL_GATHER_BQ_Q4, 5, false}},
@@ -12452,6 +12667,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"rms_norm", {WGSL_RMS_NORM, 5, true}},
         {"rms_norm_batched", {WGSL_RMS_NORM_BATCHED, 5, false}},
         {"rmsnorm", {WGSL_RMSNORM, 5, false}},
+        {"rope_batched", {WGSL_ROPE_BATCHED, 9, false}},
         {"rope_batched_simple", {WGSL_ROPE_BATCHED_SIMPLE, 9, false}},
         {"rope_inplace", {WGSL_ROPE_INPLACE, 4, false}},
         {"rope_inplace_batched", {WGSL_ROPE_INPLACE_BATCHED, 4, false}},

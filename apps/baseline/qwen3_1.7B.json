@@ -1,0 +1,52 @@
+{
+  "system": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "memory_gb": 61,
+    "os": "Windows"
+  },
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 5080",
+    "backend": "d3d12",
+    "driver": "D3D12 driver version 32.0.15.9144"
+  },
+  "model": {
+    "name": "qwen3_1.7B",
+    "type": "qwen3",
+    "layers": 28,
+    "hidden_size": 2048,
+    "head_dim": 128,
+    "vocab_size": 151936,
+    "kv_heads": 8
+  },
+  "benchmarks": {
+    "onnx_q4": {
+      "path": "E:/workspace/project/test/ai-models/qwen-3-1.7B/webgpu",
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        { "input_tokens": 128,  "prefill_ms": 33.0,   "prefill_tok_s": 3874.9, "decode_ms": 703.1,  "decode_tok_s": 182.1 },
+        { "input_tokens": 256,  "prefill_ms": 63.1,   "prefill_tok_s": 4056.0, "decode_ms": 707.7,  "decode_tok_s": 180.9 },
+        { "input_tokens": 512,  "prefill_ms": 124.9,  "prefill_tok_s": 4099.3, "decode_ms": 748.2,  "decode_tok_s": 171.1 },
+        { "input_tokens": 1024, "prefill_ms": 267.0,  "prefill_tok_s": 3834.8, "decode_ms": 711.4,  "decode_tok_s": 179.9 },
+        { "input_tokens": 2048, "prefill_ms": 583.2,  "prefill_tok_s": 3511.5, "decode_ms": 766.6,  "decode_tok_s": 167.0 },
+        { "input_tokens": 4096, "prefill_ms": 1405.9, "prefill_tok_s": 2913.4, "decode_ms": 742.0,  "decode_tok_s": 172.5 }
+      ]
+    },
+    "gguf_q8": {
+      "path": "E:/workspace/project/test/ai-models/qwen-3-1.7B/Qwen3-1.7B-Q8_0.gguf",
+      "format": "gguf",
+      "quantization": "Q8_0",
+      "decode_tokens": 128,
+      "results": [
+        { "input_tokens": 128,  "prefill_ms": 34.0,   "prefill_tok_s": 3766.0, "decode_ms": 697.8,  "decode_tok_s": 183.4 },
+        { "input_tokens": 256,  "prefill_ms": 62.0,   "prefill_tok_s": 4132.0, "decode_ms": 695.3,  "decode_tok_s": 184.1 },
+        { "input_tokens": 512,  "prefill_ms": 123.5,  "prefill_tok_s": 4144.5, "decode_ms": 700.1,  "decode_tok_s": 182.8 },
+        { "input_tokens": 1024, "prefill_ms": 262.2,  "prefill_tok_s": 3905.7, "decode_ms": 774.9,  "decode_tok_s": 165.2 },
+        { "input_tokens": 2048, "prefill_ms": 578.8,  "prefill_tok_s": 3538.6, "decode_ms": 712.8,  "decode_tok_s": 179.6 },
+        { "input_tokens": 4096, "prefill_ms": 1398.8, "prefill_tok_s": 2928.2, "decode_ms": 735.0,  "decode_tok_s": 174.2 }
+      ]
+    }
+  },
+  "timestamp": "2026-03-30T12:00:00"
+}

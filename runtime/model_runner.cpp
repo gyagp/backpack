@@ -875,7 +875,7 @@ void ModelRunner::buildDecodePipeline() {
     printf("  Subgroup matrix: %s\n",
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
-    auto& plFusedRope  = getKernelHD("fused_qknorm_rope");
+    auto& plFusedRope  = getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope");
     auto& plChunkP1    = getKernelHD("gqa_chunked_pass1");
     auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
     auto& plFp16Gemm   = getKernel("fp16_gemm");
@@ -1379,7 +1379,7 @@ void ModelRunner::initPrefillResources() {
     // Get kernels — MMA on Vulkan, prequantized DP4A on D3D12 when available
     auto& kRmsB    = getKernel("rms_norm_batched");
     auto& kAddRmsB = getKernel("add_rms_norm_batched");
-    auto& kRopeB   = getKernelHD("rope_batched_simple");
+    auto& kRopeB   = getKernelHD(cfg.hasQkNorm ? "rope_batched_simple" : "rope_batched");
 
     const auto& limits = effectiveLimits(*gpu);
     const bool canUse512ThreadKernels =
@@ -1998,6 +1998,7 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
 
     std::vector<float> logits(cfg.nVocab);
     memcpy(logits.data(), result.data(), cfg.nVocab * 4);
+
     return logits;
 }
 
@@ -2152,7 +2153,7 @@ int32_t ModelRunner::prefillBatched(
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         uint32_t ropeP[8] = {};
         ropeP[0] = cfg.nHead;  ropeP[1] = qDimL;  ropeP[2] = kvDimL;
-        ropeP[3] = posOffset;  ropeP[4] = cfg.headDim / 2;
+        ropeP[3] = posOffset;  ropeP[4] = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
         ropeP[5] = cacheLen;
         float eps_f = cfg.rmsNormEps; memcpy(&ropeP[6], &eps_f, 4);
         ropeP[7] = cfg.nKvHeads;

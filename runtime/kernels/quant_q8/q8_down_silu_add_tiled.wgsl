@@ -27,7 +27,7 @@ const TILE_N: u32 = 32u;
 const TILE_M: u32 = 8u;
 const COLS_PER_WARP: u32 = 4u;
 const BK_LOAD: u32 = 256u;
-const MAX_ITERS: u32 = 24u;  // ceil(6144/256)
+const MAX_ITERS: u32 = 64u;  // supports up to K=16384
 
 // Shared memory: SiLU-activated values [TILE_M × BK_LOAD]
 var<workgroup> smem_s: array<f32, 2048>;  // 8 × 256

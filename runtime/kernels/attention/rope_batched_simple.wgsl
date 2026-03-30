@@ -79,6 +79,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             QRot[dst_base + i] = qi * c - qj * s;
             QRot[dst_base + j] = qj * c + qi * s;
         }
+        // Non-rotary dimensions: apply norm only (no rotation)
+        let rot_dim = 2u * half_dim;
+        for (var i = rot_dim + tid; i < HD; i += 128u) {
+            QRot[dst_base + i] = QKV[src_base + i] * rstd * QNormW[i];
+        }
     } else {
         // ── KV head processing ───────────────────────────────────────
         let kv_head = head_idx - n_head;
@@ -115,6 +120,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let s = Sin[pos * half_dim + i];
             K_cache[k_dst + i] = f16(ki * c - kj * s);
             K_cache[k_dst + j] = f16(kj * c + ki * s);
+        }
+        // Non-rotary dimensions: apply norm only (no rotation)
+        let rot_dim_k = 2u * half_dim;
+        for (var i = rot_dim_k + tid; i < HD; i += 128u) {
+            K_cache[k_dst + i] = f16(QKV[k_src + i] * rstd * KNormW[i]);
         }
 
         // V: just copy to cache (no RoPE, no norm)

@@ -26,7 +26,7 @@ enable subgroups;
 
 const TILE_N: u32 = 8u;
 const STRIDE: u32 = 256u;
-const MAX_STRIDES: u32 = 24u;  // ceil(6144 / 256)
+const MAX_STRIDES: u32 = 64u;  // supports up to K=16384
 
 var<workgroup> smem_x: array<f32, 256>;
 

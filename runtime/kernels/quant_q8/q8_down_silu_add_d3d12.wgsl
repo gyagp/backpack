@@ -21,7 +21,7 @@ const TILE_M: u32 = 8u;
 const COLS_PER_WARP: u32 = 4u;
 const BK: u32 = 256u;
 const WG: u32 = 256u;
-const MAX_ITERS: u32 = 24u;
+const MAX_ITERS: u32 = 64u;  // supports up to K=16384
 
 var<workgroup> smem_s: array<array<f32, 2048>, 2>;
 

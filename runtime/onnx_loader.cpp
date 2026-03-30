@@ -156,6 +156,9 @@ struct OnnxAttribute {
     float f = 0;
     int64_t i = 0;
     std::string s;
+    // For graph attributes (type=5 = GRAPH): raw subgraph data for deferred parsing
+    const uint8_t* graphData = nullptr;
+    size_t graphSize = 0;
 };
 
 struct OnnxNode {
@@ -221,8 +224,16 @@ OnnxTensor parseTensorProto(PBReader& r) {
                     t.int64Data.push_back((int64_t)r.readVarint());
                 }
                 break;
-            case 15: dataLocation = (int)r.readVarint(); break;  // data_location
-            case 13: { // raw_data or misplaced external_data
+            case 15: dataLocation = (int)r.readVarint(); break;  // data_location (compat)
+            case 9: { // raw_data (field 9 per ONNX spec)
+                uint64_t len = r.readVarint();
+                const uint8_t* rawStart = r.data;
+                t.rawData = rawStart;
+                t.rawSize = (size_t)len;
+                r.data += len;
+                break;
+            }
+            case 13: { // external_data (StringStringEntryProto, repeated)
                 uint64_t len = r.readVarint();
                 const uint8_t* rawStart = r.data;
 
@@ -285,15 +296,6 @@ OnnxTensor parseTensorProto(PBReader& r) {
         if (t.externalLocation.empty())
             t.externalLocation = "model.onnx.data";  // default ONNX external data file
     }
-    // Debug: print external data info for tensors with data
-    if (!t.externalLocation.empty()) {
-        int64_t nel = 1;
-        for (auto d : t.dims) nel *= d;
-        fprintf(stderr, "  [pb] tensor '%s': dataLoc=%d ext='%s' off=%lld len=%lld rawSize=%zu dims=%zu nel=%lld type=%d\n",
-                t.name.c_str(), dataLocation, t.externalLocation.c_str(),
-                (long long)t.externalOffset, (long long)t.externalLength,
-                t.rawSize, t.dims.size(), (long long)nel, t.dataType);
-    }
     return t;
 }
 
@@ -304,14 +306,21 @@ OnnxAttribute parseAttributeProto(PBReader& r) {
         auto [field, wire] = r.readTag();
         switch (field) {
             case 1: a.name = r.readString(); break;
-            case 4: a.type = (int)r.readVarint(); break;
-            case 5: {  // float
+            case 2: {  // f (float)
                 uint32_t bits = r.readFixed32();
                 memcpy(&a.f, &bits, 4);
                 break;
             }
-            case 6: a.i = (int64_t)r.readVarint(); break;  // int
-            case 7: a.s = r.readString(); break;  // string
+            case 3: a.i = (int64_t)r.readVarint(); break;  // i (int64)
+            case 4: a.s = r.readString(); break;  // s (bytes/string)
+            case 6: {  // g (GraphProto) - store raw bytes for deferred parsing
+                uint64_t len = r.readVarint();
+                a.graphData = r.data;
+                a.graphSize = (size_t)len;
+                r.data += len;
+                break;
+            }
+            case 20: a.type = (int)r.readVarint(); break;  // type
             default: r.skip(wire); break;
         }
     }
@@ -615,6 +624,58 @@ std::vector<float> dequantEmbedding(const uint8_t* rawData, const uint8_t* scale
         }
     }
     return fp32;
+}
+
+/// Extract Constant node tensor values from a GraphProto subgraph.
+/// Used to find cos_cache/sin_cache embedded in If node then_branch.
+/// Returns a map of output_name → OnnxTensor for Constant nodes with tensor data.
+std::unordered_map<std::string, OnnxTensor> extractConstantsFromGraph(
+    const uint8_t* graphData, size_t graphSize) {
+    std::unordered_map<std::string, OnnxTensor> result;
+    PBReader gr(graphData, graphSize);
+    while (!gr.eof()) {
+        auto [gField, gWire] = gr.readTag();
+        if (gField == 1 && gWire == 2) {
+            // node (NodeProto)
+            auto nodeR = gr.readLengthDelimited();
+            std::string opType;
+            std::vector<std::string> outputs;
+            OnnxTensor tensor;
+            bool hasTensor = false;
+            while (!nodeR.eof()) {
+                auto [nf, nw] = nodeR.readTag();
+                switch (nf) {
+                    case 2: outputs.push_back(nodeR.readString()); break; // output
+                    case 4: opType = nodeR.readString(); break; // op_type
+                    case 5: { // attribute
+                        auto attrR = nodeR.readLengthDelimited();
+                        std::string attrName;
+                        while (!attrR.eof()) {
+                            auto [af, aw] = attrR.readTag();
+                            switch (af) {
+                                case 1: attrName = attrR.readString(); break;
+                                case 5: { // t (TensorProto) - field 5 in AttributeProto
+                                    auto tR = attrR.readLengthDelimited();
+                                    tensor = parseTensorProto(tR);
+                                    hasTensor = true;
+                                    break;
+                                }
+                                default: attrR.skip(aw); break;
+                            }
+                        }
+                        break;
+                    }
+                    default: nodeR.skip(nw); break;
+                }
+            }
+            if (opType == "Constant" && hasTensor && !outputs.empty()) {
+                result[outputs[0]] = std::move(tensor);
+            }
+        } else {
+            gr.skip(gWire);
+        }
+    }
+    return result;
 }
 
 }  // anonymous namespace
@@ -957,6 +1018,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             if (!wTensor.rawData || !sTensor.rawData) continue;
 
             auto mapping = mapOnnxName(wName);
+            fprintf(stderr, "  [MatMulNBits] %s → %s (K=%u N=%u bits=%u bs=%u)\n",
+                    wName.c_str(), mapping.backpackName.c_str(), K, N, bits, blockSize);
             if (mapping.backpackName.empty()) continue;
 
             uint32_t nGroups = (wTensor.dims.size() >= 2)
@@ -1005,7 +1068,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             normWeights[bpName] = std::move(fp32);
 
         } else if (node.opType == "Gather") {
-            // Plain embedding
+            // Embedding (plain fp16/fp32 or int8 quantized)
             if (node.inputs.empty()) continue;
             auto& embName = node.inputs[0];
             auto it = initializers.find(embName);
@@ -1013,15 +1076,60 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             auto& t = it->second;
             if (embName.find("embed") == std::string::npos) continue;
 
-            uint32_t nel = 1;
-            for (auto d : t.dims) nel *= (uint32_t)d;
-            result.embeddingCPU.resize(nel);
-            if (t.dataType == ONNX_FLOAT16) {
-                const uint16_t* src = reinterpret_cast<const uint16_t*>(t.rawData);
-                for (uint32_t j = 0; j < nel; j++)
-                    result.embeddingCPU[j] = fp16_to_f32(src[j]);
-            } else if (t.dataType == ONNX_FLOAT) {
-                memcpy(result.embeddingCPU.data(), t.rawData, nel * 4);
+            if (t.dataType == ONNX_INT8) {
+                // Int8 quantized embedding (e.g. phi-4-mini eq8)
+                // Look for matching scales initializer: replace "_quantized" with "_scales"
+                std::string scaleName = embName;
+                auto qpos = scaleName.find("_quantized");
+                if (qpos != std::string::npos)
+                    scaleName.replace(qpos, 10, "_scales");
+                else
+                    scaleName += "_scales";
+
+                auto scaleIt = initializers.find(scaleName);
+                if (scaleIt == initializers.end() || !scaleIt->second.rawData) {
+                    fprintf(stderr, "  [onnx] int8 embedding '%s' but scales '%s' not found\n",
+                            embName.c_str(), scaleName.c_str());
+                    continue;
+                }
+
+                auto& st = scaleIt->second;
+                uint32_t nVocab = (uint32_t)t.dims[0];
+                uint32_t embK = (t.dims.size() >= 2) ? (uint32_t)t.dims[1] : 1;
+                uint32_t nGroups = (st.dims.size() >= 2) ? (uint32_t)st.dims[1] : 1;
+                uint32_t blockSize = (nGroups > 0) ? embK / nGroups : embK;
+
+                fprintf(stderr, "  [onnx] int8 embedding: %s V=%u K=%u nGroups=%u bs=%u\n",
+                        embName.c_str(), nVocab, embK, nGroups, blockSize);
+
+                result.embeddingCPU.resize((size_t)nVocab * embK);
+                const int8_t* src = reinterpret_cast<const int8_t*>(t.rawData);
+                const uint16_t* scales = reinterpret_cast<const uint16_t*>(st.rawData);
+
+                for (uint32_t row = 0; row < nVocab; row++) {
+                    for (uint32_t g = 0; g < nGroups; g++) {
+                        float scale = fp16_to_f32(scales[row * nGroups + g]);
+                        for (uint32_t j = 0; j < blockSize; j++) {
+                            uint32_t col = g * blockSize + j;
+                            if (col < embK) {
+                                result.embeddingCPU[row * embK + col] =
+                                    (float)src[row * embK + col] * scale;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Plain fp16/fp32 embedding
+                uint32_t nel = 1;
+                for (auto d : t.dims) nel *= (uint32_t)d;
+                result.embeddingCPU.resize(nel);
+                if (t.dataType == ONNX_FLOAT16) {
+                    const uint16_t* src = reinterpret_cast<const uint16_t*>(t.rawData);
+                    for (uint32_t j = 0; j < nel; j++)
+                        result.embeddingCPU[j] = fp16_to_f32(src[j]);
+                } else if (t.dataType == ONNX_FLOAT) {
+                    memcpy(result.embeddingCPU.data(), t.rawData, nel * 4);
+                }
             }
 
         } else if (node.opType == "GatherBlockQuantized") {
@@ -1266,26 +1374,81 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                result.ropeMaxPositions, result.ropeHalfDim, result.rotaryDim);
     }
 
+    // Fallback: cos/sin caches may be inside If node subgraphs (phi-4-mini, LongRoPE)
+    if (!result.hasPrecomputedRope) {
+        for (auto& node : nodes) {
+            if (node.opType != "If") continue;
+            // Check if this If node outputs cos_cache or sin_cache
+            bool outputsCos = false, outputsSin = false;
+            for (auto& out : node.outputs) {
+                if (out == "cos_cache") outputsCos = true;
+                if (out == "sin_cache") outputsSin = true;
+            }
+            if (!outputsCos && !outputsSin) continue;
+
+            // Search all branches for cos/sin cache tensors, keep the largest
+            OnnxTensor bestCos, bestSin;
+            uint32_t bestPositions = 0;
+
+            for (auto& attr : node.attributes) {
+                if ((attr.name != "then_branch" && attr.name != "else_branch") ||
+                    !attr.graphData || attr.graphSize == 0) continue;
+
+                auto constants = extractConstantsFromGraph(
+                    attr.graphData, attr.graphSize);
+
+                OnnxTensor* cosTP = nullptr;
+                OnnxTensor* sinTP = nullptr;
+                for (auto& [name, tensor] : constants) {
+                    if (name.find("cos_cache") != std::string::npos && tensor.rawData)
+                        cosTP = &tensor;
+                    if (name.find("sin_cache") != std::string::npos && tensor.rawData)
+                        sinTP = &tensor;
+                }
+                if (!cosTP || !sinTP) continue;
+
+                uint32_t nPos = cosTP->dims.empty() ? 0 : (uint32_t)cosTP->dims[0];
+                if (nPos > bestPositions) {
+                    bestPositions = nPos;
+                    bestCos = std::move(*cosTP);
+                    bestSin = std::move(*sinTP);
+                }
+            }
+
+            if (bestPositions > 0 && bestCos.rawData && bestSin.rawData) {
+                auto loadTable = [](const OnnxTensor& t) -> std::vector<float> {
+                    uint32_t nel = 1;
+                    for (auto d : t.dims) nel *= (uint32_t)d;
+                    std::vector<float> out(nel);
+                    if (t.dataType == ONNX_FLOAT) {
+                        memcpy(out.data(), t.rawData, nel * 4);
+                    } else if (t.dataType == ONNX_FLOAT16) {
+                        const uint16_t* src = reinterpret_cast<const uint16_t*>(t.rawData);
+                        for (uint32_t j = 0; j < nel; j++) out[j] = fp16_to_f32(src[j]);
+                    }
+                    return out;
+                };
+
+                result.ropeCos = loadTable(bestCos);
+                result.ropeSin = loadTable(bestSin);
+                result.hasPrecomputedRope = true;
+                result.ropeMaxPositions = bestPositions;
+                result.ropeHalfDim = (bestCos.dims.size() >= 2)
+                    ? (uint32_t)bestCos.dims[1]
+                    : (uint32_t)(result.ropeCos.size() / bestPositions);
+                result.rotaryDim = 2 * result.ropeHalfDim;
+
+                printf("  RoPE cache (from If subgraph): %u positions x %u half-dim (rotary_dim=%u)\n",
+                       result.ropeMaxPositions, result.ropeHalfDim, result.rotaryDim);
+            }
+            break;
+        }
+    }
+
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     printf("  ONNX model parsed in %lldms\n", (long long)ms);
 
-    // Debug: verify first layer weight and embedding values
-    if (!result.layers.empty() && result.layers[0].qkv.N > 0) {
-        auto& qkv = result.layers[0].qkv;
-        printf("  [verify] L0 QKV: N=%u K=%u weights=%zu scales=%zu\n",
-               qkv.N, qkv.K, qkv.weights.size(), qkv.scales.size());
-    }
-    if (!result.embeddingCPU.empty()) {
-        printf("  [verify] Embedding[0][:4] = %.6f %.6f %.6f %.6f\n",
-               result.embeddingCPU[0], result.embeddingCPU[1],
-               result.embeddingCPU[2], result.embeddingCPU[3]);
-    }
-    if (!result.finalNorm.empty()) {
-        printf("  [verify] FinalNorm[:4] = %.6f %.6f %.6f %.6f\n",
-               result.finalNorm[0], result.finalNorm[1],
-               result.finalNorm[2], result.finalNorm[3]);
-    }
     printf("  Model: E=%u, IM=%u, HD=%u, V=%u\n",
            cfg.nEmbd, cfg.intermediateSize, cfg.headDim, cfg.nVocab);
 
