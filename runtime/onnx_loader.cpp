@@ -1,4 +1,5 @@
 #include "onnx_loader.h"
+#include "mapped_file.h"
 #include "json_parser.h"
 
 #include <algorithm>
@@ -749,41 +750,25 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             }
         }
     }
-    auto onnxFileSize = fs::file_size(onnxPath);
-    FILE* f = fopen(onnxPath.c_str(), "rb");
-    if (!f) {
-        fprintf(stderr, "Failed to open: %s\n", onnxPath.c_str());
+    MappedFile onnxMap;
+    if (!onnxMap.open(onnxPath)) {
+        fprintf(stderr, "Failed to mmap: %s\n", onnxPath.c_str());
         return false;
     }
-    std::vector<uint8_t> onnxData(onnxFileSize);
-    fread(onnxData.data(), 1, onnxFileSize, f);
-    fclose(f);
 
-    printf("  ONNX file: %llu bytes\n", (unsigned long long)onnxFileSize);
+    printf("  ONNX file: %llu bytes\n", (unsigned long long)onnxMap.size);
     fflush(stdout);
 
-    // Load external data file if present
-    std::vector<uint8_t> externalData;
+    // Memory-map external data file if present
+    MappedFile extDataMap;
     std::string extDataPath = (fs::path(modelDir) / "model.onnx.data").string();
     if (fs::exists(extDataPath)) {
-        // Use filesystem to get file size (handles > 2GB on Windows)
         auto extFileSize = fs::file_size(extDataPath);
-        printf("  Loading external data: %llu bytes (%.0f MB)...\n",
+        printf("  Mapping external data: %llu bytes (%.0f MB)...\n",
                (unsigned long long)extFileSize, extFileSize / 1048576.0);
         fflush(stdout);
-        FILE* ef = fopen(extDataPath.c_str(), "rb");
-        if (ef) {
-            externalData.resize(extFileSize);
-            size_t totalRead = 0;
-            while (totalRead < extFileSize) {
-                size_t chunk = std::min((size_t)(256 * 1024 * 1024),
-                                        (size_t)(extFileSize - totalRead));
-                size_t n = fread(externalData.data() + totalRead, 1, chunk, ef);
-                if (n == 0) break;
-                totalRead += n;
-            }
-            fclose(ef);
-            printf("  External data loaded: %zu bytes\n", totalRead);
+        if (extDataMap.open(extDataPath)) {
+            printf("  External data mapped: %zu bytes\n", extDataMap.size);
             fflush(stdout);
         }
     }
@@ -792,7 +777,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     std::unordered_map<std::string, OnnxTensor> initializers;
     std::vector<OnnxNode> nodes;
 
-    PBReader modelReader(onnxData.data(), onnxData.size());
+    PBReader modelReader(onnxMap.data, onnxMap.size);
     int64_t externalDataCursor = 0;  // running offset for tensors without explicit offset
     while (!modelReader.eof()) {
         auto [field, wire] = modelReader.readTag();
@@ -811,7 +796,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                     auto tensor = parseTensorProto(tensorReader);
 
                     // Resolve external data pointers
-                    if (!tensor.externalLocation.empty() && !externalData.empty()) {
+                    if (!tensor.externalLocation.empty() && extDataMap.data) {
                         int64_t offset = (tensor.externalOffset >= 0)
                             ? tensor.externalOffset : externalDataCursor;
                         int64_t length = tensor.externalLength;
@@ -830,8 +815,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                             }
                             length = nel * bytesPerElem;
                         }
-                        if (offset + length <= (int64_t)externalData.size()) {
-                            tensor.rawData = externalData.data() + offset;
+                        if (offset + length <= (int64_t)extDataMap.size) {
+                            tensor.rawData = extDataMap.data + offset;
                             tensor.rawSize = (size_t)length;
                             // Advance cursor past this tensor (aligned to 64 bytes)
                             externalDataCursor = offset + length;
@@ -839,7 +824,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                         } else {
                             fprintf(stderr, "  [onnx] WARN: external tensor '%s' offset+length (%lld+%lld=%lld) > file size (%lld)\n",
                                     tensor.name.c_str(), (long long)offset, (long long)length,
-                                    (long long)(offset + length), (long long)externalData.size());
+                                    (long long)(offset + length), (long long)extDataMap.size);
                         }
                     }
 

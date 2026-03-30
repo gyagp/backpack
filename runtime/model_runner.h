@@ -190,7 +190,7 @@ struct ModelRunner {
     void destroy();
 
 private:
-    void loadWeights(const GGUFFile& gguf, const std::vector<uint8_t>& fileData);
+    void loadWeights(const GGUFFile& gguf, const uint8_t* fileData);
     void buildDecodePipeline();
     void computeRopeTables();
     void initPrefillResources();

@@ -9,6 +9,7 @@
  */
 
 #include "gpu_context.h"
+#include "mapped_file.h"
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -545,11 +546,11 @@ private:
     // Op registry
     static std::unordered_map<std::string, OpDispatchFn>& GetOpRegistry();
 
-    // External data (kept alive for pointer stability)
-    std::vector<uint8_t> onnxData_;
-    std::vector<uint8_t> externalData_;
-    // Multi-file external data: filename → data
-    std::unordered_map<std::string, std::vector<uint8_t>> externalDataFiles_;
+    // Memory-mapped data (kept alive for pointer stability)
+    MappedFile onnxMapping_;
+    MappedFile extDataMapping_;
+    // Multi-file external data: filename → mapped file
+    std::unordered_map<std::string, MappedFile> extDataMappings_;
 
 public:
     /// Register an op implementation. Called at static init time.

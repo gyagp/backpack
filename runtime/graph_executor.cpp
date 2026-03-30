@@ -476,15 +476,13 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     gpu = &gpuCtx;
     auto t0 = std::chrono::steady_clock::now();
 
-    // Read .onnx file
-    auto fileSize = fs::file_size(onnxPath);
-    FILE* f = fopen(onnxPath.c_str(), "rb");
-    if (!f) { fprintf(stderr, "GraphExecutor: cannot open %s\n", onnxPath.c_str()); return false; }
-    onnxData_.resize(fileSize);
-    fread(onnxData_.data(), 1, fileSize, f);
-    fclose(f);
+    // Memory-map .onnx file
+    if (!onnxMapping_.open(onnxPath)) {
+        fprintf(stderr, "GraphExecutor: cannot mmap %s\n", onnxPath.c_str());
+        return false;
+    }
 
-    // Read external data if present
+    // Memory-map external data if present
     // Support multi-file external data: model.onnx_data, model.onnx_data_1, model.onnx_data_2, ...
     {
         auto dir = fs::path(onnxPath).parent_path();
@@ -498,47 +496,24 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             baseName = stem + ".data";
         }
         if (fs::exists(extPath)) {
-            // Load primary file
+            // Map primary file
             auto extSize = fs::file_size(extPath);
-            printf("  Loading external data: %s (%.0f MB)...\n", baseName.c_str(), extSize / 1048576.0);
+            printf("  Mapping external data: %s (%.0f MB)...\n", baseName.c_str(), extSize / 1048576.0);
             fflush(stdout);
-            auto& data = externalDataFiles_[baseName];
-            data.resize(extSize);
-            FILE* ef = fopen(extPath.c_str(), "rb");
-            if (ef) {
-                size_t read = 0;
-                while (read < extSize) {
-                    size_t chunk = std::min((size_t)(256*1024*1024), extSize - read);
-                    size_t n = fread(data.data() + read, 1, chunk, ef);
-                    if (n == 0) break;
-                    read += n;
-                }
-                fclose(ef);
-            }
-            // For backward compat, also set externalData_ to primary file
-            externalData_ = data;
+            auto& mapping = extDataMappings_[baseName];
+            mapping.open(extPath);
+            // Primary file also accessible via extDataMapping_
+            extDataMapping_.open(extPath);
 
-            // Load numbered continuation files: _data_1, _data_2, ...
+            // Map numbered continuation files: _data_1, _data_2, ...
             for (int idx = 1; idx < 100; idx++) {
                 std::string contName = stem + "_data_" + std::to_string(idx);
                 std::string contPath = (dir / contName).string();
                 if (!fs::exists(contPath)) break;
                 auto contSize = fs::file_size(contPath);
-                printf("  Loading external data: %s (%.0f MB)...\n", contName.c_str(), contSize / 1048576.0);
+                printf("  Mapping external data: %s (%.0f MB)...\n", contName.c_str(), contSize / 1048576.0);
                 fflush(stdout);
-                auto& contData = externalDataFiles_[contName];
-                contData.resize(contSize);
-                FILE* cf = fopen(contPath.c_str(), "rb");
-                if (cf) {
-                    size_t read = 0;
-                    while (read < contSize) {
-                        size_t chunk = std::min((size_t)(256*1024*1024), contSize - read);
-                        size_t n = fread(contData.data() + read, 1, chunk, cf);
-                        if (n == 0) break;
-                        read += n;
-                    }
-                    fclose(cf);
-                }
+                extDataMappings_[contName].open(contPath);
             }
         }
     }
@@ -549,7 +524,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     std::vector<PBValueInfo> graphInputs, graphOutputs;
     int64_t extCursor = 0;
 
-    PBReader model(onnxData_.data(), onnxData_.size());
+    PBReader model(onnxMapping_.data, onnxMapping_.size);
     while (!model.eof()) {
         auto [mf, mw] = model.readTag();
         if (mf == 7 && mw == 2) {
@@ -565,12 +540,15 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                     // Resolve external data
                     if (!tensor.extLocation.empty()) {
                         // Try multi-file lookup first
-                        auto fileIt = externalDataFiles_.find(tensor.extLocation);
-                        const std::vector<uint8_t>* extData = nullptr;
-                        if (fileIt != externalDataFiles_.end()) {
-                            extData = &fileIt->second;
-                        } else if (!externalData_.empty()) {
-                            extData = &externalData_;  // fallback to primary
+                        const uint8_t* extData = nullptr;
+                        size_t extSize = 0;
+                        auto fileIt = extDataMappings_.find(tensor.extLocation);
+                        if (fileIt != extDataMappings_.end()) {
+                            extData = fileIt->second.data;
+                            extSize = fileIt->second.size;
+                        } else if (extDataMapping_.data) {
+                            extData = extDataMapping_.data;  // fallback to primary
+                            extSize = extDataMapping_.size;
                         }
                         if (extData) {
                             int64_t off = (tensor.extOffset >= 0) ? tensor.extOffset : 0;
@@ -588,8 +566,8 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                                 }
                                 len = nel * bpe;
                             }
-                            if (off + len <= (int64_t)extData->size()) {
-                                tensor.rawData = extData->data() + off;
+                            if (off + len <= (int64_t)extSize) {
+                                tensor.rawData = extData + off;
                                 tensor.rawSize = (size_t)len;
                             }
                         }

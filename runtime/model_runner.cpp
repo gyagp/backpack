@@ -1,5 +1,6 @@
 #include "model_runner.h"
 #include "onnx_loader.h"
+#include "mapped_file.h"
 #include "wgsl_shaders.h"
 #include "clock_calibration.h"
 #include "profile_html.h"
@@ -287,17 +288,15 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     printf("  Backend: %s, single-pass dispatch\n",
            gpu->backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan");
 
-    // Read entire GGUF file for tensor data
-    FILE* f = fopen(ggufPath.c_str(), "rb");
-    fseek(f, 0, SEEK_END);
-    long fileSize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> fileData(fileSize);
-    fread(fileData.data(), 1, fileSize, f);
-    fclose(f);
+    // Memory-map GGUF file for tensor data
+    MappedFile ggufMap;
+    if (!ggufMap.open(ggufPath)) {
+        fprintf(stderr, "Failed to mmap GGUF file: %s\n", ggufPath.c_str());
+        return false;
+    }
 
     // Load weights
-    loadWeights(gguf, fileData);
+    loadWeights(gguf, ggufMap.data);
 
     // RoPE tables
     computeRopeTables();
@@ -504,7 +503,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
 // ─── Load weights ────────────────────────────────────────────────────────────
 
 void ModelRunner::loadWeights(const GGUFFile& gguf,
-                               const std::vector<uint8_t>& fileData) {
+                               const uint8_t* fileData) {
     auto t0 = std::chrono::steady_clock::now();
     printf("  Loading %llu tensors...\n", (unsigned long long)gguf.n_tensors);
 
@@ -540,7 +539,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         auto it = gguf.tensor_index.find(ggufName);
         if (it == gguf.tensor_index.end()) return;
         auto& ti = gguf.tensors[it->second];
-        const uint8_t* data = fileData.data() + gguf.data_offset + ti.offset;
+        const uint8_t* data = fileData + gguf.data_offset + ti.offset;
         uint32_t nel = 1;
         for (auto d : ti.shape) nel *= (uint32_t)d;
         std::vector<float> fp32(nel);
@@ -615,16 +614,16 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& kt = gguf.tensors[ki->second];
                 auto& vt = gguf.tensors[vi->second];
                 if (isKQuant) {
-                    auto qp = packKQ(fileData.data() + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
-                    auto kp = packKQ(fileData.data() + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
-                    auto vp = packKQ(fileData.data() + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
+                    auto qp = packKQ(fileData + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
+                    auto kp = packKQ(fileData + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
+                    auto vp = packKQ(fileData + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
                     auto fused = fuseKQ(fuseKQ(qp, kp), vp);
                     if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
                 } else {
-                    auto qr = repack_q8_0(fileData.data() + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
-                    auto kr = repack_q8_0(fileData.data() + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
-                    auto vr = repack_q8_0(fileData.data() + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
+                    auto qr = repack_q8_0(fileData + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
+                    auto kr = repack_q8_0(fileData + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
+                    auto vr = repack_q8_0(fileData + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
                     Q8Repacked fused;
                     fused.N = qkvOut; fused.K = cfg.nEmbd;
                     fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
@@ -646,11 +645,11 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
                 if (isKQuant) {
-                    auto kq = packKQ(fileData.data() + gguf.data_offset + ti.offset, cfg.nEmbd, qDim);
+                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, qDim);
                     if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
                 } else {
-                    auto rep = repack_q8_0(fileData.data() + gguf.data_offset + ti.offset,
+                    auto rep = repack_q8_0(fileData + gguf.data_offset + ti.offset,
                                             cfg.nEmbd, qDim);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
                 }
@@ -665,15 +664,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& gt = gguf.tensors[gi->second];
                 auto& ut = gguf.tensors[ui->second];
                 if (isKQuant) {
-                    auto gp = packKQ(fileData.data() + gguf.data_offset + gt.offset, cfg.intermediateSize, cfg.nEmbd);
-                    auto up = packKQ(fileData.data() + gguf.data_offset + ut.offset, cfg.intermediateSize, cfg.nEmbd);
+                    auto gp = packKQ(fileData + gguf.data_offset + gt.offset, cfg.intermediateSize, cfg.nEmbd);
+                    auto up = packKQ(fileData + gguf.data_offset + ut.offset, cfg.intermediateSize, cfg.nEmbd);
                     auto fused = fuseKQ(gp, up);
                     if (i == 0) { kqGuNBlocks = fused.nBlocks; kqGuRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".gu_kq", fused, lw.guKQ);
                 } else {
-                    auto gr = repack_q8_0(fileData.data() + gguf.data_offset + gt.offset,
+                    auto gr = repack_q8_0(fileData + gguf.data_offset + gt.offset,
                                            cfg.intermediateSize, cfg.nEmbd);
-                    auto ur = repack_q8_0(fileData.data() + gguf.data_offset + ut.offset,
+                    auto ur = repack_q8_0(fileData + gguf.data_offset + ut.offset,
                                            cfg.intermediateSize, cfg.nEmbd);
                     Q8Repacked fused;
                     fused.N = 2 * cfg.intermediateSize; fused.K = cfg.nEmbd;
@@ -694,11 +693,11 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
                 if (isKQuant) {
-                    auto kq = packKQ(fileData.data() + gguf.data_offset + ti.offset, cfg.nEmbd, cfg.intermediateSize);
+                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, cfg.intermediateSize);
                     if (i == 0) { kqDnNBlocks = kq.nBlocks; kqDnRowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".dn_kq", kq, lw.dnKQ);
                 } else {
-                    auto rep = repack_q8_0(fileData.data() + gguf.data_offset + ti.offset,
+                    auto rep = repack_q8_0(fileData + gguf.data_offset + ti.offset,
                                             cfg.nEmbd, cfg.intermediateSize);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
                 }
@@ -725,7 +724,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto& ti = gguf.tensors[it->second];
             uint32_t nel = 1;
             for (auto d : ti.shape) nel *= (uint32_t)d;
-            const uint8_t* data = fileData.data() + gguf.data_offset + ti.offset;
+            const uint8_t* data = fileData + gguf.data_offset + ti.offset;
             embeddingCPU.resize(nel);
             if (ti.type == GGUF_TYPE_F16) {
                 const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(data);
