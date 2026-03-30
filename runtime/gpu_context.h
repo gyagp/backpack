@@ -100,6 +100,10 @@ struct GPUContext {
     // OOM detection: set by Dawn error callback, checked after buffer creation
     bool lastAllocFailed = false;
 
+    // Device lost detection: set by Dawn device-lost callback
+    bool deviceLost = false;
+    std::string deviceLostReason;
+
     // --- Lifecycle ---
     bool init(WGPUBackendType backend = WGPUBackendType_Vulkan);
     void destroy();
@@ -107,6 +111,19 @@ struct GPUContext {
     // --- Buffers ---
     int createBufferCount = 0;  // allocation counter for profiling
     int poolHitCount = 0;  // pool reuse counter
+
+    // Memory tracking
+    uint64_t totalAllocatedBytes = 0;
+    uint64_t peakAllocatedBytes = 0;
+    uint64_t totalAllocCount = 0;
+    struct MemoryStats {
+        uint64_t currentBytes;
+        uint64_t peakBytes;
+        uint64_t allocCount;
+    };
+    MemoryStats getMemoryStats() const {
+        return { totalAllocatedBytes, peakAllocatedBytes, totalAllocCount };
+    }
     GPUBuffer createBuffer(const std::string& name, uint64_t size,
                            uint64_t usage = BUF_DEFAULT,
                            bool mappedAtCreation = false);

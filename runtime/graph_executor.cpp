@@ -31,18 +31,19 @@ static size_t warmupGraphPipelines(GraphExecutor& ex) {
     for (const auto& node : ex.GetGraph().nodes)
         opTypes.insert(node.opType);
 
-    std::set<std::string> warmed;
+    std::set<std::string> seen;
     bool hasF16 = ex.gpu->supportsShaderF16;
 
-    // Helper: warm a template pipeline under the EXACT runtime name
-    auto warmT = [&](const std::string& name, const char* tmpl, uint32_t nb, TensorDtype dt) {
-        if (!warmed.insert(name).second) return;
-        ex.GetPipeline(name, instantiateTemplate(tmpl, dt), nb);
+    // Collect (name, wgsl, numBindings) specs for batch warmup
+    std::vector<std::tuple<std::string, std::string, uint32_t>> specs;
+
+    auto addT = [&](const std::string& name, const char* tmpl, uint32_t nb, TensorDtype dt) {
+        if (!seen.insert(name).second) return;
+        specs.emplace_back(name, instantiateTemplate(tmpl, dt), nb);
     };
-    // Helper: warm a non-template pipeline
-    auto warmRaw = [&](const std::string& name, const char* wgsl, uint32_t nb) {
-        if (!warmed.insert(name).second) return;
-        ex.GetPipeline(name, wgsl, nb);
+    auto addRaw = [&](const std::string& name, const char* wgsl, uint32_t nb) {
+        if (!seen.insert(name).second) return;
+        specs.emplace_back(name, std::string(wgsl), nb);
     };
 
     auto has = [&](const char* op) { return opTypes.count(op) > 0; };
@@ -53,140 +54,147 @@ static size_t warmupGraphPipelines(GraphExecutor& ex) {
                      has("Erf") || has("Relu") || has("Exp") || has("Log") ||
                      has("Abs") || has("Floor") || has("Ceil") || has("Round");
 
-    // ── Elementwise ops (runtime uses "binary_t_f32", "unary_t_f32", etc.) ──
+    // ── Elementwise ops ──
     if (hasBinary) {
-        warmT("binary_t_f32", WGSL_BINARY_ELEMENTWISE_T, 4, TensorDtype::Float32);
-        if (hasF16) warmT("binary_t_f16", WGSL_BINARY_ELEMENTWISE_T, 4, TensorDtype::Float16);
+        addT("binary_t_f32", WGSL_BINARY_ELEMENTWISE_T, 4, TensorDtype::Float32);
+        if (hasF16) addT("binary_t_f16", WGSL_BINARY_ELEMENTWISE_T, 4, TensorDtype::Float16);
     }
     if (hasUnary) {
-        warmT("unary_t_f32", WGSL_UNARY_ELEMENTWISE_T, 3, TensorDtype::Float32);
-        if (hasF16) warmT("unary_t_f16", WGSL_UNARY_ELEMENTWISE_T, 3, TensorDtype::Float16);
+        addT("unary_t_f32", WGSL_UNARY_ELEMENTWISE_T, 3, TensorDtype::Float32);
+        if (hasF16) addT("unary_t_f16", WGSL_UNARY_ELEMENTWISE_T, 3, TensorDtype::Float16);
     }
     if (has("Where"))
-        warmT("where_select", WGSL_WHERE_SELECT_T, 5, TensorDtype::Float32);
+        addT("where_select", WGSL_WHERE_SELECT_T, 5, TensorDtype::Float32);
     if (has("Equal"))
-        warmT("equal_op", WGSL_EQUAL_OP_T, 4, TensorDtype::Float32);
+        addT("equal_op", WGSL_EQUAL_OP_T, 4, TensorDtype::Float32);
     if (has("Softmax"))
-        warmT("softmax_t_f32", WGSL_SOFTMAX_T, 3, TensorDtype::Float32);
+        addT("softmax_t_f32", WGSL_SOFTMAX_T, 3, TensorDtype::Float32);
 
     // ── Cast ops ──
     if (has("Cast") && hasF16) {
-        warmRaw("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
-        warmRaw("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+        addRaw("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
+        addRaw("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
     }
 
     // ── MatMul / Gemm ──
     if (has("MatMul")) {
-        warmT("matmul_f32", WGSL_MATMUL_T, 4, TensorDtype::Float32);
-        if (hasF16) warmRaw("matmul_f16", WGSL_MATMUL_F16, 4);
+        addT("matmul_f32", WGSL_MATMUL_T, 4, TensorDtype::Float32);
+        if (hasF16) addRaw("matmul_f16", WGSL_MATMUL_F16, 4);
     }
     if (has("MatMulNBits"))
-        warmRaw("matmul_q4", WGSL_MATMUL_Q4, 5);
+        addRaw("matmul_q4", WGSL_MATMUL_Q4, 5);
     if (has("Gemm")) {
-        warmT("gemm", WGSL_GEMM_T, 5, TensorDtype::Float32);
+        addT("gemm", WGSL_GEMM_T, 5, TensorDtype::Float32);
         if (ex.gpu->supportsSubgroups) {
-            warmRaw("fp16_gemm", WGSL_FP16_GEMM, 5);
-            warmRaw("fp16_gemm_wide", WGSL_FP16_GEMM_WIDE, 5);
+            addRaw("fp16_gemm", WGSL_FP16_GEMM, 5);
+            addRaw("fp16_gemm_wide", WGSL_FP16_GEMM_WIDE, 5);
         }
     }
 
     // ── Conv / Resize ──
     if (has("Conv")) {
-        warmT("conv2d_f32", WGSL_CONV2D_T, 5, TensorDtype::Float32);
-        if (hasF16) warmRaw("conv2d_f16", WGSL_CONV2D_F16, 5);
+        addT("conv2d_f32", WGSL_CONV2D_T, 5, TensorDtype::Float32);
+        if (hasF16) addRaw("conv2d_f16", WGSL_CONV2D_F16, 5);
     }
     if (has("ConvTranspose")) {
-        warmT("conv_transpose2d_f32", WGSL_CONV_TRANSPOSE2D_T, 5, TensorDtype::Float32);
-        if (hasF16) warmRaw("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5);
+        addT("conv_transpose2d_f32", WGSL_CONV_TRANSPOSE2D_T, 5, TensorDtype::Float32);
+        if (hasF16) addRaw("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5);
     }
     if (has("Resize"))
-        warmT("resize_nearest", WGSL_RESIZE_NEAREST_T, 3, TensorDtype::Float32);
+        addT("resize_nearest", WGSL_RESIZE_NEAREST_T, 3, TensorDtype::Float32);
 
     // ── Normalization ──
     if (has("SimplifiedLayerNormalization") || has("SkipSimplifiedLayerNormalization")) {
-        warmT("rmsnorm_simple", WGSL_RMSNORM_T, 5, TensorDtype::Float32);
-        if (hasF16) warmT("rmsnorm_t_f16", WGSL_RMSNORM_T, 5, TensorDtype::Float16);
+        addT("rmsnorm_simple", WGSL_RMSNORM_T, 5, TensorDtype::Float32);
+        if (hasF16) addT("rmsnorm_t_f16", WGSL_RMSNORM_T, 5, TensorDtype::Float16);
     }
     if (has("SkipSimplifiedLayerNormalization"))
-        warmT("skip_rmsnorm", WGSL_SKIP_RMSNORM_T, 6, TensorDtype::Float32);
+        addT("skip_rmsnorm", WGSL_SKIP_RMSNORM_T, 6, TensorDtype::Float32);
     if (has("LayerNormalization"))
-        warmT("layer_norm", WGSL_LAYER_NORM_T, 5, TensorDtype::Float32);
+        addT("layer_norm", WGSL_LAYER_NORM_T, 5, TensorDtype::Float32);
     if (has("InstanceNormalization"))
-        warmT("instance_norm", WGSL_INSTANCE_NORM_T, 5, TensorDtype::Float32);
+        addT("instance_norm", WGSL_INSTANCE_NORM_T, 5, TensorDtype::Float32);
     if (has("GroupNorm"))
-        warmT("group_norm", WGSL_GROUP_NORM_T, 5, TensorDtype::Float32);
+        addT("group_norm", WGSL_GROUP_NORM_T, 5, TensorDtype::Float32);
 
     // ── Shape ops ──
     if (has("Gather"))
-        warmRaw("gather", WGSL_GATHER, 4);
+        addRaw("gather", WGSL_GATHER, 4);
     if (has("Transpose")) {
-        warmRaw("transpose", WGSL_TRANSPOSE, 3);  // i64 path
-        warmT("transpose_f32", WGSL_TRANSPOSE_T, 3, TensorDtype::Float32);
+        addRaw("transpose", WGSL_TRANSPOSE, 3);
+        addT("transpose_f32", WGSL_TRANSPOSE_T, 3, TensorDtype::Float32);
     }
     if (has("Slice")) {
-        warmRaw("slice", WGSL_SLICE, 3);  // i64 path
-        warmT("slice_f32", WGSL_SLICE_T, 3, TensorDtype::Float32);
+        addRaw("slice", WGSL_SLICE, 3);
+        addT("slice_f32", WGSL_SLICE_T, 3, TensorDtype::Float32);
     }
     if (has("Expand"))
-        warmT("expand_t_f32", WGSL_EXPAND_T, 3, TensorDtype::Float32);
+        addT("expand_t_f32", WGSL_EXPAND_T, 3, TensorDtype::Float32);
     if (has("Concat"))
-        warmT("concat_2t_f32", WGSL_CONCAT_2INPUT_T, 4, TensorDtype::Float32);
+        addT("concat_2t_f32", WGSL_CONCAT_2INPUT_T, 4, TensorDtype::Float32);
 
     // ── Attention ops ──
     if (has("MultiHeadAttention") || has("GroupQueryAttention"))
-        warmT("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN_T, 5, TensorDtype::Float32);
+        addT("bidirectional_attn", WGSL_BIDIRECTIONAL_ATTN_T, 5, TensorDtype::Float32);
     if (has("RotaryEmbedding"))
-        warmT("rotary_embedding", WGSL_ROTARY_EMBEDDING_T, 6, TensorDtype::Float32);
+        addT("rotary_embedding", WGSL_ROTARY_EMBEDDING_T, 6, TensorDtype::Float32);
     if (has("GroupQueryAttention")) {
-        warmT("rope_inplace", WGSL_ROPE_INPLACE_T, 4, TensorDtype::Float32);
-        warmT("kv_cache_append", WGSL_KV_CACHE_APPEND_T, 4, TensorDtype::Float32);
-        warmT("kv_cache_write", WGSL_KV_CACHE_WRITE_T, 3, TensorDtype::Float32);
-        warmT("gqa_decode", WGSL_GQA_DECODE_T, 5, TensorDtype::Float32);
-        // GQA also needs cast pipelines for f16 models
+        addT("rope_inplace", WGSL_ROPE_INPLACE_T, 4, TensorDtype::Float32);
+        addT("kv_cache_append", WGSL_KV_CACHE_APPEND_T, 4, TensorDtype::Float32);
+        addT("kv_cache_write", WGSL_KV_CACHE_WRITE_T, 3, TensorDtype::Float32);
+        addT("gqa_decode", WGSL_GQA_DECODE_T, 5, TensorDtype::Float32);
         if (hasF16) {
-            warmRaw("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
-            warmRaw("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
+            addRaw("cast_f32_to_f16", WGSL_CAST_F32_TO_F16, 3);
+            addRaw("cast_f16_to_f32", WGSL_CAST_F16_TO_F32, 3);
         }
     }
 
     // ── MoE ops ──
     if (has("QMoE")) {
-        warmT("moe_gate", WGSL_MOE_GATE_T, 4, TensorDtype::Float32);
-        warmT("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT_T, 6, TensorDtype::Float32);
-        warmT("swiglu", WGSL_SWIGLU_T, 3, TensorDtype::Float32);
-        warmT("weighted_add_indirect", WGSL_WEIGHTED_ADD_INDIRECT_T, 4, TensorDtype::Float32);
+        addT("moe_gate", WGSL_MOE_GATE_T, 4, TensorDtype::Float32);
+        addT("matmul_q4_indirect", WGSL_MATMUL_Q4_INDIRECT_T, 6, TensorDtype::Float32);
+        addT("swiglu", WGSL_SWIGLU_T, 3, TensorDtype::Float32);
+        addT("weighted_add_indirect", WGSL_WEIGHTED_ADD_INDIRECT_T, 4, TensorDtype::Float32);
     }
     if (has("TopK"))
-        warmT("topk_f32", WGSL_TOPK_T, 4, TensorDtype::Float32);
+        addT("topk_f32", WGSL_TOPK_T, 4, TensorDtype::Float32);
     if (has("GatherElements"))
-        warmT("gather_elements_f32", WGSL_GATHER_ELEMENTS_T, 4, TensorDtype::Float32);
+        addT("gather_elements_f32", WGSL_GATHER_ELEMENTS_T, 4, TensorDtype::Float32);
     if (has("ScatterElements"))
-        warmT("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_T, 5, TensorDtype::Float32);
+        addT("scatter_elements_f32", WGSL_SCATTER_ELEMENTS_T, 5, TensorDtype::Float32);
     if (has("LinearMxfp4"))
-        warmRaw("mxfp4_matmul", WGSL_MXFP4_MATMUL, 6);
+        addRaw("mxfp4_matmul", WGSL_MXFP4_MATMUL, 6);
     if (has("GptOssGate"))
-        warmT("gptoss_gate_f32", WGSL_GPTOSS_GATE_T, 3, TensorDtype::Float32);
+        addT("gptoss_gate_f32", WGSL_GPTOSS_GATE_T, 3, TensorDtype::Float32);
     if (has("GQAAttnSink"))
-        warmRaw("gqa_decode_attn_sink", WGSL_GQA_DECODE_ATTN_SINK, 6);
+        addRaw("gqa_decode_attn_sink", WGSL_GQA_DECODE_ATTN_SINK, 6);
     if (has("GeluMul"))
-        warmT("gelu_mul_f32", WGSL_GELU_MUL_T, 4, TensorDtype::Float32);
+        addT("gelu_mul_f32", WGSL_GELU_MUL_T, 4, TensorDtype::Float32);
     if (has("AddScaled"))
-        warmT("add_scaled_f32", WGSL_ADD_SCALED_T, 3, TensorDtype::Float32);
+        addT("add_scaled_f32", WGSL_ADD_SCALED_T, 3, TensorDtype::Float32);
     if (has("ModScaleShift"))
-        warmT("mod_scale_shift_f32", WGSL_MOD_SCALE_SHIFT_T, 5, TensorDtype::Float32);
+        addT("mod_scale_shift_f32", WGSL_MOD_SCALE_SHIFT_T, 5, TensorDtype::Float32);
     if (has("GateResidualAdd"))
-        warmT("gate_residual_add_f32", WGSL_GATE_RESIDUAL_ADD_T, 4, TensorDtype::Float32);
+        addT("gate_residual_add_f32", WGSL_GATE_RESIDUAL_ADD_T, 4, TensorDtype::Float32);
     if (has("SigmoidGateInterleaved"))
-        warmT("sigmoid_gate_interleaved_f32", WGSL_SIGMOID_GATE_INTERLEAVED_T, 3, TensorDtype::Float32);
+        addT("sigmoid_gate_interleaved_f32", WGSL_SIGMOID_GATE_INTERLEAVED_T, 3, TensorDtype::Float32);
     if (has("Concat2D"))
-        warmT("concat_2d_f32", WGSL_CONCAT_2D_T, 4, TensorDtype::Float32);
+        addT("concat_2d_f32", WGSL_CONCAT_2D_T, 4, TensorDtype::Float32);
     if (has("SplitCopy"))
-        warmT("split_copy_f32", WGSL_SPLIT_COPY_T, 3, TensorDtype::Float32);
+        addT("split_copy_f32", WGSL_SPLIT_COPY_T, 3, TensorDtype::Float32);
 
-    return warmed.size();
+    // Batch-compile all collected specs (parallel shader + async pipeline)
+    if (!specs.empty())
+        ex.gpu->warmupPipelines(specs);
+
+    return seen.size();
 }
 
 }  // anonymous namespace
+
+size_t GraphExecutor::WarmupAllPipelines() {
+    return warmupGraphPipelines(*this);
+}
 
 // ─── Op Registry (static) ───────────────────────────────────────────────────
 

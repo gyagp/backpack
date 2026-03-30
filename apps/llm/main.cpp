@@ -1129,6 +1129,7 @@ int main(int argc, char* argv[]) {
     std::string resolvedPath = resolvePath(modelPath, modelFormat, formatOverride);
     printf("Loading model: %s (%s)\n", resolvedPath.c_str(), modelFormat.c_str()); fflush(stdout);
     auto t0 = std::chrono::steady_clock::now();
+    app::LoadingInfo loadInfo;
 
     // Standard transformer models (GGUF or ONNX)
     LlmContext llm;
@@ -1141,6 +1142,9 @@ int main(int argc, char* argv[]) {
         if (!onnxLlm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), resolvedPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
         }
+        auto tWeightsDone = std::chrono::steady_clock::now();
+        loadInfo.weightMs = std::chrono::duration<double, std::milli>(tWeightsDone - t0).count();
+
         // Auto-enable fast decode unless disabled
         if (!noFastDecode) {
             std::string reason = onnxLlm.CheckFastDecodeSupport();
@@ -1152,15 +1156,21 @@ int main(int argc, char* argv[]) {
             }
         }
         // Pre-compile GPU pipelines in parallel
+        auto tShaderStart = std::chrono::steady_clock::now();
         onnxLlm.WarmupPipelines();
+        auto tShaderDone = std::chrono::steady_clock::now();
+        loadInfo.shaderMs = std::chrono::duration<double, std::milli>(tShaderDone - tShaderStart).count();
     } else {
         if (!llm.Load(*static_cast<GPUContext*>(device.GetGPUContext()), modelPath)) {
             fprintf(stderr, "Failed to load model\n"); return 1;
         }
+        auto tWeightsDone = std::chrono::steady_clock::now();
+        loadInfo.weightMs = std::chrono::duration<double, std::milli>(tWeightsDone - t0).count();
     }
 
     auto t1 = std::chrono::steady_clock::now();
     auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
+    loadInfo.totalMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // (Micro-test removed — fast decode validated)
 
@@ -1222,8 +1232,17 @@ int main(int argc, char* argv[]) {
                 double pfMs = std::chrono::duration<double, std::milli>(pfEnd - pfStart).count();
                 onnxLlm.prefillDone = true;
 
-                // Warmup 3 decode steps (capture on first, replay on rest)
-                for (int i = 0; i < 3; i++) {
+                // TTFT: time the first decode step
+                auto ttftStart = std::chrono::steady_clock::now();
+                {
+                    auto logits = onnxLlm.RunStep(tok);
+                    tok = onnxLlm.Argmax(logits);
+                }
+                auto ttftEnd = std::chrono::steady_clock::now();
+                double ttftMs = std::chrono::duration<double, std::milli>(ttftEnd - ttftStart).count();
+
+                // Warmup 2 more decode steps (capture/replay stabilization)
+                for (int i = 0; i < 2; i++) {
                     auto logits = onnxLlm.RunStep(tok);
                     tok = onnxLlm.Argmax(logits);
                 }
@@ -1244,7 +1263,7 @@ int main(int argc, char* argv[]) {
                        pl, pfMs, pfTps, dcMs, dcTps);
                 fflush(stdout);
 
-                benchResults.push_back({pl, pfMs, pfTps, dcMs, dcTps});
+                benchResults.push_back({pl, pfMs, pfTps, dcMs, dcTps, ttftMs});
             }
 
             // CPU profile: single replay step (skip for now — hangs)
@@ -1289,13 +1308,16 @@ int main(int argc, char* argv[]) {
             // Save baseline JSON
             if (saveBaseline) {
                 auto sysInfo = app::getSystemInfo();
+                auto memStats = gpuCtx->getMemoryStats();
+                app::MemoryInfo memInfo{memStats.peakBytes, memStats.currentBytes, memStats.allocCount};
                 app::writeBaselineJson(baselinePath, sysInfo,
                     device.GetName(), device.GetBackendName(),
                     gpuCtx->adapterDescription,
                     onnxLlm.arch, onnxLlm.modelPath, "onnx_generic",
                     (int)onnxLlm.numLayers, (int)onnxLlm.hiddenSize,
                     (int)onnxLlm.vocabSize,
-                    benchGenTokens, benchResults);
+                    benchGenTokens, benchResults,
+                    &loadInfo, &memInfo);
             }
 
             printf("\n");
@@ -1319,13 +1341,16 @@ int main(int argc, char* argv[]) {
         // Save baseline JSON
         if (saveBaseline) {
             auto sysInfo = app::getSystemInfo();
+            auto memStats = gpuCtx->getMemoryStats();
+            app::MemoryInfo memInfo{memStats.peakBytes, memStats.currentBytes, memStats.allocCount};
             std::string mDir = fs::path(modelPath).parent_path().string();
             app::writeBaselineJson(baselinePath, sysInfo,
                 device.GetName(), device.GetBackendName(),
                 gpuCtx->adapterDescription,
                 llm.arch, modelPath, llm.format,
                 (int)llm.nLayer, (int)llm.nEmbd, (int)llm.nVocab,
-                benchGenTokens, benchResults);
+                benchGenTokens, benchResults,
+                &loadInfo, &memInfo);
         }
 
         printf("\n");

@@ -194,6 +194,21 @@ bool GPUContext::init(WGPUBackendType backend) {
         };
     ddesc.uncapturedErrorCallbackInfo.userdata1 = this;
 
+    ddesc.deviceLostCallbackInfo.callback =
+        [](WGPUDevice const*, WGPUDeviceLostReason reason, WGPUStringView m,
+           void* ud, void*) {
+            auto* ctx = static_cast<GPUContext*>(ud);
+            ctx->deviceLost = true;
+            ctx->deviceLostReason = std::string(m.data, m.length);
+            const char* reasons[] = {"?","Unknown","Destroyed","CallbackCancelled",
+                                     "FailedCreation"};
+            int ri = (int)reason;
+            const char* rs = (ri >= 1 && ri <= 4) ? reasons[ri] : "?";
+            fprintf(stderr, "[DAWN DeviceLost] reason=%s: %.*s\n",
+                    rs, (int)m.length, m.data);
+        };
+    ddesc.deviceLostCallbackInfo.userdata1 = this;
+
     device = wgpuAdapterCreateDevice(adapter, &ddesc);
     if (!device) return false;
 
@@ -266,6 +281,10 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
             pool_[bucket].pop_back();
             poolHitCount++;
             createBufferCount++;
+            totalAllocatedBytes += buf.size;
+            totalAllocCount++;
+            if (totalAllocatedBytes > peakAllocatedBytes)
+                peakAllocatedBytes = totalAllocatedBytes;
             return buf;
         }
         // Round up to bucket size for new allocation
@@ -303,7 +322,17 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
             fflush(stderr);
         }
     }
-    buffers_[name] = buf;
+    if (buf.handle) {
+        totalAllocatedBytes += buf.size;
+        totalAllocCount++;
+        if (totalAllocatedBytes > peakAllocatedBytes)
+            peakAllocatedBytes = totalAllocatedBytes;
+    }
+    // Only register device-level resources (prefixed with '_') in the shared
+    // buffers_ map. Per-model buffers (weights, intermediates) are tracked by
+    // GraphExecutor::tensorStore_ and would cause name collisions across models.
+    if (!name.empty() && name[0] == '_')
+        buffers_[name] = buf;
     return buf;
 }
 
@@ -311,6 +340,8 @@ void GPUContext::releaseBuffer(GPUBuffer buf) {
     if (!buf.handle) return;
     // Don't release aliased buffer views — only the parent buffer is released.
     if (buf.offset != 0) return;
+    if (totalAllocatedBytes >= buf.size)
+        totalAllocatedBytes -= buf.size;
     int bucket = poolBucket(buf.size);
     if (pool_[bucket].size() < 256) {
         pool_[bucket].push_back(buf);
@@ -448,17 +479,30 @@ int GPUContext::warmupPipelines(
         });
     }
 
-    // Step 2: Collect compiled shaders and create pipelines serially
+    // Step 2: Collect compiled shaders and create pipelines asynchronously
+    struct PipelineResult {
+        WGPUCreatePipelineAsyncStatus status;
+        WGPUComputePipeline pipeline;
+        bool completed = false;
+    };
+    std::vector<PipelineResult> results(uncached.size());
+    int asyncPending = 0;
+
     for (size_t j = 0; j < uncached.size(); j++) {
         auto& [name, wgsl, numBindings] = specs[uncached[j]];
         WGPUShaderModule shader = futures[j].get();
         if (!shader) {
             fprintf(stderr, "warmup: shader compilation failed: %s\n", name.c_str());
+            results[j].status = WGPUCreatePipelineAsyncStatus_InternalError;
+            results[j].pipeline = nullptr;
+            results[j].completed = true;
             continue;
         }
+        // Store shader now for later use
         CompiledPipeline p{};
         p.numBindings = numBindings;
         p.shader = shader;
+        pipelines_[name] = p;
 
         WGPUComputePipelineDescriptor cpD{};
         memset(&cpD, 0, sizeof(cpD));
@@ -466,14 +510,54 @@ int GPUContext::warmupPipelines(
         cpD.layout = nullptr;
         cpD.compute.module = shader;
         cpD.compute.entryPoint = {"main", 4};
-        p.pipeline = wgpuDeviceCreateComputePipeline(device, &cpD);
-        if (!p.pipeline) {
-            fprintf(stderr, "warmup: pipeline creation failed: %s\n", name.c_str());
+
+        results[j].status = WGPUCreatePipelineAsyncStatus_InternalError;
+        results[j].pipeline = nullptr;
+        results[j].completed = false;
+
+        WGPUCreateComputePipelineAsyncCallbackInfo asyncCb{};
+        asyncCb.mode = WGPUCallbackMode_WaitAnyOnly;
+        asyncCb.callback = [](WGPUCreatePipelineAsyncStatus s,
+                              WGPUComputePipeline p, WGPUStringView,
+                              void* ud, void*) {
+            auto* r = static_cast<PipelineResult*>(ud);
+            r->status = s;
+            r->pipeline = p;
+            r->completed = true;
+        };
+        asyncCb.userdata1 = &results[j];
+        wgpuDeviceCreateComputePipelineAsync(device, &cpD, asyncCb);
+        asyncPending++;
+    }
+
+    // Poll until all async pipeline creations complete
+    if (asyncPending > 0) {
+        wgpuInstanceProcessEvents(instance);
+        // Wait for all to complete
+        for (int remaining = asyncPending; remaining > 0; ) {
+            wgpuInstanceProcessEvents(instance);
+            remaining = 0;
+            for (size_t j = 0; j < uncached.size(); j++) {
+                if (!results[j].completed)
+                    remaining++;
+            }
+        }
+    }
+
+    // Finalize: extract bind group layouts
+    for (size_t j = 0; j < uncached.size(); j++) {
+        auto& [name, wgsl, numBindings] = specs[uncached[j]];
+        if (results[j].status != WGPUCreatePipelineAsyncStatus_Success ||
+            !results[j].pipeline) {
+            if (results[j].status != WGPUCreatePipelineAsyncStatus_InternalError)
+                fprintf(stderr, "warmup: async pipeline creation failed: %s\n", name.c_str());
+            pipelines_.erase(name);
             continue;
         }
+        auto& p = pipelines_[name];
+        p.pipeline = results[j].pipeline;
         p.bgLayout = wgpuComputePipelineGetBindGroupLayout(p.pipeline, 0);
         p.pplLayout = nullptr;
-        pipelines_[name] = p;
     }
     return (int)uncached.size();
 }

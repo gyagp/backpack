@@ -203,6 +203,11 @@ public:
     /// Get graph metadata.
     const OnnxGraph& GetGraph() const { return graph_; }
 
+    /// Pre-compile all GPU pipelines needed by the loaded graph.
+    /// Uses parallel shader compilation + async pipeline creation.
+    /// Call after Load() to eliminate first-run latency.
+    size_t WarmupAllPipelines();
+
     /// Allocate a GPU tensor.
     GpuTensor AllocTensor(std::vector<int64_t> shape, TensorDtype dtype);
 

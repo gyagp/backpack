@@ -40,6 +40,20 @@ enum class Backend { Vulkan, D3D12, Metal, Default };
 
 enum class DataType { Float32, Float16, Int32, Int64, UInt8, Int8, Bool };
 
+// ─── Options ───────────────────────────────────────────────────────────────
+
+/// Options for model loading.
+struct ModelOptions {
+    bool precompileShaders = true;  ///< Compile all shaders at Load() time
+};
+
+/// Metadata about a model input or output tensor.
+struct TensorInfo {
+    std::string name;
+    DataType dtype;
+    std::vector<int64_t> shape;  ///< -1 for dynamic dimensions
+};
+
 // ─── Device ─────────────────────────────────────────────────────────────────
 /// GPU device. One per physical GPU. Shared by all models.
 
@@ -51,6 +65,8 @@ public:
 
     std::string GetName() const;
     std::string GetBackendName() const;
+    /// Returns true if the GPU device has been lost (driver crash, reset, etc.)
+    bool IsLost() const;
     void Release();
 
     Device() = default;
@@ -79,11 +95,15 @@ public:
     struct Impl;
 
     static Model Load(Device& device, const std::string& path);
+    static Model Load(Device& device, const std::string& path,
+                      const ModelOptions& options);
 
     int GetInputCount() const;
     int GetOutputCount() const;
     std::string GetInputName(int index) const;
     std::string GetOutputName(int index) const;
+    TensorInfo GetInputInfo(int index) const;
+    TensorInfo GetOutputInfo(int index) const;
 
     void Release();
 
@@ -124,6 +144,9 @@ public:
     std::vector<int64_t> GetShape() const;
     int64_t GetElementCount() const;
 
+    /// Reinterpret shape without reallocation. Total element count must match.
+    bool Reshape(const std::vector<int64_t>& newShape);
+
     void Release();
 
     Tensor() = default;
@@ -152,6 +175,16 @@ public:
     void SetInput(const std::string& name, Tensor& tensor);
     void SetOutput(const std::string& name, Tensor& tensor);
     void Run();
+
+    /// Clear all input/output bindings for reuse in decode loops.
+    void Reset();
+
+    /// Request cooperative cancellation. Thread-safe.
+    /// Sets an internal flag checked at the start of Run().
+    void RequestStop();
+
+    /// Clear the stop flag so this session can be used for new runs.
+    void ClearStop();
 
     void Release();
 

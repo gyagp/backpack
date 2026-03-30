@@ -10,6 +10,7 @@
 #include "graph_executor.h"
 #include "wgsl_shaders.h"
 
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 
@@ -71,6 +72,10 @@ std::string bp::Device::GetBackendName() const {
     return impl_ ? backendStr(impl_->gpu.backendType) : "";
 }
 
+bool bp::Device::IsLost() const {
+    return impl_ ? impl_->gpu.deviceLost : false;
+}
+
 void bp::Device::Release() { impl_.reset(); }
 bp::Device::~Device() = default;
 bp::Device::Device(Device&& o) noexcept = default;
@@ -84,6 +89,9 @@ void* bp::Device::GetGPUContext() const {
 // Model (stub — full ONNX graph execution is future work)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Forward declaration (defined in Tensor section below)
+static bp::DataType fromGeDtype(TensorDtype dt);
+
 struct bp::Model::Impl {
     Device* device = nullptr;
     GraphExecutor executor;
@@ -92,6 +100,11 @@ struct bp::Model::Impl {
 };
 
 bp::Model bp::Model::Load(Device& device, const std::string& path) {
+    return Load(device, path, ModelOptions{});
+}
+
+bp::Model bp::Model::Load(Device& device, const std::string& path,
+                           const ModelOptions& options) {
     if (!device.IsValid()) return {};
     Model m;
     m.impl_ = std::make_unique<Impl>();
@@ -111,6 +124,10 @@ bp::Model bp::Model::Load(Device& device, const std::string& path) {
     for (auto& out : graph.outputs)
         m.impl_->outputNames.push_back(out.name);
 
+    // Eager shader compilation — all pipelines determined from graph ops
+    if (options.precompileShaders)
+        m.impl_->executor.WarmupAllPipelines();
+
     return m;
 }
 
@@ -129,6 +146,22 @@ std::string bp::Model::GetOutputName(int index) const {
     return impl_->outputNames[index];
 }
 
+bp::TensorInfo bp::Model::GetInputInfo(int index) const {
+    if (!impl_ || index < 0 || index >= (int)impl_->inputNames.size()) return {};
+    auto& graph = impl_->executor.GetGraph();
+    if (index >= (int)graph.inputs.size()) return {};
+    auto& inp = graph.inputs[index];
+    return { inp.name, fromGeDtype(inp.dtype), inp.shape };
+}
+
+bp::TensorInfo bp::Model::GetOutputInfo(int index) const {
+    if (!impl_ || index < 0 || index >= (int)impl_->outputNames.size()) return {};
+    auto& graph = impl_->executor.GetGraph();
+    if (index >= (int)graph.outputs.size()) return {};
+    auto& out = graph.outputs[index];
+    return { out.name, fromGeDtype(out.dtype), out.shape };
+}
+
 void bp::Model::Release() { impl_.reset(); }
 bp::Model::~Model() = default;
 bp::Model::Model(Model&& o) noexcept = default;
@@ -144,6 +177,13 @@ struct bp::Tensor::Impl {
     GPUBuffer gpuBuf;
     Device* device = nullptr;
     TensorDtype geDtype; // graph executor dtype
+
+    ~Impl() {
+        if (device && gpuBuf.handle) {
+            auto* gpuCtx = static_cast<GPUContext*>(device->GetGPUContext());
+            if (gpuCtx) gpuCtx->releaseBuffer(gpuBuf);
+        }
+    }
 };
 
 static TensorDtype toGeDtype(bp::DataType dt) {
@@ -246,6 +286,16 @@ int64_t bp::Tensor::GetElementCount() const {
     return n;
 }
 
+bool bp::Tensor::Reshape(const std::vector<int64_t>& newShape) {
+    if (!impl_) return false;
+    int64_t oldCount = GetElementCount();
+    int64_t newCount = 1;
+    for (auto d : newShape) newCount *= d;
+    if (newCount != oldCount) return false;
+    impl_->shape = newShape;
+    return true;
+}
+
 void bp::Tensor::Release() { impl_.reset(); }
 bp::Tensor::~Tensor() = default;
 bp::Tensor::Tensor(Tensor&& o) noexcept = default;
@@ -262,6 +312,7 @@ struct bp::Session::Impl {
     std::vector<std::string> inputNames;
     std::vector<std::string> outputNames;
     std::vector<Tensor*> outputTensors;  // back-pointers for buffer propagation
+    std::atomic<bool> shouldStop{false};
 };
 
 bp::Session bp::Session::Create(Model& model) {
@@ -297,6 +348,7 @@ void bp::Session::SetOutput(const std::string& name, Tensor& tensor) {
 
 void bp::Session::Run() {
     if (!impl_ || !impl_->model || !impl_->model->GetImpl()) return;
+    if (impl_->shouldStop.load(std::memory_order_acquire)) return;
 
     // Build input/output maps from owned vectors (pointers stable after all push_backs)
     std::unordered_map<std::string, GpuTensor*> inputs;
@@ -325,6 +377,23 @@ void bp::Session::Run() {
             }
         }
     }
+}
+
+void bp::Session::Reset() {
+    if (!impl_) return;
+    impl_->ownedInputs.clear();
+    impl_->ownedOutputs.clear();
+    impl_->inputNames.clear();
+    impl_->outputNames.clear();
+    impl_->outputTensors.clear();
+}
+
+void bp::Session::RequestStop() {
+    if (impl_) impl_->shouldStop.store(true, std::memory_order_release);
+}
+
+void bp::Session::ClearStop() {
+    if (impl_) impl_->shouldStop.store(false, std::memory_order_release);
 }
 
 void bp::Session::Release() { impl_.reset(); }

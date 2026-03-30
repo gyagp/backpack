@@ -227,6 +227,20 @@ struct BenchResultEntry {
     int inputTokens;
     double prefillMs, prefillTokS;
     double decodeMs, decodeTokS;
+    double ttftMs = 0.0;  // time to first token (ms)
+};
+
+struct LoadingInfo {
+    double weightMs = 0.0;    // weight upload time
+    double shaderMs = 0.0;    // shader compilation time
+    double autotuneMs = 0.0;  // autotune time
+    double totalMs = 0.0;     // total loading time
+};
+
+struct MemoryInfo {
+    uint64_t peakBytes = 0;      // peak GPU memory allocated
+    uint64_t currentBytes = 0;   // current GPU memory allocated
+    uint64_t allocCount = 0;     // total buffer allocations
 };
 
 inline bool writeBaselineJson(
@@ -240,7 +254,9 @@ inline bool writeBaselineJson(
     const std::string& modelFormat,
     int layers, int hiddenSize, int vocabSize,
     int decodeTokens,
-    const std::vector<BenchResultEntry>& results)
+    const std::vector<BenchResultEntry>& results,
+    const LoadingInfo* loading = nullptr,
+    const MemoryInfo* memory = nullptr)
 {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) {
@@ -280,11 +296,29 @@ inline bool writeBaselineJson(
         fprintf(f, "        \"prefill_ms\": %.1f,\n", r.prefillMs);
         fprintf(f, "        \"prefill_tok_s\": %.1f,\n", r.prefillTokS);
         fprintf(f, "        \"decode_ms\": %.1f,\n", r.decodeMs);
-        fprintf(f, "        \"decode_tok_s\": %.1f\n", r.decodeTokS);
+        fprintf(f, "        \"decode_tok_s\": %.1f,\n", r.decodeTokS);
+        fprintf(f, "        \"ttft_ms\": %.1f\n", r.ttftMs);
         fprintf(f, "      }%s\n", (i + 1 < results.size()) ? "," : "");
     }
     fprintf(f, "    ]\n");
     fprintf(f, "  },\n");
+
+    if (loading) {
+        fprintf(f, "  \"loading\": {\n");
+        fprintf(f, "    \"weight_ms\": %.1f,\n", loading->weightMs);
+        fprintf(f, "    \"shader_ms\": %.1f,\n", loading->shaderMs);
+        fprintf(f, "    \"autotune_ms\": %.1f,\n", loading->autotuneMs);
+        fprintf(f, "    \"total_ms\": %.1f\n", loading->totalMs);
+        fprintf(f, "  },\n");
+    }
+
+    if (memory) {
+        fprintf(f, "  \"memory\": {\n");
+        fprintf(f, "    \"peak_bytes\": %llu,\n", (unsigned long long)memory->peakBytes);
+        fprintf(f, "    \"current_bytes\": %llu,\n", (unsigned long long)memory->currentBytes);
+        fprintf(f, "    \"alloc_count\": %llu\n", (unsigned long long)memory->allocCount);
+        fprintf(f, "  },\n");
+    }
 
     fprintf(f, "  \"timestamp\": \"%s\"\n", isoTimestamp().c_str());
     fprintf(f, "}\n");

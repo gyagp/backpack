@@ -16,7 +16,6 @@ enable subgroups;
 
 const HD: u32 = 128u;
 const HD_PER_THREAD: u32 = 4u;
-const MAX_SEQ: u32 = 4096u;
 
 @compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -27,6 +26,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let kv_stride = _params_[0];
     let n_rep = _params_[1];
     let T_total = _params_[2];
+    let max_seq = _params_[3];
     let scale = bitcast<f32>(_params_[5]);
     let neg_inf = bitcast<f32>(_params_[6]);
 
@@ -44,7 +44,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var m_prev: f32 = neg_inf;
     var l_prev: f32 = 0.0;
 
-    for (var t = 0u; t < MAX_SEQ; t = t + 1u) {
+    for (var t = 0u; t < max_seq; t = t + 1u) {
         let valid = t < T_total;
         let k_base = select(0u, t * kv_stride + kv_off, valid);
         let k0 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD]), valid);
