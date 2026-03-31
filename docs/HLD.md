@@ -44,9 +44,9 @@ What does each project set out to solve?
 | | llama.cpp | ORT WebGPU Native | Backpack |
 |---|---|---|---|
 | **Goal** | Fast LLM inference across many GPU backends | Run any ONNX model on any backend | Single-backend (WebGPU) runtime for on-device inference |
-| **Model format** | GGUF only | ONNX only | ONNX (+ GGUF via ModelRunner) |
+| **Model format** | GGUF only | ONNX only | ONNX + GGUF |
 | **GPU backend** | ggml_backend (CUDA, Vulkan, Metal, WebGPU, 17+) | EP system (CUDA, TRT, WebGPU, etc.) | WebGPU only (via Dawn) |
-| **Model scope** | LLM only | Any ONNX model | Any ONNX model |
+| **Model scope** | LLM only | Any ONNX model | Any ONNX or GGUF model |
 | **Language** | C API (opaque structs) | C/C++ API (`Ort::` wrappers) | C++ (classes, DLL export) |
 | **LLM layer** | Built into runtime | Separate library (onnxruntime-genai) | App-layer `LlmContext` |
 
@@ -201,7 +201,7 @@ Backpack follows the same layering as ORT's ecosystem:
 bp::Device → bp::Model → bp::Session → SetInput/SetOutput → Run
 ```
 
-Works for LLM, TTS, image, audio — any ONNX model. Same API the image app uses today.
+Works for LLM, TTS, image, audio — any ONNX or GGUF model. Same API the image app uses today.
 
 **Layer 2 (app layer)** — LLM-specific, manages KV cache and positions:
 
@@ -222,7 +222,7 @@ KV caches, zero shader recompilation).
 | KV cache ownership | Runtime-managed (opaque) | Caller-managed (I/O tensors) | **App-layer managed** | Runtime is model-agnostic; avoids LLM lock-in |
 | Context size | Fixed at creation | Implicit in tensor shapes | **Implicit in tensor shapes** | Runtime doesn't care; app-layer sets maxSeqLen |
 | GPU I/O | Backend scheduler | Requires `IoBinding` | **Always GPU** | No extra API surface for GPU stay |
-| Model scope | LLM-only | Any ONNX model | **Any ONNX model** | Same Session for LLM, TTS, image, audio |
+| Model scope | LLM-only | Any ONNX model | **Any ONNX or GGUF model** | Same Session for LLM, TTS, image, audio |
 | Batch API | `llama_batch` struct | Named arrays / `IoBinding` | **Named `SetInput/SetOutput`** | Simple, web-compatible, ONNX-native |
 
 ---
