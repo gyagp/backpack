@@ -1,24 +1,74 @@
-# Backpack Architecture: Design Comparison with ORT and llama.cpp
+# Backpack High Level Design
 
-Three-way comparison of API and architecture design across ORT WebGPU Native (C++),
-llama.cpp, and Backpack. Focuses on the design rationale — why each system is
-structured the way it is, and what Backpack can do differently as a single-backend
-(WebGPU-only) runtime.
+Three-way comparison of ORT WebGPU Native (C++), llama.cpp, and Backpack.
+Organized as: scenarios first, then problems, designs, and limitations.
 
 ---
 
-## Architecture Overview
+## 1. Scenarios
 
-| Concept | llama.cpp | ORT Native (C++ WebGPU EP) | Backpack |
-|---------|-----------|---------------------------|----------|
-| **Language** | C API (opaque structs) | C/C++ API (`Ort::` wrappers) | C++ (classes, DLL export) |
+What operational situations arise when running models on a GPU?
+
+| # | Scenario | Description |
+|---|----------|-------------|
+| 1 | **Model loading** | Parse model file, upload weights to GPU, compile shaders |
+| 2 | **Session creation** | Allocate execution context, KV cache buffers |
+| 3 | **Inference execution** | Prefill prompt tokens, then decode one token at a time |
+| 4 | **Continue conversation** | User sends follow-up after EOS — reuse existing KV cache, prefill new tokens |
+| 5 | **New conversation** | Reset state, start fresh — reuse buffers without reallocation |
+| 6 | **Abort mid-generation** | User cancels during decode — stop cleanly without corrupting state |
+| 7 | **Concurrent sessions** | Multiple users or sequences sharing one model on one GPU |
+| 8 | **Multi-model on same device** | Sequential or parallel models (e.g., text encoder → DiT → VAE pipeline) |
+| 9 | **Session eviction** | Free GPU memory by evicting idle sessions under memory pressure |
+| 10 | **Device lost / GPU recovery** | GPU reset, driver crash, or browser tab backgrounded |
+| 11 | **Web deployment** | Run in browser via WASM + WebGPU |
+
+### Scenarios Not Planned
+
+The following were considered and explicitly excluded:
+
+| Scenario | Why not supported |
+|---|---|
+| **Context size change** | KV cache size fixed at session creation. Create a new session for different context size. Shaders are already shape-independent — only KV reallocation and fast decode re-capture needed. Not worth the complexity of dynamic resize + bind group invalidation. |
+| **Speculative decoding** | Requires two models (draft + verifier) with coordinated acceptance/rejection. Significant complexity for a niche optimization. |
+| **Model hot-swap** | Loading new model version while sessions are active. Would require ref-counting via `shared_ptr`. Current design: release all sessions before releasing model. |
+| **Batch inference (batch size > 1)** | Multiple independent prompts in one `Execute()`. Requires reworking dispatch dimensions and KV indexing. Future work. |
+| **Device-lost recovery** | Detection is implemented (`Device::IsLost()`). Auto-recovery (re-request adapter, re-upload weights) is not — full teardown + reload is the expected path, same as ORT and llama.cpp. |
+
+---
+
+## 2. Problems
+
+What does each project set out to solve?
+
+| | llama.cpp | ORT WebGPU Native | Backpack |
+|---|---|---|---|
+| **Goal** | Fast LLM inference across many GPU backends | Run any ONNX model on any backend | Single-backend (WebGPU) runtime for on-device inference |
 | **Model format** | GGUF only | ONNX only | ONNX (+ GGUF via ModelRunner) |
 | **GPU backend** | ggml_backend (CUDA, Vulkan, Metal, WebGPU, 17+) | EP system (CUDA, TRT, WebGPU, etc.) | WebGPU only (via Dawn) |
 | **Model scope** | LLM only | Any ONNX model | Any ONNX model |
+| **Language** | C API (opaque structs) | C/C++ API (`Ort::` wrappers) | C++ (classes, DLL export) |
+| **LLM layer** | Built into runtime | Separate library (onnxruntime-genai) | App-layer `LlmContext` |
+
+**llama.cpp** is purpose-built for autoregressive LLMs. Rich KV cache management,
+sampling, and context handling are baked into the runtime. Supports 17+ GPU backends
+but each has different maturity.
+
+**ORT** is a general-purpose ONNX runtime supporting many backends via Execution
+Providers. LLM-specific concerns (tokenization, KV management, sampling) are
+handled by a separate library, **onnxruntime-genai**. The WebGPU EP is one of many.
+
+**Backpack** exploits the simplicity of targeting a single backend (WebGPU) to
+make different trade-offs: eager shader compilation, always-GPU tensors, type-safe
+config. Like ORT, the runtime is model-agnostic — LLM logic lives in the app layer.
 
 ---
 
-## Object Model
+## 3. Designs
+
+How does each project solve these problems?
+
+### Object Model
 
 | Concept | llama.cpp | ORT Native | Backpack |
 |---------|-----------|------------|----------|
@@ -28,9 +78,6 @@ structured the way it is, and what Backpack can do differently as a single-backe
 | **Tensor** | `ggml_tensor` (internal) | `Ort::Value` | `bp::Tensor` |
 | **KV cache** | `llama_memory_t` (inside context) | Explicit I/O tensors via `IoBinding` | App-layer (explicit I/O tensors) |
 | **GPU binding** | Backend scheduler | `Ort::IoBinding` (pre-bind GPU buffers) | `session.SetInput/SetOutput` (always GPU) |
-| **LLM layer** | Built into runtime | Separate library (onnxruntime-genai) | App-layer `LlmContext` |
-
-### Key Structural Differences
 
 **llama.cpp** separates model from context — load weights once, create multiple
 contexts with different `n_ctx`. But the entire API is LLM-specific.
@@ -39,16 +86,13 @@ contexts with different `n_ctx`. But the entire API is LLM-specific.
 with different KV cache sizes since KV caches are just regular I/O tensors. For
 concurrent independent execution (e.g., two threads), you need two Sessions, which
 re-parses and re-optimizes the graph. `PrepackedWeightsContainer` shares weights
-but not optimized graph state. LLM-specific concerns (KV cache management,
-tokenization, sampling) are handled by a separate library, **onnxruntime-genai**.
+but not optimized graph state.
 
 **Backpack** separates model from session — model holds weights + compiled shaders,
 session is a lightweight execution context. LLM-specific state (KV cache, position
 tracking) lives in the app layer, similar to how onnxruntime-genai wraps ORT.
 
----
-
-## Stage 1: Model Loading
+### Model Loading
 
 | Aspect | llama.cpp | ORT Native | Backpack |
 |--------|-----------|------------|----------|
@@ -58,7 +102,7 @@ tracking) lives in the app layer, similar to how onnxruntime-genai wraps ORT.
 | **From memory buffer?** | Yes | Yes | Not yet (path only; web will use buffer) |
 | **Weight sharing** | Multiple contexts share one `llama_model` | `PrepackedWeightsContainer` across sessions | Multiple sessions share one `bp::Model` |
 
-### Why Backpack Uses Eager Shader Compilation
+#### Why Backpack Uses Eager Shader Compilation
 
 ORT's WebGPU EP defers shader compilation to first `Run()`. However, all shader
 sources can be fully determined from the parsed graph — op types, dtypes, model
@@ -75,9 +119,7 @@ until you know which EP handles a kernel), not a technical necessity. For a
 single-backend system like Backpack, eager async+parallel compilation at
 `Model::Load()` eliminates first-run latency spikes with no downside.
 
----
-
-## Stage 2: Context / Session Creation
+### Session Creation
 
 | Aspect | llama.cpp | ORT Native | Backpack |
 |--------|-----------|------------|----------|
@@ -87,9 +129,7 @@ single-backend system like Backpack, eager async+parallel compilation at
 | **Multiple per model?** | Yes — each with different `n_ctx`, shared weights | One Session suffices for different KV sizes; multiple needed only for concurrent execution | Yes — shared weights + shaders, independent sessions |
 | **KV cache type** | Configurable (`type_k`/`type_v`: f16, q8_0, q4_0) | Whatever dtype the model outputs | App-layer choice (currently f32 ONNX, f16 GGUF) |
 
----
-
-## Stage 3: Inference Execution
+### Inference Execution
 
 | Aspect | llama.cpp | ORT Native | Backpack |
 |--------|-----------|------------|----------|
@@ -99,9 +139,7 @@ single-backend system like Backpack, eager async+parallel compilation at
 | **Output location** | CPU (`llama_get_logits`) | CPU default, or GPU via `IoBinding` | GPU (`bp::Tensor` holds `GPUBuffer`) |
 | **Session reuse** | Context reused across decode calls | Session reused; `IoBinding` cleared between runs | `Session::Reset()` clears bindings between runs |
 
----
-
-## KV Cache Management
+### KV Cache Management
 
 | Aspect | llama.cpp | ORT Native | Backpack |
 |--------|-----------|------------|----------|
@@ -110,7 +148,7 @@ single-backend system like Backpack, eager async+parallel compilation at
 | **Cache ops** | Rich: `seq_rm`, `seq_cp`, `seq_add`, `seq_div`, `seq_keep` | None — caller manages | None in runtime — app-layer implements as needed |
 | **Shader recompilation on resize?** | N/A | May recompile (depends on `inputDependencies`) | **No** — all shapes are runtime params |
 
-### Context Size Independence from Compiled Shaders
+#### Context Size Independence from Compiled Shaders
 
 In Backpack, no shaders need recompilation when context size changes:
 
@@ -122,9 +160,7 @@ In Backpack, no shaders need recompilation when context size changes:
 The caller controls context size by providing differently-sized KV cache tensors.
 Same compiled model, same session, different buffer sizes — zero recompilation.
 
----
-
-## Web Compatibility
+### Web Compatibility
 
 | Aspect | llama.cpp | ORT Native | Backpack |
 |--------|-----------|------------|----------|
@@ -133,7 +169,7 @@ Same compiled model, same session, different buffer sizes — zero recompilation
 | **Graph capture** | N/A | `enableGraphCapture` — record/replay dispatch list | Fast decode capture/replay |
 | **Buffer caching** | N/A | Configurable: `disabled`, `lazyRelease`, `simple`, `bucket` | Power-of-2 bucket pool |
 
-### Web Compatibility Rules
+#### Web Compatibility Rules
 
 The API follows rules to ensure future WASM+WebGPU compatibility:
 
@@ -148,9 +184,52 @@ The API follows rules to ensure future WASM+WebGPU compatibility:
 - **No thread-dependent state** — web is single-threaded; current API is already single-threaded
 - **No platform-specific types in public header** — uses only `<cstdint>`, `<string>`, `<vector>`
 
+### The Two-Layer Pattern
+
+Backpack follows the same layering as ORT's ecosystem:
+
+| ORT ecosystem | Backpack | Role |
+|---|---|---|
+| `Ort::Session` | `bp::Session` | Model-agnostic execution |
+| `OgaModel` + `OgaGenerator` | App-layer `LlmContext` | LLM-specific (KV, positions, sampling) |
+| `Ort::Value` | `bp::Tensor` | Tensor |
+| `Ort::Env` + EP config | `bp::Device` | Runtime environment |
+
+**Layer 1 (bp:: runtime)** — model-agnostic, knows nothing about LLMs:
+
+```
+bp::Device → bp::Model → bp::Session → SetInput/SetOutput → Run
+```
+
+Works for LLM, TTS, image, audio — any ONNX model. Same API the image app uses today.
+
+**Layer 2 (app layer)** — LLM-specific, manages KV cache and positions:
+
+```
+LlmContext { Model, Session, KV tensors, position counter }
+    → Decode(token) → session.Reset/SetInput/SetOutput/Run
+```
+
+Multiple LlmContexts can share one Model (different context sizes, independent
+KV caches, zero shader recompilation).
+
+### Summary of Design Choices
+
+| Decision | llama.cpp | ORT Native | **Backpack** | Rationale |
+|----------|-----------|------------|--------------|-----------|
+| Model/session split | Separate | Merged | **Separate** | Lightweight concurrent sessions without re-parsing. Currently limited: executor is per-model (needs refactor to per-session execution state). |
+| Shader compilation | Pre-compiled | Lazy on first `Run()` | **Eager, async+parallel** | Predictable TTFT, no first-run spike |
+| KV cache ownership | Runtime-managed (opaque) | Caller-managed (I/O tensors) | **App-layer managed** | Runtime is model-agnostic; avoids LLM lock-in |
+| Context size | Fixed at creation | Implicit in tensor shapes | **Implicit in tensor shapes** | Runtime doesn't care; app-layer sets maxSeqLen |
+| GPU I/O | Backend scheduler | Requires `IoBinding` | **Always GPU** | No extra API surface for GPU stay |
+| Model scope | LLM-only | Any ONNX model | **Any ONNX model** | Same Session for LLM, TTS, image, audio |
+| Batch API | `llama_batch` struct | Named arrays / `IoBinding` | **Named `SetInput/SetOutput`** | Simple, web-compatible, ONNX-native |
+
 ---
 
-## Design Analysis
+## 4. Limitations
+
+What does each project get wrong or can't do?
 
 ### ORT: Intentional Trade-offs (Not Drawbacks)
 
@@ -185,70 +264,106 @@ handled by the separate **onnxruntime-genai** library.
 | **C API, manual lifetime** | Requires explicit `_free()`. No RAII. Easy to leak in error paths. |
 | **Sampling tightly coupled** | `llama_sampler` chain baked into library. Arguably app-layer responsibility. |
 
----
+### Scenario Comparison
 
-## Backpack's Design Position
+How each runtime handles the operational scenarios from Section 1.
 
-Rather than fixing drawbacks in ORT or llama.cpp, Backpack exploits the simplicity
-of targeting a **single backend (WebGPU)** to make different trade-offs:
+#### Concurrent Sessions
 
-| Area | ORT / llama.cpp | Backpack | Why |
+| | ORT WebGPU Native | llama.cpp | Backpack |
 |---|---|---|---|
-| **Shader compilation** | ORT: lazy (multi-EP simplification). llama.cpp: N/A | **Eager at `Model::Load()`, async+parallel** | Single backend → can eagerly compile without multi-EP complexity |
-| **Model/Session split** | ORT: merged (re-parse for concurrent use). llama.cpp: separate | **Separate** (`Model` + `Session`) | Lightweight sessions share compiled shaders + weights |
-| **GPU tensor default** | ORT: CPU default, `IoBinding` for GPU | **Always GPU** (`bp::Tensor` = GPU buffer) | Single backend → no CPU/GPU/NPU memory abstraction needed |
-| **Model introspection** | ORT: requires Session creation | **`Model::GetInputInfo/GetOutputInfo`** at load time | Graph metadata extracted at `Load()` without full optimization |
-| **Config** | ORT: `{string: string}` EP options | **Type-safe** `ModelOptions` struct | Single backend → no generic key-value config needed |
-| **LLM support** | ORT: model-agnostic + GenAI. llama.cpp: LLM-only | **Model-agnostic runtime + app-layer LLM context** | Same layering as ORT + GenAI, simplified by single backend |
+| **API support** | Multiple `Ort::Session` on same device via `context_id` ref-counting | Multiple `llama_context` from one `llama_model` (weights shared read-only) | `bp::Session` holds raw pointer to `Model::Impl` |
+| **Concurrent GPU execution** | **No** — `ConcurrentRunSupported()` returns `false` for WebGPU EP. Runs serialized via `session_mutex_`. | **Not validated** — API allows it, but server uses single-context multi-slot pattern. No mutexes in core lib. GPU backends have global state. | **No** — single `GraphExecutor` per model. Shared mutable state (tensorStore, fastDecode, tensorPlan) would corrupt. |
+| **Limitation** | WebGPU EP relies on global state; serialization is intentional | Thread safety of concurrent `llama_decode` across contexts is undocumented | Requires GraphExecutor split into GraphDef + ExecutionContext (Part 0 in plan) |
 
-### The Two-Layer Pattern (shared with ORT + GenAI)
+#### Continue Conversation (EOS → New Prompt)
 
-Backpack follows the same layering as ORT's ecosystem:
+| | ORT WebGPU Native | llama.cpp | Backpack |
+|---|---|---|---|
+| **Mechanism** | Caller passes previous `present.*` output KV tensors as next `past_key_values.*` inputs | Rich KV management: `llama_memory_seq_rm/cp/keep/add` for prefix reuse, position shifting, sequence forking | App-layer: KV cache kept, pos counter maintained, fast decode invalidated |
+| **Prefix reuse** | Caller must implement (compare old vs new prompt, reuse matching KV prefix) | Built-in: server computes longest common prefix, removes only divergent tokens | App-layer responsibility — no prefix-aware KV management in runtime |
+| **Context overflow** | Caller must handle (truncate or sliding window) | Built-in context shifting: `seq_rm` + `seq_add` to discard old tokens and shift positions | App-layer responsibility |
+| **Limitation** | No helper API — caller handles all KV lifecycle logic | KV ops are LLM-specific and baked into runtime (can't use for non-LLM models) | No limitation per se — app-layer management is intentional (same as ORT) |
 
-| ORT ecosystem | Backpack | Role |
-|---|---|---|
-| `Ort::Session` | `bp::Session` | Model-agnostic execution |
-| `OgaModel` + `OgaGenerator` | App-layer `LlmContext` | LLM-specific (KV, positions, sampling) |
-| `Ort::Value` | `bp::Tensor` | Tensor |
-| `Ort::Env` + EP config | `bp::Device` | Runtime environment |
+#### New Conversation (Reset)
 
-**Layer 1 (bp:: runtime)** — model-agnostic, knows nothing about LLMs:
+| | ORT WebGPU Native | llama.cpp | Backpack |
+|---|---|---|---|
+| **Mechanism** | Caller passes zeroed/fresh KV tensors. No session reset API needed. | `llama_memory_clear()` or `llama_memory_seq_rm(mem, id, -1, -1)` per sequence | App-layer: reset pos=0, pass zeroed KV. `Session::Reset()` clears input/output bindings for reuse. |
+| **KV buffer reuse** | Caller controls — can reuse same buffer with zeroed content | KV buffer is pre-allocated to `n_ctx`, always reused | KV buffer reused (same size), no reallocation |
+| **Limitation** | None — stateless design makes reset trivial | None | None — `Session::Reset()` implemented |
 
-```
-bp::Device → bp::Model → bp::Session → SetInput/SetOutput → Run
-```
+#### Abort Mid-Generation
 
-Works for LLM, TTS, image, audio — any ONNX model. Same API the image app uses today.
+| | ORT WebGPU Native | llama.cpp | Backpack |
+|---|---|---|---|
+| **API** | `RunOptions::SetTerminate()` — first-class, thread-safe | `ggml_abort_callback` — polling callback checked between graph nodes | `Session::RequestStop()` — sets atomic flag, checked at top of `Run()` |
+| **GPU support** | Stops CPU-side dispatch; already-queued GPU work completes | **CPU only** — GPU backends (CUDA, Vulkan, Metal) run to completion. Comment: "currently works only with CPU execution" | Cooperative — already-queued GPU work completes, next `Run()` is skipped |
+| **Granularity** | Between kernel submissions | Between graph nodes (CPU only) | Between `Run()` calls (per decode step) |
+| **Return value** | Error status from `Run()` | `llama_decode` returns `2` (aborted). Processed ubatches remain in KV cache. | `Run()` returns early without modifying state. `ClearStop()` to resume. |
+| **Limitation** | GPU work already submitted still completes | No GPU cancellation. App must check between `llama_decode` calls. | No mid-dispatch abort (same as ORT/llama.cpp GPU). |
 
-**Layer 2 (app layer)** — LLM-specific, manages KV cache and positions:
+#### Device Lost / GPU Recovery
 
-```
-LlmContext { Model, Session, KV tensors, position counter }
-    → Decode(token) → session.Reset/SetInput/SetOutput/Run
-```
+| | ORT WebGPU Native | llama.cpp | Backpack |
+|---|---|---|---|
+| **Detection** | Device-lost callback registered but **only logs**. Code has `// TODO: revise temporary device lost handling`. | **No handling** — Vulkan: `VK_CHECK` calls `exit(1)` on any error including device lost. CUDA: `GGML_ABORT()`. | `deviceLostCallbackInfo` registered in `GPUContext::init()`. Sets `deviceLost` flag + stores reason string. `Device::IsLost()` exposes to app layer. |
+| **Recovery** | None — must destroy `Ort::Session` and `Ort::Env`, recreate everything | None — process terminates on GPU error | None — full teardown + reload required (detected but not auto-recovered) |
+| **Limitation** | Device-lost is detected but not recoverable. Marked as TODO. | Fatal — any GPU error kills the process | Detection implemented. Auto-recovery not planned — same as ORT. |
 
-Multiple LlmContexts can share one Model (different context sizes, independent
-KV caches, zero shader recompilation).
+#### Session Eviction / Memory Pressure
+
+| | ORT WebGPU Native | llama.cpp | Backpack |
+|---|---|---|---|
+| **Memory tracking** | `AllocatorGetStats()` exists for CPU arena but **not for WebGPU `BufferManager`**. No GPU memory counters. | No API for memory queries. Server tracks slot states at app level. | `GPUContext` tracks `totalAllocatedBytes`, `peakAllocatedBytes`, `totalAllocCount`. `getMemoryStats()` API. Baseline JSON includes memory section. |
+| **Eviction** | No eviction API. OOM propagates as exception. | Server-level LRU eviction: `llama_memory_seq_rm` frees idle slots. `llama_memory_defrag()` compacts fragmented KV. | Tiered eviction designed: warm caches → fast decode → KV cache → session. Requires per-session ExecutionContext (Part 0). |
+| **KV defragmentation** | N/A (caller-managed KV) | `llama_memory_defrag()` compacts KV cache in-place | N/A (caller-managed KV; no internal KV fragmentation) |
+| **Limitation** | No GPU memory visibility. Cannot make informed eviction decisions. | Pre-allocated KV to `n_ctx` — no dynamic growth/shrink. Defrag only within fixed allocation. | Eviction strategy designed but requires per-session ExecutionContext for full implementation. |
+
+#### Multi-Model on Same Device
+
+| | ORT WebGPU Native | llama.cpp | Backpack |
+|---|---|---|---|
+| **Support** | Multiple `Ort::Session` share same device via `context_id`. Shared `BufferManager`. | Per-model GPU state — no global barriers. Multi-GPU with `tensor_split`. | Multiple models share `GPUContext` (pool, pipeline cache). |
+| **VRAM coordination** | No budget or priority system between sessions | No coordination — models compete for VRAM through allocator | Buffer pool shared — models can reuse freed buffers. `flushBufferPool()` between stages. |
+| **Limitation** | No memory budget per session/model | No API to query available VRAM before loading second model | `buffers_` name collision fixed (only device-level entries registered in shared map). Pool and pipelines shared safely. |
+
+### Gaps Summary
+
+**ORT WebGPU Native gaps**:
+- No concurrent GPU execution (serialized by design)
+- Device-lost handling is a placeholder (TODO in code)
+- No GPU memory tracking or eviction API
+- Graph capture incompatible with variable KV sizes
+
+**llama.cpp gaps**:
+- Context size (`n_ctx`) fixed after creation — cannot resize
+- Abort callback CPU-only — no GPU cancellation
+- GPU errors are fatal (`exit(1)` / `GGML_ABORT`)
+- No memory queries or budget API
+- Concurrent contexts undocumented for thread safety
+
+**Backpack gaps** (remaining):
+- No concurrent sessions — requires GraphExecutor split (Plan Part 0)
+
+**Backpack gaps resolved** (implemented in `55e6340`):
+- ~~No abort API~~ → `Session::RequestStop()` / `ClearStop()` with atomic flag
+- ~~No device-lost callback~~ → `deviceLostCallbackInfo` registered + `Device::IsLost()`
+- ~~No memory tracking~~ → `GPUContext::getMemoryStats()` (peak/current/count)
+- ~~No `Session::Reset()`~~ → Implemented, clears input/output bindings
+- ~~`Tensor::Release()` buffer leak~~ → `Tensor::Impl` destructor returns buffer to pool
+- ~~`buffers_` name collision~~ → Only `_`-prefixed device-level entries registered in shared map
 
 ---
 
-## Summary of Design Choices
+## 5. Backpack Internals
 
-| Decision | llama.cpp | ORT Native | **Backpack** | Rationale |
-|----------|-----------|------------|--------------|-----------|
-| Model/session split | Separate | Merged | **Separate** | Lightweight concurrent sessions without re-parsing. Currently limited: executor is per-model (needs refactor to per-session execution state). |
-| Shader compilation | Pre-compiled | Lazy on first `Run()` | **Eager, async+parallel** | Predictable TTFT, no first-run spike |
-| KV cache ownership | Runtime-managed (opaque) | Caller-managed (I/O tensors) | **App-layer managed** | Runtime is model-agnostic; avoids LLM lock-in |
-| Context size | Fixed at creation | Implicit in tensor shapes | **Implicit in tensor shapes** | Runtime doesn't care; app-layer sets maxSeqLen |
-| GPU I/O | Backend scheduler | Requires `IoBinding` | **Always GPU** | No extra API surface for GPU stay |
-| Model scope | LLM-only | Any ONNX model | **Any ONNX model** | Same Session for LLM, TTS, image, audio |
-| Batch API | `llama_batch` struct | Named arrays / `IoBinding` | **Named `SetInput/SetOutput`** | Simple, web-compatible, ONNX-native |
+Backpack-specific implementation details — not a comparison, but a deep dive into
+buffer management, resource sharing, and concurrency constraints.
 
----
+### Buffer Lifecycle
 
-## Buffer Lifecycle and Session Scenarios
-
-### Buffer Categories by Lifetime
+#### Buffer Categories by Lifetime
 
 | Category | Lifetime | Size | Release trigger |
 |----------|----------|------|-----------------|
@@ -260,71 +375,37 @@ KV caches, zero shader recompilation).
 | **Transient intermediates** | Single `Execute()` call | Variable | Released to pool at end of `Execute()` |
 | **Caller tensors** (input/output) | Caller-managed | Variable | `tensor.Release()` |
 
-### Scenario: Continue Conversation (EOS → New Prompt)
+#### Release Granularity
 
+From finest to coarsest:
+
+| Level | API | What happens |
+|-------|-----|-------------|
+| **Single buffer** | `gpu->releaseBuffer(buf)` | Returns to power-of-2 pool (27 buckets, 16B-1GB, max 256/bucket). Overflow destroys. |
+| **Single tensor** | `tensor.Release()` | Drops C++ Impl, returns GPU buffer to pool via destructor. |
+| **Session** | `session.Release()` | Drops execution context. `Reset()` clears bindings for reuse. |
+| **Model** | `model.Release()` | Frees all weight buffers + flushes pool. Full cleanup. |
+| **Pool flush** | `gpu->flushBufferPool()` | Destroys all pooled buffers. Use between pipeline stages. |
+| **Device** | `device.Release()` | Teardown everything. |
+
+#### Usage Patterns
+
+**LLM** (single model, long-lived):
 ```
-Session: pos=500, fast decode replaying
-  → EOS at pos=600
-  → User sends new prompt (10 tokens)
-  → Keep KV cache (0-600), prefill new tokens (601-610), resume decode
-```
-
-Buffer operations:
-1. KV cache stays alive (positions 0-600 are valid)
-2. `ReleaseCaptured()` — free captured bind groups (prefill has different shape than decode)
-3. `InvalidateWarmCaches()` — release tensor plan buffers to pool (shapes change)
-4. Prefill new tokens — `Execute()` with M>1, rebuilds tensor plan
-5. First decode after prefill — new `CaptureBegin()`, captures fresh bind groups
-6. Subsequent decodes — zero-allocation replay
-
-### Scenario: New Conversation (Reset)
-
-KV cache buffers can be **reused** (same size) — just reset `pos=0`. No need to
-reallocate. Only release captured bind groups and warm caches.
-
-### Scenario: Multiple Concurrent Sessions
-
-```
-Session A: maxSeqLen=2048, pos=500, fast decode replaying
-Session B: maxSeqLen=8192, pos=100, fast decode replaying
-Both share one Model
+Load model → Create session → Create KV tensors → Run in loop → Process exit
 ```
 
-What must be independent per session:
-- KV cache tensors (different sizes)
-- Fast decode captured bind groups (reference different KV buffers)
-- Tensor plan (intermediate sizes may differ)
-- Param pool (captured bind groups reference specific param buffers)
-- Position counter and param buffer contents
+**Image** (sequential pipeline, memory-constrained):
+```
+Load text encoder → Run → model.Release() → flushPool()
+→ Load DiT → Run diffusion → model.Release() → flushPool()
+→ Load VAE → Run → Done
+```
 
-What is shared:
-- Weight buffers (immutable)
-- Compiled pipelines (immutable)
-- Buffer pool (single-threaded, safe)
+**Web** (WASM, GPU memory constrained):
+Same patterns via JS. Pool-based recycling is especially important in browsers.
 
-### Scenario: Session Eviction Under Memory Pressure
-
-For a serving scenario with many sessions, can free memory by evicting idle sessions:
-
-| Priority | What to release | Memory freed | Cost to resume |
-|----------|----------------|-------------|----------------|
-| 1st | Tensor plan (`InvalidateWarmCaches()`) | ~350 intermediate buffers | One cold Execute() to rebuild plan |
-| 2nd | Fast decode (`ReleaseCaptured()`) | ~400 captured buffers | One capture Execute() to re-record |
-| 3rd | KV cache (`session.Release()`) | All KV buffers | Conversation lost, must re-prefill |
-
-### Fast Decode Buffer Retention
-
-During capture:
-- Intermediate buffers are **not released** to pool — captured bind groups hold
-  `wgpuBindGroupAddRef` references keeping GPU memory alive
-- Param pool is expanded from 512→2048 per bucket to prevent round-robin wrapping
-
-During replay:
-- **Zero allocation** — `ReplayWrites()` updates existing buffers, `ReplayDispatches()`
-  re-encodes dispatches with same bind groups
-- Only transient WebGPU command encoder/buffer objects are created (not data buffers)
-
-### Buffer Release Strategy Summary
+### Buffer Release Strategy
 
 | Event | Action | Memory freed |
 |-------|--------|-------------|
@@ -337,53 +418,17 @@ During replay:
 | Device lost | Full teardown — all GPU resources invalid | Everything (forced) |
 | Between models (image) | `model.Release()` + `flushPool()` | Everything destroyed |
 
-### Scenario: Abort Mid-Generation
+#### Session Eviction Priorities
 
-User cancels during decode. `Session::RequestStop()` sets an atomic flag; `Run()`
-checks it at the top and returns early without modifying state. `ClearStop()`
-resets the flag for the next generation.
+For a serving scenario with many sessions, free memory by evicting idle sessions:
 
-**Buffer impact**: If abort happens between `Run()` calls (the decode loop in
-app code), all state is consistent — tensor plan and fast decode remain valid.
-GPU work already submitted in the current `Run()` completes — only the next step
-is skipped. This is the same behavior as ORT (`SetTerminate`) and llama.cpp
-(`abort_callback`).
+| Priority | What to release | Memory freed | Cost to resume |
+|----------|----------------|-------------|----------------|
+| 1st | Tensor plan (`InvalidateWarmCaches()`) | ~350 intermediate buffers | One cold Execute() to rebuild plan |
+| 2nd | Fast decode (`ReleaseCaptured()`) | ~400 captured buffers | One capture Execute() to re-record |
+| 3rd | KV cache (`session.Release()`) | All KV buffers | Conversation lost, must re-prefill |
 
-**Fast decode**: Stays valid if aborted between `Run()` calls. The captured
-bind groups are unaffected — next generation can resume replay from wherever it
-left off, or the app can invalidate and re-prefill.
-
-### Scenario: WebGPU Device Lost
-
-GPU reset, driver crash, or browser tab backgrounded. `GPUContext::init()`
-registers a `deviceLostCallbackInfo` that sets `deviceLost` flag and stores the
-reason string. `Device::IsLost()` exposes this to app code.
-
-**Buffer impact**: All GPU resources become invalid — buffers, pipelines, bind
-groups. The buffer pool, pipeline cache, and per-session state are all stale.
-No resource can be reused.
-
-**Recovery**: Full teardown + reload required:
-1. Release all sessions and models (C++ side cleanup only — GPU objects already gone)
-2. Release device
-3. Create new device (re-request adapter)
-4. Reload model(s) (re-upload weights, recompile shaders)
-5. Re-create sessions
-
-Auto-recovery is not planned — this matches ORT (TODO in code) and exceeds
-llama.cpp (which crashes on GPU errors). In browser: listen for
-`visibilitychange` to preemptively pause before device loss.
-
-### Future: Intra-Execute Buffer Reuse
-
-Currently each intermediate tensor gets its own buffer. A liveness analysis could
-assign the same buffer to non-overlapping intermediates (like a register allocator),
-reducing peak memory during `Execute()` by ~30-50%. This is independent of the
-multi-session refactor.
-
----
-
-## Shared Resources Across Models
+### Shared Resources Across Models
 
 All models on the same `bp::Device` share a single `GPUContext`:
 
@@ -396,21 +441,13 @@ All models on the same `bp::Device` share a single `GPUContext`:
 | **Intermediate buffers** | Per-model (`tensorStore_`) | No — cleaned up between `Execute()` | Yes |
 | **Fast decode state** | Per-model (`GraphExecutor`) | No — but per-model, not per-session | See multi-session section |
 
-### Named Buffer Map (`buffers_`)
-
-`GPUContext::buffers_` is now used only for device-level resources (names prefixed
-with `_`, e.g., `_scale_params`). Per-model buffers (weights, intermediates) are
-tracked by their respective `GraphExecutor::tensorStore_`, avoiding the name
-collision problem that previously occurred when two models had identically named
-ONNX initializers.
-
-### Pipeline Sharing
+#### Pipeline Sharing
 
 If Model A already compiled `"matmul_f32"`, Model B gets it from cache instantly.
 Compiled pipelines (`WGPUComputePipeline`, `WGPUShaderModule`, `WGPUBindGroupLayout`)
 are immutable GPU objects — sharing is correct and beneficial.
 
-### Sequential Multi-Model Pattern (Image App)
+#### Sequential Multi-Model Pattern (Image App)
 
 The image app demonstrates correct sequential buffer management:
 
@@ -423,11 +460,9 @@ VAE:          Load → Run → _exit(0)
 The `flushBufferPool()` between text encoder and DiT is critical — without it,
 the pool holds freed buffers, and the much larger DiT might fail to allocate.
 
----
+### Multi-Session and Fast Decode
 
-## Multi-Session and Fast Decode
-
-### Current Limitation: Sessions Cannot Run Concurrently
+#### Current Limitation: Sessions Cannot Run Concurrently
 
 The current implementation has a critical limitation: `Model::Impl` owns a single
 `GraphExecutor` by value, and `Session::Run()` calls `executor.Execute()` directly
@@ -458,7 +493,7 @@ Three categories of conflict:
 
 No mutexes or locking exist anywhere in the runtime.
 
-### Fast Decode Buffer Safety
+#### Fast Decode Buffer Safety
 
 During fast decode capture:
 - Intermediate buffers are deliberately **not released to pool** — the captured
@@ -469,7 +504,17 @@ During fast decode capture:
 - `ReleaseCaptured()` calls `wgpuBindGroupRelease()` which drops the ref, allowing
   GPU to reclaim the underlying buffer resources
 
-### Required Architecture: Per-Session Execution State
+Fast decode buffer retention during capture:
+- Intermediate buffers are **not released** to pool — captured bind groups hold
+  `wgpuBindGroupAddRef` references keeping GPU memory alive
+- Param pool is expanded from 512→2048 per bucket to prevent round-robin wrapping
+
+During replay:
+- **Zero allocation** — `ReplayWrites()` updates existing buffers, `ReplayDispatches()`
+  re-encodes dispatches with same bind groups
+- Only transient WebGPU command encoder/buffer objects are created (not data buffers)
+
+#### Required Architecture: Per-Session Execution State
 
 To support multiple sessions (including independent fast decode), `GraphExecutor`
 must be split into immutable (shared via Model) and mutable (per-Session) parts:
@@ -502,7 +547,7 @@ split, and enables:
 - Safe `session.Release()` — releases only that session's intermediates and
   captured bind groups
 
-### Buffer Release With Independent Sessions
+#### Buffer Release With Independent Sessions
 
 | Action | What happens |
 |--------|-------------|
@@ -511,141 +556,9 @@ split, and enables:
 | `model.Release()` | Release weight buffers. Only safe after all sessions released. |
 | Fast decode capture | Session A captures its own bind groups. Session B unaffected. |
 
----
+### Future: Intra-Execute Buffer Reuse
 
-## GPU Buffer Lifecycle
-
-### Current Release Granularity
-
-From finest to coarsest:
-
-| Level | API | What happens |
-|-------|-----|-------------|
-| **Single buffer** | `gpu->releaseBuffer(buf)` | Returns to power-of-2 pool (27 buckets, 16B–1GB, max 256/bucket). Overflow destroys. |
-| **Single tensor** | `tensor.Release()` | Drops C++ Impl, returns GPU buffer to pool via destructor. |
-| **Session** | `session.Release()` | Drops execution context. `Reset()` clears bindings for reuse. |
-| **Model** | `model.Release()` | Frees all weight buffers + flushes pool. Full cleanup. |
-| **Pool flush** | `gpu->flushBufferPool()` | Destroys all pooled buffers. Use between pipeline stages. |
-| **Device** | `device.Release()` | Teardown everything. |
-
-### Usage Patterns
-
-**LLM** (single model, long-lived):
-```
-Load model → Create session → Create KV tensors → Run in loop → Process exit
-```
-
-**Image** (sequential pipeline, memory-constrained):
-```
-Load text encoder → Run → model.Release() → flushPool()
-→ Load DiT → Run diffusion → model.Release() → flushPool()
-→ Load VAE → Run → Done
-```
-
-**Web** (WASM, GPU memory constrained):
-Same patterns via JS. Pool-based recycling is especially important in browsers.
-
----
-
-## Scenario Comparison: ORT vs llama.cpp vs Backpack
-
-Three-way comparison of how each runtime handles the operational scenarios
-identified in the Buffer Lifecycle section.
-
-### 1. Concurrent Sessions
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **API support** | Multiple `Ort::Session` on same device via `context_id` ref-counting | Multiple `llama_context` from one `llama_model` (weights shared read-only) | `bp::Session` holds raw pointer to `Model::Impl` |
-| **Concurrent GPU execution** | **No** — `ConcurrentRunSupported()` returns `false` for WebGPU EP. Runs serialized via `session_mutex_`. | **Not validated** — API allows it, but server uses single-context multi-slot pattern. No mutexes in core lib. GPU backends have global state. | **No** — single `GraphExecutor` per model. Shared mutable state (tensorStore, fastDecode, tensorPlan) would corrupt. |
-| **Limitation** | WebGPU EP relies on global state; serialization is intentional | Thread safety of concurrent `llama_decode` across contexts is undocumented | Requires GraphExecutor split into GraphDef + ExecutionContext (Part 0 in plan) |
-
-### 2. Continue Conversation (EOS → New Prompt)
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **Mechanism** | Caller passes previous `present.*` output KV tensors as next `past_key_values.*` inputs | Rich KV management: `llama_memory_seq_rm/cp/keep/add` for prefix reuse, position shifting, sequence forking | App-layer: KV cache kept, pos counter maintained, fast decode invalidated |
-| **Prefix reuse** | Caller must implement (compare old vs new prompt, reuse matching KV prefix) | Built-in: server computes longest common prefix, removes only divergent tokens | App-layer responsibility — no prefix-aware KV management in runtime |
-| **Context overflow** | Caller must handle (truncate or sliding window) | Built-in context shifting: `seq_rm` + `seq_add` to discard old tokens and shift positions | App-layer responsibility |
-| **Limitation** | No helper API — caller handles all KV lifecycle logic | KV ops are LLM-specific and baked into runtime (can't use for non-LLM models) | No limitation per se — app-layer management is intentional (same as ORT) |
-
-### 3. New Conversation (Reset)
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **Mechanism** | Caller passes zeroed/fresh KV tensors. No session reset API needed. | `llama_memory_clear()` or `llama_memory_seq_rm(mem, id, -1, -1)` per sequence | App-layer: reset pos=0, pass zeroed KV. `Session::Reset()` clears input/output bindings for reuse. |
-| **KV buffer reuse** | Caller controls — can reuse same buffer with zeroed content | KV buffer is pre-allocated to `n_ctx`, always reused | KV buffer reused (same size), no reallocation |
-| **Limitation** | None — stateless design makes reset trivial | None | None — `Session::Reset()` implemented |
-
-### 4. Abort Mid-Generation
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **API** | `RunOptions::SetTerminate()` — first-class, thread-safe | `ggml_abort_callback` — polling callback checked between graph nodes | `Session::RequestStop()` — sets atomic flag, checked at top of `Run()` |
-| **GPU support** | Stops CPU-side dispatch; already-queued GPU work completes | **CPU only** — GPU backends (CUDA, Vulkan, Metal) run to completion. Comment: "currently works only with CPU execution" | Cooperative — already-queued GPU work completes, next `Run()` is skipped |
-| **Granularity** | Between kernel submissions | Between graph nodes (CPU only) | Between `Run()` calls (per decode step) |
-| **Return value** | Error status from `Run()` | `llama_decode` returns `2` (aborted). Processed ubatches remain in KV cache. | `Run()` returns early without modifying state. `ClearStop()` to resume. |
-| **Limitation** | GPU work already submitted still completes | No GPU cancellation. App must check between `llama_decode` calls. | No mid-dispatch abort (same as ORT/llama.cpp GPU). |
-
-### 5. WebGPU Device Lost / GPU Recovery
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **Detection** | Device-lost callback registered but **only logs**. Code has `// TODO: revise temporary device lost handling`. | **No handling** — Vulkan: `VK_CHECK` calls `exit(1)` on any error including device lost. CUDA: `GGML_ABORT()`. | `deviceLostCallbackInfo` registered in `GPUContext::init()`. Sets `deviceLost` flag + stores reason string. `Device::IsLost()` exposes to app layer. |
-| **Recovery** | None — must destroy `Ort::Session` and `Ort::Env`, recreate everything | None — process terminates on GPU error | None — full teardown + reload required (detected but not auto-recovered) |
-| **Limitation** | Device-lost is detected but not recoverable. Marked as TODO. | Fatal — any GPU error kills the process | Detection implemented. Auto-recovery not planned — same as ORT. |
-
-### 6. Session Eviction / Memory Pressure
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **Memory tracking** | `AllocatorGetStats()` exists for CPU arena but **not for WebGPU `BufferManager`**. No GPU memory counters. | No API for memory queries. Server tracks slot states at app level. | `GPUContext` tracks `totalAllocatedBytes`, `peakAllocatedBytes`, `totalAllocCount`. `getMemoryStats()` API. Baseline JSON includes memory section. |
-| **Eviction** | No eviction API. OOM propagates as exception. | Server-level LRU eviction: `llama_memory_seq_rm` frees idle slots. `llama_memory_defrag()` compacts fragmented KV. | Tiered eviction designed: warm caches → fast decode → KV cache → session. Requires per-session ExecutionContext (Part 0). |
-| **KV defragmentation** | N/A (caller-managed KV) | `llama_memory_defrag()` compacts KV cache in-place | N/A (caller-managed KV; no internal KV fragmentation) |
-| **Limitation** | No GPU memory visibility. Cannot make informed eviction decisions. | Pre-allocated KV to `n_ctx` — no dynamic growth/shrink. Defrag only within fixed allocation. | Eviction strategy designed but requires per-session ExecutionContext for full implementation. |
-
-### 7. Multi-Model on Same Device
-
-| | ORT WebGPU Native | llama.cpp | Backpack |
-|---|---|---|---|
-| **Support** | Multiple `Ort::Session` share same device via `context_id`. Shared `BufferManager`. | Per-model GPU state — no global barriers. Multi-GPU with `tensor_split`. | Multiple models share `GPUContext` (pool, pipeline cache). |
-| **VRAM coordination** | No budget or priority system between sessions | No coordination — models compete for VRAM through allocator | Buffer pool shared — models can reuse freed buffers. `flushBufferPool()` between stages. |
-| **Limitation** | No memory budget per session/model | No API to query available VRAM before loading second model | `buffers_` name collision fixed (only device-level entries registered in shared map). Pool and pipelines shared safely. |
-
-### Summary: Gaps by Runtime
-
-**ORT WebGPU Native gaps**:
-- No concurrent GPU execution (serialized by design)
-- Device-lost handling is a placeholder (TODO in code)
-- No GPU memory tracking or eviction API
-- Graph capture incompatible with variable KV sizes
-
-**llama.cpp gaps**:
-- Context size (`n_ctx`) fixed after creation — cannot resize
-- Abort callback CPU-only — no GPU cancellation
-- GPU errors are fatal (`exit(1)` / `GGML_ABORT`)
-- No memory queries or budget API
-- Concurrent contexts undocumented for thread safety
-
-**Backpack gaps** (remaining):
-- No concurrent sessions — requires GraphExecutor split (Plan Part 0)
-
-**Backpack gaps resolved** (implemented in `55e6340`):
-- ~~No abort API~~ → `Session::RequestStop()` / `ClearStop()` with atomic flag
-- ~~No device-lost callback~~ → `deviceLostCallbackInfo` registered + `Device::IsLost()`
-- ~~No memory tracking~~ → `GPUContext::getMemoryStats()` (peak/current/count)
-- ~~No `Session::Reset()`~~ → Implemented, clears input/output bindings
-- ~~`Tensor::Release()` buffer leak~~ → `Tensor::Impl` destructor returns buffer to pool
-- ~~`buffers_` name collision~~ → Only `_`-prefixed device-level entries registered in shared map
-
-### Scenarios Not Planned
-
-The following scenarios were considered and explicitly excluded from the roadmap:
-
-| Scenario | Why not supported |
-|---|---|
-| **Context size change** | Changing KV cache size mid-session. KV cache size is fixed at session creation. To use a different context size, create a new session. Shaders are already shape-independent so no recompilation needed — only KV reallocation and fast decode re-capture. Not worth the complexity of dynamic resize + bind group invalidation. |
-| **Speculative decoding** | Requires two models (draft + verifier) running coordinated inference with token acceptance/rejection logic. Significant complexity for a niche optimization. Can revisit if multi-model concurrent execution is needed. |
-| **Model hot-swap** | Loading a new model version while sessions are active. Would require ref-counting Model lifetime via `shared_ptr`. Current design requires releasing all sessions before releasing a model — this ordering constraint is simple and sufficient. |
-| **Batch inference (batch size > 1)** | Processing multiple independent prompts in a single `Execute()` call. Requires reworking matmul dispatch dimensions and KV cache indexing for multi-sequence batching. Listed in `docs/todo.md` as future work. |
-| **Device-lost recovery** | Device loss is detected (`deviceLostCallbackInfo` registered, `Device::IsLost()` API). Auto-recovery (re-request adapter, re-upload weights, rebuild sessions) is not planned — full teardown + reload is the expected recovery path, same as ORT and llama.cpp. |
+Currently each intermediate tensor gets its own buffer. A liveness analysis could
+assign the same buffer to non-overlapping intermediates (like a register allocator),
+reducing peak memory during `Execute()` by ~30-50%. This is independent of the
+multi-session refactor.
