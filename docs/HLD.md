@@ -346,14 +346,6 @@ How each runtime handles the operational scenarios from Section 1.
 **Backpack gaps** (remaining):
 - No concurrent sessions — requires GraphExecutor split (Plan Part 0)
 
-**Backpack gaps resolved** (implemented in `55e6340`):
-- ~~No abort API~~ → `Session::RequestStop()` / `ClearStop()` with atomic flag
-- ~~No device-lost callback~~ → `deviceLostCallbackInfo` registered + `Device::IsLost()`
-- ~~No memory tracking~~ → `GPUContext::getMemoryStats()` (peak/current/count)
-- ~~No `Session::Reset()`~~ → Implemented, clears input/output bindings
-- ~~`Tensor::Release()` buffer leak~~ → `Tensor::Impl` destructor returns buffer to pool
-- ~~`buffers_` name collision~~ → Only `_`-prefixed device-level entries registered in shared map
-
 ---
 
 ## 5. Backpack Internals
