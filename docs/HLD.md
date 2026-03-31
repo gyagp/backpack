@@ -554,3 +554,176 @@ Currently each intermediate tensor gets its own buffer. A liveness analysis coul
 assign the same buffer to non-overlapping intermediates (like a register allocator),
 reducing peak memory during `Execute()` by ~30-50%. This is independent of the
 multi-session refactor.
+
+---
+
+## 6. Profiling and Benchmarking
+
+### Overview
+
+Backpack provides layered instrumentation from coarse benchmarking down to
+per-kernel GPU hardware timestamps:
+
+| Layer | Trigger | What it measures | Output |
+|-------|---------|------------------|--------|
+| **Benchmark** | `--benchmark` | Prefill/decode throughput across prompt lengths | Console table |
+| **Baseline JSON** | `--save-baseline` | System info + model info + perf + memory + TTFT | `.json` file |
+| **GPU profiling** | `--profile` | Per-dispatch nanosecond timestamps via WebGPU query sets | Console table + interactive `profile.html` |
+| **CPU profiling** | `profilingEnabled` | Per-op-type wall-clock time in `Execute()` | Console table (stderr) |
+| **GPU API timing** | `--bench-detail` | Encode/submit/map/wait/unmap breakdown | Console table |
+| **Autotuning** | Automatic on first load | Optimal decode pipeline depth + kernel variant selection | Cache file |
+
+### Benchmark Mode
+
+`--benchmark` runs a prefill+decode sweep across prompt lengths
+`{128, 256, 512, 1024, 2048, 4096}` (or a single length via `--bench-prompt-len`).
+
+For each prompt length:
+1. **Prefill**: Batch-process all prompt tokens, measure wall-clock time
+2. **TTFT**: Time the first decode step after prefill (captures fast decode capture overhead)
+3. **Warmup**: 2 additional decode steps to stabilize capture/replay
+4. **Decode**: Time `--bench-gen-tokens` (default 128) decode steps
+
+Results are printed as a table:
+
+```
+prompt_len   prefill_ms   pf_tok/s  decode_ms   dc_tok/s
+128               12.3      10406       480.2      266.5
+256               23.1      11082       481.0      266.1
+```
+
+### Baseline JSON
+
+`--save-baseline [path]` writes a structured JSON file (default:
+`apps/baseline/<arch>.json`) containing:
+
+```json
+{
+  "system":    { "cpu": "...", "memory_gb": 32, "os": "Windows" },
+  "gpu":       { "name": "...", "backend": "d3d12", "driver": "..." },
+  "model":     { "name": "...", "format": "onnx_generic", "layers": 24, ... },
+  "benchmark": {
+    "decode_tokens": 128,
+    "results": [
+      { "input_tokens": 128, "prefill_ms": 12.3, ..., "ttft_ms": 8.5 },
+      ...
+    ]
+  },
+  "loading":   { "weight_ms": 1200, "shader_ms": 350, "total_ms": 1550 },
+  "memory":    { "peak_bytes": 2147483648, "current_bytes": ..., "alloc_count": ... },
+  "timestamp": "2026-03-31T..."
+}
+```
+
+Data structures (`apps/common/app_common.h`):
+- `BenchResultEntry`: per-prompt-length results including `ttftMs`
+- `LoadingInfo`: sub-phase timing (weight upload, shader compilation, autotune)
+- `MemoryInfo`: GPU memory counters from `GPUContext::getMemoryStats()`
+- `SystemInfo`: CPU name, RAM, OS (platform-specific collection)
+
+### GPU Hardware Profiling
+
+`--profile` enables per-dispatch GPU timestamp queries using WebGPU's
+`WGPUPassTimestampWrites`. Each dispatch gets its own compute pass with
+begin/end timestamp writes into a query set (`GPUProfiler::MAX_TIMESTAMPS = 16384`,
+supporting up to 8192 profiled dispatches).
+
+#### How It Works
+
+```
+1. GPUProfiler::allocate("matmul_L5") → (beginIdx, endIdx)
+2. Each dispatch gets its own compute pass with timestampWrites
+3. After all dispatches: resolveQuerySet → copy to staging buffer
+4. Map staging buffer → read nanosecond timestamps on CPU
+5. Aggregate by kernel name → print table + generate HTML
+```
+
+Profiled dispatch submission (`submitOnlyProfiled`, `submitAndReadbackProfiled`)
+uses one compute pass per dispatch instead of batching all dispatches into a single
+pass. This is required because `WGPUPassTimestampWrites` is per-pass.
+
+#### Clock Calibration
+
+GPU timestamps are in device-local nanoseconds. To align them with CPU wall-clock
+time (for the HTML timeline), `ClockCalibration` correlates the two clocks:
+
+- **D3D12**: `ID3D12CommandQueue::GetClockCalibration()` returns correlated
+  GPU tick + CPU QPC tick at the same instant
+- **Vulkan**: `vkGetCalibratedTimestampsEXT` with `VK_TIME_DOMAIN_DEVICE_EXT` +
+  `VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT`
+
+Both are accessed through Dawn's internal APIs (loaded via mangled symbols from
+`webgpu_dawn.dll`). The timestamp quantization Dawn toggle is disabled to ensure
+high-resolution timestamps.
+
+#### Profile HTML Report
+
+`generateProfileHTML()` produces a self-contained HTML file with:
+
+- **Interactive canvas timeline**: GPU lane showing each dispatch as a colored
+  block (color-coded by kernel name). Optional CPU lane with hierarchical scope
+  events from `CPUProfiler`.
+- **Step markers**: Divides timeline into prefill and decode steps (detected by
+  finding `argmax` dispatch boundaries)
+- **Summary tables**: Per-kernel aggregate (total ms, count, avg ms, percentage)
+- **Zoom/pan**: Mouse wheel zoom, click-drag pan, reset button
+- **GPU bubble analysis**: Reports percentage of time where GPU is idle between
+  dispatches (CPU overhead)
+
+### CPU-Side Profiling
+
+`GraphExecutor::profilingEnabled` enables per-op wall-clock timing within
+`Execute()`. Each op dispatch is bracketed with `steady_clock::now()` calls.
+Results are aggregated by op type and printed to stderr:
+
+```
++-- Profile (247 ops, 4.8ms total) ----------------+
+| Op                        ms    cnt       %       |
+| MatMul                  2.1     48   43.8%        |
+| Add                     0.5     24   10.4%        |
+| ...                                               |
++---------------------------------------------------+
+```
+
+Also tracks GPU sync count (`flushCount_`) and sync sources per op — useful for
+identifying ops that force CPU-GPU synchronization (e.g., shape readbacks).
+
+### GPU API Timing
+
+`GPUContext::timing` records nanosecond-precision breakdown of WebGPU API calls:
+
+| Counter | What it measures |
+|---------|------------------|
+| `encode_ns` | Command encoder creation + dispatch recording |
+| `submit_ns` | `wgpuQueueSubmit` call |
+| `map_start_ns` | `wgpuBufferMapAsync` initiation |
+| `wait_ns` | `wgpuInstanceWaitAny` (GPU completion fence) |
+| `unmap_ns` | Buffer unmap + data copy |
+| `write_buf_ns` | `wgpuQueueWriteBuffer` (param updates) |
+
+Enabled via `--bench-detail`. Useful for diagnosing whether bottlenecks are in
+GPU compute, CPU-side encoding, or synchronization.
+
+### Autotuning
+
+On first model load (D3D12 only), Backpack runs a two-phase autotune:
+
+1. **Decode pipeline depth** (`autotuneDecodeDepth`): Tries depths 2-4, benchmarks
+   24 tokens × 2 repeats each, selects lowest ms/tok with 1.5% epsilon (prefers
+   shallower depth on ties)
+
+2. **Decode kernel variants** (`autotuneDecodeKernels`): Tries all 8 combinations
+   of fast vs. base kernels for QKV, output projection, and gate-up matmuls.
+   Benchmarks 12 tokens × 1 repeat each, selects lowest ms/tok
+
+Results are cached to `gitignore/models/<model>/decode_autotune_<backend>.txt`.
+The cache key includes GPU name, model architecture, layer count, embedding size,
+and hardware limits — a key mismatch triggers re-autotune.
+
+```
+if (!model.loadDecodeAutotuneCache()) {
+    model.autotuneDecodeDepth();
+    model.autotuneDecodeKernels();
+    model.saveDecodeAutotuneCache();
+}
+```
