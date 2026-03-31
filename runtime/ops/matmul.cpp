@@ -28,7 +28,7 @@ static float fp16ToFloat(uint16_t h) {
     return v;
 }
 
-static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std::string& name) {
+static bool ensureTensorFloat32(OpContext& ex, GpuTensor& tensor, const std::string& name) {
     if (tensor.dtype == TensorDtype::Float32) {
         ex.EnsureGpu(tensor);
         return tensor.buffer.handle != nullptr;
@@ -46,12 +46,12 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     GpuTensor f32t;
     f32t.shape = tensor.shape;
     f32t.dtype = TensorDtype::Float32;
-    f32t.buffer = ex.gpu->createBuffer(name.empty() ? "mmnb_f32_cast" : name, count * 4);
+    f32t.buffer = ex.getGpu()->createBuffer(name.empty() ? "mmnb_f32_cast" : name, count * 4);
     f32t.isCpuOnly = false;
 
     uint32_t p[4] = {(uint32_t)count, 0, 0, 0};
     auto pb = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(pb, p, 16);
+    ex.getGpu()->writeBuffer(pb, p, 16);
     auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
     auto bg = ex.MakeBindGroup(pl, {{0, tensor.buffer}, {1, f32t.buffer}, {2, pb}});
     ex.QueueDispatch(pl.pipeline, bg,
@@ -61,7 +61,7 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     return tensor.buffer.handle != nullptr;
 }
 
-static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
+static bool readTensorFloats(OpContext& ex, const GpuTensor& tensor,
                              const std::string& name, std::vector<float>& out) {
     out.clear();
     size_t count = (size_t)tensor.ElementCount();
@@ -78,7 +78,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
         }
         if (tensor.buffer.handle && tensor.buffer.size >= bytes) {
             ex.FlushPendingWork();
-            auto raw = ex.gpu->readBuffer(tensor.buffer, bytes);
+            auto raw = ex.getGpu()->readBuffer(tensor.buffer, bytes);
             if (raw.size() >= bytes) {
                 memcpy(out.data(), raw.data(), bytes);
                 return true;
@@ -95,7 +95,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
         else if (auto* init = ex.GetInitData(name); init && init->data && init->size >= bytes) src = init->data;
         else if (tensor.buffer.handle && tensor.buffer.size >= bytes) {
             ex.FlushPendingWork();
-            raw = ex.gpu->readBuffer(tensor.buffer, bytes);
+            raw = ex.getGpu()->readBuffer(tensor.buffer, bytes);
             if (raw.size() >= bytes) src = raw.data();
         }
         if (!src) {
@@ -116,7 +116,7 @@ static std::vector<int64_t> computeStrides(const std::vector<int64_t>& shape) {
     return strides;
 }
 
-static bool runBatchedMatMulCpu(GraphExecutor& ex, const OnnxGraphNode& n,
+static bool runBatchedMatMulCpu(OpContext& ex, const OnnxGraphNode& n,
                                 GpuTensor& A, GpuTensor& B, GpuTensor& outTensor) {
     std::vector<float> aData, bData;
     if (!readTensorFloats(ex, A, n.inputs.empty() ? std::string() : n.inputs[0], aData) ||
@@ -194,7 +194,7 @@ static bool runBatchedMatMulCpu(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     outTensor = ex.AllocTensor(outShape, TensorDtype::Float32);
-    ex.gpu->writeBuffer(outTensor.buffer, outData.data(), outData.size() * sizeof(float));
+    ex.getGpu()->writeBuffer(outTensor.buffer, outData.data(), outData.size() * sizeof(float));
     return true;
 }
 
@@ -206,7 +206,7 @@ static const WGPULimits& effectiveLimits(const GPUContext& gpu) {
 
 // ─── MatMulNBits ─────────────────────────────────────────────────────────────
 
-static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
                            const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1]; auto* S = in[2];
     if (!X || !W || !S || !X->IsValid() || !W->IsValid() || !S->IsValid()) return;
@@ -250,8 +250,8 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
             rebuilt.dtype = TensorDtype::Float16;
             size_t bytes = count * sizeof(uint16_t);
             size_t bufSize = (bytes + 3) & ~(size_t)3;
-            rebuilt.buffer = ex.gpu->createBuffer("mmnb_scales_f16", bufSize);
-            ex.gpu->writeBuffer(rebuilt.buffer, fp16Scales.data(), bytes);
+            rebuilt.buffer = ex.getGpu()->createBuffer("mmnb_scales_f16", bufSize);
+            ex.getGpu()->writeBuffer(rebuilt.buffer, fp16Scales.data(), bytes);
             rebuilt.isCpuOnly = false;
             *S = std::move(rebuilt);
         } else if (S->buffer.handle) {
@@ -259,7 +259,7 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
             GpuTensor f16t = ex.AllocTensor(S->shape, TensorDtype::Float16);
             uint32_t params[4] = {(uint32_t)count, 0, 0, 0};
             auto pb = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(pb, params, 16);
+            ex.getGpu()->writeBuffer(pb, params, 16);
             auto& cpl = ex.GetPipelineT("cast_f32_to_f16", 3,
                 []() { return std::string(WGSL_CAST_F32_TO_F16); });
             auto cbg = ex.MakeBindGroup(cpl, {{0, S->buffer}, {1, f16t.buffer}, {2, pb}});
@@ -289,7 +289,7 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)M, N, K, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     if (ZP) {
         // Decode: K-parallel subgroup kernel (8 warps × 32 lanes, TILE_N=8).
@@ -327,7 +327,7 @@ static void opMatMulNBits(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── MatMul ──────────────────────────────────────────────────────────────────
 
-static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opMatMul(OpContext& ex, const OnnxGraphNode& n,
                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0]; auto* B = in[1];
     if (!A || !B || !A->IsValid() || !B->IsValid()) return;
@@ -355,9 +355,9 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)M, (uint32_t)N_out, (uint32_t)K, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
-    if (A->dtype == TensorDtype::Float32 && B->dtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
+    if (A->dtype == TensorDtype::Float32 && B->dtype == TensorDtype::Float16 && ex.getGpu()->supportsShaderF16) {
         auto& pl = ex.GetPipelineT("matmul_f16", 4, []() { return std::string(WGSL_MATMUL_F16); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
@@ -383,7 +383,7 @@ static void opMatMul(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── Gemm ────────────────────────────────────────────────────────────────────
 
-static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGemm(OpContext& ex, const OnnxGraphNode& n,
                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0]; auto* B = in[1];
     if (!A || !B || !A->IsValid() || !B->IsValid()) return;
@@ -394,20 +394,20 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.EnsureGpu(*A); ex.EnsureGpu(*B);
 
     // Try packed fp16 path: A=f32, B=f16, transB=1, K%4==0
-    const auto& limits = effectiveLimits(*ex.gpu);
+    const auto& limits = effectiveLimits(*ex.getGpu());
     int64_t K = A->shape.back();
     bool canUsePackedFp16 =
         A->dtype == TensorDtype::Float32 &&
         B->dtype == TensorDtype::Float16 &&
         transB == 1 &&
-        ex.gpu->supportsSubgroups &&
+        ex.getGpu()->supportsSubgroups &&
         limits.maxComputeInvocationsPerWorkgroup >= 256u &&
         K > 0 && (K % 4) == 0;
 
     // If A is fp16 but B is fp16 with transB=1, convert A to f32 to enable packed fp16 path
     if (!canUsePackedFp16 && A->dtype == TensorDtype::Float16 &&
         B->dtype == TensorDtype::Float16 && transB == 1 &&
-        ex.gpu->supportsSubgroups && K > 0 && (K % 4) == 0) {
+        ex.getGpu()->supportsSubgroups && K > 0 && (K % 4) == 0) {
         ensureTensorFloat32(ex, *A, n.inputs.empty() ? std::string() : n.inputs[0]);
         canUsePackedFp16 = (A->dtype == TensorDtype::Float32);
     }
@@ -433,13 +433,13 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         biasBuf = in[2]->buffer;
     } else {
         std::vector<float> zeros((size_t)N_out, 0.0f);
-        biasBuf = ex.gpu->createBuffer("gemm_b0", N_out * 4);
-        ex.gpu->writeBuffer(biasBuf, zeros.data(), N_out * 4);
+        biasBuf = ex.getGpu()->createBuffer("gemm_b0", N_out * 4);
+        ex.getGpu()->writeBuffer(biasBuf, zeros.data(), N_out * 4);
     }
 
     uint32_t params[4] = {(uint32_t)M, (uint32_t)N_out, (uint32_t)K, (uint32_t)transB};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     if (canUsePackedFp16) {
         bool useWide = N_out >= 32 && limits.maxComputeInvocationsPerWorkgroup >= 256u;
@@ -448,7 +448,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t tileN = useWide ? 32u : 8u;
         uint32_t fp16Params[4] = {(uint32_t)K, (uint32_t)N_out, 0u, 0u};
         auto fp16ParamBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(fp16ParamBuf, fp16Params, 16);
+        ex.getGpu()->writeBuffer(fp16ParamBuf, fp16Params, 16);
 
         auto& pl = ex.GetPipelineT(kernelName, 5, [kernelSrc]() { return std::string(kernelSrc); });
         auto bg = ex.MakeBindGroup(pl, {
@@ -470,7 +470,7 @@ static void opGemm(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── GatherBlockQuantized ────────────────────────────────────────────────────
 
-static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGatherBlockQuantized(OpContext& ex, const OnnxGraphNode& n,
                                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* W = in[0]; auto* Indices = in[1];
     auto* Scales = in.size() > 2 ? in[2] : nullptr;
@@ -534,18 +534,18 @@ static void opGatherBlockQuantized(GraphExecutor& ex, const OnnxGraphNode& n,
                 int64_t v; memcpy(&v, idxPtr + i * 8, 8);
                 i32[i] = (int32_t)v;
             }
-            idxBuf = ex.gpu->createBuffer("gbq_idx32", nIdx * 4);
-            ex.gpu->writeBuffer(idxBuf, i32.data(), nIdx * 4);
+            idxBuf = ex.getGpu()->createBuffer("gbq_idx32", nIdx * 4);
+            ex.getGpu()->writeBuffer(idxBuf, i32.data(), nIdx * 4);
             // During fast decode capture: register this buffer for replay update.
-            if (ex.fastDecodeState_ == GraphExecutor::FastDecodeState::Capturing) {
-                ex.capturedTokenIdBufs_.push_back({idxBuf, nIdx});
+            if (ex.fastDecodeState() == ExecutionContext::FastDecodeState::Capturing) {
+                ex.exec.capturedTokenIdBufs_.push_back({idxBuf, nIdx});
             }
         }
     }
 
     uint32_t params[4] = {(uint32_t)nIdx, K, n_groups, bs};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     const char* kernelSrc = (bits == 4) ? (ZP ? WGSL_GATHER_BQ_Q4_ZP : WGSL_GATHER_BQ_Q4)
                                         : WGSL_GATHER_BQ_Q8;

@@ -69,7 +69,7 @@ public:
     bool IsLost() const;
     void Release();
 
-    Device() = default;
+    Device();
     ~Device();
     Device(Device&& o) noexcept;
     Device& operator=(Device&& o) noexcept;
@@ -107,7 +107,7 @@ public:
 
     void Release();
 
-    Model() = default;
+    Model();
     ~Model();
     Model(Model&& o) noexcept;
     Model& operator=(Model&& o) noexcept;
@@ -149,7 +149,7 @@ public:
 
     void Release();
 
-    Tensor() = default;
+    Tensor();
     ~Tensor();
     Tensor(Tensor&& o) noexcept;
     Tensor& operator=(Tensor&& o) noexcept;
@@ -188,7 +188,7 @@ public:
 
     void Release();
 
-    Session() = default;
+    Session();
     ~Session();
     Session(Session&& o) noexcept;
     Session& operator=(Session&& o) noexcept;

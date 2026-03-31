@@ -5,15 +5,20 @@
  * Walks an ONNX graph in topological order, allocating GPU buffers for
  * intermediates and dispatching WGSL compute kernels for each op.
  *
+ * Architecture (concurrent sessions):
+ *   GraphExecutor  — shared immutable state (graph, weights, pipelines)
+ *   ExecutionContext — per-session mutable state (intermediates, caches, fast decode)
+ *   OpContext       — facade passed to op implementations
+ *
  * Used by bp::Session::Run() to execute arbitrary ONNX models.
  */
 
 #include "gpu_context.h"
+#include "execution_context.h"
 #include "mapped_file.h"
 #include <cstdint>
 #include <functional>
 #include <map>
-#include <set>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -92,18 +97,20 @@ struct OnnxGraphInput {
     std::vector<int64_t> shape;  // may contain -1 for dynamic dims
 };
 
+// Initializer data: raw bytes on CPU (from ONNX protobuf)
+struct OnnxInitData {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    TensorDtype dtype = TensorDtype::Float32;
+    std::vector<int64_t> shape;
+};
+
 struct OnnxGraph {
     std::vector<OnnxGraphNode> nodes;
     std::vector<OnnxGraphInput> inputs;
     std::vector<OnnxGraphInput> outputs;
 
-    // Initializer data: name → raw bytes on CPU (from ONNX protobuf)
-    struct InitData {
-        const uint8_t* data = nullptr;
-        size_t size = 0;
-        TensorDtype dtype = TensorDtype::Float32;
-        std::vector<int64_t> shape;
-    };
+    using InitData = OnnxInitData;
     std::unordered_map<std::string, InitData> initializers;
 };
 
@@ -135,77 +142,46 @@ struct FusedGroup {
 
 // ─── Op Dispatch Function ────────────────────────────────────────────────────
 
-class GraphExecutor;  // forward
-
 /// Signature for an op implementation:
 ///   Reads input tensors from the tensor store, writes outputs.
+///   OpContext provides access to both shared graph state and per-session
+///   execution state.
 using OpDispatchFn = std::function<void(
-    GraphExecutor& executor,
+    OpContext& ctx,
     const OnnxGraphNode& node,
     const std::vector<GpuTensor*>& inputs,
     std::vector<GpuTensor*>& outputs)>;
 
 // ─── Graph Executor ──────────────────────────────────────────────────────────
+// Shared immutable state: graph definition, weights, compiled pipelines.
+// Per-session mutable state lives in ExecutionContext.
 
 class GraphExecutor {
 public:
     GPUContext* gpu = nullptr;
 
-    ~GraphExecutor() {
-        if (gpu) {
-            // tensorStore_ may already be cleared by Execute().
-            // Release any remaining buffers (from models that were loaded but not executed).
-            if (!tensorStore_.empty()) {
-                gpu->waitForQueue();
-                std::set<WGPUBuffer> released;
-                for (auto& [name, tensor] : tensorStore_) {
-                    if (tensor.buffer.handle && released.find(tensor.buffer.handle) == released.end()) {
-                        released.insert(tensor.buffer.handle);
-                        gpu->releaseBuffer(tensor.buffer);
-                    }
-                    tensor.buffer = {nullptr, 0};
-                }
-                tensorStore_.clear();
-            }
-            gpu->flushBufferPool();
-        }
-    }
+    ~GraphExecutor();
 
     /// Load and parse an ONNX model. Uploads initializer weights to GPU.
     bool Load(GPUContext& gpuCtx, const std::string& onnxPath);
 
-    /// Execute the graph with bound inputs. Writes to bound outputs.
+    /// Execute the graph with a per-session ExecutionContext.
     void Execute(
+        ExecutionContext& ctx,
         const std::unordered_map<std::string, GpuTensor*>& inputs,
         std::unordered_map<std::string, GpuTensor*>& outputs);
 
-    /// Enable per-op profiling. Call before Execute(). Results printed to stderr.
-    bool profilingEnabled = false;
-
-    /// Get a reusable param buffer (16/32/48 bytes). Avoids per-dispatch createBuffer.
-    /// The buffer is valid until the next Execute() call.
-    GPUBuffer getParamBuffer(uint32_t sizeBytes);
-
-    /// GPU hardware timestamp profiler (owned, optional).
-    /// Call enableGpuProfiling() to activate. After Execute(), call
-    /// printGpuProfileReport() to read timestamps and generate HTML.
-    GPUProfiler* gpuProfiler = nullptr;
-    struct ClockCalibration* clockCalibration = nullptr;
-
-    /// Enable GPU hardware timestamp profiling. Creates query sets.
-    void enableGpuProfiling();
-
-    /// Read back GPU timestamps, print report, generate HTML timeline.
-    /// Call after all profiled Execute() runs are done.
-    void printGpuProfileReport(int nDecodeTokens, double decodeMs,
-                               const std::string& htmlPath = "profile.html");
+    /// Backward-compat: Execute using the default (internal) ExecutionContext.
+    void Execute(
+        const std::unordered_map<std::string, GpuTensor*>& inputs,
+        std::unordered_map<std::string, GpuTensor*>& outputs) {
+        Execute(defaultCtx_, inputs, outputs);
+    }
 
     /// Get graph metadata.
     const OnnxGraph& GetGraph() const { return graph_; }
 
     /// Pre-compile all GPU pipelines needed by the loaded graph.
-    /// Uses parallel shader compilation + async pipeline creation.
-    /// Call after Load() to eliminate first-run latency.
     size_t WarmupAllPipelines();
 
     /// Allocate a GPU tensor.
@@ -218,67 +194,38 @@ public:
     /// Ensure a tensor has a GPU buffer (uploads CPU data if needed).
     void EnsureGpu(GpuTensor& t);
 
-    /// GPU-side fp16→f32 cast. Dispatches a compute shader — no CPU readback.
-    /// Replaces the tensor in-place with a new f32 GPU tensor.
-    /// Returns true if the tensor is now f32 on GPU.
-    bool EnsureFloat32(GpuTensor& t);
-
     /// Get or create a WGSL compute pipeline.
     const CompiledPipeline& GetPipeline(const std::string& name,
                                          const std::string& wgsl,
                                          uint32_t numBindings);
 
     /// Get or create a pipeline from a generator function.
-    /// The generator is only called on first use (cache miss).
-    /// Use for template-generated shaders to avoid per-dispatch string work.
-    ///   auto& pl = ex.GetPipelineT("binary_f16", 4, []() {
-    ///       return instantiateTemplate(WGSL_BINARY_ELEMENTWISE_T, TensorDtype::Float16);
-    ///   });
     template<typename F>
     const CompiledPipeline& GetPipelineT(const std::string& name,
                                           uint32_t numBindings,
                                           F&& generator) {
-        // Single lookup on cache hit (hot path)
         if (auto* p = gpu->findPipeline(name)) return *p;
-        // Cache miss — generate shader once, compile and cache
         std::string wgsl = generator();
         return gpu->getOrCreatePipeline(name, wgsl, numBindings);
     }
 
-    /// Create a bind group.
+    /// Create a bind group. Optionally tracks bindings for fast decode capture.
     WGPUBindGroup MakeBindGroup(const CompiledPipeline& pl,
-                                 const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
+                                 const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings,
+                                 ExecutionContext* captureCtx = nullptr);
 
     /// Detect fuseable patterns in the graph. Called once after Load().
-    /// Populates fusedGroups_ with fusion descriptors.
     void DetectFusions();
 
     /// Submit dispatches and wait.
     void Submit(const std::vector<Dispatch>& dispatches);
 
-    /// Flush all pending GPU work (dispatches + copies) and wait.
-    /// Must be called before any GPU readback to ensure data is written.
-    void FlushPendingWork();
-
-    /// Submit all pending dispatches + copies without waiting.
-    /// Useful when GPU work can complete asynchronously (e.g. cache casts
-    /// that only need to finish before the next Execute() call).
-    void SubmitPending();
-
     /// Submit dispatches (fire and forget, no sync).
     void SubmitAsync(const std::vector<Dispatch>& dispatches);
-
-    /// Queue a GPU buffer copy (batched with dispatches).
-    void QueueCopy(GPUBuffer src, uint64_t srcOffset,
-                    GPUBuffer dst, uint64_t dstOffset, uint64_t size);
 
     /// Wait for all GPU work to complete.
     void Sync();
 
-private:
-    OnnxGraph graph_;
-
-public:
     /// Access initializer data on CPU (avoids GPU readback for metadata ops).
     const OnnxGraph::InitData* GetInitData(const std::string& name) const {
         auto it = graph_.initializers.find(name);
@@ -290,263 +237,121 @@ public:
         return graph_.initializers.count(name) > 0;
     }
 
-    /// Access a tensor by name (weights, intermediates, etc.).
-    GpuTensor* GetTensor(const std::string& name) {
-        auto it = tensorStore_.find(name);
-        return (it != tensorStore_.end()) ? &it->second : nullptr;
+    /// Access a weight tensor by name (persistent tensors only).
+    GpuTensor* GetWeightTensor(const std::string& name) {
+        auto it = weightStore_.find(name);
+        return (it != weightStore_.end()) ? &it->second : nullptr;
     }
 
+    /// Register an op implementation. Called at static init time.
+    static void RegisterOp(const std::string& opType, OpDispatchFn fn);
+
+    // ─── Backward Compatibility ─────────────────────────────────────────
+    // These methods forward to defaultCtx_ so existing code that accesses
+    // the GraphExecutor directly (OnnxLlmContext, LlmContext, tests)
+    // continues to work without changes.
+
+    /// Access the default (internal) ExecutionContext.
+    ExecutionContext& DefaultCtx() { return defaultCtx_; }
+
+    /// Access a tensor by name: defaultCtx_.tensorStore_ first, then weightStore_.
+    GpuTensor* GetTensor(const std::string& name) {
+        auto it = defaultCtx_.tensorStore_.find(name);
+        if (it != defaultCtx_.tensorStore_.end()) return &it->second;
+        auto it2 = weightStore_.find(name);
+        return (it2 != weightStore_.end()) ? &it2->second : nullptr;
+    }
+
+    // Per-session state forwarding to defaultCtx_ (backward compat)
+    bool profilingEnabled = false;  // Forwarded to defaultCtx_ in Execute()
+
+    GPUBuffer getParamBuffer(uint32_t sizeBytes) { return defaultCtx_.getParamBuffer(sizeBytes); }
+    void FlushPendingWork() { defaultCtx_.FlushPendingWork(); }
+    void SubmitPending() { defaultCtx_.SubmitPending(); }
+    void QueueCopy(GPUBuffer src, uint64_t srcOffset, GPUBuffer dst, uint64_t dstOffset, uint64_t size) {
+        defaultCtx_.QueueCopy(src, srcOffset, dst, dstOffset, size);
+    }
+    void QueueDispatch(WGPUComputePipeline pipeline, WGPUBindGroup bg,
+                       uint32_t gx, uint32_t gy, uint32_t gz, const char* name) {
+        defaultCtx_.QueueDispatch(pipeline, bg, gx, gy, gz, name);
+    }
+    void RequestReadback(GPUBuffer src, GPUBuffer dst, uint64_t size) {
+        defaultCtx_.RequestReadback(src, dst, size);
+    }
+
+    // Fast decode forwarding
+    ExecutionContext::FastDecodeState fastDecodeState_ = ExecutionContext::FastDecodeState::Off;  // alias
+
+    void CaptureBegin() { defaultCtx_.CaptureBegin(); fastDecodeState_ = defaultCtx_.fastDecodeState_; }
+    void CaptureEnd() { defaultCtx_.CaptureEnd(); fastDecodeState_ = defaultCtx_.fastDecodeState_; }
+    void Replay() { defaultCtx_.Replay(); }
+    void ReplayWrites() { defaultCtx_.ReplayWrites(); }
+    void ReplayDispatches(bool skipFence = false) { defaultCtx_.ReplayDispatches(skipFence); }
+    void ReleaseCaptured() { defaultCtx_.ReleaseCaptured(); }
+    void InvalidateWarmCaches() { defaultCtx_.InvalidateWarmCaches(); }
+    void RegisterReplayParam(GPUBuffer buf, uint32_t offset, ExecutionContext::ReplayParamUpdate::Kind kind) {
+        defaultCtx_.RegisterReplayParam(buf, offset, kind);
+    }
+    void RecordWrite(GPUBuffer buf, const void* data, uint64_t size, uint64_t offset = 0) {
+        defaultCtx_.RecordWrite(buf, data, size, offset);
+    }
+
+    // Expose defaultCtx_ fast decode state for backward compat
+    uint32_t& replayPosition() { return defaultCtx_.replayPosition_; }
+    int64_t& replayTokenId() { return defaultCtx_.replayTokenId_; }
+    uint32_t& capturePosition() { return defaultCtx_.capturePosition_; }
+    std::vector<WGPUBuffer>& replaySkipBuffers() { return defaultCtx_.replaySkipBuffers_; }
+    std::vector<ExecutionContext::CapturedTokenIdBuf>& capturedTokenIdBufs() { return defaultCtx_.capturedTokenIdBufs_; }
+    std::vector<ExecutionContext::ReplayScalarUpdate>& replayScalarUpdates() { return defaultCtx_.replayScalarUpdates_; }
+    std::vector<ExecutionContext::CapturedFlush>& capturedFlushes() { return defaultCtx_.capturedFlushes_; }
+    std::vector<ExecutionContext::ReplayParamUpdate>& replayParamUpdates() { return defaultCtx_.replayParamUpdates_; }
+    std::vector<Dispatch>& pendingDispatches() { return defaultCtx_.pendingDispatches_; }
+    std::vector<Dispatch::BindEntry>& lastCapturedBindings() { return defaultCtx_.lastCapturedBindings_; }
+
+    // Readback state forwarding
+    GPUBuffer& readbackSrc() { return defaultCtx_.readbackSrc_; }
+    GPUBuffer& readbackDst() { return defaultCtx_.readbackDst_; }
+    uint64_t& readbackSize() { return defaultCtx_.readbackSize_; }
+
+    // Deferred state forwarding
+    std::vector<GpuTensor*>& pendingIntReadbacks() { return defaultCtx_.pendingIntReadbacks_; }
+    std::vector<std::string>& pendingReleases() { return defaultCtx_.pendingReleases_; }
+    std::vector<GPUBuffer>& deferredBufferReleases() { return defaultCtx_.deferredBufferReleases_; }
+
+    // Profiling forwarding
+    GPUProfiler*& gpuProfiler() { return defaultCtx_.gpuProfiler; }
+    ClockCalibration*& clockCalibration() { return defaultCtx_.clockCalibration; }
+    void enableGpuProfiling() { defaultCtx_.enableGpuProfiling(); }
+    void printGpuProfileReport(int nDecodeTokens, double decodeMs,
+                               const std::string& htmlPath = "profile.html") {
+        defaultCtx_.printGpuProfileReport(nDecodeTokens, decodeMs, htmlPath);
+    }
+
+    // Shape cache / tensor plan forwarding
+    std::unordered_map<std::string, ExecutionContext::CachedNodeOutput>& nodeShapeCache() { return defaultCtx_.nodeShapeCache_; }
+    bool& shapeCacheValid() { return defaultCtx_.shapeCacheValid_; }
+    std::unordered_map<std::string, ExecutionContext::TensorAlloc>& tensorPlan() { return defaultCtx_.tensorPlan_; }
+    bool& tensorPlanValid() { return defaultCtx_.tensorPlanValid_; }
+
 private:
-    // Tensor store: all intermediate and initializer tensors by name
-    // Using std::map for pointer stability (unordered_map rehashes invalidate references)
-    std::map<std::string, GpuTensor> tensorStore_;
+    OnnxGraph graph_;
+
+    // Weight store: persistent tensors (initializers loaded during Load).
+    // Read-only during Execute. Using std::map for pointer stability.
+    std::map<std::string, GpuTensor> weightStore_;
 
     // Names of tensors loaded during LoadGraph (initializers + pre-store constants).
-    // These persist across Execute() calls; everything else is cleared.
     std::set<std::string> persistentTensors_;
 
     // Cached topo sort order (reused across Execute calls for the same graph)
     std::vector<size_t> cachedExecOrder_;
 
     // Fused op groups detected at graph analysis time.
-    // Key: first node index in the group. Value: fusion descriptor.
     std::unordered_map<size_t, FusedGroup> fusedGroups_;
-    // Set of node indices that are part of a fusion (skip individual dispatch)
     std::set<size_t> fusedNodeIndices_;
 
-public:
-    // Batched dispatches for the current execution (public for op access)
-    std::vector<Dispatch> pendingDispatches_;
-    struct PendingCopy { GPUBuffer src; uint64_t srcOff; GPUBuffer dst; uint64_t dstOff; uint64_t size; };
-    std::vector<PendingCopy> pendingCopies_;
-
-    /// Flush pending dispatches+copies into a command encoder and submit.
-    void flushToEncoder();
-
-    // ─── Fast Decode (Capture + Replay) ────────────────────────────────
-    // Records GPU dispatches during a capture step, then replays them on
-    // subsequent decode steps — skipping the full ONNX Execute loop.
-    //
-    // Flow: warmup(normal) → capture(save+execute) → replay(submit saved)
-
-    enum class FastDecodeState { Off, Capturing, Replaying };
-    FastDecodeState fastDecodeState_ = FastDecodeState::Off;
-
-    struct CapturedCommand {
-        WGPUComputePipeline pipeline;
-        WGPUBindGroup bindGroup = nullptr;  // AddRef'd original for direct reuse
-        std::vector<Dispatch::BindEntry> bindings;  // backup for rebuilding
-        uint32_t gx, gy, gz;
-        std::string name;
-    };
-    struct CapturedCopy {
-        GPUBuffer src; uint64_t srcOff;
-        GPUBuffer dst; uint64_t dstOff;
-        uint64_t size;
-    };
-    struct CapturedFlush {
-        std::vector<CapturedCommand> dispatches;
-        std::vector<CapturedCopy> copies;
-    };
-    std::vector<CapturedFlush> capturedFlushes_;
-
-    // WriteBuffer calls to replay before dispatches (zero-init, etc.)
-    struct CapturedWrite {
-        WGPUBuffer handle;
-        uint64_t offset;
-        std::vector<uint8_t> data;
-    };
-    std::vector<CapturedWrite> capturedWrites_;
-
-    // Param buffers that need per-step updates during replay.
-    struct ReplayParamUpdate {
-        GPUBuffer paramBuf;
-        uint32_t offsetBytes;
-        enum Kind { PosOffset, PastSeq, TotalSeq } kind;
-    };
-    std::vector<ReplayParamUpdate> replayParamUpdates_;
-
-    /// Register a param buffer for per-step replay update.
-    void RegisterReplayParam(GPUBuffer buf, uint32_t offset, ReplayParamUpdate::Kind kind) {
-        if (fastDecodeState_ == FastDecodeState::Capturing) {
-            replayParamUpdates_.push_back({buf, offset, kind});
-        }
-    }
-
-    /// Begin capture stage. Call before Execute().
-    void CaptureBegin() {
-        fastDecodeState_ = FastDecodeState::Capturing;
-        capturedFlushes_.clear();
-        capturedWrites_.clear();
-        replayParamUpdates_.clear();
-        replayScalarUpdates_.clear();
-        capturedTokenIdBufs_.clear();
-    }
-
-    /// End capture stage.
-    void CaptureEnd() {
-        fastDecodeState_ = FastDecodeState::Off;
-        gpu->captureWritesCb_ = nullptr;
-        gpu->captureWritesCtx_ = nullptr;
-    }
-
-    /// Record a writeBuffer call for replay (during capture stage).
-    /// Call this for zero-init writes and other data that must be replayed.
-    void RecordWrite(GPUBuffer buf, const void* data, uint64_t size, uint64_t offset = 0) {
-        if (fastDecodeState_ == FastDecodeState::Capturing) {
-            CapturedWrite w;
-            w.handle = buf.handle;
-            w.offset = offset + buf.offset;
-            w.data.resize((size_t)size);
-            memcpy(w.data.data(), data, (size_t)size);
-            capturedWrites_.push_back(std::move(w));
-        }
-    }
-
-    /// Position counter for GQA param updates during replay.
-    uint32_t replayPosition_ = 0;
-
-    /// Token ID for embedding re-upload during replay.
-    int64_t replayTokenId_ = 0;
-
-    /// Buffers holding token indices that need updating during replay.
-    /// GatherBlockQuantized converts int64 input_ids to int32 and writes to a
-    /// temporary buffer. During replay, we re-write the new token ID to it.
-    struct CapturedTokenIdBuf {
-        GPUBuffer buffer;         // The gbq_idx32 buffer
-        int64_t nIdx;             // Number of indices (typically 1 for decode)
-    };
-    std::vector<CapturedTokenIdBuf> capturedTokenIdBufs_;
-
-    /// Position at capture time (for detecting position-dependent scalars).
-    uint32_t capturePosition_ = 0;
-
-    /// Buffer handles to SKIP during write replay (caller updates them separately).
-    std::vector<WGPUBuffer> replaySkipBuffers_;
-
-    /// Small buffer updates detected as position-dependent during capture.
-    /// These are recomputed during replay by adding replayPosition_ delta.
-    struct ReplayScalarUpdate {
-        WGPUBuffer handle;
-        uint64_t offset;
-        uint64_t size;
-        int64_t captureValue;  // value at capture time
-        int64_t capturePos;    // position at capture time
-    };
-    std::vector<ReplayScalarUpdate> replayScalarUpdates_;
-
-    /// Replay captured commands. Encodes saved dispatches fresh.
-    void Replay() { ReplayWrites(); ReplayDispatches(); }
-
-    /// Phase 1: replay captured writes + param updates.
-    void ReplayWrites();
-
-    /// Phase 2: encode+submit captured dispatches.
-    /// If skipFence=true, don't wait for GPU completion (for pipelining multiple replays).
-    void ReplayDispatches(bool skipFence = false);
-
-    /// Release captured bind groups and clear state.
-    void ReleaseCaptured();
-
-    /// Invalidate warm execute caches (shape cache + tensor plan).
-    /// Call when external buffers (KV cache, conv cache) are recreated.
-    void InvalidateWarmCaches() {
-        if (tensorPlanValid_) {
-            // Release tensor plan buffers
-            std::set<WGPUBuffer> released;
-            for (auto& [name, alloc] : tensorPlan_) {
-                if (alloc.buffer.handle && released.find(alloc.buffer.handle) == released.end()) {
-                    released.insert(alloc.buffer.handle);
-                    gpu->releaseBuffer(alloc.buffer);
-                }
-            }
-            tensorPlan_.clear();
-        }
-        tensorPlanValid_ = false;
-        shapeCacheValid_ = false;
-        shapeCachePopulating_ = false;
-        nodeShapeCache_.clear();
-    }
-
-    // Temporary storage for bind group entries during capture
-    std::vector<Dispatch::BindEntry> lastCapturedBindings_;
-
-    /// Queue a dispatch. During capture stage, attaches bind group entries for replay.
-    void QueueDispatch(WGPUComputePipeline pipeline, WGPUBindGroup bg,
-                       uint32_t gx, uint32_t gy, uint32_t gz, const char* name) {
-        pendingDispatches_.push_back({pipeline, bg, gx, gy, gz, name, {}});
-        if (fastDecodeState_ == FastDecodeState::Capturing && !lastCapturedBindings_.empty()) {
-            pendingDispatches_.back().capturedBindings = std::move(lastCapturedBindings_);
-            lastCapturedBindings_.clear();
-        }
-    }
-
-    /// Optional: request a readback copy at the end of the next flushToEncoder.
-    /// The copy is appended to the same command buffer, avoiding a separate
-    /// submission. After waitForQueue(), map readbackDst_ to read the result.
-    GPUBuffer readbackSrc_;
-    GPUBuffer readbackDst_;      // Must have MAP_READ usage
-    uint64_t readbackSize_ = 0;
-    void RequestReadback(GPUBuffer src, GPUBuffer dst, uint64_t size) {
-        readbackSrc_ = src; readbackDst_ = dst; readbackSize_ = size;
-    }
-
-    // Deferred int readbacks — flushed at periodic sync or when needed
-    std::vector<GpuTensor*> pendingIntReadbacks_;
-
-    // Deferred buffer releases — flushed at periodic GPU sync points
-    std::vector<std::string> pendingReleases_;
-
-    // Deferred GPU buffer releases — buffers are kept alive until the next Execute
-    // call, when we know the previous GPU work is complete (caller synced between calls).
-    std::vector<GPUBuffer> deferredBufferReleases_;
-
-    // Param buffer pool: pre-allocated buffers for dispatch params.
-    // Indexed by size bucket: [0]=16B, [1]=32B, [2]=48B, [3]=64B
-    static constexpr int PARAM_POOL_BUCKETS = 4;
-    static constexpr int PARAM_POOL_SIZE = 512;  // max buffers per bucket
-    struct ParamPool {
-        std::vector<GPUBuffer> buffers;
-        int nextIdx = 0;
-    };
-    ParamPool paramPool_[PARAM_POOL_BUCKETS];
-
-    // ─── Shape Cache (Warm Execute) ─────────────────────────────────────
-    // After the first Execute() call, cache output shapes and small CPU
-    // data for each node. On subsequent calls with identical input shapes,
-    // skip GPU readbacks (FlushPendingWork) and use cached values.
-    struct CachedNodeOutput {
-        std::vector<int64_t> shape;
-        TensorDtype dtype;
-        std::vector<uint8_t> cpuData;  // small int data (avoids GPU readback)
-        bool hasCpuData = false;
-    };
-    // Key = output tensor name
-    std::unordered_map<std::string, CachedNodeOutput> nodeShapeCache_;
-    bool shapeCacheValid_ = false;
-    bool shapeCachePopulating_ = false;  // true during first Execute (recording)
-
-    // ─── Tensor Plan (Buffer Reuse) ──────────────────────────────────
-    // After the first Execute(), record intermediate buffer allocations.
-    // On subsequent calls, reuse existing GPU buffers instead of
-    // creating/destroying ~400 buffers per Execute().
-    struct TensorAlloc {
-        GPUBuffer buffer;
-        uint64_t size;
-        std::vector<int64_t> shape;
-        TensorDtype dtype;
-    };
-    std::unordered_map<std::string, TensorAlloc> tensorPlan_;
-    bool tensorPlanValid_ = false;
-
-    // Profiling accumulators (per op-type, in ms)
-    std::unordered_map<std::string, double> profileData_;
-    std::unordered_map<std::string, int> profileCounts_;
-    int flushCount_ = 0;  // GPU sync count per Execute
-    int intReadbackSyncs_ = 0;  // syncs from int readback only
-    std::unordered_map<std::string, int> flushSources_;  // sync count by op
-
-private:
+    // Default ExecutionContext for backward-compatible single-session use
+    ExecutionContext defaultCtx_;
 
     // Op registry
     static std::unordered_map<std::string, OpDispatchFn>& GetOpRegistry();
@@ -554,12 +359,7 @@ private:
     // Memory-mapped data (kept alive for pointer stability)
     MappedFile onnxMapping_;
     MappedFile extDataMapping_;
-    // Multi-file external data: filename → mapped file
     std::unordered_map<std::string, MappedFile> extDataMappings_;
-
-public:
-    /// Register an op implementation. Called at static init time.
-    static void RegisterOp(const std::string& opType, OpDispatchFn fn);
 };
 
 // ─── Op Registration Macro ───────────────────────────────────────────────────
@@ -568,3 +368,13 @@ public:
     static struct _RegOp_##name { \
         _RegOp_##name() { GraphExecutor::RegisterOp(#name, fn); } \
     } _regOp_##name;
+
+// ─── OpContext::GetPipelineT template implementation ─────────────────────────
+// Defined here because it needs the full GraphExecutor definition.
+
+template<typename F>
+const CompiledPipeline& OpContext::GetPipelineT(const std::string& name,
+                                                  uint32_t numBindings,
+                                                  F&& generator) {
+    return graph.GetPipelineT(name, numBindings, std::forward<F>(generator));
+}

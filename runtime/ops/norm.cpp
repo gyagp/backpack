@@ -39,7 +39,7 @@ static float fp16ToFloat(uint16_t h) {
     return v;
 }
 
-static bool readTensorFloats(GraphExecutor& ex, const GpuTensor* t,
+static bool readTensorFloats(OpContext& ex, const GpuTensor* t,
     const std::string& name, std::vector<float>& out) {
     out.clear();
     if (!t) return false;
@@ -82,7 +82,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor* t,
     if (t->buffer.handle) {
         ex.FlushPendingWork();
         size_t bytes = (size_t)nel * t->DtypeSize();
-        auto raw = ex.gpu->readBuffer(t->buffer, bytes);
+        auto raw = ex.getGpu()->readBuffer(t->buffer, bytes);
         if (load(raw.data(), raw.size())) return true;
     }
 
@@ -90,7 +90,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor* t,
     return false;
 }
 
-static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std::string& name,
+static bool ensureTensorFloat32(OpContext& ex, GpuTensor& tensor, const std::string& name,
                                 bool preferRawInitializer = false) {
     if (auto* init = ex.GetInitData(name); init && init->data && init->dtype == TensorDtype::Float16 &&
         (preferRawInitializer || tensor.cpuData.empty())) {
@@ -104,9 +104,9 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
             rebuilt.dtype = TensorDtype::Float32;
             rebuilt.cpuData.resize(values.size() * sizeof(float));
             memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-            rebuilt.buffer = ex.gpu->createBuffer(name.empty() ? "norm_f32_rebuilt" : name,
+            rebuilt.buffer = ex.getGpu()->createBuffer(name.empty() ? "norm_f32_rebuilt" : name,
                                                   rebuilt.cpuData.size());
-            ex.gpu->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
+            ex.getGpu()->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
             rebuilt.isCpuOnly = false;
             tensor = std::move(rebuilt);
             return tensor.buffer.handle != nullptr;
@@ -128,17 +128,17 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     rebuilt.dtype = TensorDtype::Float32;
     rebuilt.cpuData.resize(values.size() * sizeof(float));
     memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-    rebuilt.buffer = ex.gpu->createBuffer(name.empty() ? "norm_f32_cast" : name,
+    rebuilt.buffer = ex.getGpu()->createBuffer(name.empty() ? "norm_f32_cast" : name,
                                           rebuilt.cpuData.size());
-    ex.gpu->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
+    ex.getGpu()->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
     rebuilt.isCpuOnly = false;
     tensor = std::move(rebuilt);
     return tensor.buffer.handle != nullptr;
 }
 
-static bool canUseFp16NormWeights(const GraphExecutor& ex, const GpuTensor* x,
+static bool canUseFp16NormWeights(const OpContext& ex, const GpuTensor* x,
                                   const GpuTensor* w, const GpuTensor* b = nullptr) {
-    if (!ex.gpu->supportsShaderF16 || !x || !w) return false;
+    if (!ex.getGpu()->supportsShaderF16 || !x || !w) return false;
     if (x->dtype != TensorDtype::Float32 || w->dtype != TensorDtype::Float16) return false;
     if (b && b->dtype != TensorDtype::Float16) return false;
     return true;
@@ -148,7 +148,7 @@ static bool canUseFp16NormWeights(const GraphExecutor& ex, const GpuTensor* x,
 // Uses WGSL_RMSNORM_T template for both f32 and f16 activation paths.
 // Falls back to WGSL_RMSNORM_SIMPLE_F16W (kernels/norm/) for mixed f32-data/f16-weight.
 
-static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* W = in.size() > 1 ? in[1] : nullptr;
@@ -168,7 +168,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     if (out.size() > 1 && out[1] && out[1]->IsValid()) {
         rstdBuf = out[1]->buffer;
     } else {
-        rstdBuf = ex.gpu->createBuffer("rstd", std::max((int64_t)4, nRows * 4));
+        rstdBuf = ex.getGpu()->createBuffer("rstd", std::max((int64_t)4, nRows * 4));
     }
 
     struct { int32_t stride; int32_t N; float eps; } p;
@@ -176,7 +176,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     p.N = (int32_t)hiddenDim;
     p.eps = eps;
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, &p, 12);
+    ex.getGpu()->writeBuffer(paramBuf, &p, 12);
 
     // Templated path: both X and W are fp16 → use fp16 template
     if (X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16) {
@@ -223,7 +223,7 @@ static void opSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 // Uses WGSL_SKIP_RMSNORM_T template for typed path.
 // Uses WGSL_SKIP_RMSNORM_F16W (kernels/norm/) for f32-data + f16-weight.
 
-static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSkipSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* Skip = in.size() > 1 ? in[1] : nullptr;
@@ -252,7 +252,7 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)hiddenDim, (uint32_t)nRows, eps_u32, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W) && Skip->dtype == TensorDtype::Float32) {
         ex.EnsureGpu(*X);
@@ -283,7 +283,7 @@ static void opSkipSimplifiedLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── LayerNormalization ──────────────────────────────────────────────────────
 
-static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opLayerNorm(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* W = in.size() > 1 ? in[1] : nullptr;
@@ -309,14 +309,14 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     if (B && B->IsValid()) { biasBuf = B->buffer; }
     else {
         std::vector<float> zeros((size_t)hiddenDim, 0.0f);
-        biasBuf = ex.gpu->createBuffer("ln_b0", hiddenDim * 4);
-        ex.gpu->writeBuffer(biasBuf, zeros.data(), hiddenDim * 4);
+        biasBuf = ex.getGpu()->createBuffer("ln_b0", hiddenDim * 4);
+        ex.getGpu()->writeBuffer(biasBuf, zeros.data(), hiddenDim * 4);
     }
 
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)hiddenDim, (uint32_t)nRows, eps_u32, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     if (B && !isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W, B)) {
         ex.EnsureGpu(*X);
@@ -341,7 +341,7 @@ static void opLayerNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── InstanceNormalization ───────────────────────────────────────────────────
 
-static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opInstanceNorm(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* Scale = in.size() > 1 ? in[1] : nullptr;
@@ -366,7 +366,7 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)C, (uint32_t)HW, (uint32_t)N_batch, eps_u32};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, Scale, Bias)) {
         ex.EnsureGpu(*X);
@@ -391,7 +391,7 @@ static void opInstanceNorm(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── GroupNormalization ───────────────────────────────────────────────────────
 
-static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGroupNorm(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* Scale = in.size() > 1 ? in[1] : nullptr;
@@ -419,7 +419,7 @@ static void opGroupNorm(GraphExecutor& ex, const OnnxGraphNode& n,
     uint32_t eps_u32; memcpy(&eps_u32, &eps, 4);
     uint32_t params[4] = {(uint32_t)C, (uint32_t)HW, (uint32_t)numGroups, eps_u32};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, Scale, Bias)) {
         ex.EnsureGpu(*X);

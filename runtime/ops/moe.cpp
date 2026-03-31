@@ -37,7 +37,7 @@ static float fp16ToFloat(uint16_t h) {
     return v;
 }
 
-static bool readTensorIntValues(GraphExecutor& ex, const GpuTensor* t,
+static bool readTensorIntValues(OpContext& ex, const GpuTensor* t,
                                 const std::string& name, std::vector<int64_t>& values) {
     values.clear();
     if (!t) return false;
@@ -54,7 +54,7 @@ static bool readTensorIntValues(GraphExecutor& ex, const GpuTensor* t,
         src = init->data;
     } else if (t->buffer.handle) {
         ex.FlushPendingWork();
-        gpuReadback = ex.gpu->readBuffer(t->buffer, (size_t)nel * t->DtypeSize());
+        gpuReadback = ex.getGpu()->readBuffer(t->buffer, (size_t)nel * t->DtypeSize());
         src = gpuReadback.data();
     }
     if (!src) return false;
@@ -72,7 +72,7 @@ static bool readTensorIntValues(GraphExecutor& ex, const GpuTensor* t,
     return false;
 }
 
-static bool loadTensorFloats(GraphExecutor& ex, const GpuTensor* t,
+static bool loadTensorFloats(OpContext& ex, const GpuTensor* t,
                              const std::string& name, std::vector<float>& values) {
     values.clear();
     if (!t) return false;
@@ -90,7 +90,7 @@ static bool loadTensorFloats(GraphExecutor& ex, const GpuTensor* t,
         src = init->data;
     } else if (t->buffer.handle) {
         ex.FlushPendingWork();
-        gpuReadback = ex.gpu->readBuffer(t->buffer, (size_t)nel * t->DtypeSize());
+        gpuReadback = ex.getGpu()->readBuffer(t->buffer, (size_t)nel * t->DtypeSize());
         src = gpuReadback.data();
     }
     if (!src) return false;
@@ -107,7 +107,7 @@ static bool loadTensorFloats(GraphExecutor& ex, const GpuTensor* t,
     return false;
 }
 
-static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std::string& name) {
+static bool ensureTensorFloat32(OpContext& ex, GpuTensor& tensor, const std::string& name) {
     if (tensor.dtype == TensorDtype::Float32) {
         ex.EnsureGpu(tensor);
         return tensor.buffer.handle != nullptr;
@@ -126,7 +126,7 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
         src = init->data;
     } else if (tensor.buffer.handle && tensor.buffer.size >= bytes) {
         ex.FlushPendingWork();
-        raw = ex.gpu->readBuffer(tensor.buffer, bytes);
+        raw = ex.getGpu()->readBuffer(tensor.buffer, bytes);
         src = raw.data();
     }
     if (!src) return false;
@@ -137,8 +137,8 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     tensor.shape = tensor.shape;
     tensor.dtype = TensorDtype::Float32;
     tensor.cpuData.clear();
-    tensor.buffer = ex.gpu->createBuffer("moe_f32", f32.size() * 4);
-    ex.gpu->writeBuffer(tensor.buffer, f32.data(), f32.size() * 4);
+    tensor.buffer = ex.getGpu()->createBuffer("moe_f32", f32.size() * 4);
+    ex.getGpu()->writeBuffer(tensor.buffer, f32.data(), f32.size() * 4);
     tensor.isCpuOnly = false;
     return true;
 }
@@ -146,7 +146,7 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
 // ─── TopK (GPU) ──────────────────────────────────────────────────────────────
 // GPU kernel for TopK on fp16 data. For MoE routing: dimSize=32, k=4.
 
-static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opTopK(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0];
     if (!data || !data->IsValid()) return;
@@ -191,7 +191,7 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
 
         uint32_t params[4] = {(uint32_t)totalSlices, (uint32_t)dimSize, (uint32_t)k, (uint32_t)largest};
         auto paramBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(paramBuf, params, 16);
+        ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
         std::string pname = "topk" + std::string(dtypeSuffix(dtype));
         auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
@@ -249,7 +249,7 @@ static void opTopK(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── GatherElements (GPU) ────────────────────────────────────────────────────
 
-static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGatherElements(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0];
     auto* indices = in.size() > 1 ? in[1] : nullptr;
@@ -274,7 +274,7 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t params[4] = {(uint32_t)outNel, (uint32_t)data->shape[axis],
                                (uint32_t)indices->shape[axis], 0};
         auto paramBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(paramBuf, params, 16);
+        ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
         std::string pname = "gather_elements" + std::string(dtypeSuffix(dtype));
         auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
@@ -321,7 +321,7 @@ static void opGatherElements(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── ScatterElements (GPU) ───────────────────────────────────────────────────
 
-static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opScatterElements(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0];
     auto* indices = in.size() > 1 ? in[1] : nullptr;
@@ -355,7 +355,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 0};
             auto paramBuf = ex.getParamBuffer(32);
-            ex.gpu->writeBuffer(paramBuf, params, 20);
+            ex.getGpu()->writeBuffer(paramBuf, params, 20);
 
             auto& pl = ex.GetPipelineT(pname, 5, [dtype]() {
                 return instantiateTemplate(WGSL_SCATTER_ELEMENTS_T, dtype);
@@ -371,7 +371,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t params[8] = {(uint32_t)dataNel, (uint32_t)data->shape[axis],
                                    (uint32_t)idxNel, (uint32_t)indices->shape[axis], 1};
             auto paramBuf = ex.getParamBuffer(32);
-            ex.gpu->writeBuffer(paramBuf, params, 20);
+            ex.getGpu()->writeBuffer(paramBuf, params, 20);
 
             auto& pl = ex.GetPipelineT(pname, 5, [dtype]() {
                 return instantiateTemplate(WGSL_SCATTER_ELEMENTS_T, dtype);
@@ -428,7 +428,7 @@ static void opScatterElements(GraphExecutor& ex, const OnnxGraphNode& n,
 //      gate_up Q4 matmul → SwiGLU → down Q4 matmul → weighted accumulate
 //   Only one small CPU readback (32 * fp16 = 64 bytes per token).
 
-static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opQMoE(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* input = in[0];
     auto* routerWeights = in.size() > 1 ? in[1] : nullptr;
@@ -495,8 +495,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         GpuTensor gateUpBuf = ex.AllocTensor({chunkTokens * N_gu}, TensorDtype::Float32);
         GpuTensor intermediateBuf = ex.AllocTensor({chunkTokens * moeIntermediate}, TensorDtype::Float32);
         GpuTensor downBuf = ex.AllocTensor({chunkTokens * N_dn}, TensorDtype::Float32);
-        auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)(chunkTokens * k * 4));
-        auto expertWtBuf = ex.gpu->createBuffer("moe_expert_wt", (size_t)(chunkTokens * k * 4));
+        auto expertIdxBuf = ex.getGpu()->createBuffer("moe_expert_idx", (size_t)(chunkTokens * k * 4));
+        auto expertWtBuf = ex.getGpu()->createBuffer("moe_expert_wt", (size_t)(chunkTokens * k * 4));
 
         for (int64_t chunkStart = 0; chunkStart < nTokens; chunkStart += CHUNK) {
             int64_t cT = std::min(CHUNK, nTokens - chunkStart);
@@ -520,7 +520,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             {
                 uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, (uint32_t)cT};
                 auto gpBuf = ex.getParamBuffer(16);
-                ex.gpu->writeBuffer(gpBuf, gateParams, 16);
+                ex.getGpu()->writeBuffer(gpBuf, gateParams, 16);
                 auto& pl = ex.GetPipelineT("moe_gate_batched", 4, []() {
                     return std::string(WGSL_MOE_GATE_BATCHED);
                 });
@@ -535,7 +535,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                     uint32_t params[8] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
                                            (uint32_t)blocksPerCol_gu, slot, (uint32_t)k};
                     auto pBuf = ex.getParamBuffer(32);
-                    ex.gpu->writeBuffer(pBuf, params, 20);
+                    ex.getGpu()->writeBuffer(pBuf, params, 20);
                     auto& pl = ex.GetPipelineT("matmul_q4_indirect_wide_batched", 6, []() {
                         return std::string(WGSL_MATMUL_Q4_INDIRECT_WIDE_BATCHED);
                     });
@@ -548,7 +548,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                 {
                     uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
                     auto pBuf = ex.getParamBuffer(16);
-                    ex.gpu->writeBuffer(pBuf, params, 16);
+                    ex.getGpu()->writeBuffer(pBuf, params, 16);
                     auto& pl = ex.GetPipelineT("swiglu_batched", 3, []() {
                         return std::string(WGSL_SWIGLU_BATCHED);
                     });
@@ -561,7 +561,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                     uint32_t params[8] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
                                            (uint32_t)blocksPerCol_dn, slot, (uint32_t)k};
                     auto pBuf = ex.getParamBuffer(32);
-                    ex.gpu->writeBuffer(pBuf, params, 20);
+                    ex.getGpu()->writeBuffer(pBuf, params, 20);
                     auto& pl = ex.GetPipelineT("matmul_q4_indirect_wide_batched", 6, []() {
                         return std::string(WGSL_MATMUL_Q4_INDIRECT_WIDE_BATCHED);
                     });
@@ -574,7 +574,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                 {
                     uint32_t params[4] = {(uint32_t)N_dn, slot, (uint32_t)k, 0};
                     auto pBuf = ex.getParamBuffer(16);
-                    ex.gpu->writeBuffer(pBuf, params, 16);
+                    ex.getGpu()->writeBuffer(pBuf, params, 16);
                     auto& pl = ex.GetPipelineT("weighted_add_indirect_batched", 4, []() {
                         return std::string(WGSL_WEIGHTED_ADD_INDIRECT_BATCHED);
                     });
@@ -586,8 +586,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             }
         }
 
-        ex.gpu->releaseBuffer(expertIdxBuf);
-        ex.gpu->releaseBuffer(expertWtBuf);
+        ex.getGpu()->releaseBuffer(expertIdxBuf);
+        ex.getGpu()->releaseBuffer(expertWtBuf);
         return;
     }
 
@@ -598,8 +598,8 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
     GpuTensor downBuf = ex.AllocTensor({N_dn}, TensorDtype::Float32);
 
     // Per-token expert selection buffers
-    auto expertIdxBuf = ex.gpu->createBuffer("moe_expert_idx", (size_t)k * 4);
-    auto expertWtBuf = ex.gpu->createBuffer("moe_expert_wt", (size_t)k * 4);
+    auto expertIdxBuf = ex.getGpu()->createBuffer("moe_expert_idx", (size_t)k * 4);
+    auto expertWtBuf = ex.getGpu()->createBuffer("moe_expert_wt", (size_t)k * 4);
 
     // Process each token (MoE routing is inherently per-token)
     for (int64_t tok = 0; tok < nTokens; tok++) {
@@ -620,7 +620,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
         {
             uint32_t gateParams[4] = {(uint32_t)numExperts, (uint32_t)k, (uint32_t)normRouting, 0};
             auto gpBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(gpBuf, gateParams, 16);
+            ex.getGpu()->writeBuffer(gpBuf, gateParams, 16);
             auto& pl = ex.GetPipelineT("moe_gate", 4, []() { return instantiateTemplate(WGSL_MOE_GATE_T, TensorDtype::Float32); });
             auto bg = ex.MakeBindGroup(pl, {
                 {0, routerSlice}, {1, expertIdxBuf}, {2, expertWtBuf}, {3, gpBuf}});
@@ -634,7 +634,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                 uint32_t params[4] = {(uint32_t)N_gu, (uint32_t)hiddenSize,
                                        (uint32_t)blocksPerCol_gu, slot};
                 auto pBuf = ex.getParamBuffer(16);
-                ex.gpu->writeBuffer(pBuf, params, 16);
+                ex.getGpu()->writeBuffer(pBuf, params, 16);
                 auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, inputSlice}, {1, gateUpW->buffer}, {2, gateUpS->buffer},
@@ -647,7 +647,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             {
                 uint32_t params[4] = {(uint32_t)moeIntermediate, 0, 0, 0};
                 auto pBuf = ex.getParamBuffer(16);
-                ex.gpu->writeBuffer(pBuf, params, 16);
+                ex.getGpu()->writeBuffer(pBuf, params, 16);
                 auto& pl = ex.GetPipelineT("swiglu", 3, []() { return instantiateTemplate(WGSL_SWIGLU_T, TensorDtype::Float32); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, gateUpBuf.buffer}, {1, intermediateBuf.buffer}, {2, pBuf}});
@@ -660,7 +660,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
                 uint32_t params[4] = {(uint32_t)N_dn, (uint32_t)moeIntermediate,
                                        (uint32_t)blocksPerCol_dn, slot};
                 auto pBuf = ex.getParamBuffer(16);
-                ex.gpu->writeBuffer(pBuf, params, 16);
+                ex.getGpu()->writeBuffer(pBuf, params, 16);
                 auto& pl = ex.GetPipelineT("matmul_q4_indirect_sub", 6, []() { return instantiateTemplate(WGSL_MATMUL_Q4_INDIRECT_SUB_T, TensorDtype::Float32); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, intermediateBuf.buffer}, {1, downW->buffer}, {2, downS->buffer},
@@ -673,7 +673,7 @@ static void opQMoE(GraphExecutor& ex, const OnnxGraphNode& n,
             {
                 uint32_t params[4] = {(uint32_t)N_dn, slot, 0, 0};
                 auto pBuf = ex.getParamBuffer(16);
-                ex.gpu->writeBuffer(pBuf, params, 16);
+                ex.getGpu()->writeBuffer(pBuf, params, 16);
                 auto& pl = ex.GetPipelineT("weighted_add_indirect", 4, []() { return instantiateTemplate(WGSL_WEIGHTED_ADD_INDIRECT_T, TensorDtype::Float32); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, downBuf.buffer}, {1, outSlice}, {2, pBuf}, {3, expertWtBuf}});
@@ -696,7 +696,7 @@ REGISTER_OP(QMoE, opQMoE)
 // Inputs: X (f32), W_blocks (i32, packed FP4), W_scales (i32, packed E8M0), Bias (f32)
 // Attrs: K (input features), N (output features)
 
-static void opLinearMxfp4(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opLinearMxfp4(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* W_blocks = in.size() > 1 ? in[1] : nullptr;
@@ -742,7 +742,7 @@ static void opLinearMxfp4(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)K, (uint32_t)N, stride_blocks, stride_scales};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     auto& pl = ex.GetPipelineT("mxfp4_matmul", 6, []() {
         return std::string(WGSL_MXFP4_MATMUL);

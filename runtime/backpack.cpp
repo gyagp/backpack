@@ -6,6 +6,7 @@
  */
 
 #include "backpack.h"
+#include "execution_context.h"
 #include "gpu_context.h"
 #include "graph_executor.h"
 #include "wgsl_shaders.h"
@@ -77,6 +78,7 @@ bool bp::Device::IsLost() const {
 }
 
 void bp::Device::Release() { impl_.reset(); }
+bp::Device::Device() = default;
 bp::Device::~Device() = default;
 bp::Device::Device(Device&& o) noexcept = default;
 bp::Device& bp::Device::operator=(Device&& o) noexcept = default;
@@ -163,6 +165,7 @@ bp::TensorInfo bp::Model::GetOutputInfo(int index) const {
 }
 
 void bp::Model::Release() { impl_.reset(); }
+bp::Model::Model() = default;
 bp::Model::~Model() = default;
 bp::Model::Model(Model&& o) noexcept = default;
 bp::Model& bp::Model::operator=(Model&& o) noexcept = default;
@@ -297,6 +300,7 @@ bool bp::Tensor::Reshape(const std::vector<int64_t>& newShape) {
 }
 
 void bp::Tensor::Release() { impl_.reset(); }
+bp::Tensor::Tensor() = default;
 bp::Tensor::~Tensor() = default;
 bp::Tensor::Tensor(Tensor&& o) noexcept = default;
 bp::Tensor& bp::Tensor::operator=(Tensor&& o) noexcept = default;
@@ -307,6 +311,7 @@ bp::Tensor& bp::Tensor::operator=(Tensor&& o) noexcept = default;
 
 struct bp::Session::Impl {
     Model* model = nullptr;
+    ExecutionContext execCtx;  // per-session execution state
     std::vector<GpuTensor> ownedInputs;
     std::vector<GpuTensor> ownedOutputs;
     std::vector<std::string> inputNames;
@@ -319,6 +324,9 @@ bp::Session bp::Session::Create(Model& model) {
     Session s;
     s.impl_ = std::make_unique<Impl>();
     s.impl_->model = &model;
+    // Initialize per-session execution context with the model's GPU context
+    auto* gpuCtx = static_cast<GPUContext*>(model.GetImpl()->device->GetGPUContext());
+    s.impl_->execCtx.gpu = gpuCtx;
     return s;
 }
 
@@ -359,7 +367,7 @@ void bp::Session::Run() {
     for (size_t i = 0; i < impl_->outputNames.size(); i++)
         outputs[impl_->outputNames[i]] = &impl_->ownedOutputs[i];
 
-    impl_->model->GetImpl()->executor.Execute(inputs, outputs);
+    impl_->model->GetImpl()->executor.Execute(impl_->execCtx, inputs, outputs);
 
     // Propagate output buffer handles back to the Tensor objects
     // Execute may have replaced the buffer handle with the actual computed result
@@ -397,6 +405,7 @@ void bp::Session::ClearStop() {
 }
 
 void bp::Session::Release() { impl_.reset(); }
+bp::Session::Session() = default;
 bp::Session::~Session() = default;
 bp::Session::Session(Session&& o) noexcept = default;
 bp::Session& bp::Session::operator=(Session&& o) noexcept = default;

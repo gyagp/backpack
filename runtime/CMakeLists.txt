@@ -52,6 +52,7 @@ set(BACKPACK_CORE_SOURCES
     onnx_tokenizer.cpp
     json_parser.cpp
     graph_executor.cpp
+    execution_context.cpp
     ops/elementwise.cpp
     ops/fusion.cpp
     ops/shape.cpp
@@ -75,7 +76,7 @@ set_target_properties(backpack_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ─── Public library ──────────────────────────────────────────────────────────
 
-add_library(backpack SHARED backpack.cpp $<TARGET_OBJECTS:backpack_core>)
+add_library(backpack SHARED backpack.cpp lm_session.cpp $<TARGET_OBJECTS:backpack_core>)
 target_compile_definitions(backpack PRIVATE BACKPACK_BUILDING)
 set_target_properties(backpack PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"

@@ -33,7 +33,7 @@ static float fp16ToFloat(uint16_t h) {
     return v;
 }
 
-static void ensureFloat32(GraphExecutor& ex, GpuTensor& t) {
+static void ensureFloat32(OpContext& ex, GpuTensor& t) {
     if (t.dtype != TensorDtype::Float16) { ex.EnsureGpu(t); return; }
     int64_t count = tensorNel(&t);
     if (count <= 0) return;
@@ -45,7 +45,7 @@ static void ensureFloat32(GraphExecutor& ex, GpuTensor& t) {
     } else if (t.buffer.handle) {
         ex.EnsureGpu(t);
         ex.FlushPendingWork();
-        gpuReadback = ex.gpu->readBuffer(t.buffer, fp16Bytes);
+        gpuReadback = ex.getGpu()->readBuffer(t.buffer, fp16Bytes);
         if (gpuReadback.size() >= fp16Bytes) src = gpuReadback.data();
     }
     if (!src) return;
@@ -55,12 +55,12 @@ static void ensureFloat32(GraphExecutor& ex, GpuTensor& t) {
     t.shape = t.shape; // preserve shape
     t.dtype = TensorDtype::Float32;
     t.cpuData.clear();
-    t.buffer = ex.gpu->createBuffer("attn_f32", f32.size() * 4);
-    ex.gpu->writeBuffer(t.buffer, f32.data(), f32.size() * 4);
+    t.buffer = ex.getGpu()->createBuffer("attn_f32", f32.size() * 4);
+    ex.getGpu()->writeBuffer(t.buffer, f32.data(), f32.size() * 4);
     t.isCpuOnly = false;
 }
 
-static bool readTensorInt64Values(GraphExecutor& ex, GpuTensor* t,
+static bool readTensorInt64Values(OpContext& ex, GpuTensor* t,
                                   int64_t maxElements,
                                   std::vector<int64_t>& out) {
     out.clear();
@@ -76,7 +76,7 @@ static bool readTensorInt64Values(GraphExecutor& ex, GpuTensor* t,
 
     if (!t->buffer.handle || t->buffer.size < (size_t)nel * 8) return false;
     ex.FlushPendingWork();
-    auto raw = ex.gpu->readBuffer(t->buffer, (size_t)nel * 8);
+    auto raw = ex.getGpu()->readBuffer(t->buffer, (size_t)nel * 8);
     if (raw.size() < (size_t)nel * 8) return false;
     t->cpuData.resize((size_t)nel * 8);
     memcpy(t->cpuData.data(), raw.data(), raw.size());
@@ -93,7 +93,7 @@ static bool readTensorInt64Values(GraphExecutor& ex, GpuTensor* t,
 //
 //   out[0]=output, out[1]=present_key, out[2]=present_value
 
-static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGQA(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Q = in[0];
     auto* K = in.size() > 1 ? in[1] : nullptr;
@@ -142,7 +142,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t params[8] = {(uint32_t)T, (uint32_t)num_heads, (uint32_t)head_dim,
                                (uint32_t)T, scale_u32, (uint32_t)kv_heads, 0, 0};
         auto paramBuf = ex.getParamBuffer(32);
-        ex.gpu->writeBuffer(paramBuf, params, 32);
+        ex.getGpu()->writeBuffer(paramBuf, params, 32);
 
         auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return instantiateTemplate(WGSL_BIDIRECTIONAL_ATTN_T, TensorDtype::Float32); });
         auto bg = ex.MakeBindGroup(pl, {
@@ -189,7 +189,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         GpuTensor f32t = ex.AllocTensor(t.shape, TensorDtype::Float32);
         uint32_t p[4] = {(uint32_t)nel, 0, 0, 0};
         auto pb = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(pb, p, 16);
+        ex.getGpu()->writeBuffer(pb, p, 16);
         auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
         auto bg = ex.MakeBindGroup(pl, {{0, t.buffer}, {1, f32t.buffer}, {2, pb}});
         ex.QueueDispatch(pl.pipeline, bg,
@@ -227,7 +227,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                        (uint32_t)rotaryDim, (uint32_t)posOffset};
             auto rpBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
+            ex.getGpu()->writeBuffer(rpBuf, ropeParams, 16);
             auto roBg = ex.MakeBindGroup(roBatchPl, {
                 {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
             ex.QueueDispatch(roBatchPl.pipeline, roBg,
@@ -236,7 +236,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
             // RoPE on K for all tokens
             ropeParams[0] = (uint32_t)kv_heads;
             auto rpBufK = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
+            ex.getGpu()->writeBuffer(rpBufK, ropeParams, 16);
             auto roBgK = ex.MakeBindGroup(roBatchPl, {
                 {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
             ex.QueueDispatch(roBatchPl.pipeline, roBgK,
@@ -246,8 +246,8 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t ropeParams[4] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                        (uint32_t)rotaryDim, (uint32_t)posOffset};
             auto rpBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(rpBuf, ropeParams, 16);
-            ex.RegisterReplayParam(rpBuf, 12, GraphExecutor::ReplayParamUpdate::PosOffset);
+            ex.getGpu()->writeBuffer(rpBuf, ropeParams, 16);
+            ex.RegisterReplayParam(rpBuf, 12, ExecutionContext::ReplayParamUpdate::PosOffset);
             auto roBg = ex.MakeBindGroup(roPl, {
                 {0, Q->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBuf}});
             ex.QueueDispatch(roPl.pipeline, roBg,
@@ -255,8 +255,8 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
 
             ropeParams[0] = (uint32_t)kv_heads;
             auto rpBufK = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(rpBufK, ropeParams, 16);
-            ex.RegisterReplayParam(rpBufK, 12, GraphExecutor::ReplayParamUpdate::PosOffset);
+            ex.getGpu()->writeBuffer(rpBufK, ropeParams, 16);
+            ex.RegisterReplayParam(rpBufK, 12, ExecutionContext::ReplayParamUpdate::PosOffset);
             auto roBgK = ex.MakeBindGroup(roPl, {
                 {0, K->buffer}, {1, cosCache->buffer}, {2, sinCache->buffer}, {3, rpBufK}});
             ex.QueueDispatch(roPl.pipeline, roBgK,
@@ -304,7 +304,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
                                      (uint32_t)pastSeq, (uint32_t)maxSeq};
             auto kvpBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
+            ex.getGpu()->writeBuffer(kvpBuf, kvParams, 16);
 
             auto kvBgK = ex.MakeBindGroup(kvBatchPl, {
                 {0, K->buffer}, {1, presentKey.buffer}, {2, kvpBuf}});
@@ -320,8 +320,8 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
             uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
                                      (uint32_t)pastSeq, (uint32_t)maxSeq};
             auto kvpBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
-            ex.RegisterReplayParam(kvpBuf, 8, GraphExecutor::ReplayParamUpdate::PastSeq);
+            ex.getGpu()->writeBuffer(kvpBuf, kvParams, 16);
+            ex.RegisterReplayParam(kvpBuf, 8, ExecutionContext::ReplayParamUpdate::PastSeq);
 
             auto kvBgK = ex.MakeBindGroup(kvPl, {
                 {0, K->buffer}, {1, presentKey.buffer}, {2, kvpBuf}});
@@ -357,7 +357,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
         uint32_t kvParams[4] = {(uint32_t)kv_heads, (uint32_t)head_dim,
                                  (uint32_t)pastSeq, (uint32_t)totalSeq};
         auto kvpBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(kvpBuf, kvParams, 16);
+        ex.getGpu()->writeBuffer(kvpBuf, kvParams, 16);
 
         auto& kvPl = ex.GetPipelineT("kv_cache_append", 4, []() { return instantiateTemplate(WGSL_KV_CACHE_APPEND_T, TensorDtype::Float32); });
         auto kvBgK = ex.MakeBindGroup(kvPl, {
@@ -387,7 +387,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
                                           (uint32_t)pastSeq, (uint32_t)kv_heads,
                                           scale_u32, (uint32_t)maxSeq, (uint32_t)seqQ, 0};
             auto ppBuf = ex.getParamBuffer(32);
-            ex.gpu->writeBuffer(ppBuf, prefillParams, 32);
+            ex.getGpu()->writeBuffer(ppBuf, prefillParams, 32);
 
             auto prefillBg = ex.MakeBindGroup(prefillPl, {
                 {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
@@ -402,8 +402,8 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
                                        (uint32_t)totalSeq, (uint32_t)kv_heads,
                                        scale_u32, (uint32_t)maxSeq, 0, 0};
             auto apBuf = ex.getParamBuffer(32);
-            ex.gpu->writeBuffer(apBuf, attnParams, 32);
-            ex.RegisterReplayParam(apBuf, 8, GraphExecutor::ReplayParamUpdate::TotalSeq);
+            ex.getGpu()->writeBuffer(apBuf, attnParams, 32);
+            ex.RegisterReplayParam(apBuf, 8, ExecutionContext::ReplayParamUpdate::TotalSeq);
 
             auto attnBg = ex.MakeBindGroup(attnPl, {
                 {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
@@ -414,12 +414,12 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     // Cast f32 attention output back to f16 if input was f16
-    if (origDtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
+    if (origDtype == TensorDtype::Float16 && ex.getGpu()->supportsShaderF16) {
         int64_t nel = out[0]->ElementCount();
         GpuTensor f16t = ex.AllocTensor(out[0]->shape, TensorDtype::Float16);
         uint32_t cp[4] = {(uint32_t)nel, 0, 0, 0};
         auto cpBuf = ex.getParamBuffer(16);
-        ex.gpu->writeBuffer(cpBuf, cp, 16);
+        ex.getGpu()->writeBuffer(cpBuf, cp, 16);
         auto& cPl = ex.GetPipelineT("cast_f32_to_f16", 3, []() { return std::string(WGSL_CAST_F32_TO_F16); });
         auto cBg = ex.MakeBindGroup(cPl, {{0, out[0]->buffer}, {1, f16t.buffer}, {2, cpBuf}});
         ex.QueueDispatch(cPl.pipeline, cBg,
@@ -428,13 +428,13 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     }
 
     // Output present KV — in static mode, skip f16 cast (stays f32, same buffer)
-    if (!staticKV && origDtype == TensorDtype::Float16 && ex.gpu->supportsShaderF16) {
+    if (!staticKV && origDtype == TensorDtype::Float16 && ex.getGpu()->supportsShaderF16) {
         auto castToF16 = [&](GpuTensor& t, const char* label) {
             int64_t nel = t.ElementCount();
             GpuTensor f16t = ex.AllocTensor(t.shape, TensorDtype::Float16);
             uint32_t cp[4] = {(uint32_t)nel, 0, 0, 0};
             auto cpBuf = ex.getParamBuffer(16);
-            ex.gpu->writeBuffer(cpBuf, cp, 16);
+            ex.getGpu()->writeBuffer(cpBuf, cp, 16);
             auto& cPl = ex.GetPipelineT("cast_f32_to_f16", 3, []() { return std::string(WGSL_CAST_F32_TO_F16); });
             auto cBg = ex.MakeBindGroup(cPl, {{0, t.buffer}, {1, f16t.buffer}, {2, cpBuf}});
             ex.QueueDispatch(cPl.pipeline, cBg,
@@ -450,7 +450,7 @@ static void opGQA(GraphExecutor& ex, const OnnxGraphNode& n,
     if (out.size() > 2 && out[2]) *out[2] = presentVal;
 }
 
-static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opMHA(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Q = in[0]; auto* K = in[1]; auto* V = in[2];
     if (!Q || !K || !V || !Q->IsValid() || !K->IsValid() || !V->IsValid()) return;
@@ -493,7 +493,7 @@ static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
                            (uint32_t)T_kv, scale_u32, 0, 0, 0};
 
     auto paramBuf = ex.getParamBuffer(32);
-    ex.gpu->writeBuffer(paramBuf, params, 32);
+    ex.getGpu()->writeBuffer(paramBuf, params, 32);
 
     auto& pl = ex.GetPipelineT("bidirectional_attn", 5, []() { return instantiateTemplate(WGSL_BIDIRECTIONAL_ATTN_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
@@ -506,7 +506,7 @@ static void opMHA(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── RotaryEmbedding ─────────────────────────────────────────────────────────
 
-static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opRotaryEmbedding(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* PosIds = in.size() > 1 ? in[1] : nullptr;
@@ -549,8 +549,8 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
                 for (int64_t i = 0; i < nPosIds; i++) {
                     i32[i] = (int32_t)posIds[(size_t)i];
                 }
-                posIdsBuf = ex.gpu->createBuffer("rope_posids32", nPosIds * 4);
-                ex.gpu->writeBuffer(posIdsBuf, i32.data(), nPosIds * 4);
+                posIdsBuf = ex.getGpu()->createBuffer("rope_posids32", nPosIds * 4);
+                ex.getGpu()->writeBuffer(posIdsBuf, i32.data(), nPosIds * 4);
             } else {
                 posIdsBuf = PosIds->buffer;
             }
@@ -560,7 +560,7 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
     } else {
         int32_t zero = 0;
         posIdsBuf = ex.getParamBuffer(4);
-        ex.gpu->writeBuffer(posIdsBuf, &zero, 4);
+        ex.getGpu()->writeBuffer(posIdsBuf, &zero, 4);
     }
 
     if (CosCache && CosCache->IsValid()) ensureFloat32(ex, *CosCache);
@@ -572,7 +572,7 @@ static void opRotaryEmbedding(GraphExecutor& ex, const OnnxGraphNode& n,
                            (uint32_t)interleaved, (uint32_t)nPosIds,
                            (uint32_t)seqLen, 0, 0, 0};
     auto paramBuf = ex.getParamBuffer(32);
-    ex.gpu->writeBuffer(paramBuf, params, 32);
+    ex.getGpu()->writeBuffer(paramBuf, params, 32);
 
     auto& pl = ex.GetPipelineT("rotary_embedding", 6, []() { return instantiateTemplate(WGSL_ROTARY_EMBEDDING_T, TensorDtype::Float32); });
     auto bg = ex.MakeBindGroup(pl, {
@@ -597,7 +597,7 @@ REGISTER_OP(RotaryEmbedding, opRotaryEmbedding)
 // KV cache management (circular buffer, eviction) must be handled by the
 // caller before dispatching this op.
 
-static void opGQAAttnSink(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGQAAttnSink(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Q_in = in[0];
     auto* K_cache = in.size() > 1 ? in[1] : nullptr;
@@ -632,7 +632,7 @@ static void opGQAAttnSink(GraphExecutor& ex, const OnnxGraphNode& n,
     memcpy(&params[4], &scale, sizeof(float));  // bitcast f32 → u32
 
     auto paramBuf = ex.getParamBuffer(32);
-    ex.gpu->writeBuffer(paramBuf, params, 28);
+    ex.getGpu()->writeBuffer(paramBuf, params, 28);
 
     auto& pl = ex.GetPipelineT("gqa_decode_attn_sink", 6, []() {
         return std::string(WGSL_GQA_DECODE_ATTN_SINK);

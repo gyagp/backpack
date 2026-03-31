@@ -37,18 +37,18 @@ static std::vector<int64_t> preferredIntOutputShape(const GpuTensor* A, const Gp
                                                : std::vector<int64_t>{std::max<int64_t>(N_A, N_B)};
 }
 
-static GPUBuffer makeParamBuf(GraphExecutor& ex, uint32_t p0, uint32_t p1 = 0,
+static GPUBuffer makeParamBuf(OpContext& ex, uint32_t p0, uint32_t p1 = 0,
                                uint32_t p2 = 0, uint32_t p3 = 0) {
     uint32_t data[4] = {p0, p1, p2, p3};
     auto buf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(buf, data, 16);
+    ex.getGpu()->writeBuffer(buf, data, 16);
     return buf;
 }
 
-static GPUBuffer makeScalarParamBuf(GraphExecutor& ex, uint32_t p0) {
+static GPUBuffer makeScalarParamBuf(OpContext& ex, uint32_t p0) {
     uint32_t data[4] = {p0, 0, 0, 0};
     auto buf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(buf, data, 16);
+    ex.getGpu()->writeBuffer(buf, data, 16);
     return buf;
 }
 
@@ -58,7 +58,7 @@ static bool isSmallIntTensor(const GpuTensor* t) {
            tensorNel(t) <= 64;
 }
 
-static bool loadTensorBytes(GraphExecutor& ex, const GpuTensor* t,
+static bool loadTensorBytes(OpContext& ex, const GpuTensor* t,
                             const std::string& name, std::vector<uint8_t>& bytes) {
     if (!t) return false;
     size_t need = (size_t)t->ElementCount() * t->DtypeSize();
@@ -77,7 +77,7 @@ static bool loadTensorBytes(GraphExecutor& ex, const GpuTensor* t,
     }
     if (t->buffer.handle) {
         ex.FlushPendingWork();
-        auto rb = ex.gpu->readBuffer(t->buffer, need);
+        auto rb = ex.getGpu()->readBuffer(t->buffer, need);
         if (rb.size() >= need) {
             bytes.assign(rb.begin(), rb.begin() + need);
             return true;
@@ -86,7 +86,7 @@ static bool loadTensorBytes(GraphExecutor& ex, const GpuTensor* t,
     return false;
 }
 
-static bool readTensorIntValues(GraphExecutor& ex, const GpuTensor* t,
+static bool readTensorIntValues(OpContext& ex, const GpuTensor* t,
                                 const std::string& name, std::vector<int64_t>& values) {
     values.clear();
     if (!t) return false;
@@ -125,7 +125,7 @@ static float fp16ToFloat(uint16_t h) {
     return v;
 }
 
-static bool ensureCpuBackedFloat32(GraphExecutor& ex, GpuTensor& tensor, const std::string& name) {
+static bool ensureCpuBackedFloat32(OpContext& ex, GpuTensor& tensor, const std::string& name) {
     if (auto* init = ex.GetInitData(name); init && init->data && init->dtype == TensorDtype::Float16 && tensor.cpuData.empty()) {
         size_t count = (size_t)tensor.ElementCount();
         if (count > 0 && init->size >= count * sizeof(uint16_t)) {
@@ -138,8 +138,8 @@ static bool ensureCpuBackedFloat32(GraphExecutor& ex, GpuTensor& tensor, const s
             copy.dtype = TensorDtype::Float32;
             copy.cpuData.resize(values.size() * sizeof(float));
             memcpy(copy.cpuData.data(), values.data(), copy.cpuData.size());
-            copy.buffer = ex.gpu->createBuffer("ecbf32", copy.cpuData.size());
-            ex.gpu->writeBuffer(copy.buffer, copy.cpuData.data(), copy.cpuData.size());
+            copy.buffer = ex.getGpu()->createBuffer("ecbf32", copy.cpuData.size());
+            ex.getGpu()->writeBuffer(copy.buffer, copy.cpuData.data(), copy.cpuData.size());
             copy.isCpuOnly = false;
             tensor = std::move(copy);
             return true;
@@ -163,7 +163,7 @@ static bool ensureCpuBackedFloat32(GraphExecutor& ex, GpuTensor& tensor, const s
         size_t count = (size_t)tensor.ElementCount();
         size_t readBytes = count * sizeof(uint16_t);
         ex.FlushPendingWork();
-        gpuReadback = ex.gpu->readBuffer(tensor.buffer, readBytes);
+        gpuReadback = ex.getGpu()->readBuffer(tensor.buffer, readBytes);
         if (gpuReadback.size() >= readBytes) {
             src = gpuReadback.data();
             bytes = gpuReadback.size();
@@ -186,7 +186,7 @@ static bool ensureCpuBackedFloat32(GraphExecutor& ex, GpuTensor& tensor, const s
     return tensor.buffer.handle != nullptr;
 }
 
-static void debugTensorFloatStats(GraphExecutor& ex, const char* label,
+static void debugTensorFloatStats(OpContext& ex, const char* label,
                                   const GpuTensor* tensor, const std::string& name) {
     if (!tensor) {
         fprintf(stderr, "    [dbg] %s: null\n", label);
@@ -198,7 +198,7 @@ static void debugTensorFloatStats(GraphExecutor& ex, const char* label,
         GpuTensor tmp = *tensor;
         if (!ensureCpuBackedFloat32(ex, tmp, name)) return;
         size_t count = (size_t)tmp.ElementCount();
-        auto raw = ex.gpu->readBuffer(tmp.buffer, count * sizeof(float));
+        auto raw = ex.getGpu()->readBuffer(tmp.buffer, count * sizeof(float));
         if (raw.size() < count * sizeof(float)) return;
         values.resize(count);
         memcpy(values.data(), raw.data(), count * sizeof(float));
@@ -206,7 +206,7 @@ static void debugTensorFloatStats(GraphExecutor& ex, const char* label,
         size_t count = (size_t)tensor->ElementCount();
         if (count == 0) return;
         ex.FlushPendingWork();
-        auto raw = ex.gpu->readBuffer(tensor->buffer, count * sizeof(float));
+        auto raw = ex.getGpu()->readBuffer(tensor->buffer, count * sizeof(float));
         if (raw.size() < count * sizeof(float)) return;
         values.resize(count);
         memcpy(values.data(), raw.data(), count * sizeof(float));
@@ -235,7 +235,7 @@ static void debugTensorFloatStats(GraphExecutor& ex, const char* label,
 // Shape metadata ops (Div, Mul, Add on int64 scalars) must run on CPU
 // because our GPU kernels only handle f32.
 
-static void cpuBinaryInt64(GraphExecutor& ex, const OnnxGraphNode& node,
+static void cpuBinaryInt64(OpContext& ex, const OnnxGraphNode& node,
                             const std::vector<GpuTensor*>& inputs,
                             std::vector<GpuTensor*>& outputs, int op) {
     auto* A = inputs[0]; auto* B = inputs[1];
@@ -290,7 +290,7 @@ static void cpuBinaryInt64(GraphExecutor& ex, const OnnxGraphNode& node,
 
 // ─── Binary elementwise dispatch (dtype-aware) ───────────────────────────────
 
-static void dispatchBinaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
+static void dispatchBinaryOp(OpContext& ex, const OnnxGraphNode& node,
                               const std::vector<GpuTensor*>& inputs,
                               std::vector<GpuTensor*>& outputs, uint32_t opCode) {
     auto* A = inputs[0];
@@ -338,7 +338,7 @@ static void dispatchBinaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
 
 // ─── Unary elementwise dispatch ──────────────────────────────────────────────
 
-static void dispatchUnaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
+static void dispatchUnaryOp(OpContext& ex, const OnnxGraphNode& node,
                              const std::vector<GpuTensor*>& inputs,
                              std::vector<GpuTensor*>& outputs, uint32_t opCode) {
     auto* A = inputs[0];
@@ -372,34 +372,34 @@ static void dispatchUnaryOp(GraphExecutor& ex, const OnnxGraphNode& node,
 // ─── Op Registrations ────────────────────────────────────────────────────────
 
 // Binary ops
-static void opAdd(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opAdd(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchBinaryOp(ex, n, in, out, 0);
 }
-static void opSub(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSub(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchBinaryOp(ex, n, in, out, 1);
 }
-static void opMul(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opMul(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchBinaryOp(ex, n, in, out, 2);
 }
-static void opDiv(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opDiv(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchBinaryOp(ex, n, in, out, 3);
 }
 
 // Unary ops — also need dtype check for int64
-static void opSigmoid(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSigmoid(OpContext& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     if (in[0] && isSmallIntTensor(in[0])) { *out[0] = *in[0]; return; } // no-op for int
     dispatchUnaryOp(ex, n, in, out, 0);
 }
-static void opTanh(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opTanh(OpContext& ex, const OnnxGraphNode& n,
                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchUnaryOp(ex, n, in, out, 1);
 }
-static void opNeg(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opNeg(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     if (in[0] && isSmallIntTensor(in[0])) {
         std::vector<int64_t> values;
@@ -414,21 +414,21 @@ static void opNeg(GraphExecutor& ex, const OnnxGraphNode& n,
     }
     dispatchUnaryOp(ex, n, in, out, 2);
 }
-static void opSqrt(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSqrt(OpContext& ex, const OnnxGraphNode& n,
                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchUnaryOp(ex, n, in, out, 3);
 }
-static void opSin(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSin(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchUnaryOp(ex, n, in, out, 4);
 }
-static void opCos(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opCos(OpContext& ex, const OnnxGraphNode& n,
                    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     dispatchUnaryOp(ex, n, in, out, 5);
 }
 
 // Cast: actual type conversion
-static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opCast(OpContext& ex, const OnnxGraphNode& n,
                     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0];
     if (!A || !A->IsValid()) return;
@@ -469,7 +469,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
     if (srcPtr) {
         // CPU type conversion — no GPU sync needed
     } else {
-        if (ex.gpu->supportsShaderF16 && A->buffer.handle) {
+        if (ex.getGpu()->supportsShaderF16 && A->buffer.handle) {
             if (A->dtype == TensorDtype::Float32 && outDtype == TensorDtype::Float16) {
                 ex.EnsureGpu(*A);
                 *out[0] = ex.AllocTensor(A->shape, TensorDtype::Float16);
@@ -495,7 +495,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
         if (A->dtype == TensorDtype::Float16 && outDtype == TensorDtype::Float32) {
             ex.FlushPendingWork();
             size_t inBytes = (size_t)N * sizeof(uint16_t);
-            auto rb = ex.gpu->readBuffer(A->buffer, inBytes);
+            auto rb = ex.getGpu()->readBuffer(A->buffer, inBytes);
             if (rb.size() >= inBytes) {
                 std::vector<float> fp32((size_t)N);
                 auto* src = reinterpret_cast<const uint16_t*>(rb.data());
@@ -513,7 +513,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
                     fflush(stderr);
                 }
                 *out[0] = ex.AllocTensor(A->shape, TensorDtype::Float32);
-                ex.gpu->writeBuffer(out[0]->buffer, fp32.data(), fp32.size() * sizeof(float));
+                ex.getGpu()->writeBuffer(out[0]->buffer, fp32.data(), fp32.size() * sizeof(float));
                 return;
             }
         }
@@ -524,7 +524,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
             (A->dtype == TensorDtype::Float32 || A->dtype == TensorDtype::Float16)) {
             ex.FlushPendingWork();
             size_t inBytes = (size_t)N * A->DtypeSize();
-            auto rb = ex.gpu->readBuffer(A->buffer, inBytes);
+            auto rb = ex.getGpu()->readBuffer(A->buffer, inBytes);
             if (rb.size() >= inBytes) {
                 if (outDtype == TensorDtype::Int64) {
                     std::vector<int64_t> result((size_t)N);
@@ -556,7 +556,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
             A->buffer.handle) {
             ex.FlushPendingWork();
             size_t inBytes = (size_t)N * A->DtypeSize();
-            auto rb = ex.gpu->readBuffer(A->buffer, inBytes);
+            auto rb = ex.getGpu()->readBuffer(A->buffer, inBytes);
             if (rb.size() >= inBytes) {
                 std::vector<double> vals(N);
                 for (int64_t i = 0; i < N; i++) {
@@ -570,7 +570,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
                     std::vector<float> result((size_t)N);
                     for (int64_t i = 0; i < N; i++) result[i] = (float)vals[i];
                     *out[0] = ex.AllocTensor(A->shape, TensorDtype::Float32);
-                    ex.gpu->writeBuffer(out[0]->buffer, result.data(), N * 4);
+                    ex.getGpu()->writeBuffer(out[0]->buffer, result.data(), N * 4);
                 } else {
                     // Float16
                     std::vector<uint16_t> result((size_t)N);
@@ -591,7 +591,7 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
                         *out[0] = ex.AllocCpuTensor(A->shape, TensorDtype::Float16, result.data(), N * 2);
                     } else {
                         *out[0] = ex.AllocTensor(A->shape, TensorDtype::Float16);
-                        ex.gpu->writeBuffer(out[0]->buffer, result.data(), N * 2);
+                        ex.getGpu()->writeBuffer(out[0]->buffer, result.data(), N * 2);
                     }
                 }
                 return;
@@ -669,12 +669,12 @@ static void opCast(GraphExecutor& ex, const OnnxGraphNode& n,
         *out[0] = ex.AllocCpuTensor(A->shape, outDtype, outBuf.data(), outBuf.size());
     } else {
         *out[0] = ex.AllocTensor(A->shape, outDtype);
-        ex.gpu->writeBuffer(out[0]->buffer, outBuf.data(), outBuf.size());
+        ex.getGpu()->writeBuffer(out[0]->buffer, outBuf.data(), outBuf.size());
     }
 }
 
 // Where: condition ? X : Y — uses embedded where_select kernel
-static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opWhere(OpContext& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Cond = in[0];
     auto* X = in.size() > 1 ? in[1] : nullptr;
@@ -713,7 +713,7 @@ static void opWhere(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // Equal: compare two f32 tensors, output bool — uses embedded kernel
-static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opEqual(OpContext& ex, const OnnxGraphNode& n,
                      const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0]; auto* B = in.size() > 1 ? in[1] : nullptr;
     if (!A || !B || !A->IsValid() || !B->IsValid()) {
@@ -721,7 +721,7 @@ static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
             *out[0] = ex.AllocTensor(A->shape, TensorDtype::Bool);
             size_t bytes = (out[0]->ElementCount() + 3) / 4 * 4;
             std::vector<uint8_t> zeros(bytes, 0);
-            ex.gpu->writeBuffer(out[0]->buffer, zeros.data(), bytes);
+            ex.getGpu()->writeBuffer(out[0]->buffer, zeros.data(), bytes);
         }
         return;
     }
@@ -742,7 +742,7 @@ static void opEqual(GraphExecutor& ex, const OnnxGraphNode& n,
     ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "equal"}});
 }
 
-static void opGreaterOrEqual(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGreaterOrEqual(OpContext& ex, const OnnxGraphNode& n,
                               const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0]; auto* B = in.size() > 1 ? in[1] : nullptr;
     if (!A || !A->IsValid()) return;
@@ -751,11 +751,11 @@ static void opGreaterOrEqual(GraphExecutor& ex, const OnnxGraphNode& n,
     // For now, produce all-true (GreaterOrEqual is used in scheduler for step selection)
     size_t bytes = (N + 3) / 4 * 4;
     std::vector<uint8_t> ones(bytes, 1);
-    ex.gpu->writeBuffer(out[0]->buffer, ones.data(), bytes);
+    ex.getGpu()->writeBuffer(out[0]->buffer, ones.data(), bytes);
 }
 
 // Softmax: proper GPU kernel — uses embedded softmax kernel
-static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSoftmax(OpContext& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     if (!X || !X->IsValid()) return;
@@ -786,7 +786,7 @@ static void opSoftmax(GraphExecutor& ex, const OnnxGraphNode& n,
 }
 
 // ReduceSum: CPU for small tensors, GPU readback for larger ones
-static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opReduceSum(OpContext& ex, const OnnxGraphNode& n,
                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* A = in[0];
     if (!A || !A->IsValid()) return;
@@ -817,7 +817,7 @@ static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
     else if (auto* init = ex.GetInitData(n.inputs[0]); init && init->data) ptr = init->data;
     else if (A->buffer.handle) {
         ex.FlushPendingWork();
-        gpuReadback = ex.gpu->readBuffer(A->buffer, N * A->DtypeSize());
+        gpuReadback = ex.getGpu()->readBuffer(A->buffer, N * A->DtypeSize());
         if (!gpuReadback.empty()) ptr = gpuReadback.data();
     }
 
@@ -907,7 +907,7 @@ static void opReduceSum(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // Helper macro for simple unary dispatches
 #define DEF_UNARY(name, code) \
-    static void op##name(GraphExecutor& ex, const OnnxGraphNode& n, \
+    static void op##name(OpContext& ex, const OnnxGraphNode& n, \
         const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) { \
         dispatchUnaryOp(ex, n, in, out, code); \
     }
@@ -957,7 +957,7 @@ REGISTER_OP(Softplus, opSoftplus)
 // y = (up + 1.0) * gate * sigmoid(gate * 1.702)
 // Input: interleaved [gate, up] of shape (T, 2*N), output (T, N).
 
-static void opGptOssGate(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGptOssGate(OpContext& ex, const OnnxGraphNode& n,
                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     if (!X || !X->IsValid()) return;
@@ -980,7 +980,7 @@ static void opGptOssGate(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)N, 0, 0, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     std::string pname = "gptoss_gate" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
@@ -997,7 +997,7 @@ REGISTER_OP(GptOssGate, opGptOssGate)
 // ─── GeluMul: Out = GELU(gate) * up ─────────────────────────────────────────
 // Separate Gate and Up buffers. GELU uses tanh approximation.
 
-static void opGeluMul(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGeluMul(OpContext& ex, const OnnxGraphNode& n,
                        const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Gate = in[0];
     auto* Up = in[1];
@@ -1017,7 +1017,7 @@ static void opGeluMul(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)N, 0, 0, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     std::string pname = "gelu_mul" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
@@ -1034,7 +1034,7 @@ REGISTER_OP(GeluMul, opGeluMul)
 // ─── AddScaled: Acc += alpha * X (AXPY) ──────────────────────────────────────
 // In-place on Acc. Alpha from node attribute.
 
-static void opAddScaled(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opAddScaled(OpContext& ex, const OnnxGraphNode& n,
                          const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Acc = in[0];
     auto* X = in[1];
@@ -1057,7 +1057,7 @@ static void opAddScaled(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)N, alpha_u32, 0, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     std::string pname = "add_scaled" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {
@@ -1077,7 +1077,7 @@ REGISTER_OP(AddScaled, opAddScaled)
 // ─── ModScaleShift: Out = (1 + Scale[i%D]) * X + Shift[i%D] ─────────────────
 // DiT-style adaptive layer norm modulation.
 
-static void opModScaleShift(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opModScaleShift(OpContext& ex, const OnnxGraphNode& n,
                              const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     auto* Scale = in[1];
@@ -1102,7 +1102,7 @@ static void opModScaleShift(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)D, (uint32_t)N, 0, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     std::string pname = "mod_scale_shift" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 5, [dtype]() {
@@ -1120,7 +1120,7 @@ REGISTER_OP(ModScaleShift, opModScaleShift)
 // ─── GateResidualAdd: Residual += Gate[i%D] * X ─────────────────────────────
 // DiT-style gated residual. In-place on Residual.
 
-static void opGateResidualAdd(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opGateResidualAdd(OpContext& ex, const OnnxGraphNode& n,
                                const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Residual = in[0];
     auto* Gate = in[1];
@@ -1143,7 +1143,7 @@ static void opGateResidualAdd(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)D, (uint32_t)N, 0, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     std::string pname = "gate_residual_add" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 4, [dtype]() {
@@ -1163,7 +1163,7 @@ REGISTER_OP(GateResidualAdd, opGateResidualAdd)
 // ─── SigmoidGateInterleaved: Out = sigmoid(gate) * val ──────────────────────
 // Input has interleaved layout per head: [gate(HD), val(HD), gate(HD), val(HD), ...]
 
-static void opSigmoidGateInterleaved(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opSigmoidGateInterleaved(OpContext& ex, const OnnxGraphNode& n,
                                       const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     if (!X || !X->IsValid()) return;
@@ -1187,7 +1187,7 @@ static void opSigmoidGateInterleaved(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[4] = {(uint32_t)N, (uint32_t)HD, 0, 0};
     auto paramBuf = ex.getParamBuffer(16);
-    ex.gpu->writeBuffer(paramBuf, params, 16);
+    ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
     std::string pname = "sigmoid_gate_interleaved" + std::string(dtypeSuffix(dtype));
     auto& pl = ex.GetPipelineT(pname, 3, [dtype]() {

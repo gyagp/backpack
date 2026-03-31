@@ -8,8 +8,6 @@
 #include "graph_executor.h"
 #include "wgsl_shaders.h"
 #include "wgsl_template.h"
-#include "clock_calibration.h"
-#include "profile_html.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +20,16 @@
 namespace fs = std::filesystem;
 
 static constexpr bool kDebugExecTrace = false;
+
+GraphExecutor::~GraphExecutor() {
+    if (!gpu) return;
+    // Release weight store buffers
+    for (auto& [name, tensor] : weightStore_) {
+        if (tensor.buffer.handle)
+            gpu->releaseBuffer(tensor.buffer);
+    }
+    weightStore_.clear();
+}
 
 namespace {
 
@@ -653,7 +661,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                     gt.cpuData.resize(rawLen);
                     memcpy(gt.cpuData.data(), rawPtr, rawLen);
                     // Pre-store in tensor store so the Constant op finds it
-                    tensorStore_[node.outputs[0]] = std::move(gt);
+                    weightStore_[node.outputs[0]] = std::move(gt);
                     persistentTensors_.insert(node.outputs[0]);
                 }
             }
@@ -719,7 +727,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                 fprintf(stderr, "    [nodata] '%s' dims=%zu rawSize=%zu extLoc='%s' extOff=%lld\n",
                         t.name.c_str(), t.dims.size(), t.rawSize,
                         t.extLocation.c_str(), (long long)t.extOffset);
-            // Still register as a valid empty CPU tensor so it's in tensorStore_
+            // Still register as a valid empty CPU tensor so it's in weightStore_
             // (other nodes may depend on this name for topo sort resolution)
             auto emptyDtype = fromOnnxDtype(t.dataType);
             GpuTensor gt;
@@ -727,7 +735,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             gt.dtype = emptyDtype;
             gt.isCpuOnly = true;
             // Empty dims = empty tensor (0 elements), completely valid
-            tensorStore_[t.name] = std::move(gt);
+            weightStore_[t.name] = std::move(gt);
             persistentTensors_.insert(t.name);
             uploaded++;
             continue;
@@ -745,9 +753,9 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             gt.isCpuOnly = true;
             gt.cpuData.resize(t.rawSize);
             memcpy(gt.cpuData.data(), t.rawData, t.rawSize);
-            tensorStore_[t.name] = std::move(gt);
+            weightStore_[t.name] = std::move(gt);
             // Store initializer data from the OWNED cpuData (not from inlineDataBuf which is going away)
-            auto& stored = tensorStore_[t.name];
+            auto& stored = weightStore_[t.name];
             graph_.initializers[t.name] = {stored.cpuData.data(), stored.cpuData.size(), dtype, t.dims};
             persistentTensors_.insert(t.name);
             uploaded++;
@@ -781,7 +789,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             gt.dtype = TensorDtype::Float32;
             gt.buffer = gpu->createBuffer(t.name, f32Size);
             gpu->writeBuffer(gt.buffer, fp32.data(), f32Size);
-            tensorStore_[t.name] = std::move(gt);
+            weightStore_[t.name] = std::move(gt);
             graph_.initializers[t.name] = {t.rawData, t.rawSize, TensorDtype::Float16, t.dims};
             persistentTensors_.insert(t.name);
             uploaded++;
@@ -811,7 +819,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                 gpu->writeBuffer(gt.buffer, padded, 4, writeSize);
             }
         }
-        tensorStore_[t.name] = std::move(gt);
+        weightStore_[t.name] = std::move(gt);
 
         // Also record in graph initializers (for metadata)
         graph_.initializers[t.name] = {t.rawData, t.rawSize, dtype, t.dims};
@@ -837,8 +845,8 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
 
 // ─── Tensor Allocation ──────────────────────────────────────────────────────
 
-static std::string g_currentOpLabel;
-static const char* g_currentOp = nullptr;  // for debug tracking
+std::string g_currentOpLabel;
+const char* g_currentOp = nullptr;  // for debug tracking
 
 GpuTensor GraphExecutor::AllocTensor(std::vector<int64_t> shape,
                                       TensorDtype dtype) {
@@ -904,48 +912,6 @@ void GraphExecutor::EnsureGpu(GpuTensor& t) {
     t.isCpuOnly = false;
 }
 
-// ─── Param Buffer Pool ───────────────────────────────────────────────────────
-
-GPUBuffer GraphExecutor::getParamBuffer(uint32_t sizeBytes) {
-    // Round up to 16-byte aligned bucket
-    int bucket;
-    if (sizeBytes <= 16) { bucket = 0; sizeBytes = 16; }
-    else if (sizeBytes <= 32) { bucket = 1; sizeBytes = 32; }
-    else if (sizeBytes <= 48) { bucket = 2; sizeBytes = 48; }
-    else { bucket = 3; sizeBytes = 64; }
-
-    // During fast decode capture: use a larger pool to avoid wrapping.
-    // Normal pool is 512; capture needs ~1000 unique slots per step.
-    if (fastDecodeState_ == FastDecodeState::Capturing) {
-        auto& pool = paramPool_[bucket];
-        // Ensure pool has enough buffers for the entire graph without cycling
-        if (pool.buffers.empty() || (int)pool.buffers.size() < 2048) {
-            int oldSize = (int)pool.buffers.size();
-            pool.buffers.resize(2048);
-            for (int i = oldSize; i < 2048; i++) {
-                pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
-            }
-        }
-        // Reset index to 0 at capture start (avoid wrapping issues)
-        GPUBuffer buf = pool.buffers[pool.nextIdx];
-        pool.nextIdx = (pool.nextIdx + 1) % (int)pool.buffers.size();
-        return buf;
-    }
-
-    auto& pool = paramPool_[bucket];
-    if (pool.buffers.empty()) {
-        // Lazy init: pre-allocate a batch
-        pool.buffers.resize(PARAM_POOL_SIZE);
-        for (int i = 0; i < PARAM_POOL_SIZE; i++) {
-            pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
-        }
-        pool.nextIdx = 0;
-    }
-    GPUBuffer buf = pool.buffers[pool.nextIdx];
-    pool.nextIdx = (pool.nextIdx + 1) % (int)pool.buffers.size();
-    return buf;
-}
-
 // ─── Pipeline / Dispatch Helpers ─────────────────────────────────────────────
 
 const CompiledPipeline& GraphExecutor::GetPipeline(const std::string& name,
@@ -956,7 +922,8 @@ const CompiledPipeline& GraphExecutor::GetPipeline(const std::string& name,
 
 WGPUBindGroup GraphExecutor::MakeBindGroup(
         const CompiledPipeline& pl,
-        const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings) {
+        const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings,
+        ExecutionContext* captureCtx) {
     WGPUBindGroupEntry entries[16];
     for (size_t i = 0; i < bindings.size() && i < 16; i++) {
         memset(&entries[i], 0, sizeof(WGPUBindGroupEntry));
@@ -977,10 +944,10 @@ WGPUBindGroup GraphExecutor::MakeBindGroup(
     auto bg = wgpuDeviceCreateBindGroup(gpu->device, &d);
 
     // During fast decode capture: save bindings for replay (rebuild bind groups later)
-    if (fastDecodeState_ == FastDecodeState::Capturing) {
-        lastCapturedBindings_.clear();
+    if (captureCtx && captureCtx->fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing) {
+        captureCtx->lastCapturedBindings_.clear();
         for (size_t i = 0; i < bindings.size() && i < 16; i++) {
-            lastCapturedBindings_.push_back({
+            captureCtx->lastCapturedBindings_.push_back({
                 entries[i].binding, entries[i].buffer,
                 entries[i].offset, entries[i].size});
         }
@@ -994,259 +961,13 @@ void GraphExecutor::Submit(const std::vector<Dispatch>& dispatches) {
     gpu->waitForQueue();
 }
 
-// ─── Fast Decode: Replay & Release ──────────────────────────────────────────
-
-void GraphExecutor::ReplayWrites() {
-    // Update GQA param buffers — all other param values are constant
-    // and still in the buffers from the capture step's writeBuffer calls.
-    for (auto& update : replayParamUpdates_) {
-        uint32_t value = 0;
-        switch (update.kind) {
-            case ReplayParamUpdate::PosOffset: value = replayPosition_; break;
-            case ReplayParamUpdate::PastSeq:   value = replayPosition_; break;
-            case ReplayParamUpdate::TotalSeq:  value = replayPosition_ + 1; break;
-        }
-        gpu->writeBufferRaw(update.paramBuf.handle, update.offsetBytes, &value, 4);
-    }
-
-    // Re-write token ID for GatherBlockQuantized embedding lookup.
-    // During capture, the op converts int64 input_ids to int32 in a temp buffer.
-    // During replay, we re-write the current token ID to that buffer.
-    for (auto& tok : capturedTokenIdBufs_) {
-        if (!tok.buffer.handle) continue;
-        std::vector<int32_t> i32((size_t)tok.nIdx);
-        for (int64_t i = 0; i < tok.nIdx; i++)
-            i32[(size_t)i] = (int32_t)replayTokenId_;
-        gpu->writeBufferRaw(tok.buffer.handle, tok.buffer.offset,
-            i32.data(), (size_t)tok.nIdx * 4);
-    }
-}
-
-void GraphExecutor::ReplayDispatches(bool skipFence) {
-    if (capturedFlushes_.empty()) return;
-    fastDecodeState_ = FastDecodeState::Replaying;
-
-    bool profiling = gpuProfiler && gpuProfiler->enabled();
-
-    // Encode captured commands, respecting the original flush boundaries.
-    // Each flush becomes its own command buffer to pipeline GPU execution
-    // (GPU starts processing flush N while CPU encodes flush N+1).
-    for (auto& flush : capturedFlushes_) {
-        if (flush.dispatches.empty() && flush.copies.empty()) continue;
-
-        WGPUCommandEncoderDescriptor enD{};
-        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-
-        if (profiling) {
-            for (auto& cmd : flush.dispatches) {
-                auto [bIdx, eIdx] = gpuProfiler->allocate(cmd.name);
-                auto tw = gpuProfiler->makeTimestampWrites(bIdx, eIdx);
-                WGPUComputePassDescriptor cpD{};
-                cpD.timestampWrites = &tw;
-                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-                wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
-                wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
-                wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
-                wgpuComputePassEncoderEnd(pass);
-                wgpuComputePassEncoderRelease(pass);
-            }
-        } else if (!flush.dispatches.empty()) {
-            // Single compute pass per flush (batched dispatches, fewer API calls)
-            WGPUComputePassDescriptor cpD{};
-            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-            for (auto& cmd : flush.dispatches) {
-                wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
-                wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
-                wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
-            }
-            wgpuComputePassEncoderEnd(pass);
-            wgpuComputePassEncoderRelease(pass);
-        }
-        for (auto& c : flush.copies)
-            wgpuCommandEncoderCopyBufferToBuffer(enc,
-                c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-
-        WGPUCommandBufferDescriptor cbD{};
-        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
-        wgpuCommandEncoderRelease(enc);
-        wgpuCommandBufferRelease(cb);
-    }
-
-    // Readback copy (logits → readback buffer) in its own CB
-    if (!skipFence && readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
-        WGPUCommandEncoderDescriptor enD{};
-        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-        wgpuCommandEncoderCopyBufferToBuffer(enc,
-            readbackSrc_.handle, readbackSrc_.offset,
-            readbackDst_.handle, readbackDst_.offset, readbackSize_);
-        WGPUCommandBufferDescriptor cbD{};
-        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
-        wgpuCommandEncoderRelease(enc);
-        wgpuCommandBufferRelease(cb);
-        readbackSize_ = 0;
-        readbackSrc_ = {}; readbackDst_ = {};
-    }
-    if (!skipFence) gpu->waitForQueue();
-    fastDecodeState_ = FastDecodeState::Off;
-}
-
-void GraphExecutor::ReleaseCaptured() {
-    for (auto& flush : capturedFlushes_) {
-        for (auto& cmd : flush.dispatches) {
-            if (cmd.bindGroup) { wgpuBindGroupRelease(cmd.bindGroup); cmd.bindGroup = nullptr; }
-        }
-    }
-    capturedFlushes_.clear();
-    capturedWrites_.clear();
-    replayParamUpdates_.clear();
-    capturedTokenIdBufs_.clear();
-}
-
-// ─── Batched submit: encode all pending work into one CB and submit ──────────
-// flushToEncoder() encodes all pending dispatches and copies into a single
-// command buffer and submits it.
-//
-// writeBuffer ordering: wgpuQueueWriteBuffer is ordered relative to
-// queueSubmit — all writeBuffer calls done before flushToEncoder() are visible
-// to the submitted command buffer.
-
-void GraphExecutor::flushToEncoder() {
-    if (pendingDispatches_.empty() && pendingCopies_.empty()) return;
-
-    // ── Fast Decode Capture: save AND submit ──
-    // Save bind groups (with AddRef) and also submit normally.
-    // This ensures intermediate buffers get valid GPU-computed data.
-    // During replay, the AddRef'd bind groups are reused.
-    if (fastDecodeState_ == FastDecodeState::Capturing) {
-        CapturedFlush flush;
-        for (auto& d : pendingDispatches_) {
-            CapturedCommand cmd;
-            cmd.pipeline = d.pipeline;
-            cmd.gx = d.gx; cmd.gy = d.gy; cmd.gz = d.gz;
-            cmd.name = d.name;
-            cmd.bindings = std::move(d.capturedBindings);
-            // AddRef for replay — the original is used+released below
-            if (d.bindGroup) {
-                wgpuBindGroupAddRef(d.bindGroup);
-                cmd.bindGroup = d.bindGroup;
-            }
-            flush.dispatches.push_back(std::move(cmd));
-        }
-        for (auto& c : pendingCopies_) {
-            flush.copies.push_back({c.src, c.srcOff, c.dst, c.dstOff, c.size});
-        }
-        capturedFlushes_.push_back(std::move(flush));
-        // Fall through to normal encode+submit
-    }
-
-    WGPUCommandEncoderDescriptor enD{};
-    auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-
-    // Encode dispatches
-    if (!pendingDispatches_.empty()) {
-        if (gpuProfiler && gpuProfiler->enabled()) {
-            for (auto& d : pendingDispatches_) {
-                auto [bIdx, eIdx] = gpuProfiler->allocate(d.name);
-                auto tw = gpuProfiler->makeTimestampWrites(bIdx, eIdx);
-                WGPUComputePassDescriptor cpD{};
-                cpD.timestampWrites = &tw;
-                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-                wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
-                wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
-                wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
-                wgpuComputePassEncoderEnd(pass);
-                wgpuComputePassEncoderRelease(pass);
-            }
-        } else {
-            // Single compute pass for all dispatches — avoids per-dispatch
-            // resource barriers (D3D12) and reduces CB encoding overhead.
-            WGPUComputePassDescriptor cpD{};
-            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
-            for (auto& d : pendingDispatches_) {
-                wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
-                wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
-                wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
-            }
-            wgpuComputePassEncoderEnd(pass);
-            wgpuComputePassEncoderRelease(pass);
-        }
-    }
-    // Encode copies
-    for (auto& c : pendingCopies_)
-        wgpuCommandEncoderCopyBufferToBuffer(enc,
-            c.src.handle, c.srcOff, c.dst.handle, c.dstOff, c.size);
-
-    // Finish, submit, release
-    WGPUCommandBufferDescriptor cbD{};
-    auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(gpu->queue, 1, &cb);
-    wgpuCommandEncoderRelease(enc);
-    wgpuCommandBufferRelease(cb);
-    for (auto& d : pendingDispatches_)
-        if (d.bindGroup) wgpuBindGroupRelease(d.bindGroup);
-    pendingDispatches_.clear();
-    pendingCopies_.clear();
-}
-
-void GraphExecutor::FlushPendingWork() {
-    bool hadWork = !pendingDispatches_.empty() || !pendingCopies_.empty();
-    flushToEncoder();  // submits immediately
-    // Always wait (callers expect data to be ready after flush)
-    gpu->waitForQueue();
-    if (hadWork) {
-        flushCount_++;
-        std::string key = g_currentOp ? g_currentOp : "(no-op-context)";
-        flushSources_[key]++;
-    }
-}
-
-void GraphExecutor::SubmitPending() {
-    flushToEncoder();  // submits all pending dispatches + copies, no wait
-}
-
 void GraphExecutor::SubmitAsync(const std::vector<Dispatch>& dispatches) {
-    for (auto d : dispatches) {
-        // During capture stage, attach binding info from last MakeBindGroup call
-        if (fastDecodeState_ == FastDecodeState::Capturing && !lastCapturedBindings_.empty()) {
-            d.capturedBindings = std::move(lastCapturedBindings_);
-            lastCapturedBindings_.clear();
-        }
-        pendingDispatches_.push_back(std::move(d));
-    }
+    gpu->submitDispatches(dispatches);
 }
 
-void GraphExecutor::QueueCopy(GPUBuffer src, uint64_t srcOffset,
-                               GPUBuffer dst, uint64_t dstOffset, uint64_t size) {
-    if (!src.handle || !dst.handle || size == 0) return;
-    // Add buffer base offsets (for aliased/view buffers)
-    srcOffset += src.offset;
-    dstOffset += dst.offset;
-    // Clamp to buffer sizes
-    if (srcOffset + size > src.size) size = (src.size > srcOffset) ? src.size - srcOffset : 0;
-    if (dstOffset + size > dst.size) size = (dst.size > dstOffset) ? dst.size - dstOffset : 0;
-    if (size == 0) return;
-    // WebGPU requires 4-byte alignment for copies
-    size = size & ~3ULL;
-    srcOffset = srcOffset & ~3ULL;
-    dstOffset = dstOffset & ~3ULL;
-    if (size == 0) return;
+// ─── Fast Decode: Replay & Release (moved to ExecutionContext) ─────────────
 
-    if (src.handle == dst.handle && srcOffset == dstOffset) return;
-
-    if (!pendingCopies_.empty()) {
-        auto& last = pendingCopies_.back();
-        if (last.src.handle == src.handle && last.dst.handle == dst.handle &&
-            last.srcOff + last.size == srcOffset &&
-            last.dstOff + last.size == dstOffset) {
-            last.size += size;
-            return;
-        }
-    }
-
-    pendingCopies_.push_back({src, srcOffset, dst, dstOffset, size});
-}
+// ─── Batched submit (moved to ExecutionContext) ────────────────────────────
 
 void GraphExecutor::Sync() {
     gpu->waitForQueue();
@@ -1255,20 +976,25 @@ void GraphExecutor::Sync() {
 // ─── Execute Graph ──────────────────────────────────────────────────────────
 
 void GraphExecutor::Execute(
+        ExecutionContext& ctx,
         const std::unordered_map<std::string, GpuTensor*>& inputs,
         std::unordered_map<std::string, GpuTensor*>& outputs) {
 
+    // Initialize per-session GPU context
+    ctx.gpu = gpu;
+    ctx.profilingEnabled = profilingEnabled;
+
     // Enable writeBuffer recording for fast decode capture (after input setup, inside Execute)
-    if (fastDecodeState_ == FastDecodeState::Capturing && !gpu->captureWritesCb_) {
+    if (ctx.fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing && !gpu->captureWritesCb_) {
         gpu->captureWritesCb_ = [](WGPUBuffer handle, uint64_t offset,
-                                    const void* data, uint64_t size, void* ctx) {
-            auto* self = static_cast<GraphExecutor*>(ctx);
-            CapturedWrite w;
+                                    const void* data, uint64_t size, void* userCtx) {
+            auto* execCtx = static_cast<ExecutionContext*>(userCtx);
+            ExecutionContext::CapturedWrite w;
             w.handle = handle;
             w.offset = offset;
             w.data.resize((size_t)size);
             memcpy(w.data.data(), data, (size_t)size);
-            self->capturedWrites_.push_back(std::move(w));
+            execCtx->capturedWrites_.push_back(std::move(w));
 
             // Log non-trivial writes for debugging
             if (size > 64) {
@@ -1277,24 +1003,30 @@ void GraphExecutor::Execute(
                         g_currentOp ? g_currentOp : "?");
             }
         };
-        gpu->captureWritesCtx_ = this;
+        gpu->captureWritesCtx_ = &ctx;
     }
 
     // Bind graph inputs into tensor store
     // With tensor plan: reuse intermediate buffers from previous Execute().
     // Without: clear stale intermediates (persistent entries preserved).
-    if (tensorPlanValid_) {
+    //
+    // Tensor lookup layering:
+    //   ctx.tensorStore_ = per-session intermediates (cleared/restored each Execute)
+    //   weightStore_     = shared persistent weights (read-only during Execute)
+    //   OpContext::GetTensor() checks ctx.tensorStore_ first, then weightStore_.
+
+    if (ctx.tensorPlanValid_) {
         // Tensor plan active: restore planned intermediate buffers instead of erasing.
-        // First, remove non-persistent, non-planned entries.
-        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-            if (persistentTensors_.count(it->first) || tensorPlan_.count(it->first))
+        // First, remove non-planned entries from per-session store.
+        for (auto it = ctx.tensorStore_.begin(); it != ctx.tensorStore_.end(); ) {
+            if (ctx.tensorPlan_.count(it->first))
                 ++it;
             else
-                it = tensorStore_.erase(it);
+                it = ctx.tensorStore_.erase(it);
         }
         // Restore planned buffers (shape/dtype will be updated by ops)
-        for (auto& [name, alloc] : tensorPlan_) {
-            auto& t = tensorStore_[name];
+        for (auto& [name, alloc] : ctx.tensorPlan_) {
+            auto& t = ctx.tensorStore_[name];
             t.buffer = alloc.buffer;
             t.shape = alloc.shape;
             t.dtype = alloc.dtype;
@@ -1302,17 +1034,12 @@ void GraphExecutor::Execute(
             t.isCpuOnly = false;
         }
     } else {
-        // First Execute or plan invalidated: clear intermediates normally
-        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-            if (persistentTensors_.count(it->first))
-                ++it;
-            else
-                it = tensorStore_.erase(it);
-        }
+        // First Execute or plan invalidated: clear per-session intermediates
+        ctx.tensorStore_.clear();
         // Start populating tensor plan and shape cache
-        shapeCachePopulating_ = true;
-        tensorPlan_.clear();
-        nodeShapeCache_.clear();
+        ctx.shapeCachePopulating_ = true;
+        ctx.tensorPlan_.clear();
+        ctx.nodeShapeCache_.clear();
     }
 
 
@@ -1323,26 +1050,27 @@ void GraphExecutor::Execute(
     struct SavedState { TensorDtype dtype; GPUBuffer buffer; std::vector<uint8_t> cpuData; bool isCpuOnly; };
     std::unordered_map<std::string, SavedState> savedPersistent;
     for (auto& name : persistentTensors_) {
-        auto it = tensorStore_.find(name);
-        if (it != tensorStore_.end()) {
+        auto it = weightStore_.find(name);
+        if (it != weightStore_.end()) {
             savedPersistent[name] = {it->second.dtype, it->second.buffer,
                                      it->second.cpuData, it->second.isCpuOnly};
         }
     }
 
+    // Copy inputs into per-session tensor store
     for (auto& [name, tensor] : inputs) {
-        tensorStore_[name] = *tensor;
+        ctx.tensorStore_[name] = *tensor;
         // For int64 inputs, also store as CPU data for metadata ops
         if (tensor->dtype == TensorDtype::Int64 && tensor->buffer.handle && !tensor->isCpuOnly) {
             int64_t nel = tensor->ElementCount();
             if (nel <= 1024) {
                 // Readback small int64 tensor for CPU ops (ReduceSum, Sub, etc.)
                 if (!tensor->cpuData.empty()) {
-                    tensorStore_[name].cpuData = tensor->cpuData;
+                    ctx.tensorStore_[name].cpuData = tensor->cpuData;
                 } else {
                     auto rb = gpu->readBuffer(tensor->buffer, nel * 8);
-                    tensorStore_[name].cpuData.resize(nel * 8);
-                    memcpy(tensorStore_[name].cpuData.data(), rb.data(), nel * 8);
+                    ctx.tensorStore_[name].cpuData.resize(nel * 8);
+                    memcpy(ctx.tensorStore_[name].cpuData.data(), rb.data(), nel * 8);
                 }
             }
         }
@@ -1353,8 +1081,8 @@ void GraphExecutor::Execute(
     int totalDispatches = 0, totalCopies = 0;
 
     // Clear dispatch batch
-    pendingDispatches_.clear();
-    pendingCopies_.clear();
+    ctx.pendingDispatches_.clear();
+    ctx.pendingCopies_.clear();
 
 
     // Topological sort (cached across Execute calls)
@@ -1364,7 +1092,7 @@ void GraphExecutor::Execute(
         size_t N = graph_.nodes.size();
         std::unordered_set<std::string> available;
         for (auto& [name, _] : inputs) available.insert(name);
-        for (auto& [name, _] : tensorStore_) available.insert(name);
+        for (auto& [name, _] : weightStore_) available.insert(name);
 
         // Build dependency counts
         std::vector<int> depCount(N, 0);
@@ -1440,6 +1168,17 @@ void GraphExecutor::Execute(
     // record the relationship so we know not to recycle the input while output is live.
     std::unordered_map<std::string, std::string> aliasOf;
 
+    // Helper: find tensor by name in per-session store first, then shared weights
+    auto findTensor = [&](const std::string& name) -> GpuTensor* {
+        auto it = ctx.tensorStore_.find(name);
+        if (it != ctx.tensorStore_.end()) return &it->second;
+        auto it2 = weightStore_.find(name);
+        return (it2 != weightStore_.end()) ? &it2->second : nullptr;
+    };
+
+    // Create OpContext for op dispatch (shared graph + per-session exec)
+    OpContext opCtx{*this, ctx};
+
     // Execute nodes in topological order
     auto execT0 = std::chrono::steady_clock::now();
     for (size_t ei = 0; ei < execOrder.size(); ei++) {
@@ -1450,14 +1189,15 @@ void GraphExecutor::Execute(
         std::vector<std::string> inNames;
         for (auto& inName : node.inputs) inNames.push_back(inName);
 
-        // Prepare output tensor slots
+        // Prepare output tensor slots in per-session store
         std::vector<std::string> outNames;
         for (size_t oi = 0; oi < node.outputs.size(); oi++) {
             outNames.push_back(node.outputs[oi]);
             if (!node.outputs[oi].empty()) {
-                auto it = tensorStore_.find(node.outputs[oi]);
-                if (it == tensorStore_.end() || !it->second.IsValid())
-                    tensorStore_[node.outputs[oi]] = {};
+                // Check both stores
+                auto* existing = findTensor(node.outputs[oi]);
+                if (!existing || !existing->IsValid())
+                    ctx.tensorStore_[node.outputs[oi]] = {};
             }
         }
 
@@ -1468,12 +1208,7 @@ void GraphExecutor::Execute(
                 inTensors.push_back(nullptr);
                 continue;
             }
-            auto it = tensorStore_.find(inName);
-            if (it != tensorStore_.end()) {
-                inTensors.push_back(&it->second);
-            } else {
-                inTensors.push_back(nullptr);
-            }
+            inTensors.push_back(findTensor(inName));
         }
 
         std::vector<GpuTensor*> outTensors;
@@ -1481,7 +1216,8 @@ void GraphExecutor::Execute(
             if (outName.empty()) {
                 outTensors.push_back(nullptr);
             } else {
-                outTensors.push_back(&tensorStore_[outName]);
+                // Outputs go to per-session store
+                outTensors.push_back(&ctx.tensorStore_[outName]);
             }
         }
 
@@ -1494,7 +1230,7 @@ void GraphExecutor::Execute(
             fprintf(stderr, "  [exec] ei=%zu node %zu/%zu: %s (valid=%d invalid=%d, %lldms) pending=%zu\n",
                     ei, ni, graph_.nodes.size(), node.opType.c_str(),
                     validCount, invalidCount, (long long)nowMs,
-                    pendingDispatches_.size());
+                    ctx.pendingDispatches_.size());
             fflush(stderr);
         }
 
@@ -1512,8 +1248,7 @@ void GraphExecutor::Execute(
             // Resolve external inputs
             std::vector<GpuTensor*> extInputs;
             for (auto& name : group.externalInputs) {
-                auto tIt = tensorStore_.find(name);
-                extInputs.push_back(tIt != tensorStore_.end() ? &tIt->second : nullptr);
+                extInputs.push_back(findTensor(name));
             }
 
             // Determine dtype from first input
@@ -1534,8 +1269,8 @@ void GraphExecutor::Execute(
                 int64_t N = 1;
                 for (auto d : primaryIn->shape) N *= d;
 
-                // Ensure output tensor exists (last node's output)
-                auto& outTensor = tensorStore_[group.outputName];
+                // Ensure output tensor exists (last node's output) in per-session store
+                auto& outTensor = ctx.tensorStore_[group.outputName];
                 outTensor = AllocTensor(primaryIn->shape, dtype);
 
                 // Build pipeline with dtype suffix
@@ -1557,7 +1292,7 @@ void GraphExecutor::Execute(
                     }
                 }
                 size_t pbSize = std::max((size_t)16, params.size() * 4);
-                auto paramBuf = getParamBuffer((uint32_t)pbSize);
+                auto paramBuf = ctx.getParamBuffer((uint32_t)pbSize);
                 gpu->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
                 // Build bind group
@@ -1573,9 +1308,9 @@ void GraphExecutor::Execute(
                     }
                 }
 
-                auto bg = MakeBindGroup(pl, bindings);
+                auto bg = MakeBindGroup(pl, bindings, &ctx);
                 uint32_t nwg = (uint32_t)(((N + 1) / 2 + 255) / 256);
-                QueueDispatch(pl.pipeline, bg,
+                ctx.QueueDispatch(pl.pipeline, bg,
                     nwg, 1, 1, group.pipelineName.c_str());
                 continue;
             }
@@ -1589,10 +1324,8 @@ void GraphExecutor::Execute(
             bool inputsOk = true;
             for (size_t ti = 0; ti < inTensors.size(); ti++) {
                 if (inTensors[ti] && !inTensors[ti]->IsValid() && !node.inputs[ti].empty()) {
-                    // Re-resolve from tensorStore_ in case it was updated
-                    auto it2 = tensorStore_.find(node.inputs[ti]);
-                    if (it2 != tensorStore_.end())
-                        inTensors[ti] = &it2->second;
+                    // Re-resolve in case it was updated
+                    inTensors[ti] = findTensor(node.inputs[ti]);
                 }
             }
             g_currentOpLabel = node.opType;
@@ -1602,15 +1335,15 @@ void GraphExecutor::Execute(
             }
             g_currentOp = g_currentOpLabel.c_str();
 
-            auto opT0 = profilingEnabled ? std::chrono::steady_clock::now()
-                                         : std::chrono::steady_clock::time_point{};
-            opIt->second(*this, node, inTensors, outTensors);
-            if (profilingEnabled) {
+            auto opT0 = ctx.profilingEnabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+            opIt->second(opCtx, node, inTensors, outTensors);
+            if (ctx.profilingEnabled) {
                 // Include GPU sync in the op time if the op flushed
                 auto opT1 = std::chrono::steady_clock::now();
                 double opMs = std::chrono::duration<double, std::milli>(opT1 - opT0).count();
-                profileData_[node.opType] += opMs;
-                profileCounts_[node.opType]++;
+                ctx.profileData_[node.opType] += opMs;
+                ctx.profileCounts_[node.opType]++;
             }
 
             // Cache small int outputs to CPU for downstream metadata ops.
@@ -1628,10 +1361,10 @@ void GraphExecutor::Execute(
                         int64_t nel = outTensor->ElementCount();
                         if (nel <= 0 || nel > 1024) continue;
 
-                        if (shapeCacheValid_ && !shapeCachePopulating_) {
+                        if (ctx.shapeCacheValid_ && !ctx.shapeCachePopulating_) {
                             // Use cached CPU data — skip GPU readback entirely
-                            auto cIt = nodeShapeCache_.find(node.outputs[oi]);
-                            if (cIt != nodeShapeCache_.end() && cIt->second.hasCpuData) {
+                            auto cIt = ctx.nodeShapeCache_.find(node.outputs[oi]);
+                            if (cIt != ctx.nodeShapeCache_.end() && cIt->second.hasCpuData) {
                                 outTensor->cpuData = cIt->second.cpuData;
                                 continue;
                             }
@@ -1639,8 +1372,8 @@ void GraphExecutor::Execute(
 
                         // Cold path: read from GPU (first Execute or cache miss)
                         if (!outTensor->buffer.handle) continue;
-                        FlushPendingWork();
-                        intReadbackSyncs_++;
+                        ctx.FlushPendingWork();
+                        ctx.intReadbackSyncs_++;
                         size_t bytes = (size_t)nel * outTensor->DtypeSize();
                         auto rb = gpu->readBuffer(outTensor->buffer, bytes);
                         if (rb.size() >= bytes) {
@@ -1649,8 +1382,8 @@ void GraphExecutor::Execute(
                         }
 
                         // Populate shape cache
-                        if (shapeCachePopulating_) {
-                            auto& cached = nodeShapeCache_[node.outputs[oi]];
+                        if (ctx.shapeCachePopulating_) {
+                            auto& cached = ctx.nodeShapeCache_[node.outputs[oi]];
                             cached.shape = outTensor->shape;
                             cached.dtype = outTensor->dtype;
                             cached.cpuData = outTensor->cpuData;
@@ -1660,13 +1393,13 @@ void GraphExecutor::Execute(
                 }
 
                 // Also cache non-int output shapes/dtypes for tensor plan
-                if (shapeCachePopulating_) {
+                if (ctx.shapeCachePopulating_) {
                     for (size_t oi = 0; oi < outTensors.size() && oi < node.outputs.size(); oi++) {
                         auto* outTensor = outTensors[oi];
                         if (!outTensor || node.outputs[oi].empty()) continue;
                         if (!outTensor->IsValid()) continue;
-                        if (nodeShapeCache_.count(node.outputs[oi])) continue;
-                        auto& cached = nodeShapeCache_[node.outputs[oi]];
+                        if (ctx.nodeShapeCache_.count(node.outputs[oi])) continue;
+                        auto& cached = ctx.nodeShapeCache_[node.outputs[oi]];
                         cached.shape = outTensor->shape;
                         cached.dtype = outTensor->dtype;
                         cached.hasCpuData = false;
@@ -1676,7 +1409,7 @@ void GraphExecutor::Execute(
             executed++;
             if (kDebugExecTrace && graph_.nodes.size() > 1000 && ei < 128) {
                 fprintf(stderr, "  [exec] ei=%zu done %s pending=%zu\n",
-                        ei, node.opType.c_str(), pendingDispatches_.size() + pendingCopies_.size());
+                        ei, node.opType.c_str(), ctx.pendingDispatches_.size() + ctx.pendingCopies_.size());
                 fflush(stderr);
             }
 
@@ -1703,11 +1436,11 @@ void GraphExecutor::Execute(
             }
 
             // Flush to encoder periodically (prevent huge CB on very large graphs)
-            if (pendingDispatches_.size() + pendingCopies_.size() >= 256) {
-                totalDispatches += (int)pendingDispatches_.size();
-                totalCopies += (int)pendingCopies_.size();
-                flushToEncoder();
-                pendingReleases_.clear();
+            if (ctx.pendingDispatches_.size() + ctx.pendingCopies_.size() >= 256) {
+                totalDispatches += (int)ctx.pendingDispatches_.size();
+                totalCopies += (int)ctx.pendingCopies_.size();
+                ctx.flushToEncoder();
+                ctx.pendingReleases_.clear();
             }
         } else {
             if (skipped < 5)
@@ -1719,24 +1452,24 @@ void GraphExecutor::Execute(
 
     // Copy outputs
     for (auto& [name, tensor] : outputs) {
-        auto it = tensorStore_.find(name);
-        if (it != tensorStore_.end() && it->second.IsValid()) {
-            size_t outBytes = it->second.ByteSize();
+        auto* srcTensor = findTensor(name);
+        if (srcTensor && srcTensor->IsValid()) {
+            size_t outBytes = srcTensor->ByteSize();
             if (outBytes == 0) outBytes = 4;
-            if (tensor && tensor->buffer.handle && it->second.buffer.handle &&
-                tensor->buffer.handle != it->second.buffer.handle &&
-                tensor->buffer.size >= outBytes && !it->second.isCpuOnly) {
-                tensor->shape = it->second.shape;
-                tensor->dtype = it->second.dtype;
+            if (tensor && tensor->buffer.handle && srcTensor->buffer.handle &&
+                tensor->buffer.handle != srcTensor->buffer.handle &&
+                tensor->buffer.size >= outBytes && !srcTensor->isCpuOnly) {
+                tensor->shape = srcTensor->shape;
+                tensor->dtype = srcTensor->dtype;
                 tensor->isCpuOnly = false;
                 tensor->cpuData.clear();
-                QueueCopy(it->second.buffer, 0, tensor->buffer, 0, outBytes);
+                ctx.QueueCopy(srcTensor->buffer, 0, tensor->buffer, 0, outBytes);
             } else {
-                *tensor = it->second;
+                *tensor = *srcTensor;
             }
         } else {
             fprintf(stderr, "  [exec] WARNING: output '%s' not found or invalid buf=%p\n",
-                    name.c_str(), (it != tensorStore_.end()) ? (void*)it->second.buffer.handle : nullptr);
+                    name.c_str(), srcTensor ? (void*)srcTensor->buffer.handle : nullptr);
             fflush(stderr);
         }
     }
@@ -1744,87 +1477,86 @@ void GraphExecutor::Execute(
     // Append readback copy after output copies — this ensures logits data
     // is in the source buffer before the readback copy executes.
     // Goes into pendingCopies_ so it's included in the final flushToEncoder CB.
-    if (readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
-        pendingCopies_.push_back({readbackSrc_, 0, readbackDst_, 0, readbackSize_});
-        readbackSize_ = 0;
-        readbackSrc_ = {}; readbackDst_ = {};
+    if (ctx.readbackSize_ > 0 && ctx.readbackSrc_.handle && ctx.readbackDst_.handle) {
+        ctx.pendingCopies_.push_back({ctx.readbackSrc_, 0, ctx.readbackDst_, 0, ctx.readbackSize_});
+        ctx.readbackSize_ = 0;
+        ctx.readbackSrc_ = {}; ctx.readbackDst_ = {};
     }
 
-    totalDispatches += (int)pendingDispatches_.size();
-    totalCopies += (int)pendingCopies_.size();
+    totalDispatches += (int)ctx.pendingDispatches_.size();
+    totalCopies += (int)ctx.pendingCopies_.size();
 
 
     fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback), bufs=%d (pool=%d)\n",
-            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, flushCount_,
-            intReadbackSyncs_, gpu->createBufferCount, gpu->poolHitCount);
+            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, ctx.flushCount_,
+            ctx.intReadbackSyncs_, gpu->createBufferCount, gpu->poolHitCount);
     gpu->createBufferCount = 0;
     gpu->poolHitCount = 0;
     // Print sync sources on first call
     static int printSyncCount = 0;
-    if (printSyncCount < 2 && !flushSources_.empty()) {
-        std::vector<std::pair<std::string, int>> sorted(flushSources_.begin(), flushSources_.end());
+    if (printSyncCount < 2 && !ctx.flushSources_.empty()) {
+        std::vector<std::pair<std::string, int>> sorted(ctx.flushSources_.begin(), ctx.flushSources_.end());
         std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
-        fprintf(stderr, "  [sync sources] %d total:\n", flushCount_);
+        fprintf(stderr, "  [sync sources] %d total:\n", ctx.flushCount_);
         for (auto& [op, cnt] : sorted)
             fprintf(stderr, "    %-50s %d\n", op.c_str(), cnt);
         printSyncCount++;
     }
-    flushCount_ = 0;
-    intReadbackSyncs_ = 0;
-    flushSources_.clear();
+    ctx.flushCount_ = 0;
+    ctx.intReadbackSyncs_ = 0;
+    ctx.flushSources_.clear();
 
     // Submit all remaining batched GPU work
-    flushToEncoder();
+    ctx.flushToEncoder();
     gpu->waitForQueue();
 
     // Release non-output, non-persistent intermediate buffers
     // (GPU work is done, safe to free)
     // With tensor plan: keep buffers alive for reuse. Without: release normally.
     // In fast decode capture, keep ALL buffers alive — they're referenced by captured bind groups.
-    if (fastDecodeState_ != FastDecodeState::Capturing) {
-        if (tensorPlanValid_) {
+    if (ctx.fastDecodeState_ != ExecutionContext::FastDecodeState::Capturing) {
+        if (ctx.tensorPlanValid_) {
             // Tensor plan active: DON'T release planned buffers — they'll be reused.
-            // Just clear non-persistent, non-planned entries from tensorStore_.
-            for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-                if (persistentTensors_.count(it->first) || tensorPlan_.count(it->first))
+            // Just clear non-planned entries from per-session store.
+            for (auto it = ctx.tensorStore_.begin(); it != ctx.tensorStore_.end(); ) {
+                if (ctx.tensorPlan_.count(it->first))
                     ++it;
                 else
-                    it = tensorStore_.erase(it);
+                    it = ctx.tensorStore_.erase(it);
             }
-        } else if (shapeCachePopulating_) {
+        } else if (ctx.shapeCachePopulating_) {
             // First Execute: record the tensor plan, then keep buffers alive.
             std::set<WGPUBuffer> keepHandles;
             for (auto& [name, tensor] : outputs)
                 if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
             for (auto& name : persistentTensors_) {
-                auto it = tensorStore_.find(name);
-                if (it != tensorStore_.end() && it->second.buffer.handle)
+                auto it = weightStore_.find(name);
+                if (it != weightStore_.end() && it->second.buffer.handle)
                     keepHandles.insert(it->second.buffer.handle);
             }
 
             // Record non-persistent intermediate buffers into tensor plan
-            for (auto& [name, tensor] : tensorStore_) {
-                if (persistentTensors_.count(name)) continue;
+            for (auto& [name, tensor] : ctx.tensorStore_) {
                 if (!tensor.buffer.handle) continue;
                 if (keepHandles.count(tensor.buffer.handle)) continue;
-                tensorPlan_[name] = {tensor.buffer, tensor.buffer.size,
-                                     tensor.shape, tensor.dtype};
+                ctx.tensorPlan_[name] = {tensor.buffer, tensor.buffer.size,
+                                         tensor.shape, tensor.dtype};
             }
 
             // Mark caches as valid for next Execute
-            shapeCacheValid_ = true;
-            shapeCachePopulating_ = false;
-            tensorPlanValid_ = true;
+            ctx.shapeCacheValid_ = true;
+            ctx.shapeCachePopulating_ = false;
+            ctx.tensorPlanValid_ = true;
 
             fprintf(stderr, "  [warm-exec] shape cache: %zu entries, tensor plan: %zu buffers\n",
-                    nodeShapeCache_.size(), tensorPlan_.size());
+                    ctx.nodeShapeCache_.size(), ctx.tensorPlan_.size());
 
             // Don't release any buffers — keep them for reuse
-            for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-                if (persistentTensors_.count(it->first) || tensorPlan_.count(it->first))
+            for (auto it = ctx.tensorStore_.begin(); it != ctx.tensorStore_.end(); ) {
+                if (ctx.tensorPlan_.count(it->first))
                     ++it;
                 else
-                    it = tensorStore_.erase(it);
+                    it = ctx.tensorStore_.erase(it);
             }
         } else {
             // No tensor plan, not populating: normal cleanup
@@ -1832,40 +1564,31 @@ void GraphExecutor::Execute(
             for (auto& [name, tensor] : outputs)
                 if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
             for (auto& name : persistentTensors_) {
-                auto it = tensorStore_.find(name);
-                if (it != tensorStore_.end() && it->second.buffer.handle)
+                auto it = weightStore_.find(name);
+                if (it != weightStore_.end() && it->second.buffer.handle)
                     keepHandles.insert(it->second.buffer.handle);
             }
 
             std::set<WGPUBuffer> released;
-            for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-                if (persistentTensors_.count(it->first)) {
-                    ++it;
-                    continue;
-                }
+            for (auto it = ctx.tensorStore_.begin(); it != ctx.tensorStore_.end(); ) {
                 if (it->second.buffer.handle &&
                     keepHandles.find(it->second.buffer.handle) == keepHandles.end() &&
                     released.find(it->second.buffer.handle) == released.end()) {
                     released.insert(it->second.buffer.handle);
                     gpu->releaseBuffer(it->second.buffer);
                 }
-                it = tensorStore_.erase(it);
+                it = ctx.tensorStore_.erase(it);
             }
         }
     } else {
         // Capture mode: just erase tensor store entries but DON'T release buffers
-        for (auto it = tensorStore_.begin(); it != tensorStore_.end(); ) {
-            if (persistentTensors_.count(it->first))
-                ++it;
-            else
-                it = tensorStore_.erase(it);
-        }
+        ctx.tensorStore_.clear();
     }
 
     // Restore persistent tensors that may have been modified during execution
     for (auto& [name, saved] : savedPersistent) {
-        auto it = tensorStore_.find(name);
-        if (it != tensorStore_.end() &&
+        auto it = weightStore_.find(name);
+        if (it != weightStore_.end() &&
             (it->second.dtype != saved.dtype || it->second.buffer.handle != saved.buffer.handle)) {
             it->second.dtype = saved.dtype;
             it->second.buffer = saved.buffer;
@@ -1875,12 +1598,12 @@ void GraphExecutor::Execute(
     }
 
     // Print profiling report
-    if (profilingEnabled && !profileData_.empty()) {
+    if (ctx.profilingEnabled && !ctx.profileData_.empty()) {
         double totalMs = 0;
-        for (auto& [op, ms] : profileData_) totalMs += ms;
+        for (auto& [op, ms] : ctx.profileData_) totalMs += ms;
 
         // Sort by time descending
-        std::vector<std::pair<std::string, double>> sorted(profileData_.begin(), profileData_.end());
+        std::vector<std::pair<std::string, double>> sorted(ctx.profileData_.begin(), ctx.profileData_.end());
         std::sort(sorted.begin(), sorted.end(),
                   [](const auto& a, const auto& b) { return a.second > b.second; });
 
@@ -1889,137 +1612,27 @@ void GraphExecutor::Execute(
         fprintf(stderr, "  │ %-25s %7s %5s %7s │\n", "Op", "ms", "cnt", "%");
         fprintf(stderr, "  ├───────────────────────────────────────────────────────┤\n");
         for (auto& [op, ms] : sorted) {
-            int cnt = profileCounts_[op];
+            int cnt = ctx.profileCounts_[op];
             double pct = totalMs > 0 ? 100.0 * ms / totalMs : 0;
             fprintf(stderr, "  │ %-25s %7.1f %5d %6.1f%% │\n", op.c_str(), ms, cnt, pct);
         }
         fprintf(stderr, "  └───────────────────────────────────────────────────────┘\n");
         fflush(stderr);
-        profileData_.clear();
-        profileCounts_.clear();
+        ctx.profileData_.clear();
+        ctx.profileCounts_.clear();
 
         // Print sync sources
-        if (!flushSources_.empty()) {
-            std::vector<std::pair<std::string, int>> sortedSync(flushSources_.begin(), flushSources_.end());
+        if (!ctx.flushSources_.empty()) {
+            std::vector<std::pair<std::string, int>> sortedSync(ctx.flushSources_.begin(), ctx.flushSources_.end());
             std::sort(sortedSync.begin(), sortedSync.end(),
                       [](auto& a, auto& b) { return a.second > b.second; });
-            fprintf(stderr, "\n  GPU syncs (%d total):\n", flushCount_);
+            fprintf(stderr, "\n  GPU syncs (%d total):\n", ctx.flushCount_);
             for (auto& [op, cnt] : sortedSync) {
                 fprintf(stderr, "    %-40s %d\n", op.c_str(), cnt);
             }
-            flushSources_.clear();
+            ctx.flushSources_.clear();
         }
     }
 }
 
-// ─── GPU Hardware Timestamp Profiling ────────────────────────────────────────
-
-void GraphExecutor::enableGpuProfiling() {
-    if (!gpu || !gpu->supportsTimestampQuery) {
-        fprintf(stderr, "GPU timestamp queries not supported\n");
-        return;
-    }
-    gpuProfiler = new GPUProfiler();
-    if (!gpuProfiler->init(gpu->device, gpu->instance, gpu->queue)) {
-        fprintf(stderr, "Failed to init GPU profiler\n");
-        delete gpuProfiler;
-        gpuProfiler = nullptr;
-        return;
-    }
-    auto cal = acquireClockCalibration(gpu->device, gpu->backendType);
-    if (cal.valid) {
-        clockCalibration = new ClockCalibration(cal);
-    }
-}
-
-void GraphExecutor::printGpuProfileReport(int nDecodeTokens, double decodeMs,
-                                           const std::string& htmlPath) {
-    if (!gpuProfiler || !gpuProfiler->enabled() || gpuProfiler->nextIndex == 0) {
-        fprintf(stderr, "No GPU profile data\n");
-        return;
-    }
-
-    // Resolve timestamps
-    {
-        WGPUCommandEncoderDescriptor enD{};
-        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
-        gpuProfiler->resolveAndReport(enc);
-        WGPUCommandBufferDescriptor cbD{};
-        auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
-        wgpuCommandBufferRelease(cb);
-        wgpuCommandEncoderRelease(enc);
-    }
-    gpu->waitForQueue();
-
-    // Map readback buffer
-    uint32_t count = gpuProfiler->nextIndex;
-    uint64_t readSize = count * 8;
-    struct { bool done; uint32_t status; } ms{false, 0};
-    WGPUBufferMapCallbackInfo mcb{};
-    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
-    mcb.callback = [](WGPUMapAsyncStatus s, WGPUStringView, void* u, void*) {
-        auto* p = static_cast<decltype(&ms)>(u);
-        p->done = true; p->status = s;
-    };
-    mcb.userdata1 = &ms;
-    auto mf = wgpuBufferMapAsync(gpuProfiler->readbackBuf, 1, 0, readSize, mcb);
-    WGPUFutureWaitInfo mw{mf, 0};
-    wgpuInstanceWaitAny(gpu->instance, 1, &mw, UINT64_MAX);
-
-    if (ms.status != 1) {
-        fprintf(stderr, "Failed to map profiler readback buffer\n");
-        return;
-    }
-
-    auto ptr = (const uint64_t*)wgpuBufferGetConstMappedRange(
-        gpuProfiler->readbackBuf, 0, readSize);
-
-    // Aggregate by kernel name
-    struct AggEntry { double totalUs = 0; uint32_t count = 0; };
-    std::unordered_map<std::string, AggEntry> agg;
-    double totalGpuUs = 0;
-    for (auto& e : gpuProfiler->entries) {
-        uint64_t begin = ptr[e.beginIdx], end = ptr[e.endIdx];
-        if (end <= begin || begin == 0) continue;
-        double durUs = (double)(end - begin) / 1000.0;
-        agg[e.name].totalUs += durUs;
-        agg[e.name].count++;
-        totalGpuUs += durUs;
-    }
-
-    std::vector<std::pair<std::string, AggEntry>> sorted(agg.begin(), agg.end());
-    std::sort(sorted.begin(), sorted.end(),
-              [](auto& a, auto& b) { return a.second.totalUs > b.second.totalUs; });
-
-    fprintf(stderr, "\n--- GPU Profile (hardware timestamps, %d dispatches) ---\n",
-            (int)gpuProfiler->entries.size());
-    fprintf(stderr, "%-25s %10s %6s %10s %6s\n",
-            "Kernel", "Total(ms)", "Count", "Avg(us)", "%%");
-    fprintf(stderr, "%-25s %10s %6s %10s %6s\n",
-            "-------------------------", "----------", "------", "----------", "------");
-    for (auto& [name, e] : sorted) {
-        double totalMs = e.totalUs / 1000.0;
-        double avgUs = e.totalUs / e.count;
-        double pct = totalGpuUs > 0 ? e.totalUs / totalGpuUs * 100.0 : 0;
-        fprintf(stderr, "%-25s %10.2f %6u %10.1f %5.1f%%\n",
-                name.c_str(), totalMs, e.count, avgUs, pct);
-    }
-    double totalGpuMs = totalGpuUs / 1000.0;
-    double cpuMs = decodeMs / std::max(1, nDecodeTokens);
-    fprintf(stderr, "%-25s %10.2f\n", "GPU TOTAL", totalGpuMs);
-    fprintf(stderr, "\nGPU HW time: %.1fms/tok   CPU wall time: %.1fms/tok   Bubble: %.0f%%\n",
-            totalGpuMs / std::max(1, nDecodeTokens), cpuMs,
-            cpuMs > 0 ? (1.0 - totalGpuMs / std::max(1, nDecodeTokens) / cpuMs) * 100 : 0);
-
-    // Generate HTML timeline
-    generateProfileHTML(*gpu, *gpuProfiler, clockCalibration, ptr,
-                        nDecodeTokens, 0, 0, decodeMs, htmlPath);
-    fprintf(stderr, "Profile HTML: %s\n", htmlPath.c_str());
-
-    wgpuBufferUnmap(gpuProfiler->readbackBuf);
-    gpuProfiler->destroy();
-    delete gpuProfiler;
-    gpuProfiler = nullptr;
-    if (clockCalibration) { delete clockCalibration; clockCalibration = nullptr; }
-}
+// enableGpuProfiling() and printGpuProfileReport() are now in execution_context.cpp

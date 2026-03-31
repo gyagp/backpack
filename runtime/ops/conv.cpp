@@ -25,7 +25,7 @@ static TensorDtype computeOutDtype(TensorDtype dtype) {
              : dtype;
 }
 
-static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
+static bool readTensorFloats(OpContext& ex, const GpuTensor& tensor,
                              const std::string& name, std::vector<float>& out) {
     out.clear();
     size_t count = (size_t)tensor.ElementCount();
@@ -60,7 +60,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
         }
         if (tensor.buffer.handle) {
             ex.FlushPendingWork();
-            auto raw = ex.gpu->readBuffer(tensor.buffer, bytes);
+            auto raw = ex.getGpu()->readBuffer(tensor.buffer, bytes);
             if (raw.size() >= bytes) {
                 memcpy(out.data(), raw.data(), bytes);
                 return true;
@@ -75,7 +75,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
         if (auto* init = ex.GetInitData(name); init && init->data && convertFp16(init->data, init->size)) return true;
         if (tensor.buffer.handle) {
             ex.FlushPendingWork();
-            auto raw = ex.gpu->readBuffer(tensor.buffer, bytes);
+            auto raw = ex.getGpu()->readBuffer(tensor.buffer, bytes);
             if (convertFp16(raw.data(), raw.size())) return true;
         }
     }
@@ -84,7 +84,7 @@ static bool readTensorFloats(GraphExecutor& ex, const GpuTensor& tensor,
     return false;
 }
 
-static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std::string& name,
+static bool ensureTensorFloat32(OpContext& ex, GpuTensor& tensor, const std::string& name,
                                 bool preferRawInitializer = false) {
     if (auto* init = ex.GetInitData(name); init && init->data && init->dtype == TensorDtype::Float16 &&
         (preferRawInitializer || tensor.cpuData.empty())) {
@@ -108,9 +108,9 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
             rebuilt.dtype = TensorDtype::Float32;
             rebuilt.cpuData.resize(values.size() * sizeof(float));
             memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-            rebuilt.buffer = ex.gpu->createBuffer(name.empty() ? "conv_f32_rebuilt" : name,
+            rebuilt.buffer = ex.getGpu()->createBuffer(name.empty() ? "conv_f32_rebuilt" : name,
                                                   rebuilt.cpuData.size());
-            ex.gpu->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
+            ex.getGpu()->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
             rebuilt.isCpuOnly = false;
             tensor = std::move(rebuilt);
             return tensor.buffer.handle != nullptr;
@@ -131,20 +131,20 @@ static bool ensureTensorFloat32(GraphExecutor& ex, GpuTensor& tensor, const std:
     rebuilt.dtype = TensorDtype::Float32;
     rebuilt.cpuData.resize(values.size() * sizeof(float));
     memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-    rebuilt.buffer = ex.gpu->createBuffer(name.empty() ? "conv_f32_cast" : name,
+    rebuilt.buffer = ex.getGpu()->createBuffer(name.empty() ? "conv_f32_cast" : name,
                                           rebuilt.cpuData.size());
-    ex.gpu->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
+    ex.getGpu()->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
     rebuilt.isCpuOnly = false;
     tensor = std::move(rebuilt);
     return tensor.buffer.handle != nullptr;
 }
 
-static void debugTensorStats(GraphExecutor& ex, const char* label, const GpuTensor& tensor) {
+static void debugTensorStats(OpContext& ex, const char* label, const GpuTensor& tensor) {
     if (!tensor.buffer.handle || tensor.dtype != TensorDtype::Float32) return;
     size_t count = (size_t)tensor.ElementCount();
     if (count == 0) return;
     ex.FlushPendingWork();
-    auto raw = ex.gpu->readBuffer(tensor.buffer, count * sizeof(float));
+    auto raw = ex.getGpu()->readBuffer(tensor.buffer, count * sizeof(float));
     if (raw.size() < count * sizeof(float)) return;
     const float* values = reinterpret_cast<const float*>(raw.data());
     float minV = 1e30f, maxV = -1e30f;
@@ -166,7 +166,7 @@ static void debugTensorStats(GraphExecutor& ex, const char* label, const GpuTens
     fflush(stderr);
 }
 
-static void debugReadableTensorStats(GraphExecutor& ex, const char* label,
+static void debugReadableTensorStats(OpContext& ex, const char* label,
                                      const GpuTensor& tensor, const std::string& name) {
     std::vector<float> values;
     if (!readTensorFloats(ex, tensor, name, values) || values.empty()) return;
@@ -188,7 +188,7 @@ static void debugReadableTensorStats(GraphExecutor& ex, const char* label,
     fflush(stderr);
 }
 
-static void debugInitFp16Stats(GraphExecutor& ex, const char* label, const std::string& name) {
+static void debugInitFp16Stats(OpContext& ex, const char* label, const std::string& name) {
     auto* init = ex.GetInitData(name);
     if (!init || !init->data || init->dtype != TensorDtype::Float16) return;
     size_t count = init->size / sizeof(uint16_t);
@@ -223,7 +223,7 @@ static void debugInitFp16Stats(GraphExecutor& ex, const char* label, const std::
 
 // ─── Conv1D / Conv2D ─────────────────────────────────────────────────────────
 
-static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opConv(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1];
     auto* B = in.size() > 2 ? in[2] : nullptr;
@@ -231,7 +231,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
 
     // ─── Conv1D path: 3D input [batch, channels, length] ─────────────────
     if (X->shape.size() == 3) {
-        bool useFp16Path = ex.gpu->supportsShaderF16 &&
+        bool useFp16Path = ex.getGpu()->supportsShaderF16 &&
                            X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16 &&
                            (!B || !B->IsValid() || B->dtype == TensorDtype::Float16);
         if (useFp16Path) {
@@ -274,12 +274,12 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
         else {
             if (useFp16Path) {
                 std::vector<uint16_t> zeros((size_t)C_out, 0u);
-                biasBuf = ex.gpu->createBuffer("conv1d_b0_f16", C_out * 2);
-                ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 2);
+                biasBuf = ex.getGpu()->createBuffer("conv1d_b0_f16", C_out * 2);
+                ex.getGpu()->writeBuffer(biasBuf, zeros.data(), C_out * 2);
             } else {
                 std::vector<float> zeros((size_t)C_out, 0.0f);
-                biasBuf = ex.gpu->createBuffer("conv1d_b0", C_out * 4);
-                ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 4);
+                biasBuf = ex.getGpu()->createBuffer("conv1d_b0", C_out * 4);
+                ex.getGpu()->writeBuffer(biasBuf, zeros.data(), C_out * 4);
             }
         }
 
@@ -291,8 +291,8 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
             (uint32_t)L_out, 1, (uint32_t)group,                   // H_out=L_out, W_out=1
             (uint32_t)dilation, 1                                    // dil_h=dilation, dil_w=1
         };
-        auto paramBuf = ex.gpu->createBuffer("conv1d_p", 64);
-        ex.gpu->writeBuffer(paramBuf, params, 64);
+        auto paramBuf = ex.getGpu()->createBuffer("conv1d_p", 64);
+        ex.getGpu()->writeBuffer(paramBuf, params, 64);
 
         auto& pl = useFp16Path
             ? ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5)
@@ -301,7 +301,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
             {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
             {3, out[0]->buffer}, {4, paramBuf}});
         int64_t total = batch * C_out * L_out;
-        ex.pendingDispatches_.push_back({pl.pipeline, bg,
+        ex.exec.pendingDispatches_.push_back({pl.pipeline, bg,
             (uint32_t)((total + 255) / 256), 1, 1, "conv1d"});
 
         // Reshape output back to 3D
@@ -315,7 +315,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
     // ─── Conv2D path: 4D input [batch, channels, H, W] ──────────────────
     if (X->shape.size() < 4) return;
 
-    bool useFp16Path = ex.gpu->supportsShaderF16 && !isVaeDecoderNode(n.name) &&
+    bool useFp16Path = ex.getGpu()->supportsShaderF16 && !isVaeDecoderNode(n.name) &&
                        X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16 &&
                        (!B || !B->IsValid() || B->dtype == TensorDtype::Float16);
     if (useFp16Path) {
@@ -365,12 +365,12 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
     else {
         if (useFp16Path) {
             std::vector<uint16_t> zeros((size_t)C_out, 0u);
-            biasBuf = ex.gpu->createBuffer("conv_b0_f16", C_out * 2);
-            ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 2);
+            biasBuf = ex.getGpu()->createBuffer("conv_b0_f16", C_out * 2);
+            ex.getGpu()->writeBuffer(biasBuf, zeros.data(), C_out * 2);
         } else {
             std::vector<float> zeros((size_t)C_out, 0.0f);
-            biasBuf = ex.gpu->createBuffer("conv_b0", C_out * 4);
-            ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 4);
+            biasBuf = ex.getGpu()->createBuffer("conv_b0", C_out * 4);
+            ex.getGpu()->writeBuffer(biasBuf, zeros.data(), C_out * 4);
         }
     }
 
@@ -381,8 +381,8 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
         (uint32_t)H_out, (uint32_t)W_out, (uint32_t)group,
         (uint32_t)dil_h, (uint32_t)dil_w
     };
-    auto paramBuf = ex.gpu->createBuffer("conv_p", 64);
-    ex.gpu->writeBuffer(paramBuf, params, 64);
+    auto paramBuf = ex.getGpu()->createBuffer("conv_p", 64);
+    ex.getGpu()->writeBuffer(paramBuf, params, 64);
 
     auto& pl = useFp16Path
         ? ex.GetPipeline("conv2d_f16", WGSL_CONV2D_F16, 5)
@@ -391,7 +391,7 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
     int64_t total = batch * C_out * H_out * W_out;
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
+    ex.exec.pendingDispatches_.push_back({pl.pipeline, bg,
         (uint32_t)((total + 255) / 256), 1, 1, "conv2d"});
     if (debugVaeConvIn || debugVaeConvOut) {
         debugTensorStats(ex, debugVaeConvIn ? "vae conv output" : "vae conv_out output", *out[0]);
@@ -400,13 +400,13 @@ static void opConv(GraphExecutor& ex, const OnnxGraphNode& n,
 
 // ─── ConvTranspose2D ─────────────────────────────────────────────────────────
 
-static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opConvTranspose(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1];
     auto* B = in.size() > 2 ? in[2] : nullptr;
     if (!X || !W || !X->IsValid() || !W->IsValid() || X->shape.size() < 4) return;
 
-    bool useFp16Path = ex.gpu->supportsShaderF16 && X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16 &&
+    bool useFp16Path = ex.getGpu()->supportsShaderF16 && X->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16 &&
                        (!B || !B->IsValid() || B->dtype == TensorDtype::Float16);
     if (useFp16Path) {
         ex.EnsureGpu(*X);
@@ -454,12 +454,12 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
     else {
         if (useFp16Path) {
             std::vector<uint16_t> zeros((size_t)C_out, 0u);
-            biasBuf = ex.gpu->createBuffer("ct_b0_f16", C_out * 2);
-            ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 2);
+            biasBuf = ex.getGpu()->createBuffer("ct_b0_f16", C_out * 2);
+            ex.getGpu()->writeBuffer(biasBuf, zeros.data(), C_out * 2);
         } else {
             std::vector<float> zeros((size_t)C_out, 0.0f);
-            biasBuf = ex.gpu->createBuffer("ct_b0", C_out * 4);
-            ex.gpu->writeBuffer(biasBuf, zeros.data(), C_out * 4);
+            biasBuf = ex.getGpu()->createBuffer("ct_b0", C_out * 4);
+            ex.getGpu()->writeBuffer(biasBuf, zeros.data(), C_out * 4);
         }
     }
 
@@ -470,8 +470,8 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
         (uint32_t)H_out, (uint32_t)W_out, (uint32_t)group,
         (uint32_t)out_pad_h, (uint32_t)out_pad_w
     };
-    auto paramBuf = ex.gpu->createBuffer("ct_p", 64);
-    ex.gpu->writeBuffer(paramBuf, params, 64);
+    auto paramBuf = ex.getGpu()->createBuffer("ct_p", 64);
+    ex.getGpu()->writeBuffer(paramBuf, params, 64);
 
     auto& pl = useFp16Path
         ? ex.GetPipeline("conv_transpose2d_f16", WGSL_CONV_TRANSPOSE2D_F16, 5)
@@ -480,13 +480,13 @@ static void opConvTranspose(GraphExecutor& ex, const OnnxGraphNode& n,
         {0, X->buffer}, {1, W->buffer}, {2, biasBuf},
         {3, out[0]->buffer}, {4, paramBuf}});
     int64_t total = batch * C_out * H_out * W_out;
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
+    ex.exec.pendingDispatches_.push_back({pl.pipeline, bg,
         (uint32_t)((total + 255) / 256), 1, 1, "conv_transpose"});
 }
 
 // ─── Resize ──────────────────────────────────────────────────────────────────
 
-static void opResize(GraphExecutor& ex, const OnnxGraphNode& n,
+static void opResize(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0];
     if (!X || !X->IsValid() || X->shape.size() < 4) return;
@@ -521,14 +521,14 @@ static void opResize(GraphExecutor& ex, const OnnxGraphNode& n,
 
     uint32_t params[8] = {(uint32_t)N, (uint32_t)C, (uint32_t)H_in, (uint32_t)W_in,
                            (uint32_t)H_out, (uint32_t)W_out, 0, 0};
-    auto paramBuf = ex.gpu->createBuffer("resize_p", 32);
-    ex.gpu->writeBuffer(paramBuf, params, 32);
+    auto paramBuf = ex.getGpu()->createBuffer("resize_p", 32);
+    ex.getGpu()->writeBuffer(paramBuf, params, 32);
 
     auto& pl = ex.GetPipeline("resize_nearest", WGSL_RESIZE_NEAREST, 3);
     auto bg = ex.MakeBindGroup(pl, {
         {0, X->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
     int64_t total = N * C * H_out * W_out;
-    ex.pendingDispatches_.push_back({pl.pipeline, bg,
+    ex.exec.pendingDispatches_.push_back({pl.pipeline, bg,
         (uint32_t)((total + 255) / 256), 1, 1, "resize"});
 }
 
