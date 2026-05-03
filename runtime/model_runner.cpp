@@ -866,6 +866,8 @@ void ModelRunner::buildDecodePipeline() {
     const char* kqKernelName = (weightQuantType == GGUF_TYPE_Q4_K) ? "q4k_matmul" :
                                (weightQuantType == GGUF_TYPE_Q5_K) ? "q5k_matmul" :
                                (weightQuantType == GGUF_TYPE_Q6_K) ? "q6k_matmul" : nullptr;
+    // Q4K uses 32-thread WG (1 col/WG), Q5K/Q6K use 256-thread WG (8 cols/WG)
+    uint32_t kqTileN = (weightQuantType == GGUF_TYPE_Q4_K) ? 1u : 8u;
     const CompiledPipeline* plKQ = nullptr;
     if (useKQ && kqKernelName) {
         plKQ = &getKernel(kqKernelName);
@@ -1137,7 +1139,7 @@ void ModelRunner::buildDecodePipeline() {
                     {3, projOutBuf}, {4, kqOprojParams}});
                 di.oproj = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plKQ->pipeline, bg,
-                    1, (cfg.nEmbd + 7) / 8, 1, L+"kq_oproj"});
+                    1, (cfg.nEmbd + kqTileN - 1) / kqTileN, 1, L+"kq_oproj"});
             } else {
                 vbg.oprojBase = makeBG(plQ8Matmul, {
                     {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
@@ -1169,7 +1171,7 @@ void ModelRunner::buildDecodePipeline() {
                     {3, gateUpBuf}, {4, kqGuParams}});
                 di.gateup = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plKQ->pipeline, bg,
-                    1, (2 * cfg.intermediateSize + 7) / 8, 1, L+"kq_gateup"});
+                    1, (2 * cfg.intermediateSize + kqTileN - 1) / kqTileN, 1, L+"kq_gateup"});
             } else {
                 vbg.gateupBase = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
@@ -1207,7 +1209,7 @@ void ModelRunner::buildDecodePipeline() {
                     {0, siluMulOutBuf}, {1, lw.dnKQ}, {2, zeroBiasE},
                     {3, projOutBuf}, {4, kqDnParams}});
                 allDecodeDispatches.push_back({plKQ->pipeline, bgDn,
-                    1, (cfg.nEmbd + 7) / 8, 1, L+"kq_down"});
+                    1, (cfg.nEmbd + kqTileN - 1) / kqTileN, 1, L+"kq_down"});
 
                 // Add residual: xBuf[i] += projOutBuf[i] using inline add_inplace kernel
                 static const char* ADD_INPLACE_WGSL = R"(

@@ -7794,6 +7794,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 // [quant_kq] q4k_matmul
 static const char* WGSL_Q4K_MATMUL = R"WGSL(
 enable subgroups;
+diagnostic(off, subgroup_uniformity);
+
+// Q4_K matvec for decode (M=1). 32 threads (1 subgroup), 1 col per WG.
+// 16 threads per Q4K superblock, each handles 8 elements (4 lo + 4 hi nibbles).
+// With 32 threads, 2 superblocks are processed per iteration (it_stride=2).
+// No shared memory, no barriers — single subgroup is lock-step.
+//
+// Dispatch: (1, N, 1)
 
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W_Q4K: array<u32>;
@@ -7801,11 +7809,8 @@ enable subgroups;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
-const TILE_N: u32 = 8u;
 const QK_K: u32 = 256u;
-const BLOCK_WORDS: u32 = 36u; // 144 bytes / 4
-
-var<workgroup> smem_x: array<f32, 256>;
+const BLOCK_WORDS: u32 = 36u;
 
 fn get_u8(base_word: u32, byte_off: u32) -> u32 {
     let wi = base_word + byte_off / 4u;
@@ -7813,85 +7818,102 @@ fn get_u8(base_word: u32, byte_off: u32) -> u32 {
     return (W_Q4K[wi] >> sh) & 0xFFu;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
     let row = wid.x;
+    let col = wid.y;
     let tid = lid.x;
-    let warp_id = tid / 32u;
-    let lane = tid % 32u;
-    let col = wid.y * TILE_N + warp_id;
 
     let K = _params_[0];
     let N = _params_[1];
     let n_blocks = _params_[2];
     let row_stride_words = _params_[3];
+    let y_offset = _params_[4];
+
+    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
 
-    for (var b = 0u; b < n_blocks; b = b + 1u) {
-        // Cooperative X load: all 256 threads load 1 float each
-        let x_idx = b * QK_K + tid;
-        smem_x[tid] = select(0.0, X[x_base + x_idx], x_idx < K);
-        workgroupBarrier();
+    // 16 threads per superblock, 2 groups of 16 = 32 threads
+    let itid = tid % 16u;  // thread index within 16-thread group
+    let il = itid / 4u;    // group within superblock (0..3)
+    let ir = itid % 4u;    // element subset within group (0..3)
+    let it_stride = 2u;    // 32/16 = 2 blocks per iteration
 
-        if (col < N) {
-            let block_base = col * row_stride_words + b * BLOCK_WORDS;
+    for (var b = tid / 16u; b < n_blocks; b += it_stride) {
+        let block_base = col * row_stride_words + b * BLOCK_WORDS;
+        let k_start = b * QK_K;
 
-            let dd = unpack2x16float(W_Q4K[block_base]);
-            let d = dd.x;
-            let dmin = dd.y;
+        // Super-block scale/min
+        let dd = unpack2x16float(W_Q4K[block_base]);
+        let d = dd.x;
+        let dmin = dd.y;
 
-            let d0 = get_u8(block_base, 4u);
-            let d1 = get_u8(block_base, 5u);
-            let d2 = get_u8(block_base, 6u);
-            let d3 = get_u8(block_base, 7u);
-            let m0 = get_u8(block_base, 8u);
-            let m1 = get_u8(block_base, 9u);
-            let m2 = get_u8(block_base, 10u);
-            let m3 = get_u8(block_base, 11u);
-            let md0 = get_u8(block_base, 12u);
-            let md1 = get_u8(block_base, 13u);
-            let md2 = get_u8(block_base, 14u);
-            let md3 = get_u8(block_base, 15u);
+        // Load scale bytes as words for efficient extraction
+        let sw1 = W_Q4K[block_base + 1u]; // bytes 4-7: d0,d1,d2,d3
+        let sw2 = W_Q4K[block_base + 2u]; // bytes 8-11: m0,m1,m2,m3
+        let sw3 = W_Q4K[block_base + 3u]; // bytes 12-15: md0,md1,md2,md3
 
-            for (var sb = 0u; sb < 8u; sb = sb + 1u) {
-                var sc_u: u32;
-                var mn_u: u32;
-                if (sb < 4u) {
-                    let dv = select(select(select(d0, d1, sb == 1u), d2, sb == 2u), d3, sb == 3u);
-                    let mv = select(select(select(m0, m1, sb == 1u), m2, sb == 2u), m3, sb == 3u);
-                    sc_u = dv & 0x3Fu;
-                    mn_u = mv & 0x3Fu;
-                } else {
-                    let j = sb - 4u;
-                    let dv = select(select(select(d0, d1, j == 1u), d2, j == 2u), d3, j == 3u);
-                    let mv = select(select(select(m0, m1, j == 1u), m2, j == 2u), m3, j == 3u);
-                    let mdv = select(select(select(md0, md1, j == 1u), md2, j == 2u), md3, j == 3u);
-                    sc_u = (mdv & 0x0Fu) | ((dv >> 2u) & 0x30u);
-                    mn_u = (mdv >> 4u) | ((mv >> 2u) & 0x30u);
-                }
+        // Sub-block indices for this thread's group
+        let sb_lo = 2u * il;      // low-nibble sub-block
+        let sb_hi = 2u * il + 1u; // high-nibble sub-block
 
-                let sc = d * f32(sc_u);
-                let mn = dmin * f32(mn_u);
-                let g = sb / 2u;
-                let hi = (sb & 1u) == 1u;
-
-                let i = lane;
-                let local_idx = sb * 32u + i;
-                let qb = get_u8(block_base, 16u + g * 32u + i);
-                let q = select(qb & 0x0Fu, (qb >> 4u) & 0x0Fu, hi);
-                let w = sc * f32(q) - mn;
-                acc = acc + smem_x[local_idx] * w;
-            }
+        // Scale/min for low-nibble sub-block
+        var sc_lo: f32;
+        var mn_lo: f32;
+        if (sb_lo < 4u) {
+            sc_lo = d * f32((sw1 >> (sb_lo * 8u)) & 0x3Fu);
+            mn_lo = dmin * f32((sw2 >> (sb_lo * 8u)) & 0x3Fu);
+        } else {
+            let j = sb_lo - 4u;
+            let dv = (sw1 >> (j * 8u)) & 0xFFu;
+            let mv = (sw2 >> (j * 8u)) & 0xFFu;
+            let mdv = (sw3 >> (j * 8u)) & 0xFFu;
+            sc_lo = d * f32((mdv & 0x0Fu) | ((dv >> 2u) & 0x30u));
+            mn_lo = dmin * f32((mdv >> 4u) | ((mv >> 2u) & 0x30u));
         }
-        workgroupBarrier();
+
+        // Scale/min for high-nibble sub-block
+        var sc_hi: f32;
+        var mn_hi: f32;
+        if (sb_hi < 4u) {
+            sc_hi = d * f32((sw1 >> (sb_hi * 8u)) & 0x3Fu);
+            mn_hi = dmin * f32((sw2 >> (sb_hi * 8u)) & 0x3Fu);
+        } else {
+            let j = sb_hi - 4u;
+            let dv = (sw1 >> (j * 8u)) & 0xFFu;
+            let mv = (sw2 >> (j * 8u)) & 0xFFu;
+            let mdv = (sw3 >> (j * 8u)) & 0xFFu;
+            sc_hi = d * f32((mdv & 0x0Fu) | ((dv >> 2u) & 0x30u));
+            mn_hi = dmin * f32((mdv >> 4u) | ((mv >> 2u) & 0x30u));
+        }
+
+        // Read 4 quant bytes from this thread's position in the group
+        let qb0 = get_u8(block_base, 16u + il * 32u + ir * 4u);
+        let qb1 = get_u8(block_base, 16u + il * 32u + ir * 4u + 1u);
+        let qb2 = get_u8(block_base, 16u + il * 32u + ir * 4u + 2u);
+        let qb3 = get_u8(block_base, 16u + il * 32u + ir * 4u + 3u);
+
+        // Low nibbles → sub-block 2*il
+        let k_lo = k_start + sb_lo * 32u + ir * 4u;
+        acc += (sc_lo * f32(qb0 & 0xFu) - mn_lo) * X[x_base + k_lo];
+        acc += (sc_lo * f32(qb1 & 0xFu) - mn_lo) * X[x_base + k_lo + 1u];
+        acc += (sc_lo * f32(qb2 & 0xFu) - mn_lo) * X[x_base + k_lo + 2u];
+        acc += (sc_lo * f32(qb3 & 0xFu) - mn_lo) * X[x_base + k_lo + 3u];
+
+        // High nibbles → sub-block 2*il+1
+        let k_hi = k_start + sb_hi * 32u + ir * 4u;
+        acc += (sc_hi * f32((qb0 >> 4u) & 0xFu) - mn_hi) * X[x_base + k_hi];
+        acc += (sc_hi * f32((qb1 >> 4u) & 0xFu) - mn_hi) * X[x_base + k_hi + 1u];
+        acc += (sc_hi * f32((qb2 >> 4u) & 0xFu) - mn_hi) * X[x_base + k_hi + 2u];
+        acc += (sc_hi * f32((qb3 >> 4u) & 0xFu) - mn_hi) * X[x_base + k_hi + 3u];
     }
 
     let sum = subgroupAdd(acc);
-    if (lane == 0u && col < N) {
-        Y[row * N + col] = sum + Bias[col];
+    if (tid == 0u) {
+        Y[row * N + col + y_offset] = sum + Bias[col];
     }
 }
 )WGSL";
