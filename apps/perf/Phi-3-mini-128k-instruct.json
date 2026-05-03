@@ -1,0 +1,88 @@
+{
+  "benchmarks": {
+    "backpack_onnx": {
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_ms": 60.1,
+          "prefill_tok_s": 2128.6,
+          "decode_ms": 931.9,
+          "decode_tok_s": 137.4
+        },
+        {
+          "input_tokens": 256,
+          "prefill_ms": 114.4,
+          "prefill_tok_s": 2238.2,
+          "decode_ms": 929.9,
+          "decode_tok_s": 137.7
+        },
+        {
+          "input_tokens": 512,
+          "prefill_ms": 230.1,
+          "prefill_tok_s": 2225.4,
+          "decode_ms": 981.4,
+          "decode_tok_s": 130.4
+        },
+        {
+          "input_tokens": 1024,
+          "prefill_ms": 486.0,
+          "prefill_tok_s": 2106.9,
+          "decode_ms": 942.1,
+          "decode_tok_s": 135.9
+        },
+        {
+          "input_tokens": 2048,
+          "prefill_ms": 1093.2,
+          "prefill_tok_s": 1873.3,
+          "decode_ms": 1018.7,
+          "decode_tok_s": 125.6
+        },
+        {
+          "input_tokens": 4096,
+          "prefill_ms": 2709.7,
+          "prefill_tok_s": 1511.6,
+          "decode_ms": 1194.8,
+          "decode_tok_s": 107.1
+        }
+      ]
+    },
+    "llamacpp_vulkan": {
+      "format": "gguf",
+      "quantization": "Q4_K",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 8248.025324,
+          "decode_tok_s": 239.344282
+        },
+        {
+          "input_tokens": 256,
+          "prefill_tok_s": 10503.337129,
+          "decode_tok_s": 239.344282
+        },
+        {
+          "input_tokens": 512,
+          "prefill_tok_s": 10590.616598,
+          "decode_tok_s": 239.344282
+        }
+      ]
+    },
+    "ort_webgpu": {
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 2613.71,
+          "decode_tok_s": 175.939
+        }
+      ]
+    }
+  },
+  "timestamp": "2026-05-02T13:03:10"
+}

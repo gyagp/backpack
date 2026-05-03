@@ -1,5 +1,6 @@
 enable f16;
 enable subgroups;
+diagnostic(off, subgroup_uniformity);
 
 // Fused single-dispatch GQA decode attention with fp16 KV cache.
 // Replaces the 2-dispatch chunked approach (attn_p1 + attn_p2).
@@ -34,26 +35,25 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let kv_off = kv_head * HD;
     let q_base = head * HD;
 
-    let q0 = Q[q_base + lane * HD_PER_THREAD];
-    let q1 = Q[q_base + lane * HD_PER_THREAD + 1u];
-    let q2 = Q[q_base + lane * HD_PER_THREAD + 2u];
-    let q3 = Q[q_base + lane * HD_PER_THREAD + 3u];
+    var q: array<f32, HD_PER_THREAD>;
+    for (var e = 0u; e < HD_PER_THREAD; e++) {
+        q[e] = Q[q_base + lane * HD_PER_THREAD + e];
+    }
 
-    var acc0: f32 = 0.0; var acc1: f32 = 0.0;
-    var acc2: f32 = 0.0; var acc3: f32 = 0.0;
+    var acc: array<f32, HD_PER_THREAD>;
+    for (var e = 0u; e < HD_PER_THREAD; e++) { acc[e] = 0.0; }
     var m_prev: f32 = neg_inf;
     var l_prev: f32 = 0.0;
 
     for (var t = 0u; t < max_seq; t = t + 1u) {
         let valid = t < T_total;
         let k_base = select(0u, t * kv_stride + kv_off, valid);
-        let k0 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD]), valid);
-        let k1 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 1u]), valid);
-        let k2 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 2u]), valid);
-        let k3 = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + 3u]), valid);
-
-        let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
-        let dot_qk = subgroupAdd(partial);
+        var dot_partial: f32 = 0.0;
+        for (var e = 0u; e < HD_PER_THREAD; e++) {
+            let k = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + e]), valid);
+            dot_partial += q[e] * k;
+        }
+        let dot_qk = subgroupAdd(dot_partial);
         let score = select(neg_inf, dot_qk * scale, valid);
 
         let m_new = max(m_prev, score);
@@ -63,22 +63,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let rescale = l_prev * exp_prev / max(l_new, 1e-10);
         let w = exp_score / max(l_new, 1e-10);
 
-        let v0 = select(0.0, f32(V_cache[k_base + lane * HD_PER_THREAD]), valid);
-        let v1 = select(0.0, f32(V_cache[k_base + lane * HD_PER_THREAD + 1u]), valid);
-        let v2 = select(0.0, f32(V_cache[k_base + lane * HD_PER_THREAD + 2u]), valid);
-        let v3 = select(0.0, f32(V_cache[k_base + lane * HD_PER_THREAD + 3u]), valid);
-
-        acc0 = acc0 * rescale + v0 * w;
-        acc1 = acc1 * rescale + v1 * w;
-        acc2 = acc2 * rescale + v2 * w;
-        acc3 = acc3 * rescale + v3 * w;
+        for (var e = 0u; e < HD_PER_THREAD; e++) {
+            let v = select(0.0, f32(V_cache[k_base + lane * HD_PER_THREAD + e]), valid);
+            acc[e] = acc[e] * rescale + v * w;
+        }
 
         m_prev = m_new;
         l_prev = l_new;
     }
 
-    Out[head * HD + lane * HD_PER_THREAD]      = acc0;
-    Out[head * HD + lane * HD_PER_THREAD + 1u] = acc1;
-    Out[head * HD + lane * HD_PER_THREAD + 2u] = acc2;
-    Out[head * HD + lane * HD_PER_THREAD + 3u] = acc3;
+    for (var e = 0u; e < HD_PER_THREAD; e++) {
+        Out[head * HD + lane * HD_PER_THREAD + e] = acc[e];
+    }
 }

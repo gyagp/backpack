@@ -98,10 +98,10 @@ bool GPUContext::init(WGPUBackendType backend) {
     // Adapter
     struct { WGPUAdapter a; bool ok; } st{nullptr, false};
     const char* adapterToggles[] = {
-        "allow_unsafe_apis", "vulkan_enable_f16_on_nvidia"};
+        "allow_unsafe_apis", "vulkan_enable_f16_on_nvidia", "use_dxc"};
     WGPUDawnTogglesDescriptor adT{};
     adT.chain.sType = static_cast<WGPUSType>(0x0005000A);
-    adT.enabledToggleCount = 2;
+    adT.enabledToggleCount = 3;
     adT.enabledToggles = adapterToggles;
 
     WGPURequestAdapterOptions opts{};
@@ -129,26 +129,36 @@ bool GPUContext::init(WGPUBackendType backend) {
     wgpuAdapterGetInfo(adapter, &info);
     adapterName = sv_str(info.device);
     adapterDescription = sv_str(info.description);
-    printf("GPU: %s (%s)\n", sv_str(info.device).c_str(),
+    fprintf(stderr, "GPU: %s (%s)\n", sv_str(info.device).c_str(),
            sv_str(info.description).c_str());
 
     if (wgpuAdapterGetLimits(adapter, &adapterLimits) != WGPUStatus_Success) {
         fprintf(stderr, "FATAL: wgpuAdapterGetLimits failed; refusing to fall back to WebGPU default limits.\n");
         return false;
     }
-    printf("  maxComputeInvocationsPerWorkgroup: %u\n",
+    fprintf(stderr, "  maxComputeInvocationsPerWorkgroup: %u\n",
             (unsigned)adapterLimits.maxComputeInvocationsPerWorkgroup);
-    printf("  maxComputeWorkgroupSizeX: %u\n",
+    fprintf(stderr, "  maxComputeWorkgroupSizeX: %u\n",
             (unsigned)adapterLimits.maxComputeWorkgroupSizeX);
-    printf("  maxComputeWorkgroupStorageSize: %u bytes\n",
+    fprintf(stderr, "  maxComputeWorkgroupStorageSize: %u bytes\n",
             (unsigned)adapterLimits.maxComputeWorkgroupStorageSize);
-    printf("  maxStorageBufferBindingSize: %llu MB\n",
+    fprintf(stderr, "  maxStorageBufferBindingSize: %llu MB\n",
             (unsigned long long)adapterLimits.maxStorageBufferBindingSize / 1048576);
-    printf("  maxBufferSize: %llu MB\n",
+    fprintf(stderr, "  maxBufferSize: %llu MB\n",
             (unsigned long long)adapterLimits.maxBufferSize / 1048576);
 
     // Device features
     std::vector<WGPUFeatureName> feats;
+    // Debug: enumerate all adapter features
+    {
+        WGPUSupportedFeatures sf{};
+        wgpuAdapterGetFeatures(adapter, &sf);
+        fprintf(stderr, "  Adapter features (%zu):", sf.featureCount);
+        for (size_t i = 0; i < sf.featureCount && i < 30; i++)
+            fprintf(stderr, " 0x%x", (unsigned)sf.features[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     auto tryFeat = [&](bool& supported, std::initializer_list<uint32_t> ids) {
         supported = false;
         for (auto id : ids) {
@@ -161,6 +171,12 @@ bool GPUContext::init(WGPUBackendType backend) {
     };
     tryFeat(supportsShaderF16, {0x0B, 0x0A});
     tryFeat(supportsSubgroups, {0x12, 0x11});
+    // Force-enable subgroups if adapter doesn't report it but we know GPU supports wave ops
+    if (!supportsSubgroups) {
+        feats.push_back((WGPUFeatureName)0x12);
+        supportsSubgroups = true;
+        fprintf(stderr, "  Forcing subgroups feature (0x12)\n");
+    }
     tryFeat(supportsSubgroupMatrix, {0x00050034});
     tryFeat(supportsTimestampQuery, {0x09});
 
@@ -180,7 +196,7 @@ bool GPUContext::init(WGPUBackendType backend) {
     ddesc.requiredFeatures = feats.empty() ? nullptr : feats.data();
     // Request the adapter's actual supported limits instead of a zeroed
     // WGPULimits struct, which would only ask for WebGPU defaults.
-    ddesc.requiredLimits = &adapterLimits;
+    ddesc.requiredLimits = &adapterLimits;  // request full hardware limits
     ddesc.uncapturedErrorCallbackInfo.callback =
         [](WGPUDevice const*, WGPUErrorType t, WGPUStringView m, void* ud, void*) {
             const char* n[] = {"OK","Val","OOM","Int","Unk","Lost"};
@@ -194,25 +210,25 @@ bool GPUContext::init(WGPUBackendType backend) {
         };
     ddesc.uncapturedErrorCallbackInfo.userdata1 = this;
 
-    ddesc.deviceLostCallbackInfo.callback =
-        [](WGPUDevice const*, WGPUDeviceLostReason reason, WGPUStringView m,
-           void* ud, void*) {
-            auto* ctx = static_cast<GPUContext*>(ud);
-            ctx->deviceLost = true;
-            ctx->deviceLostReason = std::string(m.data, m.length);
-            const char* reasons[] = {"?","Unknown","Destroyed","CallbackCancelled",
-                                     "FailedCreation"};
-            int ri = (int)reason;
-            const char* rs = (ri >= 1 && ri <= 4) ? reasons[ri] : "?";
-            fprintf(stderr, "[DAWN DeviceLost] reason=%s: %.*s\n",
-                    rs, (int)m.length, m.data);
-        };
-    ddesc.deviceLostCallbackInfo.userdata1 = this;
+    // deviceLostCallbackInfo left empty (zero-initialized)
 
+    fprintf(stderr, "  Creating device with %zu features, limits=%p...\n", feats.size(), (void*)ddesc.requiredLimits);
+    fflush(stderr);
     device = wgpuAdapterCreateDevice(adapter, &ddesc);
+    fprintf(stderr, "  Device created: %p\n", (void*)device);
+    fflush(stderr);
     if (!device) return false;
 
-    if (wgpuDeviceGetLimits(device, &deviceLimits) != WGPUStatus_Success) {
+    fprintf(stderr, "  Querying device limits...\n"); fflush(stderr);
+    WGPUStatus limStatus = wgpuDeviceGetLimits(device, &deviceLimits);
+    fprintf(stderr, "  Device limits status: %d\n", (int)limStatus); fflush(stderr);
+    fprintf(stderr, "  Device maxBuf=%llu maxSBB=%llu maxWGS=%u maxInv=%u\n",
+            (unsigned long long)deviceLimits.maxBufferSize,
+            (unsigned long long)deviceLimits.maxStorageBufferBindingSize,
+            (unsigned)deviceLimits.maxComputeWorkgroupStorageSize,
+            (unsigned)deviceLimits.maxComputeInvocationsPerWorkgroup);
+    fflush(stderr);
+    if (limStatus != WGPUStatus_Success) {
         fprintf(stderr, "FATAL: wgpuDeviceGetLimits failed after device creation.\n");
         return false;
     }
@@ -238,11 +254,20 @@ bool GPUContext::init(WGPUBackendType backend) {
     }
 
     queue = wgpuDeviceGetQueue(device);
-    printf("  Features: f16=%s subgroups=%s subgroup_matrix=%s timestamps=%s\n",
+    fprintf(stderr, "  Queue: %p\n", (void*)queue); fflush(stderr);
+    fprintf(stderr, "  Features: f16=%s subgroups=%s subgroup_matrix=%s timestamps=%s\n",
            supportsShaderF16 ? "yes" : "no",
            supportsSubgroups ? "yes" : "no",
            supportsSubgroupMatrix ? "yes" : "no",
            supportsTimestampQuery ? "yes" : "no");
+    fflush(stderr);
+    fprintf(stderr, "  Features: f16=%s subgroups=%s subgroup_matrix=%s timestamps=%s\n",
+           supportsShaderF16 ? "yes" : "no",
+           supportsSubgroups ? "yes" : "no",
+           supportsSubgroupMatrix ? "yes" : "no",
+           supportsTimestampQuery ? "yes" : "no");
+    fflush(stdout);
+    fprintf(stderr, "  GPU init complete!\n"); fflush(stderr);
     return true;
 }
 

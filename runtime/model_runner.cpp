@@ -266,26 +266,30 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     gpu = &ctx;
     ggufPath = path;
     modelFormat = "gguf";
+    fprintf(stderr, "  [runner.load] opening GGUF: %s\n", path.c_str()); fflush(stderr);
 
     // Parse GGUF (metadata + tensor index)
     if (!gguf.open(ggufPath)) {
         fprintf(stderr, "Failed to open GGUF: %s\n", ggufPath.c_str());
         return false;
     }
+    fprintf(stderr, "  [runner.load] GGUF opened, extracting config...\n"); fflush(stderr);
 
     // Extract model config from GGUF metadata
     cfg = extractModelConfig(gguf);
+    fprintf(stderr, "  [runner.load] config extracted: arch=%s nLayer=%u\n", cfg.arch.c_str(), cfg.nLayer); fflush(stderr);
+    fprintf(stderr, "  [runner.load] printing model info...\n"); fflush(stderr);
 
-    printf("Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u)\n",
+    fprintf(stderr, "Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u)\n",
            cfg.arch.c_str(), cfg.nLayer, cfg.nEmbd, cfg.headDim,
            cfg.nVocab, cfg.nKvHeads);
-    printf("  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
+    fprintf(stderr, "  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
            cfg.ropeTheta, cfg.rmsNormEps,
            cfg.hasQkNorm ? "yes" : "no");
 
     // Single compute pass for all backends — Dawn handles barriers internally
     passPerDispatch = false;
-    printf("  Backend: %s, single-pass dispatch\n",
+    fprintf(stderr, "  Backend: %s, single-pass dispatch\n",
            gpu->backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan");
 
     // Memory-map GGUF file for tensor data
@@ -325,28 +329,28 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     rotaryDim = onnx.rotaryDim;
     hasPrecomputedRope = onnx.hasPrecomputedRope;
 
-    printf("Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u) [ONNX]\n",
+    fprintf(stderr, "Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u) [ONNX]\n",
            cfg.arch.c_str(), cfg.nLayer, cfg.nEmbd, cfg.headDim,
            cfg.nVocab, cfg.nKvHeads);
-    printf("  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
+    fprintf(stderr, "  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
            cfg.ropeTheta, cfg.rmsNormEps,
            cfg.hasQkNorm ? "yes" : "no");
     if (rotaryDim > 0 && rotaryDim != cfg.headDim)
-        printf("  Partial RoPE: rotary_dim=%u (head_dim=%u)\n", rotaryDim, cfg.headDim);
+        fprintf(stderr, "  Partial RoPE: rotary_dim=%u (head_dim=%u)\n", rotaryDim, cfg.headDim);
     if (cfg.headDim != 128 && cfg.headDim % 32 == 0)
-        printf("  Note: head_dim=%u (attention kernels will be HD-patched)\n", cfg.headDim);
+        fprintf(stderr, "  Note: head_dim=%u (attention kernels will be HD-patched)\n", cfg.headDim);
     if (cfg.headDim % 32 != 0) {
         fprintf(stderr, "Error: head_dim=%u is not a multiple of 32\n", cfg.headDim);
         return false;
     }
 
     passPerDispatch = false;
-    printf("  Backend: %s, single-pass dispatch\n",
+    fprintf(stderr, "  Backend: %s, single-pass dispatch\n",
            gpu->backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan");
 
     // 2. Upload weights to GPU
     auto t0 = std::chrono::steady_clock::now();
-    printf("  Uploading weights to GPU...\n");
+    fprintf(stderr, "  Uploading weights to GPU...\n");
 
     uint32_t qDimL = cfg.nHead * cfg.headDim;
     uint32_t kvDimL = cfg.nKvHeads * cfg.headDim;
@@ -373,7 +377,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
         kvCache[i].len = 0;
     }
-    printf("  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
+    fprintf(stderr, "  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
 
     // Per-layer weights
     layerWeights.resize(cfg.nLayer);
@@ -410,7 +414,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         }
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
-            printf("  uploaded layer %u/%u\n", i + 1, cfg.nLayer);
+            fprintf(stderr, "  uploaded layer %u/%u\n", i + 1, cfg.nLayer);
     }
 
     // Final norm
@@ -421,13 +425,13 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
 
     // Embedding
     embeddingCPU = std::move(onnx.embeddingCPU);
-    printf("  Embedding: %u × %u (fp32)\n", cfg.nVocab, cfg.nEmbd);
+    fprintf(stderr, "  Embedding: %u × %u (fp32)\n", cfg.nVocab, cfg.nEmbd);
 
     // LM head
     if (onnx.hasLmHeadQ8) {
         uploadQ8Weight(*gpu, "lm_head_q8", onnx.lmHeadQ8, lmHeadQ8W, lmHeadQ8S);
         lmHeadIsQ8 = true;
-        printf("  LM head: separate (Q8)\n");
+        fprintf(stderr, "  LM head: separate (Q8)\n");
     } else if (cfg.tieWordEmbeddings) {
         // Build Q8 LM head from embedding table
         uint32_t nBlocksPerRow = (cfg.nEmbd + 31) / 32;
@@ -464,12 +468,12 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         auto rep = repack_q8_0(blocks.data(), cfg.nVocab, nBlocksPerRow * 32);
         uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
         lmHeadIsQ8 = true;
-        printf("  LM head: tied embeddings (Q8)\n");
+        fprintf(stderr, "  LM head: tied embeddings (Q8)\n");
     }
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    printf("  Weights uploaded in %lldms\n", (long long)ms);
+    fprintf(stderr, "  Weights uploaded in %lldms\n", (long long)ms);
 
     // 3. RoPE tables
     if (hasPrecomputedRope && !onnx.ropeCos.empty()) {
@@ -488,7 +492,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             gpu->writeBuffer(ropeCosBuf, onnx.ropeCos.data(), ropeBytes);
             gpu->writeBuffer(ropeSinBuf, onnx.ropeSin.data(), ropeBytes);
         }
-        printf("  Using ONNX RoPE cache: %u positions × %u half-dim\n",
+        fprintf(stderr, "  Using ONNX RoPE cache: %u positions × %u half-dim\n",
                maxPos, ropeHalf);
     }
     computeRopeTables();
@@ -505,7 +509,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
 void ModelRunner::loadWeights(const GGUFFile& gguf,
                                const uint8_t* fileData) {
     auto t0 = std::chrono::steady_clock::now();
-    printf("  Loading %llu tensors...\n", (unsigned long long)gguf.n_tensors);
+    fprintf(stderr, "  Loading %llu tensors...\n", (unsigned long long)gguf.n_tensors);
 
     uint32_t qDim  = cfg.nHead * cfg.headDim;
     uint32_t kvDim = cfg.nKvHeads * cfg.headDim;
@@ -532,7 +536,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
         kvCache[i].len = 0;
     }
-    printf("  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
+    fprintf(stderr, "  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
 
     // Helper: load fp32/fp16 norm weight from GGUF tensor
     auto loadNorm = [&](const std::string& ggufName, GPUBuffer& buf) {
@@ -596,7 +600,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     const char* kqName = (weightQuantType == GGUF_TYPE_Q4_K) ? "Q4_K" :
                          (weightQuantType == GGUF_TYPE_Q5_K) ? "Q5_K" :
                          (weightQuantType == GGUF_TYPE_Q6_K) ? "Q6_K" : "Q8_0";
-    printf("  Weight format: %s\n", kqName);
+    fprintf(stderr, "  Weight format: %s\n", kqName);
 
     // Per-layer weights
     layerWeights.resize(cfg.nLayer);
@@ -711,7 +715,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         loadNorm(pfx + "attn_k_norm.weight", lw.kNorm);
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
-            printf("  loaded layer %u/%u\n", i + 1, cfg.nLayer);
+            fprintf(stderr, "  loaded layer %u/%u\n", i + 1, cfg.nLayer);
     }
 
     // Final norm
@@ -751,7 +755,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             } else {
                 memcpy(embeddingCPU.data(), data, nel * 4);
             }
-            printf("  Embedding: %u × %u (%s)\n", cfg.nVocab, cfg.nEmbd,
+            fprintf(stderr, "  Embedding: %u × %u (%s)\n", cfg.nVocab, cfg.nEmbd,
                    ti.type == GGUF_TYPE_Q8_0 ? "Q8_0→f32" :
                    ti.type == GGUF_TYPE_Q4_K ? "Q4_K→f32" :
                    ti.type == GGUF_TYPE_Q5_K ? "Q5_K→f32" :
@@ -768,7 +772,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     kqLmRowStride = kq.rowStrideWords;
                     uploadKQWeight("lm_head_kq", kq, lmHeadKQ);
                     lmHeadIsKQ = true;
-                    printf("  LM head: tied embeddings (%s, %llu MB)\n", kqName,
+                    fprintf(stderr, "  LM head: tied embeddings (%s, %llu MB)\n", kqName,
                            (unsigned long long)(kq.data.size() * 4 / 1048576));
                 } else if (ti.type == GGUF_TYPE_Q8_0) {
                     // Keep as Q8 on GPU — no dequant needed
@@ -778,7 +782,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     lmHeadIsQ8 = true;
                     uint64_t wBytes = (uint64_t)rep.weights.size() * 4;
                     uint64_t sBytes = (uint64_t)rep.scales.size() * 4;
-                    printf("  LM head: tied embeddings (Q8, %llu MB)\n",
+                    fprintf(stderr, "  LM head: tied embeddings (Q8, %llu MB)\n",
                            (unsigned long long)((wBytes + sBytes) / 1048576));
                 } else {
                     // fp16 fallback
@@ -793,7 +797,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         wgpuQueueWriteBuffer(gpu->queue, lmHeadW.handle, off,
                                              (const uint8_t*)fp16.data() + off, sz);
                     }
-                    printf("  LM head: tied embeddings (fp16, %llu MB)\n",
+                    fprintf(stderr, "  LM head: tied embeddings (fp16, %llu MB)\n",
                            (unsigned long long)(totalBytes / 1048576));
                 }
             }
@@ -802,7 +806,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    printf("  Weights loaded in %lldms\n", (long long)ms);
+    fprintf(stderr, "  Weights loaded in %lldms\n", (long long)ms);
 }
 
 // ─── RoPE tables ─────────────────────────────────────────────────────────────
@@ -871,7 +875,7 @@ void ModelRunner::buildDecodePipeline() {
         gpu->supportsSubgroupMatrix &&
         canUse512ThreadKernels &&
         canCompileEmbeddedKernel(*gpu, "test_subgroup_matrix");
-    printf("  Subgroup matrix: %s\n",
+    fprintf(stderr, "  Subgroup matrix: %s\n",
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
     auto& plFusedRope  = getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope");
@@ -899,7 +903,7 @@ void ModelRunner::buildDecodePipeline() {
     decodePoolCapacity = chooseDecodePoolDepth(*gpu);
     decodePoolDepth = decodePoolCapacity;
     decodeCbPoolBatch = chooseDecodeCbPoolBatch(*gpu, cfg);
-        printf("  Initial decode heuristic: qkv=%s oproj=%s gateup=%s lm_head=%s pool=%d batch=%d\n",
+        fprintf(stderr, "  Initial decode heuristic: qkv=%s oproj=%s gateup=%s lm_head=%s pool=%d batch=%d\n",
         tuning.decodeUseFastQkv ? "fast" : "base",
         tuning.decodeUseFastOproj ? "fast" : "base",
         tuning.decodeUseFastGateup ? "fast" : "base",
@@ -1298,7 +1302,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             allDecodeDispatches.begin(), allDecodeDispatches.end());
     }
 
-    printf("  %zu decode dispatches (%u layers)\n",
+    fprintf(stderr, "  %zu decode dispatches (%u layers)\n",
            allDecodeDispatches.size(), cfg.nLayer);
 
     // ─── Create staging pool ──────────────────────────────────────────────
@@ -1312,11 +1316,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pool[s].stagingBuf = wgpuDeviceCreateBuffer(gpu->device, &bd);
         refillCBPool(s);
     }
-    printf("  Pool: %d slots × %d pre-recorded CBs\n",
+    fprintf(stderr, "  Pool: %d slots × %d pre-recorded CBs\n",
             decodePoolCapacity, decodeCbPoolBatch);
 
     // Pre-allocate prefill resources (buffers + bind groups at maxSeqLen)
-    initPrefillResources();
+    // Skip for K-quant models — prefill kernels only support Q8/fp32 weights
+    bool isKQ = (weightQuantType == GGUF_TYPE_Q4_K ||
+                 weightQuantType == GGUF_TYPE_Q5_K ||
+                 weightQuantType == GGUF_TYPE_Q6_K);
+    if (!isKQ) {
+        initPrefillResources();
+    } else {
+        fprintf(stderr, "  Prefill: skipped (K-quant weights, using serial decode)\n");
+    }
 }
 
 // ─── Pre-allocate prefill resources ──────────────────────────────────────────
@@ -1400,7 +1412,7 @@ void ModelRunner::initPrefillResources() {
     if (!useMMA) {
         useDP4A = canUse256ThreadSubgroupKernels &&
                   canCompileEmbeddedKernel(*gpu, "q8_matmul_dp4a_d3d12");
-        printf("  DP4A (dot4I8Packed): %s\n",
+        fprintf(stderr, "  DP4A (dot4I8Packed): %s\n",
                useDP4A ? "available" : "not available");
     }
 
@@ -1440,7 +1452,7 @@ void ModelRunner::initPrefillResources() {
     auto& kMat     = getKernel(matKernel);
     auto& kDnSilu  = getKernel(dnSiluKernel);
     auto& kAttn    = getKernelHD(attnKernel);
-    printf("  Prefill tuning: mat=%s qkv/gateup=%s down=%s attn=%s tiles=%ux%u wide=%ux%u pool=%d\n",
+    fprintf(stderr, "  Prefill tuning: mat=%s qkv/gateup=%s down=%s attn=%s tiles=%ux%u wide=%ux%u pool=%d\n",
            matKernel,
            tuning.prefillUseWidePrequant ? wideMatKernel : matKernel,
            dnSiluKernel,
@@ -1682,7 +1694,7 @@ void ModelRunner::autotuneDecodeDepth() {
         refillCBPool(s);
     resetKVCache();
 
-    printf("  Decode depth autotune: %d -> %d (%.2f ms/tok)\n",
+    fprintf(stderr, "  Decode depth autotune: %d -> %d (%.2f ms/tok)\n",
            originalDepth, decodePoolDepth, bestMsPerTok);
 }
 
@@ -1784,7 +1796,7 @@ void ModelRunner::autotuneDecodeKernels() {
 
     applyDecodeKernelSelection(bestQkv, bestOproj, bestGateup);
     resetKVCache();
-    printf("  Decode kernel autotune: qkv=%s oproj=%s gateup=%s (%.2f ms/tok)\n",
+    fprintf(stderr, "  Decode kernel autotune: qkv=%s oproj=%s gateup=%s (%.2f ms/tok)\n",
            bestQkv ? "fast" : "base",
            bestOproj ? "fast" : "base",
            bestGateup ? "fast" : "base",
@@ -1862,7 +1874,7 @@ bool ModelRunner::loadDecodeAutotuneCache() {
     decodePoolDepth = cachedDepth;
     applyDecodeKernelSelection(cachedQkv != 0, cachedOproj != 0, cachedGateup != 0);
     resetKVCache();
-    printf("  Decode autotune cache: loaded from %s\n", path.c_str());
+    fprintf(stderr, "  Decode autotune cache: loaded from %s\n", path.c_str());
     return true;
 }
 
@@ -1880,7 +1892,7 @@ void ModelRunner::saveDecodeAutotuneCache() const {
 }
 
 void ModelRunner::printActiveDecodeTuning(const char* prefix) const {
-    printf("%s: depth=%d/%d qkv=%s oproj=%s gateup=%s lm_head=%s batch=%d\n",
+    fprintf(stderr, "%s: depth=%d/%d qkv=%s oproj=%s gateup=%s lm_head=%s batch=%d\n",
            prefix,
            decodePoolDepth,
            decodePoolCapacity,
@@ -2092,8 +2104,9 @@ std::vector<float> ModelRunner::prefillFinish(int32_t tokenId, uint32_t posOffse
 
 int32_t ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
-    // For small T, serial path is faster
-    if (T <= 16) {
+    // For small T or when prefill resources are not available (K-quant), use serial path
+    if (T <= 16 || !pfCache.pX.handle) {
+        fprintf(stderr, "  [prefillBatched] serial path T=%u\n", T); fflush(stderr);
         if (T == 1) {
             auto logits = decode(tokenIds[0], posOffset);
             return argmax(logits);
@@ -2355,7 +2368,7 @@ int32_t ModelRunner::prefillBatched(
 
         // Detailed CPU timing breakdown
         auto us = [](auto a, auto b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
-        printf("    cpu: encode=%.0fus finish=%.0fus submit=%.0fus gpu_wait=%.0fus\n",
+        fprintf(stderr, "    cpu: encode=%.0fus finish=%.0fus submit=%.0fus gpu_wait=%.0fus\n",
                us(t_enc0, t_enc1), us(t_enc1, t_finish),
                us(t_finish, t_submitted), us(t_submitted, t_gpudone));
     }
@@ -2363,7 +2376,7 @@ int32_t ModelRunner::prefillBatched(
 
     // Print prefill timing breakdown
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    printf("  [prefill T=%u] params=%.1fms build=%.1fms gpu+readback=%.1fms total=%.1fms (%zu dispatches)\n",
+    fprintf(stderr, "  [prefill T=%u] params=%.1fms build=%.1fms gpu+readback=%.1fms total=%.1fms (%zu dispatches)\n",
            T, ms(t_start, t_params), ms(t_params, t_dispatches),
            ms(t_dispatches, t_submit),
            ms(t_start, t_submit), pfCache.indirectTable.size());
@@ -2414,12 +2427,12 @@ void ModelRunner::enableProfiling() {
     auto cal = acquireClockCalibration(gpu->device, gpu->backendType);
     if (cal.valid) {
         calibration = new ClockCalibration(cal);
-        printf("  Clock calibration: GPU=%llu ns, CPU=%llu ns, deviation=%llu ns\n",
+        fprintf(stderr, "  Clock calibration: GPU=%llu ns, CPU=%llu ns, deviation=%llu ns\n",
                (unsigned long long)cal.gpuTimestampNs,
                (unsigned long long)cal.cpuTimestampNs,
                (unsigned long long)cal.maxDeviationNs);
     } else {
-        printf("  Clock calibration: not available (GPU-only timing)\n");
+        fprintf(stderr, "  Clock calibration: not available (GPU-only timing)\n");
     }
 }
 
@@ -2492,19 +2505,19 @@ void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
               [](auto& a, auto& b) { return a.second.totalUs > b.second.totalUs; });
 
     // Print report
-    printf("\n--- GPU Profile (hardware timestamps) ---\n");
-    printf("%-20s %10s %6s %10s %6s\n",
+    fprintf(stderr, "\n--- GPU Profile (hardware timestamps) ---\n");
+    fprintf(stderr, "%-20s %10s %6s %10s %6s\n",
            "Kernel", "Total(ms)", "Count", "Avg(us)", "%%");
-    printf("%-20s %10s %6s %10s %6s\n",
+    fprintf(stderr, "%-20s %10s %6s %10s %6s\n",
            "--------------------", "----------", "------", "----------", "------");
     for (auto& [name, e] : sorted_agg) {
         double totalMs = e.totalUs / 1000.0;
         double avgUs = e.totalUs / e.count;
         double pct = totalGpuUs > 0 ? e.totalUs / totalGpuUs * 100.0 : 0;
-        printf("%-20s %10.2f %6u %10.1f %5.1f%%\n",
+        fprintf(stderr, "%-20s %10.2f %6u %10.1f %5.1f%%\n",
                name.c_str(), totalMs, e.count, avgUs, pct);
     }
-    printf("%-20s %10.2f\n", "TOTAL", totalGpuUs / 1000.0);
+    fprintf(stderr, "%-20s %10.2f\n", "TOTAL", totalGpuUs / 1000.0);
 
     // Generate HTML timeline report
     std::string htmlPath = profileOutputPath;

@@ -102,7 +102,7 @@ target_include_directories(backpack_runtime PRIVATE
 
 set(BACKPACK_LLM_APP "${CMAKE_SOURCE_DIR}/../apps/llm/main.cpp")
 if(EXISTS ${BACKPACK_LLM_APP})
-    add_executable(backpack_llm ${BACKPACK_LLM_APP} $<TARGET_OBJECTS:backpack_core>)
+    add_executable(backpack_llm ${BACKPACK_LLM_APP})
     target_link_libraries(backpack_llm PRIVATE backpack)
     target_include_directories(backpack_llm PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -119,6 +119,20 @@ if(EXISTS ${BACKPACK_IMAGE_APP})
     add_executable(backpack_image ${BACKPACK_IMAGE_APP} $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_image PRIVATE backpack)
     target_include_directories(backpack_image PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${DAWN_SRC}/include
+        ${DAWN_BUILD}/gen/include
+        ${DAWN_SRC}/include/dawn/native
+    )
+endif()
+
+# ─── ASR (speech-to-text) application ────────────────────────────────────────
+
+set(BACKPACK_ASR_APP "${CMAKE_SOURCE_DIR}/../apps/asr/main.cpp")
+if(EXISTS ${BACKPACK_ASR_APP})
+    add_executable(backpack_asr ${BACKPACK_ASR_APP} $<TARGET_OBJECTS:backpack_core>)
+    target_link_libraries(backpack_asr PRIVATE backpack)
+    target_include_directories(backpack_asr PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${DAWN_SRC}/include
         ${DAWN_BUILD}/gen/include
@@ -177,6 +191,10 @@ if(WIN32)
         target_link_libraries(backpack_image PRIVATE
             ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     endif()
+    if(TARGET backpack_asr)
+        target_link_libraries(backpack_asr PRIVATE
+            ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    endif()
     target_link_libraries(op_test_runner PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     target_link_libraries(backpack_kernel_test PRIVATE
@@ -184,7 +202,7 @@ if(WIN32)
     target_link_libraries(backpack_op_test PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     # Copy DLLs next to executables
-    foreach(_target backpack_runtime backpack_llm backpack_image op_test_runner backpack_kernel_test backpack_op_test)
+    foreach(_target backpack_runtime backpack_llm backpack_image backpack_asr op_test_runner backpack_kernel_test backpack_op_test)
         if(TARGET ${_target})
             add_custom_command(TARGET ${_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -202,6 +220,9 @@ else()
     endif()
     if(TARGET backpack_image)
         target_link_libraries(backpack_image PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    endif()
+    if(TARGET backpack_asr)
+        target_link_libraries(backpack_asr PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     endif()
     target_link_libraries(op_test_runner PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     target_link_libraries(backpack_kernel_test PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)

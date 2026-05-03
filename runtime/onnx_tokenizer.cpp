@@ -285,7 +285,7 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
                 token_to_id[key] = id;
             }
         }
-        printf("  Vocab: %zu tokens (max_id=%zu)\n", count, maxId);
+        fprintf(stderr, "  Vocab: %zu tokens (max_id=%zu)\n", count, maxId);
     }
 
     // Find "merges": [ ... ]
@@ -406,7 +406,7 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
             bos_token_id = root["bos_token_id"].as_int();
     }
 
-    printf("  Tokenizer: %zu tokens, %zu merges, %zu added, EOS=%d\n",
+    fprintf(stderr, "  Tokenizer: %zu tokens, %zu merges, %zu added, EOS=%d\n",
            vocab.size(), merge_rank.size(), added_tokens.size(), eos_token_id);
 
     return true;

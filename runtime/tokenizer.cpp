@@ -128,7 +128,7 @@ bool Tokenizer::load(const GGUFFile& gguf) {
     uint32_t byte_to_unicode[256];
     build_byte_tables(unicode_to_byte_, byte_to_unicode);
 
-    printf("  Tokenizer: %zu tokens, %zu merges, EOS=%d\n",
+    fprintf(stderr, "  Tokenizer: %zu tokens, %zu merges, EOS=%d\n",
            vocab.size(), merge_rank.size(), eos_token_id);
 
     return true;

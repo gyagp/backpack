@@ -1,0 +1,53 @@
+{
+  "benchmarks": {
+    "backpack_gguf": {
+      "format": "gguf",
+      "quantization": "Q4_K",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_ms": 493.7,
+          "prefill_tok_s": 259.3,
+          "decode_ms": 583.7,
+          "decode_tok_s": 219.3
+        }
+      ]
+    },
+    "llamacpp_vulkan": {
+      "format": "gguf",
+      "quantization": "Q4_K",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 15286.233374,
+          "decode_tok_s": 459.378746
+        },
+        {
+          "input_tokens": 256,
+          "prefill_tok_s": 18580.24213,
+          "decode_tok_s": 459.378746
+        },
+        {
+          "input_tokens": 512,
+          "prefill_tok_s": 20085.669905,
+          "decode_tok_s": 459.378746
+        }
+      ]
+    },
+    "ort_webgpu": {
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 6123.9,
+          "decode_tok_s": 254.789
+        }
+      ]
+    }
+  },
+  "timestamp": "2026-05-02T13:19:55"
+}

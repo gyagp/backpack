@@ -647,7 +647,7 @@ struct GenericOnnxState {
             int compiled = gpu->warmupPipelines(specs);
             auto t1 = std::chrono::steady_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            printf("  Warmed %d/%zu GPU pipelines in %.0fms\n",
+            fprintf(stderr, "  Warmed %d/%zu GPU pipelines in %.0fms\n",
                    compiled, specs.size(), ms);
         }
     }
@@ -802,11 +802,15 @@ struct StandardState {
 
     bool Load(GPUContext& gpuCtx, const std::string& path) {
         gpu = &gpuCtx;
+        fprintf(stderr, "  [Load] resolving path: %s\n", path.c_str()); fflush(stderr);
         std::string resolved = resolvePath(path, format);
+        fprintf(stderr, "  [Load] resolved=%s format=%s\n", resolved.c_str(), format.c_str()); fflush(stderr);
 
+        fprintf(stderr, "  [Load] calling runner.load...\n"); fflush(stderr);
         bool ok = (format == "onnx")
             ? runner.loadOnnx(gpuCtx, resolved)
             : runner.load(gpuCtx, resolved);
+        fprintf(stderr, "  [Load] runner.load returned: %s\n", ok ? "true" : "false"); fflush(stderr);
         if (!ok) return false;
 
         if (format == "onnx") {
@@ -819,7 +823,8 @@ struct StandardState {
         runner.resetKVCache();
         if (!runner.loadDecodeAutotuneCache()) {
             runner.autotuneDecodeDepth();
-            runner.autotuneDecodeKernels();
+            // Skip kernel autotune (may crash with new Dawn DXC)
+            // runner.autotuneDecodeKernels();
             runner.saveDecodeAutotuneCache();
         }
 
@@ -931,7 +936,7 @@ LmSession LmSession::Create(Device& device, const std::string& modelPath,
             std::string reason = gen->CheckFastDecodeSupport();
             if (reason.empty()) {
                 gen->EnableFastDecode();
-                printf("  Fast decode: enabled\n");
+                fprintf(stderr, "  Fast decode: enabled\n");
             } else {
                 fprintf(stderr, "  Fast decode: disabled — %s\n", reason.c_str());
             }
@@ -1198,6 +1203,7 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
     // Standard path
     auto* st = impl_->std_.get();
     int DEPTH = st->runner.decodePoolDepth;
+    fprintf(stderr, "  [Benchmark] standard path, DEPTH=%d, warmupDone=%d\n", DEPTH, (int)st->benchWarmupDone); fflush(stderr);
 
     if (!st->benchWarmupDone) {
         st->Reset();

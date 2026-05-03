@@ -319,5 +319,5 @@ addEventListener('resize',resize);resize();
     }
     out << html;
     out.close();
-    printf("  Profile saved to %s\n", outputPath.c_str());
+    fprintf(stderr, "  Profile saved to %s\n", outputPath.c_str());
 }

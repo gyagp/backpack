@@ -514,7 +514,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         if (fs::exists(extPath)) {
             // Map primary file
             auto extSize = fs::file_size(extPath);
-            printf("  Mapping external data: %s (%.0f MB)...\n", baseName.c_str(), extSize / 1048576.0);
+            fprintf(stderr, "  Mapping external data: %s (%.0f MB)...\n", baseName.c_str(), extSize / 1048576.0);
             fflush(stdout);
             auto& mapping = extDataMappings_[baseName];
             mapping.open(extPath);
@@ -527,7 +527,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                 std::string contPath = (dir / contName).string();
                 if (!fs::exists(contPath)) break;
                 auto contSize = fs::file_size(contPath);
-                printf("  Mapping external data: %s (%.0f MB)...\n", contName.c_str(), contSize / 1048576.0);
+                fprintf(stderr, "  Mapping external data: %s (%.0f MB)...\n", contName.c_str(), contSize / 1048576.0);
                 fflush(stdout);
                 extDataMappings_[contName].open(contPath);
             }
@@ -607,7 +607,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         }
     }
 
-    printf("  Parsed: %zu initializers, %zu nodes, %zu inputs, %zu outputs\n",
+    fprintf(stderr, "  Parsed: %zu initializers, %zu nodes, %zu inputs, %zu outputs\n",
            initTensors.size(), pbNodes.size(), graphInputs.size(), graphOutputs.size());
     fflush(stdout);
 
@@ -834,10 +834,10 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     auto warmupMs = std::chrono::duration_cast<std::chrono::milliseconds>(warmupT1 - warmupT0).count();
-    printf("  %d initializers uploaded, %d no-data, %zu pipelines warmed, %lldms\n",
+    fprintf(stderr, "  %d initializers uploaded, %d no-data, %zu pipelines warmed, %lldms\n",
            uploaded, nodata, warmedPipelines, (long long)ms);
     if (warmedPipelines > 0) {
-        printf("  Pipeline warmup: %lldms\n", (long long)warmupMs);
+        fprintf(stderr, "  Pipeline warmup: %lldms\n", (long long)warmupMs);
     }
 
     return true;

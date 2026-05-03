@@ -10,6 +10,9 @@ const TILE_N: u32 = 8u;
 const QK_K: u32 = 256u;
 const BLOCK_WORDS: u32 = 36u; // 144 bytes / 4
 
+// Shared memory: cooperative X load (256 floats = 1 K-block)
+var<workgroup> smem_x: array<f32, 256>;
+
 fn get_u8(base_word: u32, byte_off: u32) -> u32 {
     let wi = base_word + byte_off / 4u;
     let sh = (byte_off % 4u) * 8u;
@@ -30,11 +33,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_blocks = _params_[2];
     let row_stride_words = _params_[3];
 
+    let x_base = row * K;
     var acc: f32 = 0.0;
-    if (col < N) {
-        let x_base = row * K;
 
-        for (var b = 0u; b < n_blocks; b = b + 1u) {
+    for (var b = 0u; b < n_blocks; b = b + 1u) {
+        // Cooperative X load: all 256 threads load 1 float each
+        let k_start = b * QK_K;
+        let x_idx = k_start + tid;
+        smem_x[tid] = select(0.0, X[x_base + x_idx], x_idx < K);
+        workgroupBarrier();
+
+        if (col < N) {
             let block_base = col * row_stride_words + b * BLOCK_WORDS;
 
             let dd = unpack2x16float(W_Q4K[block_base]);
@@ -77,15 +86,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let hi = (sb & 1u) == 1u;
 
                 let i = lane;
-                let kidx = b * QK_K + sb * 32u + i;
-                if (kidx < K) {
-                    let qb = get_u8(block_base, 16u + g * 32u + i);
-                    let q = select(qb & 0x0Fu, (qb >> 4u) & 0x0Fu, hi);
-                    let w = sc * f32(q) - mn;
-                    acc = acc + X[x_base + kidx] * w;
-                }
+                let local_idx = sb * 32u + i;
+                let qb = get_u8(block_base, 16u + g * 32u + i);
+                let q = select(qb & 0x0Fu, (qb >> 4u) & 0x0Fu, hi);
+                let w = sc * f32(q) - mn;
+                acc += smem_x[local_idx] * w;
             }
         }
+        workgroupBarrier();
     }
 
     let sum = subgroupAdd(acc);

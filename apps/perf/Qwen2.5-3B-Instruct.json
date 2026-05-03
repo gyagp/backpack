@@ -1,0 +1,102 @@
+{
+  "benchmarks": {
+    "backpack_gguf": {
+      "format": "gguf",
+      "quantization": "Q4_K",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_ms": 825.4,
+          "prefill_tok_s": 155.1,
+          "decode_ms": 936.7,
+          "decode_tok_s": 136.6
+        }
+      ]
+    },
+    "backpack_onnx": {
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_ms": 46.6,
+          "prefill_tok_s": 2749.5,
+          "decode_ms": 1021.9,
+          "decode_tok_s": 125.3
+        },
+        {
+          "input_tokens": 256,
+          "prefill_ms": 86.2,
+          "prefill_tok_s": 2971.3,
+          "decode_ms": 1026.1,
+          "decode_tok_s": 124.7
+        },
+        {
+          "input_tokens": 512,
+          "prefill_ms": 169.7,
+          "prefill_tok_s": 3017.3,
+          "decode_ms": 1029.5,
+          "decode_tok_s": 124.3
+        },
+        {
+          "input_tokens": 1024,
+          "prefill_ms": 354.9,
+          "prefill_tok_s": 2885.6,
+          "decode_ms": 1117.1,
+          "decode_tok_s": 114.6
+        },
+        {
+          "input_tokens": 2048,
+          "prefill_ms": 771.9,
+          "prefill_tok_s": 2653.0,
+          "decode_ms": 1052.8,
+          "decode_tok_s": 121.6
+        },
+        {
+          "input_tokens": 4096,
+          "prefill_ms": 1822.0,
+          "prefill_tok_s": 2248.0,
+          "decode_ms": 1080.6,
+          "decode_tok_s": 118.5
+        }
+      ]
+    },
+    "llamacpp_vulkan": {
+      "format": "gguf",
+      "quantization": "Q4_K",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 9700.608856,
+          "decode_tok_s": 286.214857
+        },
+        {
+          "input_tokens": 256,
+          "prefill_tok_s": 11919.542879,
+          "decode_tok_s": 286.214857
+        },
+        {
+          "input_tokens": 512,
+          "prefill_tok_s": 14015.434776,
+          "decode_tok_s": 286.214857
+        }
+      ]
+    },
+    "ort_webgpu": {
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 3250.45,
+          "decode_tok_s": 140.114
+        }
+      ]
+    }
+  },
+  "timestamp": "2026-05-02T13:10:19"
+}

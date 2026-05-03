@@ -735,7 +735,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     cfg.hasQkNorm = false;
     cfg.intermediateSize = 0;  // inferred from weights
 
-    printf("ONNX Config: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u)\n",
+    fprintf(stderr, "ONNX Config: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u)\n",
            cfg.arch.c_str(), cfg.nLayer, cfg.nEmbd, cfg.headDim,
            cfg.nVocab, cfg.nKvHeads);
 
@@ -756,7 +756,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         return false;
     }
 
-    printf("  ONNX file: %llu bytes\n", (unsigned long long)onnxMap.size);
+    fprintf(stderr, "  ONNX file: %llu bytes\n", (unsigned long long)onnxMap.size);
     fflush(stdout);
 
     // Memory-map external data file if present
@@ -764,11 +764,11 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     std::string extDataPath = (fs::path(modelDir) / "model.onnx.data").string();
     if (fs::exists(extDataPath)) {
         auto extFileSize = fs::file_size(extDataPath);
-        printf("  Mapping external data: %llu bytes (%.0f MB)...\n",
+        fprintf(stderr, "  Mapping external data: %llu bytes (%.0f MB)...\n",
                (unsigned long long)extFileSize, extFileSize / 1048576.0);
         fflush(stdout);
         if (extDataMap.open(extDataPath)) {
-            printf("  External data mapped: %zu bytes\n", extDataMap.size);
+            fprintf(stderr, "  External data mapped: %zu bytes\n", extDataMap.size);
             fflush(stdout);
         }
     }
@@ -839,7 +839,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         }
     }
 
-    printf("  Parsed: %zu initializers, %zu nodes\n",
+    fprintf(stderr, "  Parsed: %zu initializers, %zu nodes\n",
            initializers.size(), nodes.size());
     fflush(stdout);
 
@@ -1205,7 +1205,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         }
     }
 
-    printf("  Extracted: %zu Q8 weights, %zu norm weights\n",
+    fprintf(stderr, "  Extracted: %zu Q8 weights, %zu norm weights\n",
            q8Weights.size(), normWeights.size());
 
     // ─── 5. Fuse Q/K/V → QKV and gate/up per layer ──────────────────────
@@ -1295,7 +1295,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         moveNorm(pfx + "k_norm.weight", ld.kNorm);
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
-            printf("  processed layer %u/%u\n", i + 1, cfg.nLayer);
+            fprintf(stderr, "  processed layer %u/%u\n", i + 1, cfg.nLayer);
     }
 
     // Final norm
@@ -1355,7 +1355,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         // Infer rotary_dim from RoPE table dimensions
         result.rotaryDim = 2 * result.ropeHalfDim;
 
-        printf("  RoPE cache: %u positions x %u half-dim (rotary_dim=%u)\n",
+        fprintf(stderr, "  RoPE cache: %u positions x %u half-dim (rotary_dim=%u)\n",
                result.ropeMaxPositions, result.ropeHalfDim, result.rotaryDim);
     }
 
@@ -1423,7 +1423,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                     : (uint32_t)(result.ropeCos.size() / bestPositions);
                 result.rotaryDim = 2 * result.ropeHalfDim;
 
-                printf("  RoPE cache (from If subgraph): %u positions x %u half-dim (rotary_dim=%u)\n",
+                fprintf(stderr, "  RoPE cache (from If subgraph): %u positions x %u half-dim (rotary_dim=%u)\n",
                        result.ropeMaxPositions, result.ropeHalfDim, result.rotaryDim);
             }
             break;
@@ -1432,9 +1432,9 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    printf("  ONNX model parsed in %lldms\n", (long long)ms);
+    fprintf(stderr, "  ONNX model parsed in %lldms\n", (long long)ms);
 
-    printf("  Model: E=%u, IM=%u, HD=%u, V=%u\n",
+    fprintf(stderr, "  Model: E=%u, IM=%u, HD=%u, V=%u\n",
            cfg.nEmbd, cfg.intermediateSize, cfg.headDim, cfg.nVocab);
 
     return true;

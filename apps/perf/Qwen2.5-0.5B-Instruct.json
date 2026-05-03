@@ -1,0 +1,39 @@
+{
+  "benchmarks": {
+    "llamacpp_vulkan": {
+      "format": "gguf",
+      "quantization": "Q4_K",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 21349.937491,
+          "decode_tok_s": 677.407288
+        },
+        {
+          "input_tokens": 256,
+          "prefill_tok_s": 34534.630711,
+          "decode_tok_s": 677.407288
+        },
+        {
+          "input_tokens": 512,
+          "prefill_tok_s": 48239.992658,
+          "decode_tok_s": 677.407288
+        }
+      ]
+    },
+    "ort_webgpu": {
+      "format": "onnx",
+      "quantization": "Q4",
+      "decode_tokens": 128,
+      "results": [
+        {
+          "input_tokens": 128,
+          "prefill_tok_s": 12491.1,
+          "decode_tok_s": 219.91
+        }
+      ]
+    }
+  },
+  "timestamp": "2026-05-02T13:08:53"
+}

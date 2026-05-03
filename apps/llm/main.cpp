@@ -115,12 +115,15 @@ int main(int argc, char* argv[]) {
     auto t1 = std::chrono::steady_clock::now();
     auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
+    fprintf(stderr, "  [main] getting config...\n"); fflush(stderr);
     auto cfg = session.GetConfig();
-    printf("\nModel: %s (%s, %dL, H=%d, V=%d)\n",
+    fprintf(stderr, "  [main] config: arch=%s format=%s layers=%d\n",
+            cfg.arch.c_str(), cfg.format.c_str(), cfg.layers); fflush(stderr);
+    fprintf(stderr, "\nModel: %s (%s, %dL, H=%d, V=%d)\n",
            cfg.arch.c_str(), cfg.format.c_str(),
            cfg.layers, cfg.hiddenSize, cfg.vocabSize);
-    printf("GPU:   %s (%s)\n", device.GetName().c_str(), device.GetBackendName().c_str());
-    printf("Ready: %lldms\n\n", (long long)loadMs);
+    fprintf(stderr, "GPU:   %s (%s)\n", device.GetName().c_str(), device.GetBackendName().c_str());
+    fprintf(stderr, "Ready: %lldms\n\n", (long long)loadMs);
 
     // Resolve baseline output path
     if (saveBaseline && baselinePath.empty()) {
@@ -136,10 +139,10 @@ int main(int argc, char* argv[]) {
         if (benchPromptLen > 0) lens.push_back(benchPromptLen);
         else lens = {128, 256, 512, 1024, 2048, 4096};
 
-        printf("=== Benchmark: %s ===\n", cfg.arch.c_str());
-        printf("%-12s %10s %10s %10s %10s\n",
+        fprintf(stderr, "=== Benchmark: %s ===\n", cfg.arch.c_str());
+        fprintf(stderr, "%-12s %10s %10s %10s %10s\n",
                "prompt_len", "prefill_ms", "pf_tok/s", "decode_ms", "dc_tok/s");
-        printf("%-12s %10s %10s %10s %10s\n",
+        fprintf(stderr, "%-12s %10s %10s %10s %10s\n",
                "----------", "----------", "--------", "---------", "--------");
 
         int genTokens = benchGenTokens > 0 ? benchGenTokens : 128;
@@ -147,18 +150,18 @@ int main(int argc, char* argv[]) {
         for (int pl : lens) {
             auto r = session.Benchmark(pl, genTokens);
             if (r.prefillMs == 0 && r.decodeTokPerSec == 0) {
-                printf("%-12d   (skipped — exceeds maxSeqLen)\n", pl);
+                fprintf(stderr, "%-12d   (skipped — exceeds maxSeqLen)\n", pl);
                 continue;
             }
-            printf("%-12d %10.1f %10.1f %10.1f %10.1f\n",
+            fprintf(stderr, "%-12d %10.1f %10.1f %10.1f %10.1f\n",
                    pl, r.prefillMs, r.prefillTokPerSec, r.decodeMs, r.decodeTokPerSec);
-            fflush(stdout);
+            fflush(stderr);
             benchResults.push_back({pl, r.prefillMs, r.prefillTokPerSec,
                                     r.decodeMs, r.decodeTokPerSec, r.ttftMs});
         }
 
         if (profile) {
-            printf("\n=== GPU Hardware Timestamp Profile ===\n");
+            fprintf(stderr, "\n=== GPU Hardware Timestamp Profile ===\n");
             std::string htmlPath = "profile.html";
             session.PrintProfileReport(htmlPath);
         }
@@ -180,7 +183,7 @@ int main(int argc, char* argv[]) {
                 &loadInfo, &memInfo);
         }
 
-        printf("\n");
+        fprintf(stderr, "\n");
         return 0;
     }
 
@@ -189,19 +192,19 @@ int main(int argc, char* argv[]) {
     bool chat = !chatMessage.empty();
     if (chat) {
         finalPrompt = app::applyChatTemplate(chatMessage, cfg.arch);
-        printf("Chat: %s\n", chatMessage.c_str());
+        fprintf(stderr, "Chat: %s\n", chatMessage.c_str());
     } else {
         finalPrompt = prompt;
     }
 
     auto promptTokens = session.Tokenize(finalPrompt);
-    printf("Prompt: %zu tokens\n", promptTokens.size());
+    fprintf(stderr, "Prompt: %zu tokens\n", promptTokens.size());
     if (temperature > 0)
-        printf("Sampling: temperature=%.2f, top_k=%d, seed=%llu\n",
+        fprintf(stderr, "Sampling: temperature=%.2f, top_k=%d, seed=%llu\n",
                temperature, topK, (unsigned long long)samplerSeed);
-    printf("\n--- Output ---\n");
-    if (!chat) printf("%s", finalPrompt.c_str());
-    fflush(stdout);
+    fprintf(stderr, "\n--- Output ---\n");
+    if (!chat) fprintf(stderr, "%s", finalPrompt.c_str());
+    fflush(stderr);
 
     bp::SamplingParams sp{temperature, topK, samplerSeed};
     auto genStart = std::chrono::steady_clock::now();
@@ -209,7 +212,7 @@ int main(int argc, char* argv[]) {
 
     session.Generate(finalPrompt, maxTokens, sp,
         [&](const std::string& text) {
-            printf("%s", text.c_str()); fflush(stdout);
+            fprintf(stderr, "%s", text.c_str()); fflush(stderr);
             tokenCount++;
             return true;
         });
@@ -218,8 +221,8 @@ int main(int argc, char* argv[]) {
         std::chrono::steady_clock::now() - genStart).count();
     double tps = tokenCount > 0 ? tokenCount * 1000.0 / genMs : 0;
 
-    printf("\n\n--- Performance ---\n");
-    printf("  Prompt:   %zu tokens\n", promptTokens.size());
-    printf("  Generate: %d tokens in %.0fms (%.1f tok/s)\n", tokenCount, genMs, tps);
+    fprintf(stderr, "\n\n--- Performance ---\n");
+    fprintf(stderr, "  Prompt:   %zu tokens\n", promptTokens.size());
+    fprintf(stderr, "  Generate: %d tokens in %.0fms (%.1f tok/s)\n", tokenCount, genMs, tps);
     return 0;
 }
