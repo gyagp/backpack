@@ -7805,6 +7805,8 @@ const TILE_N: u32 = 8u;
 const QK_K: u32 = 256u;
 const BLOCK_WORDS: u32 = 36u; // 144 bytes / 4
 
+var<workgroup> smem_x: array<f32, 256>;
+
 fn get_u8(base_word: u32, byte_off: u32) -> u32 {
     let wi = base_word + byte_off / 4u;
     let sh = (byte_off % 4u) * 8u;
@@ -7825,11 +7827,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_blocks = _params_[2];
     let row_stride_words = _params_[3];
 
+    let x_base = row * K;
     var acc: f32 = 0.0;
-    if (col < N) {
-        let x_base = row * K;
 
-        for (var b = 0u; b < n_blocks; b = b + 1u) {
+    for (var b = 0u; b < n_blocks; b = b + 1u) {
+        // Cooperative X load: all 256 threads load 1 float each
+        let x_idx = b * QK_K + tid;
+        smem_x[tid] = select(0.0, X[x_base + x_idx], x_idx < K);
+        workgroupBarrier();
+
+        if (col < N) {
             let block_base = col * row_stride_words + b * BLOCK_WORDS;
 
             let dd = unpack2x16float(W_Q4K[block_base]);
@@ -7872,15 +7879,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let hi = (sb & 1u) == 1u;
 
                 let i = lane;
-                let kidx = b * QK_K + sb * 32u + i;
-                if (kidx < K) {
-                    let qb = get_u8(block_base, 16u + g * 32u + i);
-                    let q = select(qb & 0x0Fu, (qb >> 4u) & 0x0Fu, hi);
-                    let w = sc * f32(q) - mn;
-                    acc = acc + X[x_base + kidx] * w;
-                }
+                let local_idx = sb * 32u + i;
+                let qb = get_u8(block_base, 16u + g * 32u + i);
+                let q = select(qb & 0x0Fu, (qb >> 4u) & 0x0Fu, hi);
+                let w = sc * f32(q) - mn;
+                acc = acc + smem_x[local_idx] * w;
             }
         }
+        workgroupBarrier();
     }
 
     let sum = subgroupAdd(acc);
@@ -8008,6 +8014,8 @@ enable subgroups;
 const TILE_N: u32 = 8u;
 const QK_K: u32 = 256u;
 
+var<workgroup> smem_x: array<f32, 256>;
+
 fn get_u8(base_word: u32, byte_off: u32) -> u32 {
     let wi = base_word + byte_off / 4u;
     let sh = (byte_off % 4u) * 8u;
@@ -8033,47 +8041,41 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_blocks = _params_[2];
     let row_stride_words = _params_[3];
 
+    let x_base = row * K;
     var acc: f32 = 0.0;
-    if (col < N) {
-        let x_base = row * K;
 
-        for (var b = 0u; b < n_blocks; b = b + 1u) {
+    for (var b = 0u; b < n_blocks; b = b + 1u) {
+        // Cooperative X load: all 256 threads load 1 float each
+        let x_idx = b * QK_K + tid;
+        smem_x[tid] = select(0.0, X[x_base + x_idx], x_idx < K);
+        workgroupBarrier();
+
+        if (col < N) {
             let block_base = col * row_stride_words + b * row_stride_words / n_blocks;
-
-            // Q6_K block layout (210 bytes):
-            //   [0:2]     = fp16 d (super-block scale)
-            //   [2:130]   = ql: 128 bytes, low 4 bits of 256 quants
-            //   [130:194] = qh: 64 bytes, high 2 bits of 256 quants
-            //   [194:210] = scales: 16 int8 sub-block scales
 
             let d_u16 = W_Q6K[block_base] & 0xFFFFu;
             let d = unpack2x16float(d_u16).x;
 
             for (var sb = 0u; sb < 8u; sb = sb + 1u) {
                 let i = lane;
-                let kidx = b * QK_K + sb * 32u + i;
-                if (kidx < K) {
-                    // ql: 4 low bits, packed as nibbles
-                    let ql_idx = sb * 32u + i;
-                    let ql_byte = get_u8(block_base, 2u + ql_idx / 2u);
-                    let ql = select(ql_byte & 0x0Fu, (ql_byte >> 4u) & 0x0Fu, (ql_idx & 1u) == 1u);
+                let local_idx = sb * 32u + i;
 
-                    // qh: 2 high bits
-                    let qh_byte = get_u8(block_base, 130u + (sb * 32u + i) / 4u);
-                    let qh_shift = ((sb * 32u + i) % 4u) * 2u;
-                    let qh = (qh_byte >> qh_shift) & 0x03u;
+                let ql_idx = sb * 32u + i;
+                let ql_byte = get_u8(block_base, 2u + ql_idx / 2u);
+                let ql = select(ql_byte & 0x0Fu, (ql_byte >> 4u) & 0x0Fu, (ql_idx & 1u) == 1u);
 
-                    // Combine: 6-bit value = ql | (qh << 4), range [0, 63], bias by -32
-                    let q6 = i32(ql | (qh << 4u)) - 32;
+                let qh_byte = get_u8(block_base, 130u + (sb * 32u + i) / 4u);
+                let qh_shift = ((sb * 32u + i) % 4u) * 2u;
+                let qh = (qh_byte >> qh_shift) & 0x03u;
 
-                    // Per-sub-block scale (int8)
-                    let sc = f32(get_i8(block_base, 194u + sb));
+                let q6 = i32(ql | (qh << 4u)) - 32;
+                let sc = f32(get_i8(block_base, 194u + sb));
 
-                    let w = d * sc * f32(q6);
-                    acc = acc + X[x_base + kidx] * w;
-                }
+                let w = d * sc * f32(q6);
+                acc = acc + smem_x[local_idx] * w;
             }
         }
+        workgroupBarrier();
     }
 
     let sum = subgroupAdd(acc);
