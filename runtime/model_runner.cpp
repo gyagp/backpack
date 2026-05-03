@@ -891,7 +891,7 @@ void ModelRunner::buildDecodePipeline() {
     tuning.decodeUseFastGateup = decodeFastQ8Eligible;
     tuning.decodeUseFastOproj = false;
     tuning.decodeUseWideFp16 = decodeWideFp16Eligible;
-    decodeFastVariantsAvailable = decodeFastQ8Eligible;
+    decodeFastVariantsAvailable = decodeFastQ8Eligible && !useKQ;
 
     // Kernel selection per projection:
     auto& plQkv = tuning.decodeUseFastQkv ? plQ8Fast : plQ8Matmul;

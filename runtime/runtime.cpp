@@ -229,13 +229,20 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Warmup: %lldms (shader compilation)\n", (long long)warmupMs);
     }
 
+    fprintf(stderr, "  [autotune] loading cache...\n"); fflush(stderr);
     if (!model.loadDecodeAutotuneCache()) {
+        fprintf(stderr, "  [autotune] no cache, running autotune...\n"); fflush(stderr);
         model.autotuneDecodeDepth();
-        // Skip kernel autotune for now (may crash with new Dawn)
-        // model.autotuneDecodeKernels();
+        model.autotuneDecodeKernels();
+        fprintf(stderr, "  [autotune] saving cache...\n"); fflush(stderr);
         model.saveDecodeAutotuneCache();
+        fprintf(stderr, "  [autotune] cache saved\n"); fflush(stderr);
+    } else {
+        fprintf(stderr, "  [autotune] loaded from cache\n"); fflush(stderr);
     }
+    fprintf(stderr, "  [autotune] printing tuning...\n"); fflush(stderr);
     model.printActiveDecodeTuning();
+    fprintf(stderr, "  [main] autotune complete, entering main loop...\n"); fflush(stderr);
 
     if (profile && model.profiler) {
         model.profiler->nextIndex = 0;

@@ -823,8 +823,7 @@ struct StandardState {
         runner.resetKVCache();
         if (!runner.loadDecodeAutotuneCache()) {
             runner.autotuneDecodeDepth();
-            // Skip kernel autotune (may crash with new Dawn DXC)
-            // runner.autotuneDecodeKernels();
+            runner.autotuneDecodeKernels();
             runner.saveDecodeAutotuneCache();
         }
 
