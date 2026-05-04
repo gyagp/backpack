@@ -796,6 +796,8 @@ struct StandardState {
     std::string format;
     uint32_t pos = 0;
     bool benchWarmupDone = false;
+    int pipelineInFlight = 0;
+    uint32_t pipelineNextSubmitPos = 0;
 
     std::string arch, gpuName, backendName;
     uint32_t nLayer=0, nHead=0, nKvHeads=0, nEmbd=0, headDim=0, nVocab=0;
@@ -857,9 +859,24 @@ struct StandardState {
     }
 
     int32_t DecodePipelined() {
-        int slot = pos % runner.decodePoolDepth;
-        runner.submitDecode(pos, slot);
-        int32_t tok = runner.readArgmax(slot);
+        int depth = runner.decodePoolDepth;
+
+        if (pipelineInFlight == 0) {
+            for (int i = 0; i < depth; i++) {
+                runner.submitDecode(pos + i, i);
+            }
+            pipelineInFlight = depth;
+            pipelineNextSubmitPos = pos + depth;
+        }
+
+        int readSlot = pos % depth;
+        int32_t tok = runner.readArgmax(readSlot);
+        pipelineInFlight--;
+
+        runner.submitDecode(pipelineNextSubmitPos, readSlot);
+        pipelineNextSubmitPos++;
+        pipelineInFlight++;
+
         pos++;
         return tok;
     }
@@ -870,7 +887,7 @@ struct StandardState {
         return logits;
     }
 
-    void Reset() { runner.resetKVCache(); pos = 0; }
+    void Reset() { runner.resetKVCache(); pos = 0; pipelineInFlight = 0; pipelineNextSubmitPos = 0; }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

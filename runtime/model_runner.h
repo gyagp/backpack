@@ -39,6 +39,12 @@ struct ModelRunner {
     std::vector<Dispatch> allDecodeDispatches;
     std::vector<Dispatch> autoDecodeDispatches;  // embed_gather + all + argmax
 
+    // Indices into autoDecodeDispatches that reference dynamic param buffers
+    // (used to clone per-slot bind groups).
+    std::vector<int> ropeDispatchIndices;   // fused_rope per layer
+    std::vector<int> attnP1DispatchIndices; // gqa_chunked_pass1 per layer
+    std::vector<int> attnP2DispatchIndices; // gqa_chunked_pass2 per layer
+
     // Shared argmax result buffer
     GPUBuffer argmaxResultBuf;
 
@@ -53,6 +59,12 @@ struct ModelRunner {
         // nGroups CBs. cbPool[tokenIdx * nGroups + groupIdx] is one CB.
         std::vector<WGPUCommandBuffer> cbPool;
         int cbIdx = 0;  // index of next token's first CB
+        // Per-slot param buffers — allow writing next token's params
+        // while GPU still reads current token's params.
+        GPUBuffer ropeParamsBuf, attnParamsBuf;
+        // Per-slot dispatch list (cloned from autoDecodeDispatches with
+        // per-slot bind groups for param-referencing dispatches).
+        std::vector<Dispatch> dispatches;
     };
     std::vector<PoolSlot> pool;
     int nGroups = 1;  // number of CB groups per token (1 = single submit)
@@ -180,6 +192,7 @@ struct ModelRunner {
 
     void uploadEmbedding(int32_t tokenId);
     void updateDecodeParams(uint32_t pos, uint32_t cacheLen);
+    void prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot);
     void resetKVCache();
     void refillCBPool(int slot);
     void autotuneDecodeDepth();

@@ -1,11 +1,12 @@
 # Autopo test Session
 
 ## Work Unit
-Consolidate GPUContext::submitDispatches() to use single compute pass — currently creates one pass per dispatch, should batch like flushToEncoder does
+Update DecodePipelined() in lm_session to use full pipeline depth instead of depth-1 submit+read pattern
 
 ## Acceptance Criteria
-- submitDispatches() uses a single compute pass for all dispatches when not profiling
-- Profiling mode still uses per-dispatch passes for timestamp writes
+- DecodePipelined() maintains a rolling window of in-flight tokens up to decodePoolDepth
+- First N calls prime the pipeline, subsequent calls read oldest then submit next
+- Token output order is preserved correctly
 - Build succeeds
 
 ## Rules

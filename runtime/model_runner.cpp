@@ -1072,6 +1072,9 @@ void ModelRunner::buildDecodePipeline() {
     allDecodeDispatches.reserve(cfg.nLayer * 11 + 2);
     decodeDispatchIndices.assign(cfg.nLayer, {});
     decodeVariantBGs.assign(cfg.nLayer, {});
+    ropeDispatchIndices.resize(cfg.nLayer);
+    attnP1DispatchIndices.resize(cfg.nLayer);
+    attnP2DispatchIndices.resize(cfg.nLayer);
 
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         auto& lw = layerWeights[i];
@@ -1114,6 +1117,7 @@ void ModelRunner::buildDecodePipeline() {
                 {4, ropeCosBuf}, {5, ropeSinBuf},
                 {6, lw.qNorm}, {7, lw.kNorm},
                 {8, fusedRopeParamsBuf}});
+            ropeDispatchIndices[i] = (int)allDecodeDispatches.size();
             allDecodeDispatches.push_back({plFusedRope.pipeline, bg,
                 cfg.nHead + cfg.nKvHeads, 1, 1, L+"fused_rope"});
         }
@@ -1122,6 +1126,7 @@ void ModelRunner::buildDecodePipeline() {
             auto bg = makeBG(plChunkP1, {
                 {0, qRotBuf}, {1, kvCache[i].K}, {2, kvCache[i].V},
                 {3, attnPartialsBuf}, {4, chunkedAttnParamsBuf}});
+            attnP1DispatchIndices[i] = (int)allDecodeDispatches.size();
             allDecodeDispatches.push_back({plChunkP1.pipeline, bg,
                 cfg.nHead, maxChunks, 1, L+"attn_p1"});
         }
@@ -1130,6 +1135,7 @@ void ModelRunner::buildDecodePipeline() {
             auto bg = makeBG(plChunkP2, {
                 {0, attnPartialsBuf}, {1, attnOutBuf},
                 {2, chunkedAttnParamsBuf}});
+            attnP2DispatchIndices[i] = (int)allDecodeDispatches.size();
             allDecodeDispatches.push_back({plChunkP2.pipeline, bg,
                 cfg.nHead, 1, 1, L+"attn_p2"});
         }
@@ -1312,12 +1318,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ─── Create staging pool ──────────────────────────────────────────────
     pool.resize(decodePoolCapacity);
     for (int s = 0; s < decodePoolCapacity; s++) {
+        auto& ps = pool[s];
         WGPUBufferDescriptor bd{};
         bd.usage = BUF_MAP_READ | BUF_COPY_DST;
         bd.size = 4;
         char label[32]; snprintf(label, 32, "staging_%d", s);
         bd.label = {label, (uint32_t)strlen(label)};
-        pool[s].stagingBuf = wgpuDeviceCreateBuffer(gpu->device, &bd);
+        ps.stagingBuf = wgpuDeviceCreateBuffer(gpu->device, &bd);
+
+        // Per-slot param buffers
+        char rl[32]; snprintf(rl, 32, "p_frope_%d", s);
+        ps.ropeParamsBuf = gpu->createBuffer(std::string(rl), 32);
+        gpu->writeBuffer(ps.ropeParamsBuf, ropeParamData.data(), 32);
+        char al[32]; snprintf(al, 32, "p_cattn_%d", s);
+        ps.attnParamsBuf = gpu->createBuffer(std::string(al), 32);
+        gpu->writeBuffer(ps.attnParamsBuf, chunkedAttnParamData.data(), 32);
+
+        // Clone autoDecodeDispatches with per-slot bind groups for
+        // dispatches that reference dynamic param buffers.
+        ps.dispatches = autoDecodeDispatches;
+        for (uint32_t layer = 0; layer < cfg.nLayer; layer++) {
+            // +1 offset: autoDecodeDispatches[0] is embed_gather
+            int ropeIdx = ropeDispatchIndices[layer] + 1;
+            int p1Idx   = attnP1DispatchIndices[layer] + 1;
+            int p2Idx   = attnP2DispatchIndices[layer] + 1;
+
+            ps.dispatches[ropeIdx].bindGroup = makeBG(plFusedRope, {
+                {0, qkvBuf}, {1, qRotBuf},
+                {2, kvCache[layer].K}, {3, kvCache[layer].V},
+                {4, ropeCosBuf}, {5, ropeSinBuf},
+                {6, layerWeights[layer].qNorm}, {7, layerWeights[layer].kNorm},
+                {8, ps.ropeParamsBuf}});
+
+            ps.dispatches[p1Idx].bindGroup = makeBG(plChunkP1, {
+                {0, qRotBuf}, {1, kvCache[layer].K}, {2, kvCache[layer].V},
+                {3, attnPartialsBuf}, {4, ps.attnParamsBuf}});
+
+            ps.dispatches[p2Idx].bindGroup = makeBG(plChunkP2, {
+                {0, attnPartialsBuf}, {1, attnOutBuf},
+                {2, ps.attnParamsBuf}});
+        }
+
         refillCBPool(s);
     }
     fprintf(stderr, "  Pool: %d slots × %d pre-recorded CBs\n",
@@ -1620,8 +1661,9 @@ void ModelRunner::refillCBPool(int slot) {
     ps.cbPool.resize(totalCBs);
     ps.cbIdx = 0;
 
-    // Compute group boundaries: split autoDecodeDispatches into nGroups chunks
-    int total = (int)autoDecodeDispatches.size();
+    // Compute group boundaries: split per-slot dispatches into nGroups chunks
+    auto& dispatches = ps.dispatches;
+    int total = (int)dispatches.size();
     std::vector<int> groupStart(nGroups + 1);
     for (int g = 0; g <= nGroups; g++)
         groupStart[g] = g * total / nGroups;
@@ -1632,7 +1674,7 @@ void ModelRunner::refillCBPool(int slot) {
 
         if (passPerDispatch) {
             for (int d = gBegin; d < gEnd; d++) {
-                auto& di = autoDecodeDispatches[d];
+                auto& di = dispatches[d];
                 WGPUComputePassDescriptor cpD{};
                 auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
                 wgpuComputePassEncoderSetPipeline(pass, di.pipeline);
@@ -1645,7 +1687,7 @@ void ModelRunner::refillCBPool(int slot) {
             WGPUComputePassDescriptor cpD{};
             auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
             for (int d = gBegin; d < gEnd; d++) {
-                auto& di = autoDecodeDispatches[d];
+                auto& di = dispatches[d];
                 wgpuComputePassEncoderSetPipeline(pass, di.pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, di.bindGroup, 0, nullptr);
                 wgpuComputePassEncoderDispatchWorkgroups(pass, di.gx, di.gy, di.gz);
@@ -1767,8 +1809,21 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
         }
     }
 
-    for (int s = 0; s < decodePoolDepth; s++)
+    for (int s = 0; s < decodePoolDepth; s++) {
+        auto& ps = pool[s];
+        if (!ps.dispatches.empty()) {
+            for (uint32_t i = 0; i < cfg.nLayer; i++) {
+                auto& di = decodeDispatchIndices[i];
+                if (di.qkv >= 0)
+                    ps.dispatches[di.qkv + 1] = autoDecodeDispatches[di.qkv + 1];
+                if (di.oproj >= 0)
+                    ps.dispatches[di.oproj + 1] = autoDecodeDispatches[di.oproj + 1];
+                if (di.gateup >= 0)
+                    ps.dispatches[di.gateup + 1] = autoDecodeDispatches[di.gateup + 1];
+            }
+        }
         refillCBPool(s);
+    }
 }
 
 void ModelRunner::autotuneDecodeKernels() {
@@ -1962,6 +2017,15 @@ void ModelRunner::destroy() {
             wgpuBufferRelease(slot.stagingBuf);
             slot.stagingBuf = nullptr;
         }
+        if (slot.ropeParamsBuf.handle) {
+            wgpuBufferRelease(slot.ropeParamsBuf.handle);
+            slot.ropeParamsBuf.handle = nullptr;
+        }
+        if (slot.attnParamsBuf.handle) {
+            wgpuBufferRelease(slot.attnParamsBuf.handle);
+            slot.attnParamsBuf.handle = nullptr;
+        }
+        slot.dispatches.clear();
     }
     pool.clear();
 
@@ -1992,6 +2056,25 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
     cp[2] = T_total;
     cp[4] = n_chunks;
     gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
+}
+
+void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot) {
+    auto& ps = pool[slot];
+
+    uint8_t localRope[32], localAttn[32];
+    memcpy(localRope, ropeParamData.data(), 32);
+    auto* p = reinterpret_cast<int32_t*>(localRope);
+    p[3] = pos;
+    p[5] = cacheLen * cfg.nKvHeads * cfg.headDim;
+    gpu->writeBuffer(ps.ropeParamsBuf, localRope, 32);
+
+    uint32_t T_total = cacheLen + 1;
+    uint32_t n_chunks = (T_total + gqaChunkSize - 1) / gqaChunkSize;
+    memcpy(localAttn, chunkedAttnParamData.data(), 32);
+    auto* cp = reinterpret_cast<uint32_t*>(localAttn);
+    cp[2] = T_total;
+    cp[4] = n_chunks;
+    gpu->writeBuffer(ps.attnParamsBuf, localAttn, 32);
 }
 
 std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
@@ -2038,7 +2121,7 @@ int32_t ModelRunner::decodeArgmax(int32_t tokenId, uint32_t posOffset) {
 void ModelRunner::submitDecode(uint32_t posOffset, int slot) {
     auto& ps = pool[slot];
     uint32_t cacheLen = kvCache[0].len;
-    updateDecodeParams(posOffset, cacheLen);
+    prepareDecodeParams(posOffset, cacheLen, slot);
 
     // Refill pool if exhausted
     if (ps.cbIdx >= (int)ps.cbPool.size())
