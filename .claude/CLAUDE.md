@@ -1,4 +1,4 @@
-# Autopo review Session
+# Autopo test Session
 
 ## Work Unit
 Create packed fp16 MatMul kernel (B as array<u32> with unpack2x16float) based on existing matmul.wgsl template
