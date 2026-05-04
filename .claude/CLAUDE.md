@@ -1,12 +1,12 @@
 # Autopo test Session
 
 ## Work Unit
-Update DecodePipelined() in lm_session to use full pipeline depth instead of depth-1 submit+read pattern
+Update autotune cache key and format to include depth range up to 8, invalidate old caches
 
 ## Acceptance Criteria
-- DecodePipelined() maintains a rolling window of in-flight tokens up to decodePoolDepth
-- First N calls prime the pipeline, subsequent calls read oldest then submit next
-- Token output order is preserved correctly
+- Cache key includes new pool_cap=8 so old depth<=4 caches don't match
+- saveDecodeAutotuneCache writes depth values up to 8
+- loadDecodeAutotuneCache validates depth <= decodePoolCapacity (8)
 - Build succeeds
 
 ## Rules
