@@ -1,13 +1,12 @@
-# Autopo test Session
+# Autopo execute Session
 
 ## Work Unit
-Update MatMul op dispatch in runtime/ops/matmul.cpp to route fp16 weights to packed u32 kernel instead of f32 fallback
+Extend Gemm op to use fp16_gemm packed path for non-transB cases or when subgroups unavailable
 
 ## Acceptance Criteria
-- When A=f32 and B=fp16, dispatch uses matmul_fp16_packed kernel (not f32 conversion)
-- Packed path used on D3D12 regardless of shader f16 support
-- Native f16 path still used when available and preferred
-- Code compiles cleanly
+- Gemm with fp16 B weights uses packed u32 path even without subgroup support
+- Non-transB Gemm with fp16 weights avoids f32 conversion where possible
+- Fallback to f32 only when truly necessary
 
 ## Rules
 # Rules
