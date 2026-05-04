@@ -1,12 +1,11 @@
 # Autopo test Session
 
 ## Work Unit
-Raise decodePoolCapacity upper bound from 4/6 to 8 and allocate staging buffers accordingly
+Consolidate GPUContext::submitDispatches() to use single compute pass — currently creates one pass per dispatch, should batch like flushToEncoder does
 
 ## Acceptance Criteria
-- chooseDecodePoolDepth returns up to 8 for both D3D12 and Vulkan
-- decodePoolCapacity=8 staging buffers are created in buildDecodePipeline
-- autotuneDecodeDepth explores depths 2..8 instead of 2..4
+- submitDispatches() uses a single compute pass for all dispatches when not profiling
+- Profiling mode still uses per-dispatch passes for timestamp writes
 - Build succeeds
 
 ## Rules

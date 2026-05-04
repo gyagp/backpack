@@ -690,15 +690,15 @@ void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
     WGPUCommandEncoderDescriptor enD{};
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
+    WGPUComputePassDescriptor cpD{};
+    auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
     for (auto& d : dispatches) {
-        WGPUComputePassDescriptor cpD{};
-        auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
         wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
-        wgpuComputePassEncoderEnd(pass);
-        wgpuComputePassEncoderRelease(pass);
     }
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
