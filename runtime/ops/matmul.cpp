@@ -366,6 +366,17 @@ static void opMatMul(OpContext& ex, const OnnxGraphNode& n,
         return;
     }
 
+    // Packed fp16 path: reads fp16 weights as array<u32> with unpack2x16float.
+    // Works on D3D12 without shader f16 support. N must be even for correct u32 packing.
+    if (A->dtype == TensorDtype::Float32 && B->dtype == TensorDtype::Float16 && (N_out % 2) == 0) {
+        auto& pl = ex.GetPipelineT("matmul_fp16_packed_nt", 4, []() { return std::string(WGSL_MATMUL_FP16_PACKED_NT); });
+        auto bg = ex.MakeBindGroup(pl, {
+            {0, A->buffer}, {1, B->buffer}, {2, out[0]->buffer}, {3, paramBuf}});
+        ex.QueueDispatch(pl.pipeline, bg,
+            (uint32_t)((N_out + 15) / 16), (uint32_t)((M + 15) / 16), 1, "matmul_fp16_packed_nt");
+        return;
+    }
+
     // Ensure both inputs are f32 for the basic kernel
     if (A->dtype == TensorDtype::Float16) {
         ensureTensorFloat32(ex, *A, n.inputs.empty() ? std::string() : n.inputs[0]);

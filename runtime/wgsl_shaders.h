@@ -3836,6 +3836,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// [matmul] matmul_fp16_packed_nt — non-transposed B, reads fp16 as packed u32
+static const char* WGSL_MATMUL_FP16_PACKED_NT = R"WGSL(
+// MatMul — fp32 activations by fp16 weights (non-transposed)
+// C[m,n] = sum_k A[m,k] * B[k,n]
+// B is stored as array<u32> where each u32 holds two adjacent fp16 values along N.
+
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let M = _params_[0];
+    let N = _params_[1];
+    let K = _params_[2];
+    let row = gid.y;
+    let col = gid.x;
+    if (row >= M || col >= N) { return; }
+    let half_N = (N + 1u) / 2u;
+    var acc: f32 = 0.0;
+    for (var k = 0u; k < K; k++) {
+        let idx = k * half_N + col / 2u;
+        let pair = unpack2x16float(B[idx]);
+        let w = select(pair.x, pair.y, (col & 1u) == 1u);
+        acc += A[row * K + k] * w;
+    }
+    C[row * N + col] = acc;
+}
+)WGSL";
+
 // [matmul] matmul_fp16_packed
 static const char* WGSL_MATMUL_FP16_PACKED = R"WGSL(
 enable subgroups;
@@ -13028,6 +13059,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"layer_norm", {WGSL_LAYER_NORM, 5, false}},
         {"matmul_f32", {WGSL_MATMUL, 4, false}},
         {"matmul_fp16_packed", {WGSL_MATMUL_FP16_PACKED, 5, false}},
+        {"matmul_fp16_packed_nt", {WGSL_MATMUL_FP16_PACKED_NT, 4, false}},
         {"matmul_q4", {WGSL_MATMUL_Q4, 5, false}},
         {"matmul_q4_indirect", {WGSL_MATMUL_Q4_INDIRECT, 6, false}},
         {"matmul_q4_indirect_sub", {WGSL_MATMUL_Q4_INDIRECT_SUB, 6, false}},

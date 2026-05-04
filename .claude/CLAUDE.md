@@ -1,13 +1,13 @@
 # Autopo test Session
 
 ## Work Unit
-Create gemm_fp16_packed.wgsl kernel: array<u32> weights with unpack2x16float for Gemm (Y=A*B^T+Bias)
+Update MatMul op dispatch in runtime/ops/matmul.cpp to route fp16 weights to packed u32 kernel instead of f32 fallback
 
 ## Acceptance Criteria
-- New kernel file runtime/kernels/matmul/gemm_fp16_packed.wgsl exists or inline shader in wgsl_shaders.h added
-- B weights stored as array<u32>, unpacked via unpack2x16float
-- Supports transB=1 and optional bias addition
-- Activations and output remain f32
+- When A=f32 and B=fp16, dispatch uses matmul_fp16_packed kernel (not f32 conversion)
+- Packed path used on D3D12 regardless of shader f16 support
+- Native f16 path still used when available and preferred
+- Code compiles cleanly
 
 ## Rules
 # Rules
