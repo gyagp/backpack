@@ -61,6 +61,7 @@ struct BenchmarkResult {
     double decodeMs = 0;
     double decodeTokPerSec = 0;
     double ttftMs = 0;            ///< Time to first token
+    double fenceWaitMs = 0;       ///< Time blocked waiting for GPU fences
 };
 
 /// Callback for streaming token output. Return false to stop generation.

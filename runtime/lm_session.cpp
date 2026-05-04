@@ -1242,6 +1242,7 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
     result.prefillTokPerSec = promptLen * 1000.0 / result.prefillMs;
 
     st->gpu->writeBuffer(st->runner.argmaxResultBuf, &first, 4);
+    st->gpu->timing.wait_ns = 0;
     auto t2 = std::chrono::steady_clock::now();
     int sub = 0, comp = 0;
     for (int i = 0; i < std::min(DEPTH, genTokens); i++) {
@@ -1259,6 +1260,7 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
     auto t3 = std::chrono::steady_clock::now();
     result.decodeMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
     result.decodeTokPerSec = comp * 1000.0 / result.decodeMs;
+    result.fenceWaitMs = st->gpu->timing.wait_ns / 1e6;
 
     st->Reset();
     return result;

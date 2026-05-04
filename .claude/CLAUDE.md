@@ -1,12 +1,11 @@
 # Autopo test Session
 
 ## Work Unit
-Update autotune cache key and format to include depth range up to 8, invalidate old caches
+Add fence-wait-time instrumentation to measure time spent in completeAsyncMapI32/waitForQueue
 
 ## Acceptance Criteria
-- Cache key includes new pool_cap=8 so old depth<=4 caches don't match
-- saveDecodeAutotuneCache writes depth values up to 8
-- loadDecodeAutotuneCache validates depth <= decodePoolCapacity (8)
+- readArgmax records time spent blocking in completeAsyncMapI32
+- Cumulative fence wait time is reported in benchmark output (ms total and % of decode time)
 - Build succeeds
 
 ## Rules

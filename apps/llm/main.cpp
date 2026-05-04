@@ -140,10 +140,10 @@ int main(int argc, char* argv[]) {
         else lens = {128, 256, 512, 1024, 2048, 4096};
 
         fprintf(stderr, "=== Benchmark: %s ===\n", cfg.arch.c_str());
-        fprintf(stderr, "%-12s %10s %10s %10s %10s\n",
-               "prompt_len", "prefill_ms", "pf_tok/s", "decode_ms", "dc_tok/s");
-        fprintf(stderr, "%-12s %10s %10s %10s %10s\n",
-               "----------", "----------", "--------", "---------", "--------");
+        fprintf(stderr, "%-12s %10s %10s %10s %10s %12s %8s\n",
+               "prompt_len", "prefill_ms", "pf_tok/s", "decode_ms", "dc_tok/s", "fence_ms", "fence%");
+        fprintf(stderr, "%-12s %10s %10s %10s %10s %12s %8s\n",
+               "----------", "----------", "--------", "---------", "--------", "--------", "------");
 
         int genTokens = benchGenTokens > 0 ? benchGenTokens : 128;
 
@@ -153,8 +153,10 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "%-12d   (skipped — exceeds maxSeqLen)\n", pl);
                 continue;
             }
-            fprintf(stderr, "%-12d %10.1f %10.1f %10.1f %10.1f\n",
-                   pl, r.prefillMs, r.prefillTokPerSec, r.decodeMs, r.decodeTokPerSec);
+            double fencePct = r.decodeMs > 0 ? 100.0 * r.fenceWaitMs / r.decodeMs : 0;
+            fprintf(stderr, "%-12d %10.1f %10.1f %10.1f %10.1f %12.1f %7.1f%%\n",
+                   pl, r.prefillMs, r.prefillTokPerSec, r.decodeMs, r.decodeTokPerSec,
+                   r.fenceWaitMs, fencePct);
             fflush(stderr);
             benchResults.push_back({pl, r.prefillMs, r.prefillTokPerSec,
                                     r.decodeMs, r.decodeTokPerSec, r.ttftMs});
