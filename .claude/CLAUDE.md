@@ -1,13 +1,13 @@
 # Autopo test Session
 
 ## Work Unit
-Create packed fp16 MatMul kernel (B as array<u32> with unpack2x16float) based on existing matmul.wgsl template
+Create gemm_fp16_packed.wgsl kernel: array<u32> weights with unpack2x16float for Gemm (Y=A*B^T+Bias)
 
 ## Acceptance Criteria
-- runtime/kernels/matmul/matmul_fp16_packed.wgsl exists
-- Kernel reads B weights from array<u32> and unpacks via unpack2x16float()
-- Kernel handles both aligned (K%2==0) and edge cases
-- Kernel is registered in wgsl_shaders.h shader registry
+- New kernel file runtime/kernels/matmul/gemm_fp16_packed.wgsl exists or inline shader in wgsl_shaders.h added
+- B weights stored as array<u32>, unpacked via unpack2x16float
+- Supports transB=1 and optional bias addition
+- Activations and output remain f32
 
 ## Rules
 # Rules

@@ -13011,6 +13011,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"gather_elements", {WGSL_GATHER_ELEMENTS, 4, false}},
         {"gelu_mul", {WGSL_GELU_MUL, 4, false}},
         {"gemm", {WGSL_GEMM, 5, false}},
+        {"gemm_fp16_packed", {WGSL_GEMM_FP16_PACKED, 5, false}},
         {"gptoss_gate", {WGSL_GPTOSS_GATE, 3, false}},
         {"gptoss_gate_batched", {WGSL_GPTOSS_GATE_BATCHED, 3, false}},
         {"gqa_chunked_pass1", {WGSL_GQA_CHUNKED_PASS1, 5, false}},
