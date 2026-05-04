@@ -45,8 +45,8 @@ int chooseDecodePoolDepth(const GPUContext& gpu) {
     if (limits.maxComputeWorkgroupStorageSize >= 24u * 1024u) depth++;
     if (gpu.backendType != WGPUBackendType_D3D12 && gpu.supportsSubgroups) depth++;
     return gpu.backendType == WGPUBackendType_D3D12
-        ? std::clamp(depth, 3, 4)
-        : std::clamp(depth, 2, 6);
+        ? std::clamp(depth, 3, 8)
+        : std::clamp(depth, 2, 8);
 }
 
 int chooseDecodeCbPoolBatch(const GPUContext& gpu, const ModelConfig& cfg) {
@@ -1678,7 +1678,7 @@ void ModelRunner::autotuneDecodeDepth() {
     if (decodePoolCapacity < 3) return;
 
     const int originalDepth = decodePoolDepth;
-    const int maxDepth = std::min(decodePoolCapacity, 4);
+    const int maxDepth = std::min(decodePoolCapacity, 8);
     const int nTokens = 24;
     const double epsilon = 0.015;
     double bestMsPerTok = 1e30;

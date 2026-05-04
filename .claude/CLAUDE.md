@@ -1,11 +1,12 @@
-# Autopo execute Session
+# Autopo test Session
 
 ## Work Unit
-Wire RMSNorm+QKV fused kernel into GGUF decode pipeline (Q8 path)
+Raise decodePoolCapacity upper bound from 4/6 to 8 and allocate staging buffers accordingly
 
 ## Acceptance Criteria
-- buildDecodePipeline() uses q8_matmul_norm for QKV projection instead of separate rms_norm + q8_matmul
-- Decode dispatch count reduced by 1 per layer (eliminates standalone rms_norm before QKV)
+- chooseDecodePoolDepth returns up to 8 for both D3D12 and Vulkan
+- decodePoolCapacity=8 staging buffers are created in buildDecodePipeline
+- autotuneDecodeDepth explores depths 2..8 instead of 2..4
 - Build succeeds
 
 ## Rules
