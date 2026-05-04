@@ -1,4 +1,4 @@
-# Autopo review Session
+# Autopo execute Session
 
 ## Work Unit
 Wire RMSNorm+QKV fused kernel into GGUF decode pipeline (Q8 path)
