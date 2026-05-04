@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Backpack Benchmark Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         max-width: 1400px; margin: 40px auto; padding: 0 20px; background: #f8f9fa; }
+  h1 { color: #1a1a2e; }
+  h2 { color: #16213e; margin-top: 40px; }
+  .chart-container { background: white; border-radius: 8px; padding: 20px;
+                      margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  canvas { max-height: 500px; }
+  table { border-collapse: collapse; width: 100%; background: white;
+           border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  th { background: #1a1a2e; color: white; padding: 12px 8px; text-align: left; font-size: 13px; }
+  td { padding: 10px 8px; border-bottom: 1px solid #eee; font-size: 13px; }
+  tr:hover td { background: #f0f4ff; }
+  .error-log { background: #fff3f3; border: 1px solid #ffcdd2; border-radius: 8px;
+                padding: 15px; margin: 20px 0; }
+  .error-log pre { font-size: 12px; white-space: pre-wrap; }
+  .good { color: #2e7d32; font-weight: bold; }
+  .bad { color: #c62828; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Backpack Full Model Suite Benchmark</h1>
+<p>Generated: 2026-05-02 00:45:43</p>
+<p>Models tested: 56 | Errors: 22</p>
+
+<h2>GGUF: Backpack vs llama.cpp (Decode tok/s @ 512 prompt)</h2>
+<div class="chart-container"><canvas id="ggufChart"></canvas></div>
+
+<h2>ONNX: Backpack vs ORT WebGPU (Decode tok/s @ 512 prompt)</h2>
+<div class="chart-container"><canvas id="onnxChart"></canvas></div>
+
+<h2>Summary Table (@ 128 prompt tokens)</h2>
+<table>
+<tr>
+  <th>Model</th>
+  <th>BP GGUF<br>decode</th><th>llama.cpp<br>decode</th><th>Ratio</th>
+  <th>BP ONNX<br>decode</th><th>ORT<br>decode</th><th>Ratio</th>
+</tr>
+<tr>
+  <td>CodeLlama-7b-Instruct-hf</td>
+  <td>81.8</td><td>161.3</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>62.7</td><td>131.5</td>
+  <td><span class="bad">0.48x</span></td>
+</tr>
+<tr>
+  <td>DeepSeek-R1-0528-Qwen3-8B</td>
+  <td>73.0</td><td>140.3</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>51.6</td><td>97.5</td>
+  <td><span class="bad">0.53x</span></td>
+</tr>
+<tr>
+  <td>DeepSeek-R1-Distill-Llama-8B</td>
+  <td>75.5</td><td>146.6</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>64.2</td><td>116.1</td>
+  <td><span class="bad">0.55x</span></td>
+</tr>
+<tr>
+  <td>DeepSeek-R1-Distill-Qwen-1.5B</td>
+  <td>216.9</td><td>454.5</td>
+  <td><span class="bad">0.48x</span></td>
+  <td>—</td><td>203.2</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>DeepSeek-R1-Distill-Qwen-7B</td>
+  <td>83.3</td><td>160.4</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>—</td><td>117.0</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Ministral-8B-Instruct-2410</td>
+  <td>74.4</td><td>144.6</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>61.4</td><td>113.4</td>
+  <td><span class="bad">0.54x</span></td>
+</tr>
+<tr>
+  <td>Mistral-7B-Instruct-v0.2</td>
+  <td>78.8</td><td>151.1</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>—</td><td>129.0</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Mistral-7B-Instruct-v0.3</td>
+  <td>79.1</td><td>155.0</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>—</td><td>128.2</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Mistral-Nemo-Instruct-2407</td>
+  <td>53.3</td><td>99.9</td>
+  <td><span class="bad">0.53x</span></td>
+  <td>—</td><td>82.7</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Nemotron-Cascade-8B-Thinking</td>
+  <td>72.6</td><td>139.9</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>51.1</td><td>97.1</td>
+  <td><span class="bad">0.53x</span></td>
+</tr>
+<tr>
+  <td>Nemotron-Mini-4B-Instruct</td>
+  <td>—</td><td>242.4</td>
+  <td>—</td>
+  <td>188790.6</td><td>162.5</td>
+  <td><span class="good">1161.85x</span></td>
+</tr>
+<tr>
+  <td>Phi-3-mini-128k-instruct</td>
+  <td>—</td><td>235.1</td>
+  <td>—</td>
+  <td>—</td><td>175.2</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Phi-3-mini-4k-instruct</td>
+  <td>—</td><td>233.9</td>
+  <td>—</td>
+  <td>106.4</td><td>173.4</td>
+  <td><span class="bad">0.61x</span></td>
+</tr>
+<tr>
+  <td>Phi-3.5-mini-instruct</td>
+  <td>—</td><td>235.5</td>
+  <td>—</td>
+  <td>—</td><td>173.9</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Phi-4-mini-instruct</td>
+  <td>—</td><td>238.4</td>
+  <td>—</td>
+  <td>—</td><td>145.7</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Phi-4-mini-reasoning</td>
+  <td>—</td><td>239.7</td>
+  <td>—</td>
+  <td>115.6</td><td>150.4</td>
+  <td><span class="bad">0.77x</span></td>
+</tr>
+<tr>
+  <td>Qwen2-0.5B-Instruct</td>
+  <td>—</td><td>657.6</td>
+  <td>—</td>
+  <td>391.6</td><td>248.0</td>
+  <td><span class="good">1.58x</span></td>
+</tr>
+<tr>
+  <td>Qwen2-1.5B-Instruct</td>
+  <td>214.0</td><td>452.1</td>
+  <td><span class="bad">0.47x</span></td>
+  <td>217.8</td><td>201.9</td>
+  <td><span class="good">1.08x</span></td>
+</tr>
+<tr>
+  <td>Qwen2-7B-Instruct</td>
+  <td>83.9</td><td>159.1</td>
+  <td><span class="bad">0.53x</span></td>
+  <td>29.7</td><td>121.6</td>
+  <td><span class="bad">0.24x</span></td>
+</tr>
+<tr>
+  <td>Qwen2.5-0.5B-Instruct</td>
+  <td>—</td><td>686.8</td>
+  <td>—</td>
+  <td>399.2</td><td>257.1</td>
+  <td><span class="good">1.55x</span></td>
+</tr>
+<tr>
+  <td>Qwen2.5-1.5B-Instruct</td>
+  <td>221.0</td><td>465.9</td>
+  <td><span class="bad">0.47x</span></td>
+  <td>—</td><td>205.8</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Qwen2.5-3B-Instruct</td>
+  <td>137.8</td><td>287.8</td>
+  <td><span class="bad">0.48x</span></td>
+  <td>—</td><td>163.6</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Qwen2.5-7B-Instruct</td>
+  <td>86.0</td><td>164.2</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>37.3</td><td>121.1</td>
+  <td><span class="bad">0.31x</span></td>
+</tr>
+<tr>
+  <td>Qwen2.5-Coder-0.5B-Instruct</td>
+  <td>—</td><td>687.6</td>
+  <td>—</td>
+  <td>400.6</td><td>257.1</td>
+  <td><span class="good">1.56x</span></td>
+</tr>
+<tr>
+  <td>Qwen2.5-Coder-1.5B-Instruct</td>
+  <td>220.0</td><td>466.9</td>
+  <td><span class="bad">0.47x</span></td>
+  <td>223.9</td><td>214.2</td>
+  <td><span class="good">1.05x</span></td>
+</tr>
+<tr>
+  <td>Qwen2.5-Coder-7B-Instruct</td>
+  <td>86.1</td><td>164.9</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>—</td><td>121.5</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Qwen3-0.6B</td>
+  <td>333.7</td><td>653.1</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>282.1</td><td>179.4</td>
+  <td><span class="good">1.57x</span></td>
+</tr>
+<tr>
+  <td>Qwen3-1.7B</td>
+  <td>211.6</td><td>438.8</td>
+  <td><span class="bad">0.48x</span></td>
+  <td>199.2</td><td>174.0</td>
+  <td><span class="good">1.14x</span></td>
+</tr>
+<tr>
+  <td>Qwen3-4B</td>
+  <td>—</td><td>236.3</td>
+  <td>—</td>
+  <td>109.1</td><td>126.9</td>
+  <td><span class="bad">0.86x</span></td>
+</tr>
+<tr>
+  <td>Qwen3-8B</td>
+  <td>74.9</td><td>144.1</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>62.4</td><td>93.6</td>
+  <td><span class="bad">0.67x</span></td>
+</tr>
+<tr>
+  <td>SOLAR-10.7B-Instruct-v1.0</td>
+  <td>54.3</td><td>106.0</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>44.2</td><td>91.5</td>
+  <td><span class="bad">0.48x</span></td>
+</tr>
+<tr>
+  <td>SmolLM-1.7B-Instruct</td>
+  <td>227.8</td><td>463.9</td>
+  <td><span class="bad">0.49x</span></td>
+  <td>210.4</td><td>299.6</td>
+  <td><span class="bad">0.70x</span></td>
+</tr>
+<tr>
+  <td>SmolLM-135M-Instruct</td>
+  <td>—</td><td>840.3</td>
+  <td>—</td>
+  <td>433.8</td><td>255.6</td>
+  <td><span class="good">1.70x</span></td>
+</tr>
+<tr>
+  <td>SmolLM-360M-Instruct</td>
+  <td>—</td><td>643.9</td>
+  <td>—</td>
+  <td>346.5</td><td>242.5</td>
+  <td><span class="good">1.43x</span></td>
+</tr>
+<tr>
+  <td>SmolLM2-1.7B-Instruct</td>
+  <td>227.6</td><td>463.4</td>
+  <td><span class="bad">0.49x</span></td>
+  <td>210.3</td><td>293.7</td>
+  <td><span class="bad">0.72x</span></td>
+</tr>
+<tr>
+  <td>SmolLM2-135M-Instruct</td>
+  <td>—</td><td>837.6</td>
+  <td>—</td>
+  <td>—</td><td>261.9</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>SmolLM2-360M-Instruct</td>
+  <td>—</td><td>642.6</td>
+  <td>—</td>
+  <td>320.9</td><td>240.0</td>
+  <td><span class="good">1.34x</span></td>
+</tr>
+<tr>
+  <td>TinyLlama-1.1B-Chat-v1.0</td>
+  <td>303.6</td><td>652.2</td>
+  <td><span class="bad">0.47x</span></td>
+  <td>—</td><td>325.3</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Yi-1.5-6B-Chat</td>
+  <td>93.0</td><td>186.2</td>
+  <td><span class="bad">0.50x</span></td>
+  <td>80.7</td><td>128.2</td>
+  <td><span class="bad">0.63x</span></td>
+</tr>
+<tr>
+  <td>Yi-1.5-9B-Chat</td>
+  <td>62.6</td><td>126.5</td>
+  <td><span class="bad">0.49x</span></td>
+  <td>—</td><td>100.2</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Yi-Coder-1.5B-Chat</td>
+  <td>250.7</td><td>524.6</td>
+  <td><span class="bad">0.48x</span></td>
+  <td>230.6</td><td>280.3</td>
+  <td><span class="bad">0.82x</span></td>
+</tr>
+<tr>
+  <td>gemma-2-2b-it</td>
+  <td>—</td><td>281.0</td>
+  <td>—</td>
+  <td>134.0</td><td>143.0</td>
+  <td><span class="bad">0.94x</span></td>
+</tr>
+<tr>
+  <td>gemma-2-9b-it</td>
+  <td>57.6</td><td>108.5</td>
+  <td><span class="bad">0.53x</span></td>
+  <td>34.5</td><td>76.4</td>
+  <td><span class="bad">0.45x</span></td>
+</tr>
+<tr>
+  <td>gemma-2b-it</td>
+  <td>184.3</td><td>389.0</td>
+  <td><span class="bad">0.47x</span></td>
+  <td>187.4</td><td>205.9</td>
+  <td><span class="bad">0.91x</span></td>
+</tr>
+<tr>
+  <td>gemma-3-1b-it</td>
+  <td>—</td><td>396.5</td>
+  <td>—</td>
+  <td>243.9</td><td>126.2</td>
+  <td><span class="good">1.93x</span></td>
+</tr>
+<tr>
+  <td>gemma-7b-it</td>
+  <td>74.1</td><td>136.8</td>
+  <td><span class="bad">0.54x</span></td>
+  <td>23.9</td><td>100.3</td>
+  <td><span class="bad">0.24x</span></td>
+</tr>
+<tr>
+  <td>gpt-oss-20b</td>
+  <td>—</td><td>230.7</td>
+  <td>—</td>
+  <td>109994.0</td><td>137.8</td>
+  <td><span class="good">798.03x</span></td>
+</tr>
+<tr>
+  <td>granite-3.1-2b-instruct</td>
+  <td>143.4</td><td>294.8</td>
+  <td><span class="bad">0.49x</span></td>
+  <td>—</td><td>161.1</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>granite-3.1-8b-instruct</td>
+  <td>65.9</td><td>130.3</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>—</td><td>105.5</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>granite-3.2-2b-instruct</td>
+  <td>141.8</td><td>294.6</td>
+  <td><span class="bad">0.48x</span></td>
+  <td>142.7</td><td>157.4</td>
+  <td><span class="bad">0.91x</span></td>
+</tr>
+<tr>
+  <td>granite-3.2-8b-instruct</td>
+  <td>65.9</td><td>130.4</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>—</td><td>105.9</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>granite-3.3-2b-instruct</td>
+  <td>140.8</td><td>296.2</td>
+  <td><span class="bad">0.48x</span></td>
+  <td>—</td><td>160.1</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>granite-3.3-8b-instruct</td>
+  <td>66.1</td><td>130.3</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>—</td><td>104.9</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>internlm2-chat-1_8b</td>
+  <td>223.7</td><td>472.2</td>
+  <td><span class="bad">0.47x</span></td>
+  <td>—</td><td>248.1</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>internlm2-chat-7b</td>
+  <td>77.7</td><td>149.1</td>
+  <td><span class="bad">0.52x</span></td>
+  <td>64.6</td><td>122.4</td>
+  <td><span class="bad">0.53x</span></td>
+</tr>
+<tr>
+  <td>internlm2_5-7b-chat</td>
+  <td>76.7</td><td>149.7</td>
+  <td><span class="bad">0.51x</span></td>
+  <td>64.7</td><td>121.4</td>
+  <td><span class="bad">0.53x</span></td>
+</tr>
+</table>
+<h2>Failure Log</h2>
+<div class="error-log">
+<p><b>DeepSeek-R1-Distill-Qwen-1.5B</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\DeepSeek-R1-Distill-Qwen-1.5B\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 370 inline (1416.7 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_</pre></p>
+<p><b>DeepSeek-R1-Distill-Qwen-7B</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\DeepSeek-R1-Distill-Qwen-7B\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 370 inline (5124.8 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_at</pre></p>
+<p><b>gpt-oss-20b</b> (backpack_gguf): <pre>Error: head_dim=45 is not a multiple of 32 (unsupported)
+bp::LmSession: failed to load model
+Failed to load model
+</pre></p>
+<p><b>granite-3.1-2b-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\granite-3.1-2b-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 485 inline (1423.3 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weig</pre></p>
+<p><b>granite-3.1-8b-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\granite-3.1-8b-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 485 inline (4511.6 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weig</pre></p>
+<p><b>granite-3.2-8b-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\granite-3.2-8b-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 485 inline (4511.6 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weig</pre></p>
+<p><b>granite-3.3-2b-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\granite-3.3-2b-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 485 inline (1423.3 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weig</pre></p>
+<p><b>granite-3.3-8b-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\granite-3.3-8b-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 485 inline (4511.7 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weig</pre></p>
+<p><b>internlm2-chat-1_8b</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\internlm2-chat-1_8b\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 294 inline (1371.7 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.weight' </pre></p>
+<p><b>Mistral-7B-Instruct-v0.2</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Mistral-7B-Instruct-v0.2\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 390 inline (4135.3 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.wei</pre></p>
+<p><b>Mistral-7B-Instruct-v0.3</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Mistral-7B-Instruct-v0.3\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 390 inline (4144.5 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.wei</pre></p>
+<p><b>Mistral-Nemo-Instruct-2407</b> (backpack_onnx): <pre>TIMEOUT</pre></p>
+<p><b>Phi-3-mini-128k-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Phi-3-mini-128k-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 390 inline (2256.8 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.12.input_layernorm.weight' → 'layers.12.input_layernorm.wei</pre></p>
+<p><b>Phi-3.5-mini-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Phi-3.5-mini-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 390 inline (2256.8 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.12.input_layernorm.weight' → 'layers.12.input_layernorm.weight</pre></p>
+<p><b>Phi-4-mini-instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Phi-4-mini-instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 389 inline (2375.9 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.12.input_layernorm.weight' → 'layers.12.input_layernorm.weight' </pre></p>
+<p><b>Qwen2.5-1.5B-Instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Qwen2.5-1.5B-Instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 369 inline (947.6 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_attention</pre></p>
+<p><b>Qwen2.5-3B-Instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Qwen2.5-3B-Instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 473 inline (1812.1 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_attention_</pre></p>
+<p><b>Qwen2.5-Coder-7B-Instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Qwen2.5-Coder-7B-Instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 370 inline (5100.8 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_atte</pre></p>
+<p><b>Qwen3-4B</b> (backpack_gguf): <pre>Error: head_dim=80 is not a multiple of 32 (unsupported)
+bp::LmSession: failed to load model
+Failed to load model
+</pre></p>
+<p><b>SmolLM2-135M-Instruct</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\SmolLM2-135M-Instruct\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 365 inline (86.7 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weight' </pre></p>
+<p><b>TinyLlama-1.1B-Chat-v1.0</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\TinyLlama-1.1B-Chat-v1.0\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 270 inline (711.6 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.weig</pre></p>
+<p><b>Yi-1.5-9B-Chat</b> (backpack_onnx): <pre>[onnx_loader] entering loadOnnxModel: E:\workspace\project\agents\ai-models\Yi-1.5-9B-Chat\onnx-webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 582 inline (5222.4 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.weight' dims=</pre></p>
+</div>
+
+<script>
+new Chart(document.getElementById('ggufChart'), {
+  type: 'bar',
+  data: {
+    labels: [],
+    datasets: [
+      { label: 'Backpack GGUF', data: [], backgroundColor: '#3498db' },
+      { label: 'llama.cpp Vulkan', data: [], backgroundColor: '#e74c3c' }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: { title: { display: true, text: 'Decode tok/s (higher is better)' } },
+    scales: {
+      x: { ticks: { maxRotation: 45 } },
+      y: { beginAtZero: true, title: { display: true, text: 'tok/s' } }
+    }
+  }
+});
+
+new Chart(document.getElementById('onnxChart'), {
+  type: 'bar',
+  data: {
+    labels: [],
+    datasets: [
+      { label: 'Backpack ONNX', data: [], backgroundColor: '#2ecc71' },
+      { label: 'ORT WebGPU', data: [], backgroundColor: '#f39c12' }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: { title: { display: true, text: 'Decode tok/s (higher is better)' } },
+    scales: {
+      x: { ticks: { maxRotation: 45 } },
+      y: { beginAtZero: true, title: { display: true, text: 'tok/s' } }
+    }
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,544 @@
+GPU: NVIDIA GeForce RTX 5080 (D3D12 driver version 32.0.15.9186)
+  maxComputeInvocationsPerWorkgroup: 1024
+  maxComputeWorkgroupSizeX: 1024
+  maxComputeWorkgroupStorageSize: 32768 bytes
+  maxStorageBufferBindingSize: 2048 MB
+  maxBufferSize: 2048 MB
+  Features: f16=yes subgroups=yes subgroup_matrix=no timestamps=yes
+ONNX Config: gemma4 (42 layers, E=2560, HD=256, V=262144, KV=2, IM=10240)
+  Hybrid: 42 layer_types, sliding_window=512, global_head_dim=512
+  Logit softcapping: 30.0
+  Activation: gelu_pytorch_tanh
+  Per-layer embedding: dim=256
+  Split model layout (flat): loading decoder from e:/workspace/project/test/ai-models/gemma-4-E4B/webgpu\onnx\decoder_model_merged_q4f16.onnx
+  ONNX file: 850610 bytes
+  Mapping external data 'decoder_model_merged_q4f16.onnx_data': 2074847232 bytes (1979 MB)...
+  Mapping external data 'decoder_model_merged_q4f16.onnx_data_1': 812318720 bytes (775 MB)...
+  Parsed: 1322 initializers, 1615 nodes
+  Loading embedding from e:/workspace/project/test/ai-models/gemma-4-E4B/webgpu\onnx\embed_tokens_q4f16.onnx
+  Mapping embed external data 'embed_tokens_q4f16.onnx_data'...
+  Mapped embed data: 2017460224 bytes at 000002774EEF0000
+  embed_tokens: Q4 allocating 2560.0 MB for 262144 x 2560 fp32
+  embed_tokens: Q4 allocation OK, dequantizing...
+    nVocab=262144 packedK=1280 embK=2560 nGroups=80 blockSize=32
+    qData=000002774EEF0000 scales=0000027762EF0000 zpData=00000277656F0000
+    tensor rawSize=335544320 scaleRawSize=41943040
+    dequant row 0/262144
+    dequant row 65536/262144
+    dequant row 131072/262144
+    dequant row 196608/262144
+  embed_tokens: Q4 dequant V=262144 K=2560 (80 groups, bs=32)
+  embed ZP: 21356/80000 are 8 (26.7%)
+  PLE embed: Q4 copied 1512.0 MB (10.5 GB fp32 equiv, V=262144 K=10752)
+  Embed processing complete
+  Extracted: 302 Q8 weights, 278 norm weights
+  KV sharing: 18 shared layers starting at layer 24
+  KV sharing: layer 24 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 25 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 26 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 27 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 28 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 29 (full) ← layer 23 (K=2560, N=1024)
+  KV sharing: layer 30 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 31 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 32 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 33 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 34 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 35 (full) ← layer 23 (K=2560, N=1024)
+  KV sharing: layer 36 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 37 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 38 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 39 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 40 (sliding) ← layer 22 (K=2560, N=512)
+  KV sharing: layer 41 (full) ← layer 23 (K=2560, N=1024)
+  QKV fusion starting (42 layers)
+  Organizing into 42 layer structs...
+  processed layer 7/42
+  processed layer 14/42
+  processed layer 21/42
+  processed layer 28/42
+  processed layer 35/42
+  processed layer 42/42
+  Post-organize: final norm + lm head...
+  PLE: model_proj weight N=10752 K=2560
+  ONNX model parsed in 6306ms
+  Model: E=2560, IM=10240, HD=256, V=262144
+[loadOnnx] ONNX model loaded, configuring...
+Model: gemma4 (42 layers, E=2560, HD=256, V=262144, KV=2) [ONNX]
+  RoPE theta=10000, RMSNorm eps=1.0e-06, QK-norm=yes
+  Note: head_dim=256 (attention kernels will be HD-patched)
+  Backend: D3D12, single-pass dispatch
+  Uploading weights to GPU...
+  Hybrid architecture: 42 layers (35 sliding HD=256, 7 full HD=512)
+  [dbg] zero bias buffers created
+  KV sharing: layer 24 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 25 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 26 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 27 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 28 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 29 (full) → donor layer 23 (cache[23])
+  KV sharing: layer 30 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 31 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 32 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 33 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 34 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 35 (full) → donor layer 23 (cache[23])
+  KV sharing: layer 36 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 37 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 38 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 39 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 40 (sliding) → donor layer 22 (cache[22])
+  KV sharing: layer 41 (full) → donor layer 23 (cache[23])
+  KV cache: 24 unique entries (42 layers, shared=18, firstShared=24)
+  [dbg] uploading 42 layers of weights...
+  uploaded layer 7/42
+  uploaded layer 14/42
+  uploaded layer 21/42
+  uploaded layer 28/42
+  uploaded layer 35/42
+  uploaded layer 42/42
+  Sandwich norms: preFfn=42 postFfn=42 layerScalar=42 (L0=0.0610)
+  Layer scalars: L0=0.0610 L1=0.1602 L2=0.8398 L3=0.7109 L4=0.5859 L5=0.6055 ... L41=0.4453
+  [dbg] freed ONNX layer weights from CPU
+  Embedding: 262144 × 2560 (fp32)
+  [dbg] LM head: hasQ8=1, tie=0, N=262144 K=2560 weights=167772160 scales=10485760
+  [dbg] LM head: creating 671088640 byte w buffer + 41943040 byte s buffer
+  [dbg] LM head w buffer: 00000277192DC290
+  [dbg] LM head s buffer: 00000277192DBE30
+  [dbg] LM head w uploaded
+  [dbg] LM head s uploaded
+  LM head: separate (Q8)
+  [dbg] PLE global weights...
+  PLE Q4 embed: ready for on-demand dequant (V=262144 K=10752)
+  PLE model proj: dequantized to fp32 (10752 x 2560) row0_norm=1.2399 first4=[0.000000 -0.014938 -0.014938 0.059753]
+  PLE model_proj_norm: 256 elements
+  PLE: dim=256, buffer=42.0 KB
+  Weights uploaded in 1598ms
+  [dbg] RoPE tables... hasPrecomp=0 ropeCos=0
+  [dbg] computeRopeTables...
+  RoPE: sliding theta=10000 HD=256 rotDim=256, global theta=1000000 HD=512 rotDim=128
+  [dbg] buildDecodePipeline...
+  [buildDecode] entering...
+  Subgroup matrix: not available
+  [buildDecode] loading kernels...
+  [buildDecode] kernels loaded
+  Initial decode heuristic: qkv=fast oproj=base gateup=fast lm_head=fp16_wide pool=4 batch=160
+  [buildDecode] creating buffers...
+  [buildDecode] intermediate buffers done, hasSandwich=1 isHybrid=1
+  [buildDecode] creating global (full-attn) kernels for HD=512...
+  Hybrid decode: sliding QKV=3072 oproj=2048, global QKV=6144 oproj=4096
+  PLE decode: gate=2560→256, proj=256→2560
+  [buildDecode] building per-layer dispatches (42 layers)...
+  [buildDecode] L0: full=0
+  [buildDecode] L1: full=0
+  [buildDecode] L41: full=1
+  Logit softcapping: cap=30.0
+  803 decode dispatches (42 layers)
+  Pool: 4 slots × 160 pre-recorded CBs
+  DP4A (dot4I8Packed): available
+  Prefill tuning: mat=q8_matmul_prequant_d3d12 qkv/gateup=q8_matmul_prequant_wide_d3d12 down=q8_matmul_prequant_add_wide_d3d12 attn=causal_attn tiles=8x32 wide=4x64 pool=4
+  Vocab: 262144 tokens (max_id=262143)
+  Tokenizer: 262144 tokens, 514906 merges, 24 added, EOS=1
+  [emb] token=0 raw first8=[-0.035034 0.004379 0.030655 -0.008759 0.008759 -0.021896 0.008759 0.021896] norm=0.9995
+  [ple] L0 input first4=[-0.443763 0.272947 -0.016008 0.057655] norm=19.2878
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [trace] emb: [-1.7726 0.2216 1.5510 -0.4432] norm=50.57
+  [ref] xNorm[0..3]: -13.689290 1.766584 16.100159 -3.685578
+  [ref] CPU QKV[0] = -81.593170
+  [ref] CPU QKV[1] = -38.442932
+  [ref] CPU QKV[2] = 4.412497
+  [ref] CPU QKV[3] = -6.882437
+  [ref] GPU QKV[0..3]: -81.593094 -38.442902 4.412497 -6.882429
+  [trace] L0/0(L0/q8_qkv): x_norm=50.57
+    [qkv] Q[0..7]: [-81.5931 -38.4429 4.4125 -6.8824 25.9188 -1.0493 8.3121 -5.1326] norm=1552.9717
+    [qkv] K[0..7]: [-1.2563 -27.2189 -10.3904 -5.7472 -14.6023 -40.7860 5.5931 -35.4257] norm=691.5923
+    [qkv] V[0..7]: [38.6840 -7.4840 -9.4817 11.0692 9.9759 -27.6139 8.1531 15.2844] norm=539.9401
+  [trace] L0/1(L0/fused_rope): x_norm=50.57
+    [buf] qkvBuf: [-81.5931 -38.4429 4.4125 -6.8824] norm=1783.69
+    [buf] qRotBuf: [-4.0141 -1.8913 0.2171 -0.3386] norm=44.55
+    [cpu_vnorm] V head0 raw first4=[38.6840 -7.4840 -9.4817 11.0692] sumSq=187181.7031 rms=27.0403
+    [cpu_vnorm] V head0 normed first4=[1.430604 -0.276773 -0.350650 0.409359]
+    [cpu_vnorm] V head0 normed norm=16.0000 (expect 16.0)
+    [gpu_vcache] V head0 first8=[1.430664 -0.276855 -0.350586 0.409424 0.368896 -1.021484 0.301514 0.565430]
+    [gpu_kcache] K head0 first8=[-0.008545 -0.185181 -0.070679 -0.039093 -0.099304 -0.277344 0.038055 -0.240967]
+  [trace] L0/2(L0/attn_p1): x_norm=50.57
+  [trace] L0/3(L0/attn_p2): x_norm=50.57
+    [buf] attnOut: [1.4307 -0.2769 -0.3506 0.4094] norm=45.26
+    [attn] head0 first4=[1.4307 -0.2769 -0.3506 0.4094] norm=16.0001
+    [attn] head1 first4=[1.4307 -0.2769 -0.3506 0.4094] norm=16.0001
+    [attn] head2 first4=[1.4307 -0.2769 -0.3506 0.4094] norm=16.0001
+    [attn] head3 first4=[1.4307 -0.2769 -0.3506 0.4094] norm=16.0001
+    [attn] head4 first4=[-0.6533 0.8237 -0.1025 -0.7407] norm=16.0004
+    [attn] head5 first4=[-0.6533 0.8237 -0.1025 -0.7407] norm=16.0004
+    [attn] head6 first4=[-0.6533 0.8237 -0.1025 -0.7407] norm=16.0004
+    [attn] head7 first4=[-0.6533 0.8237 -0.1025 -0.7407] norm=16.0004
+    [OK] attn head0 matches V cache head0 within 0.01
+  [trace] L0/4(L0/q8_oproj): x_norm=50.57
+    [buf] projOut: [-0.3058 -1.6214 2.2486 -0.6050] norm=99.70
+    [buf] projOut: [-0.3058 -1.6214 2.2486 -0.6050] norm=99.70
+  [trace] L0/5(L0/post_attn_norm): x_norm=50.57
+    [buf] normOut: [-0.0730 -0.5561 32.8091 -8.8274] norm=490.34
+    [nw] postAttnNorm L0: min=0.0194 max=28.7500 mean=2.6157 first4=[0.4707 0.6758 28.7500 28.7500]
+  [trace] L0/6(L0/attn_residual_add): x_norm=492.05
+  [trace] L0/7(L0/pre_ffn_norm): x_norm=492.05
+  [trace] L0/8(L0/q8_gateup): x_norm=492.05
+    [buf] gateUpBuf: [-3.3955 -4.4739 -0.0999 0.0133] norm=283.21
+  [trace] L0/9(L0/gelu_mul): x_norm=492.05
+  [trace] L0/10(L0/q8_down): x_norm=492.05
+    [buf] downProjOut: [-1.9934 3.2265 11.5637 0.4269] norm=259.75
+  [trace] L0/11(L0/post_ffn_norm): x_norm=492.05
+  [trace] L0/12(L0/ffn_residual_add): x_norm=536.66
+  [trace] L0/13(L0/ple_gate): x_norm=536.66
+  [trace] L0/14(L0/ple_gelu_mul): x_norm=536.66
+  [trace] L0/15(L0/ple_proj): x_norm=536.66
+  [trace] L0/16(L0/ple_norm): x_norm=536.66
+  [trace] L0/17(L0/ple_add): x_norm=592.36
+  [trace] L0/18(L0/layer_scalar): x_norm=36.16
+  [trace] L0: [-0.2385 0.0842 3.7192 -0.5948] norm=36.16
+  [kv] L0 kv[0] K first4=[-0.008545 -0.185181 -0.070679 -0.039093] head0_norm=2.0312
+  [kv] L0 kv[0] V first4=[1.430664 -0.276855 -0.350586 0.409424] head0_norm=16.0001
+  [trace] L1/0(L1/q8_qkv): x_norm=36.16
+    [qkv] Q[0..7]: [11.7110 -0.1681 -21.5435 7.0641 11.9516 -7.2318 -14.9457 4.4682] norm=605.5297
+    [qkv] K[0..7]: [0.7546 -3.4255 -14.1022 -1.7925 5.5323 -26.7938 -17.1238 2.0960] norm=315.6289
+    [qkv] V[0..7]: [5.4282 12.4251 -13.3398 16.7944 -8.3180 16.3694 -1.0027 6.2735] norm=233.6339
+  [trace] L1/1(L1/fused_rope): x_norm=36.16
+    [buf] qkvBuf: [11.7110 -0.1681 -21.5435 7.0641] norm=721.72
+    [buf] qRotBuf: [1.0297 -0.0148 -1.8943 0.6211] norm=43.66
+    [cpu_vnorm] V head0 raw first4=[5.4282 12.4251 -13.3398 16.7944] sumSq=28028.0918 rms=10.4635
+    [cpu_vnorm] V head0 normed first4=[0.518775 1.187470 -1.274889 1.605047]
+    [cpu_vnorm] V head0 normed norm=16.0000 (expect 16.0)
+    [gpu_vcache] V head0 first8=[0.518555 1.187500 -1.274414 1.605469 -0.794922 1.564453 -0.095825 0.599609]
+    [gpu_kcache] K head0 first8=[0.007736 -0.035126 -0.144653 -0.018387 0.056732 -0.274658 -0.175537 0.021500]
+  [trace] L1/2(L1/attn_p1): x_norm=36.16
+  [trace] L1/3(L1/attn_p2): x_norm=36.16
+    [buf] attnOut: [0.5186 1.1875 -1.2744 1.6055] norm=45.26
+    [attn] head0 first4=[0.5186 1.1875 -1.2744 1.6055] norm=16.0006
+    [attn] head1 first4=[0.5186 1.1875 -1.2744 1.6055] norm=16.0006
+    [attn] head2 first4=[0.5186 1.1875 -1.2744 1.6055] norm=16.0006
+    [attn] head3 first4=[0.5186 1.1875 -1.2744 1.6055] norm=16.0006
+    [attn] head4 first4=[1.9668 -0.9980 -1.5889 -0.1917] norm=15.9999
+    [attn] head5 first4=[1.9668 -0.9980 -1.5889 -0.1917] norm=15.9999
+    [attn] head6 first4=[1.9668 -0.9980 -1.5889 -0.1917] norm=15.9999
+    [attn] head7 first4=[1.9668 -0.9980 -1.5889 -0.1917] norm=15.9999
+    [OK] attn head0 matches V cache head0 within 0.01
+  [trace] L1/4(L1/q8_oproj): x_norm=36.16
+    [buf] projOut: [-0.7320 -1.4323 0.0108 1.1006] norm=114.10
+    [buf] projOut: [-0.7320 -1.4323 0.0108 1.1006] norm=114.10
+  [trace] L1/5(L1/post_attn_norm): x_norm=36.16
+    [buf] normOut: [-0.0035 -0.0062 0.0581 5.9479] norm=427.20
+    [nw] postAttnNorm L1: min=0.0065 max=12.1875 mean=2.2272 first4=[0.0107 0.0098 12.1875 12.1875]
+  [trace] L1/6(L1/attn_residual_add): x_norm=425.09
+  [trace] L1/7(L1/pre_ffn_norm): x_norm=425.09
+  [trace] L1/8(L1/q8_gateup): x_norm=425.09
+    [buf] gateUpBuf: [-0.4556 -4.0369 -4.4328 -1.8109] norm=519.04
+  [trace] L1/9(L1/gelu_mul): x_norm=425.09
+  [trace] L1/10(L1/q8_down): x_norm=425.09
+    [buf] downProjOut: [18.8727 3.7924 7.9620 0.5578] norm=990.69
+  [trace] L1/11(L1/post_ffn_norm): x_norm=425.09
+  [trace] L1/12(L1/ffn_residual_add): x_norm=450.40
+  [trace] L1/13(L1/ple_gate): x_norm=450.40
+  [trace] L1/14(L1/ple_gelu_mul): x_norm=450.40
+  [trace] L1/15(L1/ple_proj): x_norm=450.40
+  [trace] L1/16(L1/ple_norm): x_norm=450.40
+  [trace] L1/17(L1/ple_add): x_norm=453.32
+  [trace] L1/18(L1/layer_scalar): x_norm=72.60
+  [trace] L1: [-0.0258 0.1211 0.7185 0.8239] norm=72.60
+  [kv] L1 kv[1] K first4=[0.007736 -0.035126 -0.144653 -0.018387] head0_norm=2.0781
+  [kv] L1 kv[1] V first4=[0.518555 1.187500 -1.274414 1.605469] head0_norm=16.0006
+  [trace] L2/0(L2/q8_qkv): x_norm=72.60
+    [qkv] Q[0..7]: [9.0244 -0.0246 -1.2403 -5.4399 -4.3663 -3.2792 1.7707 -7.2452] norm=185.0475
+    [qkv] K[0..7]: [2.5244 4.2854 -4.1213 5.1800 1.1185 5.3603 -5.2637 2.4410] norm=103.7480
+    [qkv] V[0..7]: [-0.2669 2.7503 4.2238 3.2250 2.4916 -1.0776 -1.5765 -3.4608] norm=73.7621
+  [trace] L2/1(L2/fused_rope): x_norm=72.60
+    [buf] qkvBuf: [9.0244 -0.0246 -1.2403 -5.4399] norm=224.60
+    [buf] qRotBuf: [2.1909 -0.0060 -0.3011 -1.3207] norm=42.96
+    [cpu_vnorm] V head0 raw first4=[-0.2669 2.7503 4.2238 3.2250] sumSq=2757.1167 rms=3.2818
+    [cpu_vnorm] V head0 normed first4=[-0.081325 0.838048 1.287036 0.982712]
+    [cpu_vnorm] V head0 normed norm=16.0000 (expect 16.0)
+    [gpu_vcache] V head0 first8=[-0.081299 0.837891 1.287109 0.982910 0.759277 -0.328369 -0.480469 -1.054688]
+    [gpu_kcache] K head0 first8=[0.074951 0.127197 -0.122375 0.153809 0.033203 0.159180 -0.156250 0.072449]
+  [trace] L2/2(L2/attn_p1): x_norm=72.60
+  [trace] L2/3(L2/attn_p2): x_norm=72.60
+    [buf] attnOut: [-0.0813 0.8379 1.2871 0.9829] norm=45.26
+    [attn] head0 first4=[-0.0813 0.8379 1.2871 0.9829] norm=16.0003
+    [attn] head1 first4=[-0.0813 0.8379 1.2871 0.9829] norm=16.0003
+    [attn] head2 first4=[-0.0813 0.8379 1.2871 0.9829] norm=16.0003
+    [attn] head3 first4=[-0.0813 0.8379 1.2871 0.9829] norm=16.0003
+    [attn] head4 first4=[-1.6094 -0.6821 -0.0680 1.1240] norm=15.9999
+    [attn] head5 first4=[-1.6094 -0.6821 -0.0680 1.1240] norm=15.9999
+    [attn] head6 first4=[-1.6094 -0.6821 -0.0680 1.1240] norm=15.9999
+    [attn] head7 first4=[-1.6094 -0.6821 -0.0680 1.1240] norm=15.9999
+    [OK] attn head0 matches V cache head0 within 0.01
+  [trace] L2/4(L2/q8_oproj): x_norm=72.60
+    [buf] projOut: [-1.2571 1.1302 -0.9749 1.0266] norm=127.75
+    [buf] projOut: [-1.2571 1.1302 -0.9749 1.0266] norm=127.75
+  [trace] L2/5(L2/post_attn_norm): x_norm=72.60
+    [buf] normOut: [-0.0026 0.0586 -0.2806 0.2954] norm=15.66
+    [nw] postAttnNorm L2: min=0.0004 max=0.7266 mean=0.2845 first4=[0.0052 0.1309 0.7266 0.7266]
+  [trace] L2/6(L2/attn_residual_add): x_norm=83.33
+  [trace] L2/7(L2/pre_ffn_norm): x_norm=83.33
+  [trace] L2/8(L2/q8_gateup): x_norm=83.33
+    [buf] gateUpBuf: [-3.4619 -1.4707 -1.6923 -2.9820] norm=254.82
+  [trace] L2/9(L2/gelu_mul): x_norm=83.33
+  [trace] L2/10(L2/q8_down): x_norm=83.33
+    [buf] downProjOut: [-1.2200 -0.3807 0.9129 2.0773] norm=176.16
+  [trace] L2/11(L2/post_ffn_norm): x_norm=83.33
+  [trace] L2/12(L2/ffn_residual_add): x_norm=97.31
+  [trace] L2/13(L2/ple_gate): x_norm=97.31
+  [trace] L2/14(L2/ple_gelu_mul): x_norm=97.31
+  [trace] L2/15(L2/ple_proj): x_norm=97.31
+  [trace] L2/16(L2/ple_norm): x_norm=97.31
+  [trace] L2/17(L2/ple_add): x_norm=98.05
+  [trace] L2/18(L2/layer_scalar): x_norm=82.35
+  [trace] L2: [-0.0325 -0.0122 0.6763 1.4163] norm=82.35
+  [kv] L2 kv[2] K first4=[0.074951 0.127197 -0.122375 0.153809] head0_norm=2.1094
+  [kv] L2 kv[2] V first4=[-0.081299 0.837891 1.287109 0.982910] head0_norm=16.0003
+  [trace] L3: [-0.0381 1.0102 -1.6227 1.5028] norm=89.99
+  [trace] L4: [-0.0275 -1.2105 -1.6495 0.2424] norm=81.67
+  [trace] L5: [-0.0086 -1.5881 -1.1811 -0.8182] norm=84.48
+  [trace] L10: [-0.2057 0.5650 -2.9106 0.2615] norm=109.67
+  [trace] L15: [-1.0193 -0.2750 1.0707 -1.0680] norm=131.43
+  [trace] L20: [0.6956 -0.0046 -0.0370 -1.4027] norm=87.36
+  [trace] L25: [-1.5526 -0.9388 0.6723 0.6498] norm=85.78
+  [trace] L30: [-0.7848 -0.1638 0.9294 -3.2756] norm=101.30
+  [trace] L35: [-1.7090 0.7569 2.3280 -0.2614] norm=142.36
+  [trace] L40: [-0.9504 -0.4164 1.5658 0.4638] norm=93.93
+  [trace] L41: [-0.1088 0.1192 -0.3431 0.3021] norm=62.96
+  [trace] final_rms out: [-0.691174 0.790253 -1.137214 1.836004] norm=114.2715
+  [trace] lm_head out [0..4]: 3.9102 -0.6133 -6.2661 4.3611 -10.6371
+  [trace] lm_head logit[10979] = -11.9959
+  [trace] logits: min=-18.75 max=9.00
+  [trace] top5: [258014]=9.00 [258022]=8.94 [258039]=8.89 [258090]=8.87 [258066]=8.68
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  Decode depth autotune: 4 -> 2 (12.55 ms/tok)
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+  Decode kernel autotune: qkv=base oproj=base gateup=base (10.00 ms/tok)
+
+Model: gemma4 (onnx, 42L, H=2560, V=262144)
+GPU:   NVIDIA GeForce RTX 5080 (d3d12)
+Ready: 18002ms
+
+Prompt: 1 tokens
+
+--- Output ---
+Hi  [prefill] n=1 tokens=[10979]
+  [emb] token=10979 raw first8=[-0.010811 0.027027 -0.027027 -0.032433 -0.005405 0.016216 -0.010811 -0.016216] norm=1.2888
+  [ple] L0 input first4=[0.407684 0.781092 0.466795 0.511054] norm=19.4893
+  [dbg] updateDecodeParams: pos=0 cacheLen=0 T_total=1 cache_offset=0
+  [trace] emb: [-0.5470 1.3675 -1.3675 -1.6410] norm=65.21
+  [ref] xNorm[0..3]: -3.275944 8.455120 -11.008235 -10.583821
+  [ref] CPU QKV[0] = -250.906952
+  [ref] CPU QKV[1] = 109.817764
+  [ref] CPU QKV[2] = -134.037552
+  [ref] CPU QKV[3] = 31.073610
+  [ref] GPU QKV[0..3]: -250.907303 109.817924 -134.037750 31.073664
+  [trace] L0/0(L0/q8_qkv): x_norm=65.21
+    [qkv] Q[0..7]: [-250.9073 109.8179 -134.0378 31.0737 32.8833 -40.8734 86.3549 12.0710] norm=1210.4377
+    [qkv] K[0..7]: [-35.5424 -15.4048 -44.4403 -34.6856 46.2876 -33.4441 6.4440 33.5241] norm=833.8387
+    [qkv] V[0..7]: [-3.6288 -15.9068 0.8534 49.0301 -9.1758 -3.0877 -29.4556 -11.8381] norm=409.1235
+  [trace] L0/1(L0/fused_rope): x_norm=65.21
+    [buf] qkvBuf: [-250.9073 109.8179 -134.0378 31.0737] norm=1525.72
+    [buf] qRotBuf: [-7.3349 3.2104 -3.9184 0.9084] norm=44.55
+    [cpu_vnorm] V head0 raw first4=[-3.6288 -15.9068 0.8534 49.0301] sumSq=80723.5391 rms=17.7574
+    [cpu_vnorm] V head0 normed first4=[-0.204351 -0.895784 0.048060 2.761105]
+    [cpu_vnorm] V head0 normed norm=16.0000 (expect 16.0)
+    [gpu_vcache] V head0 first8=[-0.204346 -0.895996 0.048065 2.761719 -0.516602 -0.173828 -1.659180 -0.666504]
+    [gpu_kcache] K head0 first8=[-0.197876 -0.085815 -0.247437 -0.193115 0.257812 -0.186279 0.035889 0.186646]
+  [trace] L0/2(L0/attn_p1): x_norm=65.21
+  [trace] L0/3(L0/attn_p2): x_norm=65.21
+    [buf] attnOut: [-0.2043 -0.8960 0.0481 2.7617] norm=45.26
+    [attn] head0 first4=[-0.2043 -0.8960 0.0481 2.7617] norm=16.0000
+    [attn] head1 first4=[-0.2043 -0.8960 0.0481 2.7617] norm=16.0000
+    [attn] head2 first4=[-0.2043 -0.8960 0.0481 2.7617] norm=16.0000
+    [attn] head3 first4=[-0.2043 -0.8960 0.0481 2.7617] norm=16.0000
+    [attn] head4 first4=[0.1333 0.5044 0.4233 -0.0566] norm=16.0004
+    [attn] head5 first4=[0.1333 0.5044 0.4233 -0.0566] norm=16.0004
+    [attn] head6 first4=[0.1333 0.5044 0.4233 -0.0566] norm=16.0004
+    [attn] head7 first4=[0.1333 0.5044 0.4233 -0.0566] norm=16.0004
+    [OK] attn head0 matches V cache head0 within 0.01
+  [trace] L0/4(L0/q8_oproj): x_norm=65.21
+    [buf] projOut: [-1.3054 0.9635 0.0857 -2.0618] norm=86.56
+    [buf] projOut: [-1.3054 0.9635 0.0857 -2.0618] norm=86.56
+  [trace] L0/5(L0/post_attn_norm): x_norm=65.21
+    [buf] normOut: [-0.3592 0.3806 1.4404 -34.6499] norm=602.07
+    [nw] postAttnNorm L0: min=0.0194 max=28.7500 mean=2.6157 first4=[0.4707 0.6758 28.7500 28.7500]
+  [trace] L0/6(L0/attn_residual_add): x_norm=605.76
+  [trace] L0/7(L0/pre_ffn_norm): x_norm=605.76
+  [trace] L0/8(L0/q8_gateup): x_norm=605.76
+    [buf] gateUpBuf: [-4.9550 -1.2607 -0.4658 -2.3561] norm=283.80
+  [trace] L0/9(L0/gelu_mul): x_norm=605.76
+  [trace] L0/10(L0/q8_down): x_norm=605.76
+    [buf] downProjOut: [0.0291 -9.1265 3.3737 11.2148] norm=235.68
+  [trace] L0/11(L0/post_ffn_norm): x_norm=605.76
+  [trace] L0/12(L0/ffn_residual_add): x_norm=696.86
+  [trace] L0/13(L0/ple_gate): x_norm=696.86
+  [trace] L0/14(L0/ple_gelu_mul): x_norm=696.86
+  [trace] L0/15(L0/ple_proj): x_norm=696.86
+  [trace] L0/16(L0/ple_norm): x_norm=696.86
+  [trace] L0/17(L0/ple_add): x_norm=764.74
+  [trace] L0/18(L0/layer_scalar): x_norm=46.68
+  [trace] L0: [-0.1287 -0.4722 0.6237 -0.2536] norm=46.68
+  [kv] L0 kv[0] K first4=[-0.197876 -0.085815 -0.247437 -0.193115] head0_norm=2.0312
+  [kv] L0 kv[0] V first4=[-0.204346 -0.895996 0.048065 2.761719] head0_norm=16.0000
+  [trace] L1/0(L1/q8_qkv): x_norm=46.68
+    [qkv] Q[0..7]: [-11.2760 11.4773 -9.4975 2.2673 -14.3384 -13.5565 -10.3074 -13.3554] norm=496.5711
+    [qkv] K[0..7]: [17.5195 -4.2179 -3.4128 9.2122 8.5701 2.5283 -17.0723 6.5345] norm=318.9443
+    [qkv] V[0..7]: [0.5288 10.1334 8.1537 0.6831 -1.5610 -8.6299 -20.9798 -5.5462] norm=231.3977
+  [trace] L1/1(L1/fused_rope): x_norm=46.68
+    [buf] qkvBuf: [-11.2760 11.4773 -9.4975 2.2673] norm=633.92
+    [buf] qRotBuf: [-1.5428 1.5703 -1.2995 0.3102] norm=43.66
+    [cpu_vnorm] V head0 raw first4=[0.5288 10.1334 8.1537 0.6831] sumSq=31069.2070 rms=11.0165
+    [cpu_vnorm] V head0 normed first4=[0.047998 0.919835 0.740129 0.062011]
+    [cpu_vnorm] V head0 normed norm=16.0000 (expect 16.0)
+    [gpu_vcache] V head0 first8=[0.048004 0.919922 0.740234 0.062012 -0.141724 -0.783203 -1.904297 -0.503418]
+    [gpu_kcache] K head0 first8=[0.197021 -0.047424 -0.038361 0.103577 0.096375 0.028427 -0.192017 0.073486]
+  [trace] L1/2(L1/attn_p1): x_norm=46.68
+  [trace] L1/3(L1/attn_p2): x_norm=46.68
+    [buf] attnOut: [0.0480 0.9199 0.7402 0.0620] norm=45.26
+    [attn] head0 first4=[0.0480 0.9199 0.7402 0.0620] norm=16.0001
+    [attn] head1 first4=[0.0480 0.9199 0.7402 0.0620] norm=16.0001
+    [attn] head2 first4=[0.0480 0.9199 0.7402 0.0620] norm=16.0001
+    [attn] head3 first4=[0.0480 0.9199 0.7402 0.0620] norm=16.0001
+    [attn] head4 first4=[0.9722 -0.4351 0.4045 -1.1191] norm=16.0004
+    [attn] head5 first4=[0.9722 -0.4351 0.4045 -1.1191] norm=16.0004
+    [attn] head6 first4=[0.9722 -0.4351 0.4045 -1.1191] norm=16.0004
+    [attn] head7 first4=[0.9722 -0.4351 0.4045 -1.1191] norm=16.0004
+    [OK] attn head0 matches V cache head0 within 0.01
+  [trace] L1/4(L1/q8_oproj): x_norm=46.68
+    [buf] projOut: [-2.6080 -1.2653 1.4582 0.5704] norm=107.66
+    [buf] projOut: [-2.6080 -1.2653 1.4582 0.5704] norm=107.66
+  [trace] L1/5(L1/post_attn_norm): x_norm=46.68
+    [buf] normOut: [-0.0132 -0.0058 8.3522 3.2672] norm=522.34
+    [nw] postAttnNorm L1: min=0.0065 max=12.1875 mean=2.2272 first4=[0.0107 0.0098 12.1875 12.1875]
+  [trace] L1/6(L1/attn_residual_add): x_norm=524.54
+  [trace] L1/7(L1/pre_ffn_norm): x_norm=524.54
+  [trace] L1/8(L1/q8_gateup): x_norm=524.54
+    [buf] gateUpBuf: [-1.6712 -2.3035 0.9078 -3.0941] norm=528.41
+  [trace] L1/9(L1/gelu_mul): x_norm=524.54
+  [trace] L1/10(L1/q8_down): x_norm=524.54
+    [buf] downProjOut: [10.0569 5.3053 3.1090 0.6306] norm=348.29
+  [trace] L1/11(L1/post_ffn_norm): x_norm=524.54
+  [trace] L1/12(L1/ffn_residual_add): x_norm=546.74
+  [trace] L1/13(L1/ple_gate): x_norm=546.74
+  [trace] L1/14(L1/ple_gelu_mul): x_norm=546.74
+  [trace] L1/15(L1/ple_proj): x_norm=546.74
+  [trace] L1/16(L1/ple_norm): x_norm=546.74
+  [trace] L1/17(L1/ple_add): x_norm=548.65
+  [trace] L1/18(L1/layer_scalar): x_norm=87.87
+  [trace] L1: [-0.0030 0.0482 1.6159 0.4555] norm=87.87
+  [kv] L1 kv[1] K first4=[0.197021 -0.047424 -0.038361 0.103577] head0_norm=2.0782
+  [kv] L1 kv[1] V first4=[0.048004 0.919922 0.740234 0.062012] head0_norm=16.0001
+  [trace] L2/0(L2/q8_qkv): x_norm=87.87
+    [qkv] Q[0..7]: [6.3036 4.5805 -4.0582 0.0469 -3.5242 -1.7133 -0.8865 -9.5997] norm=216.6483
+    [qkv] K[0..7]: [1.2844 2.0857 -5.9906 5.0498 -3.7505 2.3776 -1.3109 2.3860] norm=119.8925
+    [qkv] V[0..7]: [-4.0907 5.4480 4.4358 -2.2652 0.6537 1.7299 0.8250 -3.2988] norm=86.0852
+  [trace] L2/1(L2/fused_rope): x_norm=87.87
+    [buf] qkvBuf: [6.3036 4.5805 -4.0582 0.0469] norm=262.15
+    [buf] qRotBuf: [1.2316 0.8949 -0.7929 0.0092] norm=42.96
+    [cpu_vnorm] V head0 raw first4=[-4.0907 5.4480 4.4358 -2.2652] sumSq=3234.8123 rms=3.5547
+    [cpu_vnorm] V head0 normed first4=[-1.150780 1.532627 1.247860 -0.637233]
+    [cpu_vnorm] V head0 normed norm=16.0000 (expect 16.0)
+    [gpu_vcache] V head0 first8=[-1.150391 1.532227 1.248047 -0.637207 0.183838 0.486572 0.232056 -0.928223]
+    [gpu_kcache] K head0 first8=[0.032379 0.052582 -0.151001 0.127319 -0.094543 0.059937 -0.033051 0.060150]
+  [trace] L2/2(L2/attn_p1): x_norm=87.87
+  [trace] L2/3(L2/attn_p2): x_norm=87.87
+    [buf] attnOut: [-1.1504 1.5322 1.2480 -0.6372] norm=45.25
+    [attn] head0 first4=[-1.1504 1.5322 1.2480 -0.6372] norm=16.0003
+    [attn] head1 first4=[-1.1504 1.5322 1.2480 -0.6372] norm=16.0003
+    [attn] head2 first4=[-1.1504 1.5322 1.2480 -0.6372] norm=16.0003
+    [attn] head3 first4=[-1.1504 1.5322 1.2480 -0.6372] norm=16.0003
+    [attn] head4 first4=[-0.6758 0.6772 0.5171 -1.1689] norm=15.9996
+    [attn] head5 first4=[-0.6758 0.6772 0.5171 -1.1689] norm=15.9996
+    [attn] head6 first4=[-0.6758 0.6772 0.5171 -1.1689] norm=15.9996
+    [attn] head7 first4=[-0.6758 0.6772 0.5171 -1.1689] norm=15.9996
+    [OK] attn head0 matches V cache head0 within 0.01
+  [trace] L2/4(L2/q8_oproj): x_norm=87.87
+    [buf] projOut: [1.0422 -1.2626 -2.2788 2.3524] norm=107.65
+    [buf] projOut: [1.0422 -1.2626 -2.2788 2.3524] norm=107.65
+  [trace] L2/5(L2/post_attn_norm): x_norm=87.87
+    [buf] normOut: [0.0026 -0.0777 -0.7782 0.8033] norm=19.27
+    [nw] postAttnNorm L2: min=0.0004 max=0.7266 mean=0.2845 first4=[0.0052 0.1309 0.7266 0.7266]
+  [trace] L2/6(L2/attn_residual_add): x_norm=100.99
+  [trace] L2/7(L2/pre_ffn_norm): x_norm=100.99
+  [trace] L2/8(L2/q8_gateup): x_norm=100.99
+    [buf] gateUpBuf: [-5.6227 -0.6493 -3.6195 -2.1467] norm=295.83
+  [trace] L2/9(L2/gelu_mul): x_norm=100.99
+  [trace] L2/10(L2/q8_down): x_norm=100.99
+    [buf] downProjOut: [-2.4459 -2.5439 0.6546 -4.4353] norm=109.20
+  [trace] L2/11(L2/post_ffn_norm): x_norm=100.99
+  [trace] L2/12(L2/ffn_residual_add): x_norm=116.83
+  [trace] L2/13(L2/ple_gate): x_norm=116.83
+  [trace] L2/14(L2/ple_gelu_mul): x_norm=116.83
+  [trace] L2/15(L2/ple_proj): x_norm=116.83
+  [trace] L2/16(L2/ple_norm): x_norm=116.83
+  [trace] L2/17(L2/ple_add): x_norm=117.78
+  [trace] L2/18(L2/layer_scalar): x_norm=98.92
+  [trace] L2: [-0.0212 -0.6379 1.0580 -0.8434] norm=98.92
+  [kv] L2 kv[2] K first4=[0.032379 0.052582 -0.151001 0.127319] head0_norm=2.1094
+  [kv] L2 kv[2] V first4=[-1.150391 1.532227 1.248047 -0.637207] head0_norm=16.0003
+  [trace] L3: [-0.0594 1.0972 4.0359 -2.3953] norm=101.30
+  [trace] L4: [-0.0450 -0.8121 2.7479 -3.5902] norm=87.52
+  [trace] L5: [-0.0259 -1.9954 2.1353 -2.5154] norm=86.97
+  [trace] L10: [-0.3475 0.4790 -7.4002 0.3232] norm=103.60
+  [trace] L15: [-0.9853 -0.1783 0.1340 -0.8127] norm=136.24
+  [trace] L20: [0.4871 -0.0650 -0.1226 -0.5742] norm=88.28
+  [trace] L25: [-1.5528 0.3856 0.2399 1.0408] norm=92.85
+  [trace] L30: [-0.0715 0.4637 2.3818 -0.1432] norm=114.81
+  [trace] L35: [-0.9089 1.0151 2.5741 1.1316] norm=146.53
+  [trace] L40: [-0.4193 -0.1022 1.9391 1.1704] norm=100.37
+  [trace] L41: [-0.2862 0.0337 0.1699 0.8288] norm=65.45
+  [trace] final_rms out: [-1.749446 0.214892 0.541692 4.845443] norm=131.9565
+  [trace] lm_head out [0..4]: -14.3823 -8.3752 -9.9865 -14.3362 -23.1071
+  [trace] lm_head logit[10979] = 9.7146
+  [trace] logits: min=-25.90 max=9.39
+  [trace] top5: [10979]=9.39 [3586]=-0.17 [19702]=-1.19 [236829]=-1.38 [1018]=-1.52
+  [dbg] Prefill → tokenId=10979
+  [dbg] decode[0] → tokenId=10979 text='Hi'
+Hi  [dbg] updateDecodeParams: pos=1 cacheLen=1 T_total=2 cache_offset=512
+  [dbg] decode[1] → tokenId=10979 text='Hi'
+Hi  [dbg] updateDecodeParams: pos=2 cacheLen=2 T_total=3 cache_offset=1024
+
+
+--- Performance ---
+  Prompt:   1 tokens
+  Generate: 2 tokens in 60ms (33.2 tok/s)

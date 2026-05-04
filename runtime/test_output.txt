@@ -1,0 +1,10 @@
+Backpack Runtime -- WebGPU inference from GGUF/ONNX models
+
+Usage: .\backpack_runtime.exe --model <model.gguf or model-dir/>
+  [--prompt <text>] [--max-tokens <n>] [--backend vulkan|d3d12]
+  [--profile] [--benchmark] [--bench-detail]
+  [--bench-prompt-len <n>] [--bench-gen-tokens <n>]
+
+Supports:
+  - GGUF files (Q8_0 quantization)
+  - ONNX directories (model.onnx + config.json)

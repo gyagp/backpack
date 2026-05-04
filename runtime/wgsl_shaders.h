@@ -3836,6 +3836,102 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// [matmul] matmul_fp16_packed
+static const char* WGSL_MATMUL_FP16_PACKED = R"WGSL(
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> W: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read_write> _params_: array<u32>;
+
+const TILE_M: u32 = 4u;
+const TILE_N: u32 = 4u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let tile_row = wid.x;
+    let tile_col = wid.y;
+    let tid = lid.x;
+
+    let K = _params_[0];
+    let N = _params_[1];
+    let M = _params_[2];
+
+    let half_K = K / 2u;
+
+    let warp_id = tid / 32u;
+    let lane = tid % 32u;
+
+    let local_row = warp_id / 2u;
+    let local_col2 = warp_id % 2u;
+
+    let row = tile_row * TILE_M + local_row;
+    let col0 = tile_col * TILE_N + local_col2 * 2u;
+
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+
+    if (row < M) {
+        let x_base = row * K;
+        let stride = 128u;
+        var k = lane * 4u;
+
+        for (; k + 3u < K; k = k + stride) {
+            let x0 = X[x_base + k];
+            let x1 = X[x_base + k + 1u];
+            let x2 = X[x_base + k + 2u];
+            let x3 = X[x_base + k + 3u];
+            let xv = vec4<f32>(x0, x1, x2, x3);
+
+            if (col0 < N) {
+                let w_base0 = col0 * half_K;
+                let w01 = unpack2x16float(W[w_base0 + k / 2u]);
+                let w23 = unpack2x16float(W[w_base0 + k / 2u + 1u]);
+                acc0 += dot(xv, vec4<f32>(w01.x, w01.y, w23.x, w23.y));
+            }
+
+            if (col0 + 1u < N) {
+                let w_base1 = (col0 + 1u) * half_K;
+                let w01 = unpack2x16float(W[w_base1 + k / 2u]);
+                let w23 = unpack2x16float(W[w_base1 + k / 2u + 1u]);
+                acc1 += dot(xv, vec4<f32>(w01.x, w01.y, w23.x, w23.y));
+            }
+        }
+
+        for (; k < K; k = k + stride) {
+            let xv = X[x_base + k];
+            if (col0 < N) {
+                let w_base0 = col0 * half_K;
+                let pair = unpack2x16float(W[w_base0 + k / 2u]);
+                let w_val = select(pair.x, pair.y, (k & 1u) == 1u);
+                acc0 += xv * w_val;
+            }
+            if (col0 + 1u < N) {
+                let w_base1 = (col0 + 1u) * half_K;
+                let pair = unpack2x16float(W[w_base1 + k / 2u]);
+                let w_val = select(pair.x, pair.y, (k & 1u) == 1u);
+                acc1 += xv * w_val;
+            }
+        }
+    }
+
+    let sum0 = subgroupAdd(acc0);
+    let sum1 = subgroupAdd(acc1);
+
+    if (lane == 0u) {
+        if (row < M && col0 < N) {
+            Y[row * N + col0] = sum0 + Bias[col0];
+        }
+        if (row < M && col0 + 1u < N) {
+            Y[row * N + col0 + 1u] = sum1 + Bias[col0 + 1u];
+        }
+    }
+}
+)WGSL";
+
 // [matmul] matmul_f32
 static const char* WGSL_MATMUL_F32 = R"WGSL(
 // MatMul — fp32 matrix multiplication
@@ -12853,6 +12949,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"kv_cache_write_batched", {WGSL_KV_CACHE_WRITE_BATCHED, 3, false}},
         {"layer_norm", {WGSL_LAYER_NORM, 5, false}},
         {"matmul_f32", {WGSL_MATMUL, 4, false}},
+        {"matmul_fp16_packed", {WGSL_MATMUL_FP16_PACKED, 5, false}},
         {"matmul_q4", {WGSL_MATMUL_Q4, 5, false}},
         {"matmul_q4_indirect", {WGSL_MATMUL_Q4_INDIRECT, 6, false}},
         {"matmul_q4_indirect_sub", {WGSL_MATMUL_Q4_INDIRECT_SUB, 6, false}},

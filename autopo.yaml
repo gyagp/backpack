@@ -1,0 +1,71 @@
+project:
+  name: backpack
+  description: "High-performance WebGPU LLM inference engine — optimize decode throughput to match or beat llamacpp Vulkan and ORT WebGPU"
+  path: "E:/workspace/project/agents/backpack"
+
+goals:
+  - id: fp16-weight-storage
+    description: "Universal fp16 weight storage via u32 packing to halve memory bandwidth"
+    acceptance:
+      - "All matmul kernels use array<u32> + unpack2x16float() for fp16 weights on D3D12"
+      - "No regressions in kernel correctness tests"
+      - "Decode throughput improves measurably on Qwen3-1.7B and Phi-4-mini"
+    priority: 1
+
+  - id: kernel-fusion
+    description: "Fuse high-frequency op pairs to reduce dispatch overhead"
+    acceptance:
+      - "RMSNorm+QKV projection fused kernel implemented and tested"
+      - "O-proj+residual-add fused kernel implemented and tested"
+      - "Down-proj+residual-add fused kernel implemented and tested"
+      - "Fused kernels used automatically in model_runner decode path"
+      - "Correctness validated against unfused path within 1e-3 tolerance"
+    priority: 2
+    depends_on: [fp16-weight-storage]
+
+  - id: dispatch-consolidation
+    description: "Reduce per-step command encoding overhead by consolidating dispatches"
+    acceptance:
+      - "Single compute pass mode enabled for D3D12 backend in decode path"
+      - "All per-layer dispatches packed into minimal command buffers"
+      - "Decode throughput improves by reducing CPU encoding time"
+      - "No correctness regressions"
+    priority: 3
+    depends_on: [kernel-fusion]
+
+  - id: buffer-lifetime
+    description: "Implement buffer lifetime analysis to reduce GPU memory usage"
+    acceptance:
+      - "Activation buffer lifetime analysis tracks first-use to last-use per tensor"
+      - "Buffers reused across non-overlapping lifetimes"
+      - "Peak GPU memory reduced by at least 50% for activation buffers"
+      - "No correctness regressions in op or kernel tests"
+    priority: 4
+    depends_on: [dispatch-consolidation]
+
+  - id: decode-pipeline-depth
+    description: "Deepen async decode pipeline to hide GPU-CPU sync latency"
+    acceptance:
+      - "Decode pipeline supports depth up to 8 with multiple staging buffers"
+      - "Auto-tuner updated to explore deeper pipeline depths"
+      - "CPU-side work overlaps with GPU execution more effectively"
+      - "Measured reduction in fence wait time"
+    priority: 5
+    depends_on: [buffer-lifetime]
+
+  - id: perf-benchmark
+    description: "Run full benchmark suite and measure gains against llamacpp Vulkan and ORT WebGPU"
+    acceptance:
+      - "benchmark_suite.py runs successfully on at least 10 models"
+      - "Backpack GGUF decode tok/s >= 80% of llamacpp Vulkan on DeepSeek-R1-Distill-Qwen-1.5B"
+      - "Backpack GGUF decode tok/s >= llamacpp Vulkan on at least 2 models"
+      - "HTML comparison report generated with before/after data"
+    priority: 6
+    depends_on: [decode-pipeline-depth]
+
+settings:
+  max_iterations: 150
+  max_time_hours: 48
+  tech_stack: "C++17, CMake, Dawn WebGPU, WGSL compute shaders, GGUF/ONNX formats"
+  auto_push: true
+  test_mode: "unit"

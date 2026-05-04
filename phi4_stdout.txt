@@ -1,0 +1,58 @@
+GPU: NVIDIA GeForce RTX 5080 (D3D12 driver version 32.0.15.9144)
+  maxComputeInvocationsPerWorkgroup: 1024
+  maxComputeWorkgroupSizeX: 1024
+  maxComputeWorkgroupStorageSize: 32768 bytes
+  maxStorageBufferBindingSize: 2048 MB
+  maxBufferSize: 2048 MB
+  Features: f16=yes subgroups=yes subgroup_matrix=no timestamps=yes
+Loading model: e:/workspace/project/ort-models/phi4_fp16_eq8 (onnx)
+ONNX Config: phi3 (32 layers, E=3072, HD=128, V=200064, KV=8)
+  ONNX file: 26241118 bytes
+  Loading external data: 2782248960 bytes (2653 MB)...
+  External data loaded: 2782248960 bytes
+  Parsed: 521 initializers, 511 nodes
+  Extracted: 225 Q8 weights, 65 norm weights
+  processed layer 7/32
+  processed layer 14/32
+  processed layer 21/32
+  processed layer 28/32
+  processed layer 32/32
+  ONNX model parsed in 4348ms
+  Model: E=3072, IM=8192, HD=128, V=200064
+Model: phi3 (32 layers, E=3072, HD=128, V=200064, KV=8) [ONNX]
+  RoPE theta=10000, RMSNorm eps=1.0e-05, QK-norm=no
+  Backend: D3D12, single-pass dispatch
+  Uploading weights to GPU...
+  KV cache: 512 MB (fp16)
+  uploaded layer 7/32
+  uploaded layer 14/32
+  uploaded layer 21/32
+  uploaded layer 28/32
+  uploaded layer 32/32
+  Embedding: 200064 × 3072 (fp32)
+  LM head: separate (Q8)
+  Weights uploaded in 2257ms
+  Subgroup matrix: not available
+  Initial decode heuristic: qkv=fast oproj=base gateup=fast lm_head=fp16_wide pool=4 batch=160
+  291 decode dispatches (32 layers)
+  Pool: 4 slots × 160 pre-recorded CBs
+  DP4A (dot4I8Packed): available
+  Prefill tuning: mat=q8_matmul_prequant_d3d12 qkv/gateup=q8_matmul_prequant_wide_d3d12 down=q8_matmul_prequant_add_wide_d3d12 attn=causal_attn tiles=8x32 wide=4x64 pool=4
+  Vocab: 200019 tokens (max_id=200018)
+  Tokenizer: 200019 tokens, 199742 merges, 12 added, EOS=200020
+  Decode depth autotune: 4 -> 2 (9.42 ms/tok)
+  Decode kernel autotune: qkv=base oproj=base gateup=base (7.07 ms/tok)
+
+Model: phi3 (onnx, 32L, E=3072, HD=128, V=200064)
+GPU:   NVIDIA GeForce RTX 5080 (d3d12)
+Ready: 12504ms
+
+Chat: What is 2+2?
+Prompt: 10 tokens
+
+--- Output ---
+ and and T , String Ad is Ad ( and build and  and is Ad is Ad is Ad ( dataAd is Ad is initial isA T ( data ( data ( data T T T T and data          and ( and and and and and and and and and and and ( and and and and and and data data and and and and and and and and and and and and and and and and and and and and and and and and and and
+
+--- Performance ---
+  Prompt:   10 tokens
+  Generate: 100 tokens in 1006ms (99.4 tok/s)

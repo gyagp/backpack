@@ -1,0 +1,1405 @@
+{
+  "models": {
+    "CodeLlama-7b-Instruct-hf": {
+      "name": "CodeLlama-7b-Instruct-hf",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1418.1,
+          "prefill_tok_s": 90.3,
+          "decode_ms": 1516.5,
+          "decode_tok_s": 84.4
+        }
+      ],
+      "backpack_onnx": null,
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 4895.020929,
+          "decode_tok_s": 165.775775
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 5974.236257,
+          "decode_tok_s": 165.775775
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 7018.798133,
+          "decode_tok_s": 165.775775
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 6762.442813,
+          "decode_tok_s": 165.775775
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 6022.693464,
+          "decode_tok_s": 165.775775
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 5047.619934,
+          "decode_tok_s": 165.775775
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1524.59,
+          "decode_tok_s": 133.971
+        }
+      ]
+    },
+    "DeepSeek-R1-0528-Qwen3-8B": {
+      "name": "DeepSeek-R1-0528-Qwen3-8B",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1592.4,
+          "prefill_tok_s": 80.4,
+          "decode_ms": 1692.5,
+          "decode_tok_s": 75.6
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 905.2,
+          "prefill_tok_s": 141.4,
+          "decode_ms": 2217.4,
+          "decode_tok_s": 57.7
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 1123.8,
+          "prefill_tok_s": 227.8,
+          "decode_ms": 2303.8,
+          "decode_tok_s": 55.6
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 1420.0,
+          "prefill_tok_s": 360.6,
+          "decode_ms": 2301.4,
+          "decode_tok_s": 55.6
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 2300.2,
+          "prefill_tok_s": 445.2,
+          "decode_ms": 2381.3,
+          "decode_tok_s": 53.8
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 4004.5,
+          "prefill_tok_s": 511.4,
+          "decode_ms": 2174.6,
+          "decode_tok_s": 58.9
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 7879.2,
+          "prefill_tok_s": 519.8,
+          "decode_ms": 2439.9,
+          "decode_tok_s": 52.5
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 4711.115644,
+          "decode_tok_s": 144.449746
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 5759.787591,
+          "decode_tok_s": 144.449746
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 6586.282635,
+          "decode_tok_s": 144.449746
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 6403.931204,
+          "decode_tok_s": 144.449746
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 5667.328764,
+          "decode_tok_s": 144.449746
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 4804.530768,
+          "decode_tok_s": 144.449746
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1616.54,
+          "decode_tok_s": 98.2443
+        }
+      ]
+    },
+    "DeepSeek-R1-Distill-Llama-8B": {
+      "name": "DeepSeek-R1-Distill-Llama-8B",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1542.4,
+          "prefill_tok_s": 83.0,
+          "decode_ms": 1641.3,
+          "decode_tok_s": 78.0
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 525.3,
+          "prefill_tok_s": 243.7,
+          "decode_ms": 1775.0,
+          "decode_tok_s": 72.1
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 704.6,
+          "prefill_tok_s": 363.3,
+          "decode_ms": 1703.3,
+          "decode_tok_s": 75.1
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 1101.8,
+          "prefill_tok_s": 464.7,
+          "decode_ms": 1694.3,
+          "decode_tok_s": 75.5
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 1930.8,
+          "prefill_tok_s": 530.3,
+          "decode_ms": 1773.0,
+          "decode_tok_s": 72.2
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 3647.7,
+          "prefill_tok_s": 561.4,
+          "decode_ms": 1700.2,
+          "decode_tok_s": 75.3
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 7505.6,
+          "prefill_tok_s": 545.7,
+          "decode_ms": 1876.2,
+          "decode_tok_s": 68.2
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 5251.358483,
+          "decode_tok_s": 147.881787
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 6374.958284,
+          "decode_tok_s": 147.881787
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 6976.799364,
+          "decode_tok_s": 147.881787
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 6766.936057,
+          "decode_tok_s": 147.881787
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 6094.321672,
+          "decode_tok_s": 147.881787
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 5200.482057,
+          "decode_tok_s": 147.881787
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1783.87,
+          "decode_tok_s": 117.305
+        }
+      ]
+    },
+    "DeepSeek-R1-Distill-Qwen-1.5B": {
+      "name": "DeepSeek-R1-Distill-Qwen-1.5B",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 491.3,
+          "prefill_tok_s": 260.5,
+          "decode_ms": 574.8,
+          "decode_tok_s": 222.7
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 24.2,
+          "prefill_tok_s": 5278.9,
+          "decode_ms": 672.0,
+          "decode_tok_s": 190.5
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 44.2,
+          "prefill_tok_s": 5788.7,
+          "decode_ms": 704.1,
+          "decode_tok_s": 181.8
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 86.9,
+          "prefill_tok_s": 5891.2,
+          "decode_ms": 688.0,
+          "decode_tok_s": 186.1
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 182.1,
+          "prefill_tok_s": 5624.5,
+          "decode_ms": 735.4,
+          "decode_tok_s": 174.1
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 400.5,
+          "prefill_tok_s": 5113.9,
+          "decode_ms": 687.4,
+          "decode_tok_s": 186.2
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 965.4,
+          "prefill_tok_s": 4243.0,
+          "decode_ms": 702.7,
+          "decode_tok_s": 182.1
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 12893.562409,
+          "decode_tok_s": 465.341828
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 18712.727756,
+          "decode_tok_s": 465.341828
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 23333.61581,
+          "decode_tok_s": 465.341828
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 22989.474275,
+          "decode_tok_s": 465.341828
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 21521.244774,
+          "decode_tok_s": 465.341828
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 17985.450845,
+          "decode_tok_s": 465.341828
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 5401.92,
+          "decode_tok_s": 194.556
+        }
+      ]
+    },
+    "DeepSeek-R1-Distill-Qwen-7B": {
+      "name": "DeepSeek-R1-Distill-Qwen-7B",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1397.3,
+          "prefill_tok_s": 91.6,
+          "decode_ms": 1488.1,
+          "decode_tok_s": 86.0
+        }
+      ],
+      "backpack_onnx": null,
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 5948.522847,
+          "decode_tok_s": 164.811523
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 7728.930113,
+          "decode_tok_s": 164.811523
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 7985.277064,
+          "decode_tok_s": 164.811523
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 7813.426625,
+          "decode_tok_s": 164.811523
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 7125.694058,
+          "decode_tok_s": 164.811523
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 6172.126202,
+          "decode_tok_s": 164.811523
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1892.45,
+          "decode_tok_s": 120.309
+        }
+      ]
+    },
+    "gemma-2-2b-it": {
+      "name": "gemma-2-2b-it",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": null,
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 34.2,
+          "prefill_tok_s": 3745.9,
+          "decode_ms": 723.1,
+          "decode_tok_s": 177.0
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 63.5,
+          "prefill_tok_s": 4030.6,
+          "decode_ms": 722.8,
+          "decode_tok_s": 177.1
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 124.8,
+          "prefill_tok_s": 4102.0,
+          "decode_ms": 769.1,
+          "decode_tok_s": 166.4
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 254.5,
+          "prefill_tok_s": 4023.6,
+          "decode_ms": 732.8,
+          "decode_tok_s": 174.7
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 539.0,
+          "prefill_tok_s": 3799.3,
+          "decode_ms": 787.9,
+          "decode_tok_s": 162.5
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 1220.5,
+          "prefill_tok_s": 3355.9,
+          "decode_ms": 766.5,
+          "decode_tok_s": 167.0
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 12460.309647,
+          "decode_tok_s": 290.486279
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 16216.716348,
+          "decode_tok_s": 290.486279
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 18237.732197,
+          "decode_tok_s": 290.486279
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 18212.19527,
+          "decode_tok_s": 290.486279
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 17271.035877,
+          "decode_tok_s": 290.486279
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 14798.462012,
+          "decode_tok_s": 290.486279
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 2648.14,
+          "decode_tok_s": 144.35
+        }
+      ]
+    },
+    "gemma-2-9b-it": {
+      "name": "gemma-2-9b-it",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 2022.7,
+          "prefill_tok_s": 63.3,
+          "decode_ms": 2152.9,
+          "decode_tok_s": 59.5
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1585.7,
+          "prefill_tok_s": 80.7,
+          "decode_ms": 3189.9,
+          "decode_tok_s": 40.1
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 1930.5,
+          "prefill_tok_s": 132.6,
+          "decode_ms": 3108.7,
+          "decode_tok_s": 41.2
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 2342.9,
+          "prefill_tok_s": 218.5,
+          "decode_ms": 2907.0,
+          "decode_tok_s": 44.0
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 3134.0,
+          "prefill_tok_s": 326.7,
+          "decode_ms": 3082.5,
+          "decode_tok_s": 41.5
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 5095.2,
+          "prefill_tok_s": 401.9,
+          "decode_ms": 2950.5,
+          "decode_tok_s": 43.4
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 9324.9,
+          "prefill_tok_s": 439.3,
+          "decode_ms": 3177.0,
+          "decode_tok_s": 40.3
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 3618.510235,
+          "decode_tok_s": 111.400679
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 5420.00113,
+          "decode_tok_s": 111.400679
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 5779.703615,
+          "decode_tok_s": 111.400679
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 5700.512196,
+          "decode_tok_s": 111.400679
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 5165.63503,
+          "decode_tok_s": 111.400679
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 4091.541738,
+          "decode_tok_s": 111.400679
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1053.06,
+          "decode_tok_s": 77.6806
+        }
+      ]
+    },
+    "gemma-2b-it": {
+      "name": "gemma-2b-it",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 605.2,
+          "prefill_tok_s": 211.5,
+          "decode_ms": 676.3,
+          "decode_tok_s": 189.3
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 41.6,
+          "prefill_tok_s": 3075.7,
+          "decode_ms": 771.1,
+          "decode_tok_s": 166.0
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 71.1,
+          "prefill_tok_s": 3602.9,
+          "decode_ms": 775.1,
+          "decode_tok_s": 165.1
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 132.3,
+          "prefill_tok_s": 3870.7,
+          "decode_ms": 800.5,
+          "decode_tok_s": 159.9
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 260.1,
+          "prefill_tok_s": 3937.6,
+          "decode_ms": 782.3,
+          "decode_tok_s": 163.6
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 533.2,
+          "prefill_tok_s": 3840.6,
+          "decode_ms": 820.3,
+          "decode_tok_s": 156.0
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 1158.1,
+          "prefill_tok_s": 3536.7,
+          "decode_ms": 808.7,
+          "decode_tok_s": 158.3
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 15233.294808,
+          "decode_tok_s": 397.228492
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 18454.482681,
+          "decode_tok_s": 397.228492
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 21574.847299,
+          "decode_tok_s": 397.228492
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 21485.214199,
+          "decode_tok_s": 397.228492
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 20866.561169,
+          "decode_tok_s": 397.228492
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 19435.12397,
+          "decode_tok_s": 397.228492
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 6263.03,
+          "decode_tok_s": 208.014
+        }
+      ]
+    },
+    "gemma-3-1b-it": {
+      "name": "gemma-3-1b-it",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": null,
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 15.0,
+          "prefill_tok_s": 8537.4,
+          "decode_ms": 506.8,
+          "decode_tok_s": 252.6
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 25.4,
+          "prefill_tok_s": 10076.2,
+          "decode_ms": 506.0,
+          "decode_tok_s": 253.0
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 47.5,
+          "prefill_tok_s": 10785.8,
+          "decode_ms": 508.5,
+          "decode_tok_s": 251.7
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 96.3,
+          "prefill_tok_s": 10637.5,
+          "decode_ms": 577.0,
+          "decode_tok_s": 221.8
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 206.0,
+          "prefill_tok_s": 9943.5,
+          "decode_ms": 520.2,
+          "decode_tok_s": 246.1
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 481.0,
+          "prefill_tok_s": 8515.7,
+          "decode_ms": 536.8,
+          "decode_tok_s": 238.5
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 18019.124613,
+          "decode_tok_s": 403.333786
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 26943.944129,
+          "decode_tok_s": 403.333786
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 33311.063575,
+          "decode_tok_s": 403.333786
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 34365.901018,
+          "decode_tok_s": 403.333786
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 34589.427031,
+          "decode_tok_s": 403.333786
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 34739.148151,
+          "decode_tok_s": 403.333786
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 3126.72,
+          "decode_tok_s": 124.231
+        }
+      ]
+    },
+    "gemma-7b-it": {
+      "name": "gemma-7b-it",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1576.5,
+          "prefill_tok_s": 81.2,
+          "decode_ms": 1675.3,
+          "decode_tok_s": 76.4
+        }
+      ],
+      "backpack_onnx": null,
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 4830.800795,
+          "decode_tok_s": 140.823853
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 6071.048191,
+          "decode_tok_s": 140.823853
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 6278.049851,
+          "decode_tok_s": 140.823853
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 6279.768602,
+          "decode_tok_s": 140.823853
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 5953.647384,
+          "decode_tok_s": 140.823853
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 5359.191012,
+          "decode_tok_s": 140.823853
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 2610.51,
+          "decode_tok_s": 101.641
+        }
+      ]
+    },
+    "gpt-oss-20b": {
+      "name": "gpt-oss-20b",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": null,
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1.3,
+          "prefill_tok_s": 99371.2,
+          "decode_ms": 1.4,
+          "decode_tok_s": 90478.5
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 1.5,
+          "prefill_tok_s": 169312.2,
+          "decode_ms": 1.4,
+          "decode_tok_s": 92713.3
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 2.1,
+          "prefill_tok_s": 240895.8,
+          "decode_ms": 1.4,
+          "decode_tok_s": 92539.0
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 3.4,
+          "prefill_tok_s": 301708.9,
+          "decode_ms": 1.3,
+          "decode_tok_s": 95758.2
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 6.0,
+          "prefill_tok_s": 342509.3,
+          "decode_ms": 246.1,
+          "decode_tok_s": 520.1
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 6.6,
+          "prefill_tok_s": 616496.1,
+          "decode_ms": 0.7,
+          "decode_tok_s": 180332.5
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 2833.165816,
+          "decode_tok_s": 239.81572
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 4688.97874,
+          "decode_tok_s": 239.81572
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 6558.661172,
+          "decode_tok_s": 239.81572
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 6253.818059,
+          "decode_tok_s": 239.81572
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 5895.288723,
+          "decode_tok_s": 239.81572
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 5298.119957,
+          "decode_tok_s": 239.81572
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 680.976,
+          "decode_tok_s": 141.387
+        }
+      ]
+    },
+    "granite-3.1-2b-instruct": {
+      "name": "granite-3.1-2b-instruct",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 758.9,
+          "prefill_tok_s": 168.7,
+          "decode_ms": 911.1,
+          "decode_tok_s": 140.5
+        }
+      ],
+      "backpack_onnx": null,
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 10831.824588,
+          "decode_tok_s": 301.90003
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 13280.727008,
+          "decode_tok_s": 301.90003
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 14347.153202,
+          "decode_tok_s": 301.90003
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 12505.22751,
+          "decode_tok_s": 301.90003
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 10171.172324,
+          "decode_tok_s": 301.90003
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 7489.466183,
+          "decode_tok_s": 301.90003
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 3892.78,
+          "decode_tok_s": 154.411
+        }
+      ]
+    },
+    "granite-3.1-8b-instruct": {
+      "name": "granite-3.1-8b-instruct",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1770.2,
+          "prefill_tok_s": 72.3,
+          "decode_ms": 1898.1,
+          "decode_tok_s": 67.4
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 874.7,
+          "prefill_tok_s": 146.3,
+          "decode_ms": 2094.6,
+          "decode_tok_s": 61.1
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 986.3,
+          "prefill_tok_s": 259.6,
+          "decode_ms": 2093.0,
+          "decode_tok_s": 61.2
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 1429.1,
+          "prefill_tok_s": 358.3,
+          "decode_ms": 2172.0,
+          "decode_tok_s": 58.9
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 2397.4,
+          "prefill_tok_s": 427.1,
+          "decode_ms": 2108.5,
+          "decode_tok_s": 60.7
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 4354.0,
+          "prefill_tok_s": 470.4,
+          "decode_ms": 2182.1,
+          "decode_tok_s": 58.7
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 8754.3,
+          "prefill_tok_s": 467.9,
+          "decode_ms": 2367.5,
+          "decode_tok_s": 54.1
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 4457.648407,
+          "decode_tok_s": 133.996739
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 5443.076285,
+          "decode_tok_s": 133.996739
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 6292.419763,
+          "decode_tok_s": 133.996739
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 5976.573519,
+          "decode_tok_s": 133.996739
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 5321.798448,
+          "decode_tok_s": 133.996739
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 4452.707967,
+          "decode_tok_s": 133.996739
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1607.53,
+          "decode_tok_s": 108.638
+        }
+      ]
+    },
+    "granite-3.2-2b-instruct": {
+      "name": "granite-3.2-2b-instruct",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 757.8,
+          "prefill_tok_s": 168.9,
+          "decode_ms": 871.6,
+          "decode_tok_s": 146.8
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 42.7,
+          "prefill_tok_s": 2997.5,
+          "decode_ms": 951.1,
+          "decode_tok_s": 134.6
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 80.5,
+          "prefill_tok_s": 3180.3,
+          "decode_ms": 952.3,
+          "decode_tok_s": 134.4
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 164.3,
+          "prefill_tok_s": 3116.4,
+          "decode_ms": 1021.1,
+          "decode_tok_s": 125.4
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 367.4,
+          "prefill_tok_s": 2787.5,
+          "decode_ms": 975.0,
+          "decode_tok_s": 131.3
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 881.9,
+          "prefill_tok_s": 2322.3,
+          "decode_ms": 1037.1,
+          "decode_tok_s": 123.4
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 2376.3,
+          "prefill_tok_s": 1723.7,
+          "decode_ms": 1177.6,
+          "decode_tok_s": 108.7
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 10814.46794,
+          "decode_tok_s": 303.135751
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 13276.818978,
+          "decode_tok_s": 303.135751
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 14194.153391,
+          "decode_tok_s": 303.135751
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 12520.525005,
+          "decode_tok_s": 303.135751
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 10134.653066,
+          "decode_tok_s": 303.135751
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 7488.407532,
+          "decode_tok_s": 303.135751
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 3889.21,
+          "decode_tok_s": 151.233
+        }
+      ]
+    },
+    "granite-3.2-8b-instruct": {
+      "name": "granite-3.2-8b-instruct",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1769.4,
+          "prefill_tok_s": 72.3,
+          "decode_ms": 1885.9,
+          "decode_tok_s": 67.9
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 1002.3,
+          "prefill_tok_s": 127.7,
+          "decode_ms": 2213.1,
+          "decode_tok_s": 57.8
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 1182.8,
+          "prefill_tok_s": 216.4,
+          "decode_ms": 2283.3,
+          "decode_tok_s": 56.1
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 1613.4,
+          "prefill_tok_s": 317.3,
+          "decode_ms": 2226.2,
+          "decode_tok_s": 57.5
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 2583.4,
+          "prefill_tok_s": 396.4,
+          "decode_ms": 2303.1,
+          "decode_tok_s": 55.6
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 4541.7,
+          "prefill_tok_s": 450.9,
+          "decode_ms": 2234.8,
+          "decode_tok_s": 57.3
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 9188.5,
+          "prefill_tok_s": 445.8,
+          "decode_ms": 2472.9,
+          "decode_tok_s": 51.8
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 4261.051835,
+          "decode_tok_s": 128.426003
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 5284.26783,
+          "decode_tok_s": 128.426003
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 5990.722934,
+          "decode_tok_s": 128.426003
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 5697.36097,
+          "decode_tok_s": 128.426003
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 5089.977742,
+          "decode_tok_s": 128.426003
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 4301.914187,
+          "decode_tok_s": 128.426003
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 1563.86,
+          "decode_tok_s": 103.252
+        }
+      ]
+    },
+    "granite-3.3-2b-instruct": {
+      "name": "granite-3.3-2b-instruct",
+      "has_gguf": true,
+      "has_onnx": true,
+      "backpack_gguf": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 787.7,
+          "prefill_tok_s": 162.5,
+          "decode_ms": 897.4,
+          "decode_tok_s": 142.6
+        }
+      ],
+      "backpack_onnx": [
+        {
+          "prompt_len": 128,
+          "prefill_ms": 45.5,
+          "prefill_tok_s": 2812.2,
+          "decode_ms": 982.3,
+          "decode_tok_s": 130.3
+        },
+        {
+          "prompt_len": 256,
+          "prefill_ms": 85.3,
+          "prefill_tok_s": 2999.6,
+          "decode_ms": 999.0,
+          "decode_tok_s": 128.1
+        },
+        {
+          "prompt_len": 512,
+          "prefill_ms": 171.6,
+          "prefill_tok_s": 2983.7,
+          "decode_ms": 1055.0,
+          "decode_tok_s": 121.3
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_ms": 384.5,
+          "prefill_tok_s": 2663.3,
+          "decode_ms": 1005.3,
+          "decode_tok_s": 127.3
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_ms": 914.6,
+          "prefill_tok_s": 2239.3,
+          "decode_ms": 1066.3,
+          "decode_tok_s": 120.0
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_ms": 2476.3,
+          "prefill_tok_s": 1654.1,
+          "decode_ms": 1223.5,
+          "decode_tok_s": 104.6
+        }
+      ],
+      "llama_cpp": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 10341.63674,
+          "decode_tok_s": 300.07582
+        },
+        {
+          "prompt_len": 256,
+          "prefill_tok_s": 13263.163886,
+          "decode_tok_s": 300.07582
+        },
+        {
+          "prompt_len": 512,
+          "prefill_tok_s": 13909.044202,
+          "decode_tok_s": 300.07582
+        },
+        {
+          "prompt_len": 1024,
+          "prefill_tok_s": 12139.503515,
+          "decode_tok_s": 300.07582
+        },
+        {
+          "prompt_len": 2048,
+          "prefill_tok_s": 9839.793602,
+          "decode_tok_s": 300.07582
+        },
+        {
+          "prompt_len": 4096,
+          "prefill_tok_s": 7266.510502,
+          "decode_tok_s": 300.07582
+        }
+      ],
+      "ort": [
+        {
+          "prompt_len": 128,
+          "prefill_tok_s": 3895.59,
+          "decode_tok_s": 143.913
+        }
+      ]
+    }
+  },
+  "errors": [
+    {
+      "model": "CodeLlama-7b-Instruct-hf",
+      "backend": "backpack_onnx",
+      "error": "[onnx_loader] entering loadOnnxModel: E:\\workspace\\project\\agents\\ai-models\\CodeLlama-7b-Instruct-hf\\onnx-webgpu\n[onnx_loader] config parsed OK\n  [onnx] initializers: 390 inline (3861.5 MB), 0 external, 0 no-data\n  [norm-init] 'model.layers.11.input_layernorm.weight' \u2192 'layers.11.input_layernorm.weight' dims=[4096] dtype=10\n  [norm-init] 'model.layers.2.input_layernorm.weight' \u2192 'layers.2.input_layernorm.weight' dims=[4096] dtype=10\n  [norm-stats] layers.2.input_layernorm.weight: nel=4096 min=-0"
+    },
+    {
+      "model": "DeepSeek-R1-Distill-Qwen-7B",
+      "backend": "backpack_onnx",
+      "error": "[onnx_loader] entering loadOnnxModel: E:\\workspace\\project\\agents\\ai-models\\DeepSeek-R1-Distill-Qwen-7B\\onnx-webgpu\n[onnx_loader] config parsed OK\n  [onnx] initializers: 370 inline (5124.8 MB), 0 external, 0 no-data\n  [norm-init] 'model.layers.10.post_attention_layernorm.weight' \u2192 'layers.10.post_attention_layernorm.weight' dims=[3584] dtype=10\n  [norm-init] 'model.layers.3.post_attention_layernorm.weight' \u2192 'layers.3.post_attention_layernorm.weight' dims=[3584] dtype=10\n  [norm-init] 'model.lay"
+    },
+    {
+      "model": "gemma-7b-it",
+      "backend": "backpack_onnx",
+      "error": "[onnx_loader] entering loadOnnxModel: E:\\workspace\\project\\agents\\ai-models\\gemma-7b-it\\onnx-webgpu\n[onnx_loader] config parsed OK\n  [onnx] initializers: 341 inline (4959.2 MB), 0 external, 0 no-data\n  [norm-init] 'model.layers.26.input_layernorm.weight' \u2192 'layers.26.input_layernorm.weight' dims=[3072] dtype=10\n  [norm-init] 'model.layers.10.post_attention_layernorm.weight' \u2192 'layers.10.post_attention_layernorm.weight' dims=[3072] dtype=10\n  [norm-init] 'model.layers.3.post_attention_layernorm.w"
+    },
+    {
+      "model": "gpt-oss-20b",
+      "backend": "backpack_gguf",
+      "error": "Error: head_dim=45 is not a multiple of 32 (unsupported)\nbp::LmSession: failed to load model\nFailed to load model\n"
+    },
+    {
+      "model": "granite-3.1-2b-instruct",
+      "backend": "backpack_onnx",
+      "error": "[onnx_loader] entering loadOnnxModel: E:\\workspace\\project\\agents\\ai-models\\granite-3.1-2b-instruct\\onnx-webgpu\n[onnx_loader] config parsed OK\n  [onnx] initializers: 485 inline (1423.3 MB), 0 external, 0 no-data\n  [norm-init] 'model.layers.26.input_layernorm.weight' \u2192 'layers.26.input_layernorm.weight' dims=[2048] dtype=10\n  [norm-init] 'model.layers.10.post_attention_layernorm.weight' \u2192 'layers.10.post_attention_layernorm.weight' dims=[2048] dtype=10\n  [norm-init] 'model.layers.3.post_attention"
+    }
+  ],
+  "_completed": [
+    "DeepSeek-R1-Distill-Qwen-1.5B",
+    "DeepSeek-R1-Distill-Qwen-7B",
+    "granite-3.1-8b-instruct",
+    "CodeLlama-7b-Instruct-hf",
+    "gemma-2-9b-it",
+    "DeepSeek-R1-0528-Qwen3-8B",
+    "gemma-2b-it",
+    "gemma-3-1b-it",
+    "gpt-oss-20b",
+    "granite-3.1-2b-instruct",
+    "gemma-2-2b-it",
+    "granite-3.2-2b-instruct",
+    "granite-3.3-2b-instruct",
+    "gemma-7b-it",
+    "DeepSeek-R1-Distill-Llama-8B",
+    "granite-3.2-8b-instruct"
+  ]
+}

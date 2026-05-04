@@ -1,0 +1,1385 @@
+[onnx_loader] entering loadOnnxModel: e:/workspace/project/test/ai-models/gemma-4-E4B/webgpu
+[onnx_loader] config parsed OK
+  [onnx] initializers: 1322 inline (2753.5 MB), 0 external, 0 no-data
+  [norm-init] 'model.layers.39.post_attention_layernorm.weight' → 'layers.39.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.21.post_feedforward_layernorm.weight' → 'layers.21.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.0.post_attention_layernorm.weight' → 'layers.0.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.0.post_attention_layernorm.weight: nel=2560 min=0.019409 max=28.750000 mean=2.615730 first4=[0.470703 0.675781 28.750000 28.750000]
+  [norm-init] 'model.layers.31.post_per_layer_input_norm.weight' → 'layers.31.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.24.input_layernorm.weight' → 'layers.24.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.2.attn.k_norm.layernorm.weight' → 'layers.2.k_norm.weight' dims=[256] dtype=10
+  [norm-stats] layers.2.k_norm.weight: nel=256 min=0.131836 max=0.131836 mean=0.131836 first4=[0.131836 0.131836 0.131836 0.131836]
+  [norm-init] 'model.layers.0.input_layernorm.weight' → 'layers.0.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.0.input_layernorm.weight: nel=2560 min=3.937500 max=92.000000 mean=10.131848 first4=[7.718750 7.968750 10.375000 8.312500]
+  [norm-init] 'model.layers.13.input_layernorm.weight' → 'layers.13.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.0.post_feedforward_layernorm.weight' → 'layers.0.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.0.post_feedforward_layernorm.weight: nel=2560 min=0.008240 max=13.250000 mean=6.157210 first4=[2.343750 5.156250 13.250000 13.250000]
+  [norm-init] 'model.layers.23.pre_feedforward_layernorm.weight' → 'layers.23.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.33.post_per_layer_input_norm.weight' → 'layers.33.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.per_layer_projection_norm.weight' → 'ple_model_proj_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.14.post_attention_layernorm.weight' → 'layers.14.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.41.post_per_layer_input_norm.weight' → 'layers.41.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.21.attn.q_norm.layernorm.weight' → 'layers.21.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.9.post_feedforward_layernorm.weight' → 'layers.9.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.13.attn.q_norm.layernorm.weight' → 'layers.13.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.39.input_layernorm.weight' → 'layers.39.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.0.attn.q_norm.layernorm.weight' → 'layers.0.q_norm.weight' dims=[256] dtype=10
+  [norm-stats] layers.0.q_norm.weight: nel=256 min=0.984375 max=0.984375 mean=0.984375 first4=[0.984375 0.984375 0.984375 0.984375]
+  [norm-init] 'model.layers.0.attn.k_norm.layernorm.weight' → 'layers.0.k_norm.weight' dims=[256] dtype=10
+  [norm-stats] layers.0.k_norm.weight: nel=256 min=0.126953 max=0.126953 mean=0.126953 first4=[0.126953 0.126953 0.126953 0.126953]
+  [norm-init] 'model.layers.36.post_attention_layernorm.weight' → 'layers.36.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.2.pre_feedforward_layernorm.weight' → 'layers.2.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.2.pre_feedforward_layernorm.weight: nel=2560 min=-2.937500 max=143.000000 mean=20.087925 first4=[39.500000 8.812500 0.996094 0.824219]
+  [norm-init] 'model.layers.34.post_per_layer_input_norm.weight' → 'layers.34.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.1.attn.k_norm.layernorm.weight' → 'layers.1.k_norm.weight' dims=[256] dtype=10
+  [norm-stats] layers.1.k_norm.weight: nel=256 min=0.129883 max=0.129883 mean=0.129883 first4=[0.129883 0.129883 0.129883 0.129883]
+  [norm-init] 'model.layers.29.input_layernorm.weight' → 'layers.29.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.pre_feedforward_layernorm.weight' → 'layers.11.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.41.input_layernorm.weight' → 'layers.41.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.3.post_feedforward_layernorm.weight' → 'layers.3.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.38.attn.q_norm.layernorm.weight' → 'layers.38.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.0.pre_feedforward_layernorm.weight' → 'layers.0.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.0.pre_feedforward_layernorm.weight: nel=2560 min=-2.750000 max=21.125000 mean=6.306566 first4=[6.593750 6.500000 0.925781 0.683594]
+  [norm-init] 'model.layers.0.post_per_layer_input_norm.weight' → 'layers.0.ple_norm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.0.ple_norm.weight: nel=2560 min=0.005920 max=8.375000 mean=4.325963 first4=[1.453125 2.453125 8.375000 8.375000]
+  [norm-init] 'model.layers.1.input_layernorm.weight' → 'layers.1.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.1.input_layernorm.weight: nel=2560 min=-8.375000 max=72.500000 mean=12.155171 first4=[14.187500 7.500000 1.335938 1.781250]
+  [norm-init] 'model.layers.1.attn.q_norm.layernorm.weight' → 'layers.1.q_norm.weight' dims=[256] dtype=10
+  [norm-stats] layers.1.q_norm.weight: nel=256 min=0.964844 max=0.964844 mean=0.964844 first4=[0.964844 0.964844 0.964844 0.964844]
+  [norm-init] 'model.layers.1.post_attention_layernorm.weight' → 'layers.1.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.1.post_attention_layernorm.weight: nel=2560 min=0.006470 max=12.187500 mean=2.227245 first4=[0.010742 0.009766 12.187500 12.187500]
+  [norm-init] 'model.layers.1.pre_feedforward_layernorm.weight' → 'layers.1.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.1.pre_feedforward_layernorm.weight: nel=2560 min=-9.500000 max=184.000000 mean=35.138348 first4=[49.500000 36.750000 3.234375 1.640625]
+  [norm-init] 'model.layers.4.attn.q_norm.layernorm.weight' → 'layers.4.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.6.attn.k_norm.layernorm.weight' → 'layers.6.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.1.post_feedforward_layernorm.weight' → 'layers.1.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.1.post_feedforward_layernorm.weight: nel=2560 min=0.001335 max=1.906250 mean=0.911485 first4=[0.084473 1.906250 1.906250 1.906250]
+  [norm-init] 'model.layers.1.post_per_layer_input_norm.weight' → 'layers.1.ple_norm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.1.ple_norm.weight: nel=2560 min=0.000290 max=0.435547 mean=0.230733 first4=[0.000383 0.435547 0.435547 0.435547]
+  [norm-init] 'model.layers.2.input_layernorm.weight' → 'layers.2.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.2.input_layernorm.weight: nel=2560 min=-9.812500 max=215.000000 mean=33.298958 first4=[47.500000 17.625000 3.625000 6.062500]
+  [norm-init] 'model.layers.37.input_layernorm.weight' → 'layers.37.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.2.attn.q_norm.layernorm.weight' → 'layers.2.q_norm.weight' dims=[256] dtype=10
+  [norm-stats] layers.2.q_norm.weight: nel=256 min=0.949219 max=0.949219 mean=0.949219 first4=[0.949219 0.949219 0.949219 0.949219]
+  [norm-init] 'model.layers.3.attn.q_norm.layernorm.weight' → 'layers.3.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.2.post_attention_layernorm.weight' → 'layers.2.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.2.post_attention_layernorm.weight: nel=2560 min=0.000397 max=0.726562 mean=0.284453 first4=[0.005219 0.130859 0.726562 0.726562]
+  [norm-init] 'model.layers.4.post_per_layer_input_norm.weight' → 'layers.4.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.33.attn.q_norm.layernorm.weight' → 'layers.33.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.9.post_attention_layernorm.weight' → 'layers.9.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.2.post_feedforward_layernorm.weight' → 'layers.2.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.2.post_feedforward_layernorm.weight: nel=2560 min=0.000656 max=1.070312 mean=0.507845 first4=[0.020508 0.613281 1.070312 1.070312]
+  [norm-init] 'model.layers.40.post_feedforward_layernorm.weight' → 'layers.40.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.27.pre_feedforward_layernorm.weight' → 'layers.27.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.2.post_per_layer_input_norm.weight' → 'layers.2.ple_norm.weight' dims=[2560] dtype=10
+  [norm-stats] layers.2.ple_norm.weight: nel=2560 min=0.000080 max=0.138672 mean=0.073131 first4=[0.003906 0.138672 0.138672 0.138672]
+  [norm-init] 'model.layers.22.attn.q_norm.layernorm.weight' → 'layers.22.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.25.attn.q_norm.layernorm.weight' → 'layers.25.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.3.input_layernorm.weight' → 'layers.3.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.3.attn.k_norm.layernorm.weight' → 'layers.3.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.8.pre_feedforward_layernorm.weight' → 'layers.8.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.41.post_attention_layernorm.weight' → 'layers.41.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.4.attn.k_norm.layernorm.weight' → 'layers.4.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.6.attn.q_norm.layernorm.weight' → 'layers.6.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.3.pre_feedforward_layernorm.weight' → 'layers.3.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.3.post_attention_layernorm.weight' → 'layers.3.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.4.pre_feedforward_layernorm.weight' → 'layers.4.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.23.input_layernorm.weight' → 'layers.23.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.3.post_per_layer_input_norm.weight' → 'layers.3.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.4.input_layernorm.weight' → 'layers.4.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.4.post_attention_layernorm.weight' → 'layers.4.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.4.post_feedforward_layernorm.weight' → 'layers.4.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.9.pre_feedforward_layernorm.weight' → 'layers.9.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.5.input_layernorm.weight' → 'layers.5.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.5.attn.q_norm.layernorm.weight' → 'layers.5.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.21.input_layernorm.weight' → 'layers.21.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.35.pre_feedforward_layernorm.weight' → 'layers.35.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.7.attn.k_norm.layernorm.weight' → 'layers.7.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.5.attn.k_norm.layernorm.weight' → 'layers.5.k_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.32.input_layernorm.weight' → 'layers.32.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.5.post_attention_layernorm.weight' → 'layers.5.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.5.pre_feedforward_layernorm.weight' → 'layers.5.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.5.post_feedforward_layernorm.weight' → 'layers.5.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.5.post_per_layer_input_norm.weight' → 'layers.5.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.6.input_layernorm.weight' → 'layers.6.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.6.post_attention_layernorm.weight' → 'layers.6.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.19.post_attention_layernorm.weight' → 'layers.19.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.6.pre_feedforward_layernorm.weight' → 'layers.6.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.6.post_feedforward_layernorm.weight' → 'layers.6.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.8.post_feedforward_layernorm.weight' → 'layers.8.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.6.post_per_layer_input_norm.weight' → 'layers.6.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.20.input_layernorm.weight' → 'layers.20.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.7.input_layernorm.weight' → 'layers.7.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.7.attn.q_norm.layernorm.weight' → 'layers.7.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.19.attn.q_norm.layernorm.weight' → 'layers.19.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.7.post_attention_layernorm.weight' → 'layers.7.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.7.pre_feedforward_layernorm.weight' → 'layers.7.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.7.post_feedforward_layernorm.weight' → 'layers.7.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.13.pre_feedforward_layernorm.weight' → 'layers.13.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.30.input_layernorm.weight' → 'layers.30.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.7.post_per_layer_input_norm.weight' → 'layers.7.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.8.input_layernorm.weight' → 'layers.8.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.28.post_per_layer_input_norm.weight' → 'layers.28.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.18.post_attention_layernorm.weight' → 'layers.18.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.8.attn.q_norm.layernorm.weight' → 'layers.8.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.8.attn.k_norm.layernorm.weight' → 'layers.8.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.8.post_attention_layernorm.weight' → 'layers.8.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.8.post_per_layer_input_norm.weight' → 'layers.8.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.9.input_layernorm.weight' → 'layers.9.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.25.post_per_layer_input_norm.weight' → 'layers.25.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.9.attn.q_norm.layernorm.weight' → 'layers.9.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.9.attn.k_norm.layernorm.weight' → 'layers.9.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.9.post_per_layer_input_norm.weight' → 'layers.9.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.24.post_attention_layernorm.weight' → 'layers.24.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.10.input_layernorm.weight' → 'layers.10.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.10.attn.q_norm.layernorm.weight' → 'layers.10.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.10.attn.k_norm.layernorm.weight' → 'layers.10.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.17.attn.k_norm.layernorm.weight' → 'layers.17.k_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.10.pre_feedforward_layernorm.weight' → 'layers.10.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.attn.q_norm.layernorm.weight' → 'layers.15.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.26.attn.q_norm.layernorm.weight' → 'layers.26.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.10.post_feedforward_layernorm.weight' → 'layers.10.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.14.attn.k_norm.layernorm.weight' → 'layers.14.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.10.post_per_layer_input_norm.weight' → 'layers.10.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.20.post_attention_layernorm.weight' → 'layers.20.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.attn.q_norm.layernorm.weight' → 'layers.11.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.34.pre_feedforward_layernorm.weight' → 'layers.34.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.attn.k_norm.layernorm.weight' → 'layers.11.k_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.29.post_feedforward_layernorm.weight' → 'layers.29.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.12.input_layernorm.weight' → 'layers.12.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.37.pre_feedforward_layernorm.weight' → 'layers.37.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.post_attention_layernorm.weight' → 'layers.11.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.post_feedforward_layernorm.weight' → 'layers.11.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.11.post_per_layer_input_norm.weight' → 'layers.11.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.37.attn.q_norm.layernorm.weight' → 'layers.37.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.12.attn.q_norm.layernorm.weight' → 'layers.12.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.12.attn.k_norm.layernorm.weight' → 'layers.12.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.20.post_per_layer_input_norm.weight' → 'layers.20.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.12.post_attention_layernorm.weight' → 'layers.12.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.17.attn.q_norm.layernorm.weight' → 'layers.17.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.12.pre_feedforward_layernorm.weight' → 'layers.12.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.attn.k_norm.layernorm.weight' → 'layers.15.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.36.attn.q_norm.layernorm.weight' → 'layers.36.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.33.pre_feedforward_layernorm.weight' → 'layers.33.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.12.post_feedforward_layernorm.weight' → 'layers.12.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.12.post_per_layer_input_norm.weight' → 'layers.12.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.13.attn.k_norm.layernorm.weight' → 'layers.13.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.36.pre_feedforward_layernorm.weight' → 'layers.36.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.26.pre_feedforward_layernorm.weight' → 'layers.26.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.13.post_attention_layernorm.weight' → 'layers.13.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.13.post_feedforward_layernorm.weight' → 'layers.13.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.13.post_per_layer_input_norm.weight' → 'layers.13.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.14.input_layernorm.weight' → 'layers.14.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.14.attn.q_norm.layernorm.weight' → 'layers.14.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.14.pre_feedforward_layernorm.weight' → 'layers.14.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.14.post_feedforward_layernorm.weight' → 'layers.14.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.37.post_attention_layernorm.weight' → 'layers.37.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.30.post_feedforward_layernorm.weight' → 'layers.30.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.14.post_per_layer_input_norm.weight' → 'layers.14.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.input_layernorm.weight' → 'layers.15.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.post_attention_layernorm.weight' → 'layers.15.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.27.post_feedforward_layernorm.weight' → 'layers.27.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.18.input_layernorm.weight' → 'layers.18.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.pre_feedforward_layernorm.weight' → 'layers.15.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.post_feedforward_layernorm.weight' → 'layers.15.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.15.post_per_layer_input_norm.weight' → 'layers.15.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.30.attn.q_norm.layernorm.weight' → 'layers.30.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.16.input_layernorm.weight' → 'layers.16.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.16.attn.q_norm.layernorm.weight' → 'layers.16.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.16.attn.k_norm.layernorm.weight' → 'layers.16.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.16.post_attention_layernorm.weight' → 'layers.16.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.16.pre_feedforward_layernorm.weight' → 'layers.16.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.16.post_feedforward_layernorm.weight' → 'layers.16.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.16.post_per_layer_input_norm.weight' → 'layers.16.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.29.attn.q_norm.layernorm.weight' → 'layers.29.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.17.input_layernorm.weight' → 'layers.17.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.17.post_attention_layernorm.weight' → 'layers.17.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.17.pre_feedforward_layernorm.weight' → 'layers.17.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.17.post_feedforward_layernorm.weight' → 'layers.17.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.21.pre_feedforward_layernorm.weight' → 'layers.21.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.17.post_per_layer_input_norm.weight' → 'layers.17.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.22.post_feedforward_layernorm.weight' → 'layers.22.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.40.attn.q_norm.layernorm.weight' → 'layers.40.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.18.attn.q_norm.layernorm.weight' → 'layers.18.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.18.attn.k_norm.layernorm.weight' → 'layers.18.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.26.post_per_layer_input_norm.weight' → 'layers.26.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.23.post_attention_layernorm.weight' → 'layers.23.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.18.pre_feedforward_layernorm.weight' → 'layers.18.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.18.post_feedforward_layernorm.weight' → 'layers.18.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.18.post_per_layer_input_norm.weight' → 'layers.18.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.19.input_layernorm.weight' → 'layers.19.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.19.attn.k_norm.layernorm.weight' → 'layers.19.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.39.pre_feedforward_layernorm.weight' → 'layers.39.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.19.pre_feedforward_layernorm.weight' → 'layers.19.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.19.post_feedforward_layernorm.weight' → 'layers.19.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.19.post_per_layer_input_norm.weight' → 'layers.19.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.20.attn.q_norm.layernorm.weight' → 'layers.20.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.20.attn.k_norm.layernorm.weight' → 'layers.20.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.20.pre_feedforward_layernorm.weight' → 'layers.20.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.20.post_feedforward_layernorm.weight' → 'layers.20.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.21.attn.k_norm.layernorm.weight' → 'layers.21.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.21.post_attention_layernorm.weight' → 'layers.21.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.21.post_per_layer_input_norm.weight' → 'layers.21.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.22.input_layernorm.weight' → 'layers.22.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.34.post_attention_layernorm.weight' → 'layers.34.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.22.attn.k_norm.layernorm.weight' → 'layers.22.k_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.22.post_attention_layernorm.weight' → 'layers.22.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.22.pre_feedforward_layernorm.weight' → 'layers.22.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.22.post_per_layer_input_norm.weight' → 'layers.22.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.23.attn.q_norm.layernorm.weight' → 'layers.23.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.34.post_feedforward_layernorm.weight' → 'layers.34.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.33.post_attention_layernorm.weight' → 'layers.33.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.23.attn.k_norm.layernorm.weight' → 'layers.23.k_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.23.post_feedforward_layernorm.weight' → 'layers.23.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.23.post_per_layer_input_norm.weight' → 'layers.23.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.38.post_feedforward_layernorm.weight' → 'layers.38.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.41.attn.q_norm.layernorm.weight' → 'layers.41.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.24.attn.q_norm.layernorm.weight' → 'layers.24.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.24.pre_feedforward_layernorm.weight' → 'layers.24.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.24.post_feedforward_layernorm.weight' → 'layers.24.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.24.post_per_layer_input_norm.weight' → 'layers.24.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.38.post_per_layer_input_norm.weight' → 'layers.38.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.25.input_layernorm.weight' → 'layers.25.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.25.post_attention_layernorm.weight' → 'layers.25.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.25.pre_feedforward_layernorm.weight' → 'layers.25.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.25.post_feedforward_layernorm.weight' → 'layers.25.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.26.post_attention_layernorm.weight' → 'layers.26.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.26.post_feedforward_layernorm.weight' → 'layers.26.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.27.input_layernorm.weight' → 'layers.27.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.27.attn.q_norm.layernorm.weight' → 'layers.27.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.27.post_attention_layernorm.weight' → 'layers.27.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.27.post_per_layer_input_norm.weight' → 'layers.27.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.29.pre_feedforward_layernorm.weight' → 'layers.29.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.28.input_layernorm.weight' → 'layers.28.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.28.attn.q_norm.layernorm.weight' → 'layers.28.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.28.post_attention_layernorm.weight' → 'layers.28.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.28.pre_feedforward_layernorm.weight' → 'layers.28.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.28.post_feedforward_layernorm.weight' → 'layers.28.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.38.pre_feedforward_layernorm.weight' → 'layers.38.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.29.post_attention_layernorm.weight' → 'layers.29.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.38.input_layernorm.weight' → 'layers.38.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.29.post_per_layer_input_norm.weight' → 'layers.29.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.30.post_attention_layernorm.weight' → 'layers.30.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.30.pre_feedforward_layernorm.weight' → 'layers.30.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.30.post_per_layer_input_norm.weight' → 'layers.30.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.31.input_layernorm.weight' → 'layers.31.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.39.post_feedforward_layernorm.weight' → 'layers.39.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.31.attn.q_norm.layernorm.weight' → 'layers.31.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.31.post_attention_layernorm.weight' → 'layers.31.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.31.pre_feedforward_layernorm.weight' → 'layers.31.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.34.attn.q_norm.layernorm.weight' → 'layers.34.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.31.post_feedforward_layernorm.weight' → 'layers.31.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.32.attn.q_norm.layernorm.weight' → 'layers.32.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.32.post_attention_layernorm.weight' → 'layers.32.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.32.pre_feedforward_layernorm.weight' → 'layers.32.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.32.post_feedforward_layernorm.weight' → 'layers.32.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.32.post_per_layer_input_norm.weight' → 'layers.32.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.33.input_layernorm.weight' → 'layers.33.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.33.post_feedforward_layernorm.weight' → 'layers.33.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.35.post_per_layer_input_norm.weight' → 'layers.35.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.34.input_layernorm.weight' → 'layers.34.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.35.input_layernorm.weight' → 'layers.35.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.35.attn.q_norm.layernorm.weight' → 'layers.35.q_norm.weight' dims=[512] dtype=10
+  [norm-init] 'model.layers.35.post_attention_layernorm.weight' → 'layers.35.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.35.post_feedforward_layernorm.weight' → 'layers.35.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.36.input_layernorm.weight' → 'layers.36.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.36.post_feedforward_layernorm.weight' → 'layers.36.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.36.post_per_layer_input_norm.weight' → 'layers.36.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.37.post_feedforward_layernorm.weight' → 'layers.37.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.37.post_per_layer_input_norm.weight' → 'layers.37.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.38.post_attention_layernorm.weight' → 'layers.38.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.39.attn.q_norm.layernorm.weight' → 'layers.39.q_norm.weight' dims=[256] dtype=10
+  [norm-init] 'model.layers.39.post_per_layer_input_norm.weight' → 'layers.39.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.40.input_layernorm.weight' → 'layers.40.input_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.40.post_attention_layernorm.weight' → 'layers.40.post_attention_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.40.pre_feedforward_layernorm.weight' → 'layers.40.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.40.post_per_layer_input_norm.weight' → 'layers.40.ple_norm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.41.pre_feedforward_layernorm.weight' → 'layers.41.pre_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.41.post_feedforward_layernorm.weight' → 'layers.41.post_feedforward_layernorm.weight' dims=[2560] dtype=10
+  [norm-init] 'model.layers.42.final_norm_layernorm.weight' → 'norm.weight' dims=[2560] dtype=10
+  [onnx] node 0/1615: op=Cast inputs=1 outputs=1
+    in[0]=inputs_embeds
+  [onnx] node 1/1615: op=Cast inputs=1 outputs=1
+    in[0]=per_layer_inputs
+  [onnx] node 2/1615: op=Shape inputs=1 outputs=1
+    in[0]=attention_mask
+  [onnx] node 3/1615: op=Gather inputs=2 outputs=1
+    in[0]=/model/shared_dims/attention_mask/Shape/output_0
+    in[1]=/model/constants/INT64/1
+  [onnx] node 4/1615: op=Shape inputs=1 outputs=1
+    in[0]=inputs_embeds
+  [onnx] node 5/1615: op=Gather inputs=2 outputs=1
+    in[0]=/model/shared_dims/root_input/Shape/output_0
+    in[1]=/model/constants/INT64/0
+  [onnx] node 6/1615: op=Gather inputs=2 outputs=1
+    in[0]=/model/shared_dims/root_input/Shape/output_0
+    in[1]=/model/constants/INT64/1
+  [onnx] node 7/1615: op=Sub inputs=2 outputs=1
+    in[0]=/model/shared_dims/attention_mask/Gather_1/output_0
+    in[1]=/model/constants/INT64/1
+  [onnx] node 8/1615: op=Unsqueeze inputs=2 outputs=1
+    in[0]=/model/attn_mask_reformat/attn_mask_subgraph/Sub/output_0
+    in[1]=/model/constants/INT64/[0]
+  [onnx] node 9/1615: op=Unsqueeze inputs=2 outputs=1
+    in[0]=/model/shared_dims/root_input/Gather_0/output_0
+    in[1]=/model/constants/INT64/[0]
+  [MatMulNBits] model_per_layer_projection_MatMul_weight_quant → ple.model_proj.weight (K=2560 N=10752 bits=4 bs=32)
+  [ZP] ple.model_proj.weight: has non-8 zero points!
+  [norm-node] 'model.per_layer_projection_norm.weight' → 'ple_model_proj_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.0.input_layernorm.weight' → 'layers.0.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.0.input_layernorm.weight: nel=2560 min=3.937500 max=92.000000 mean=10.131848 first4=[7.718750 7.968750 10.375000 8.312500]
+  [MatMulNBits] model_layers_0_attn_q_proj_MatMul_weight_quant → layers.0.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.0.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_0_attn_k_proj_MatMul_weight_quant → layers.0.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.0.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_0_attn_v_proj_MatMul_weight_quant → layers.0.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.0.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.0.attn.q_norm.layernorm.weight' → 'layers.0.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-stats-node] layers.0.q_norm.weight: nel=256 min=0.984375 max=0.984375 mean=0.984375 first4=[0.984375 0.984375 0.984375 0.984375]
+  [norm-node] 'model.layers.0.attn.k_norm.layernorm.weight' → 'layers.0.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-stats-node] layers.0.k_norm.weight: nel=256 min=0.126953 max=0.126953 mean=0.126953 first4=[0.126953 0.126953 0.126953 0.126953]
+  [norm-node] '/model/layers.0/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_0_attn_o_proj_MatMul_weight_quant → layers.0.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.0.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.0.post_attention_layernorm.weight' → 'layers.0.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.0.post_attention_layernorm.weight: nel=2560 min=0.019409 max=28.750000 mean=2.615730 first4=[0.470703 0.675781 28.750000 28.750000]
+  [norm-node] 'model.layers.0.pre_feedforward_layernorm.weight' → 'layers.0.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.0.pre_feedforward_layernorm.weight: nel=2560 min=-2.750000 max=21.125000 mean=6.306566 first4=[6.593750 6.500000 0.925781 0.683594]
+  [MatMulNBits] model_layers_0_mlp_gate_up_proj_MatMul_weight_quant → layers.0.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.0.mlp.gate_up_proj.weight: has non-8 zero points!
+  [onnx] node 50/1615: op=Gelu inputs=1 outputs=1
+    in[0]=/model/layers.0/mlp/gate_up_proj/Split/gate
+  [MatMulNBits] model_layers_0_mlp_down_proj_MatMul_weight_quant → layers.0.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.0.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.0.post_feedforward_layernorm.weight' → 'layers.0.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.0.post_feedforward_layernorm.weight: nel=2560 min=0.008240 max=13.250000 mean=6.157210 first4=[2.343750 5.156250 13.250000 13.250000]
+  [MatMulNBits] model_layers_0_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.0.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.0.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_0_per_layer_per_layer_projection_MatMul_weight_quant → layers.0.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.0.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.0.post_per_layer_input_norm.weight' → 'layers.0.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.0.ple_norm.weight: nel=2560 min=0.005920 max=8.375000 mean=4.325963 first4=[1.453125 2.453125 8.375000 8.375000]
+  [norm-node] 'model.layers.1.input_layernorm.weight' → 'layers.1.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.1.input_layernorm.weight: nel=2560 min=-8.375000 max=72.500000 mean=12.155171 first4=[14.187500 7.500000 1.335938 1.781250]
+  [MatMulNBits] model_layers_1_attn_q_proj_MatMul_weight_quant → layers.1.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.1.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_1_attn_k_proj_MatMul_weight_quant → layers.1.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.1.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_1_attn_v_proj_MatMul_weight_quant → layers.1.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.1.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.1.attn.q_norm.layernorm.weight' → 'layers.1.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-stats-node] layers.1.q_norm.weight: nel=256 min=0.964844 max=0.964844 mean=0.964844 first4=[0.964844 0.964844 0.964844 0.964844]
+  [norm-node] 'model.layers.1.attn.k_norm.layernorm.weight' → 'layers.1.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-stats-node] layers.1.k_norm.weight: nel=256 min=0.129883 max=0.129883 mean=0.129883 first4=[0.129883 0.129883 0.129883 0.129883]
+  [norm-node] '/model/layers.1/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_1_attn_o_proj_MatMul_weight_quant → layers.1.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.1.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.1.post_attention_layernorm.weight' → 'layers.1.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.1.post_attention_layernorm.weight: nel=2560 min=0.006470 max=12.187500 mean=2.227245 first4=[0.010742 0.009766 12.187500 12.187500]
+  [norm-node] 'model.layers.1.pre_feedforward_layernorm.weight' → 'layers.1.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.1.pre_feedforward_layernorm.weight: nel=2560 min=-9.500000 max=184.000000 mean=35.138348 first4=[49.500000 36.750000 3.234375 1.640625]
+  [MatMulNBits] model_layers_1_mlp_gate_up_proj_MatMul_weight_quant → layers.1.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.1.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_1_mlp_down_proj_MatMul_weight_quant → layers.1.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.1.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.1.post_feedforward_layernorm.weight' → 'layers.1.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.1.post_feedforward_layernorm.weight: nel=2560 min=0.001335 max=1.906250 mean=0.911485 first4=[0.084473 1.906250 1.906250 1.906250]
+  [MatMulNBits] model_layers_1_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.1.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.1.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_1_per_layer_per_layer_projection_MatMul_weight_quant → layers.1.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.1.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.1.post_per_layer_input_norm.weight' → 'layers.1.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.1.ple_norm.weight: nel=2560 min=0.000290 max=0.435547 mean=0.230733 first4=[0.000383 0.435547 0.435547 0.435547]
+  [norm-node] 'model.layers.2.input_layernorm.weight' → 'layers.2.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.2.input_layernorm.weight: nel=2560 min=-9.812500 max=215.000000 mean=33.298958 first4=[47.500000 17.625000 3.625000 6.062500]
+  [MatMulNBits] model_layers_2_attn_q_proj_MatMul_weight_quant → layers.2.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.2.self_attn.q_proj.weight: has non-8 zero points!
+  [onnx] node 100/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.2/input_layernorm/output_0
+    in[1]=model_layers_2_attn_k_proj_MatMul_weight_quant
+    in[2]=model_layers_2_attn_k_proj_MatMul_weight_scales
+    in[3]=model_layers_2_attn_k_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_2_attn_k_proj_MatMul_weight_quant → layers.2.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.2.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_2_attn_v_proj_MatMul_weight_quant → layers.2.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.2.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.2.attn.q_norm.layernorm.weight' → 'layers.2.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-stats-node] layers.2.q_norm.weight: nel=256 min=0.949219 max=0.949219 mean=0.949219 first4=[0.949219 0.949219 0.949219 0.949219]
+  [norm-node] 'model.layers.2.attn.k_norm.layernorm.weight' → 'layers.2.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-stats-node] layers.2.k_norm.weight: nel=256 min=0.131836 max=0.131836 mean=0.131836 first4=[0.131836 0.131836 0.131836 0.131836]
+  [norm-node] '/model/layers.2/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_2_attn_o_proj_MatMul_weight_quant → layers.2.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.2.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.2.post_attention_layernorm.weight' → 'layers.2.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.2.post_attention_layernorm.weight: nel=2560 min=0.000397 max=0.726562 mean=0.284453 first4=[0.005219 0.130859 0.726562 0.726562]
+  [norm-node] 'model.layers.2.pre_feedforward_layernorm.weight' → 'layers.2.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.2.pre_feedforward_layernorm.weight: nel=2560 min=-2.937500 max=143.000000 mean=20.087925 first4=[39.500000 8.812500 0.996094 0.824219]
+  [MatMulNBits] model_layers_2_mlp_gate_up_proj_MatMul_weight_quant → layers.2.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.2.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_2_mlp_down_proj_MatMul_weight_quant → layers.2.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.2.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.2.post_feedforward_layernorm.weight' → 'layers.2.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.2.post_feedforward_layernorm.weight: nel=2560 min=0.000656 max=1.070312 mean=0.507845 first4=[0.020508 0.613281 1.070312 1.070312]
+  [MatMulNBits] model_layers_2_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.2.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.2.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_2_per_layer_per_layer_projection_MatMul_weight_quant → layers.2.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.2.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.2.post_per_layer_input_norm.weight' → 'layers.2.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-stats-node] layers.2.ple_norm.weight: nel=2560 min=0.000080 max=0.138672 mean=0.073131 first4=[0.003906 0.138672 0.138672 0.138672]
+  [norm-node] 'model.layers.3.input_layernorm.weight' → 'layers.3.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_3_attn_q_proj_MatMul_weight_quant → layers.3.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.3.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_3_attn_k_proj_MatMul_weight_quant → layers.3.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.3.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_3_attn_v_proj_MatMul_weight_quant → layers.3.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.3.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.3.attn.q_norm.layernorm.weight' → 'layers.3.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.3.attn.k_norm.layernorm.weight' → 'layers.3.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.3/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_3_attn_o_proj_MatMul_weight_quant → layers.3.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.3.self_attn.o_proj.weight: has non-8 zero points!
+  [onnx] node 150/1615: op=SimplifiedLayerNormalization inputs=2 outputs=1
+    in[0]=/model/layers.3/attn/o_proj/MatMul/output_0
+    in[1]=model.layers.3.post_attention_layernorm.weight
+  [norm-node] 'model.layers.3.post_attention_layernorm.weight' → 'layers.3.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.3.pre_feedforward_layernorm.weight' → 'layers.3.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_3_mlp_gate_up_proj_MatMul_weight_quant → layers.3.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.3.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_3_mlp_down_proj_MatMul_weight_quant → layers.3.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.3.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.3.post_feedforward_layernorm.weight' → 'layers.3.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_3_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.3.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.3.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_3_per_layer_per_layer_projection_MatMul_weight_quant → layers.3.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.3.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.3.post_per_layer_input_norm.weight' → 'layers.3.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.4.input_layernorm.weight' → 'layers.4.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_4_attn_q_proj_MatMul_weight_quant → layers.4.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.4.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_4_attn_k_proj_MatMul_weight_quant → layers.4.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.4.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_4_attn_v_proj_MatMul_weight_quant → layers.4.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.4.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.4.attn.q_norm.layernorm.weight' → 'layers.4.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.4.attn.k_norm.layernorm.weight' → 'layers.4.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.4/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_4_attn_o_proj_MatMul_weight_quant → layers.4.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.4.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.4.post_attention_layernorm.weight' → 'layers.4.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.4.pre_feedforward_layernorm.weight' → 'layers.4.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_4_mlp_gate_up_proj_MatMul_weight_quant → layers.4.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.4.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_4_mlp_down_proj_MatMul_weight_quant → layers.4.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.4.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.4.post_feedforward_layernorm.weight' → 'layers.4.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_4_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.4.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.4.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_4_per_layer_per_layer_projection_MatMul_weight_quant → layers.4.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.4.ple.proj.weight: has non-8 zero points!
+  [onnx] node 200/1615: op=SimplifiedLayerNormalization inputs=2 outputs=1
+    in[0]=/model/layers.4/per_layer/per_layer_projection/MatMul/output_0
+    in[1]=model.layers.4.post_per_layer_input_norm.weight
+  [norm-node] 'model.layers.4.post_per_layer_input_norm.weight' → 'layers.4.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.5.input_layernorm.weight' → 'layers.5.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_5_attn_q_proj_MatMul_weight_quant → layers.5.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.5.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.5.attn.q_norm.layernorm.weight' → 'layers.5.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_5_attn_k_proj_MatMul_weight_quant → layers.5.self_attn.k_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.5.self_attn.k_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.5.attn.k_norm.layernorm.weight' → 'layers.5.k_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_5_attn_v_proj_MatMul_weight_quant → layers.5.self_attn.v_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.5.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] '/model/layers.5/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_5_attn_o_proj_MatMul_weight_quant → layers.5.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.5.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.5.post_attention_layernorm.weight' → 'layers.5.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.5.pre_feedforward_layernorm.weight' → 'layers.5.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_5_mlp_gate_up_proj_MatMul_weight_quant → layers.5.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.5.mlp.gate_up_proj.weight: has non-8 zero points!
+  [onnx] node 250/1615: op=Split inputs=1 outputs=2
+    in[0]=/model/layers.5/mlp/gate_up_proj/MatMul/output_0
+  [MatMulNBits] model_layers_5_mlp_down_proj_MatMul_weight_quant → layers.5.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.5.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.5.post_feedforward_layernorm.weight' → 'layers.5.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_5_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.5.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.5.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_5_per_layer_per_layer_projection_MatMul_weight_quant → layers.5.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.5.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.5.post_per_layer_input_norm.weight' → 'layers.5.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.6.input_layernorm.weight' → 'layers.6.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_6_attn_q_proj_MatMul_weight_quant → layers.6.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.6.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_6_attn_k_proj_MatMul_weight_quant → layers.6.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.6.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_6_attn_v_proj_MatMul_weight_quant → layers.6.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.6.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.6.attn.q_norm.layernorm.weight' → 'layers.6.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.6.attn.k_norm.layernorm.weight' → 'layers.6.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.6/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_6_attn_o_proj_MatMul_weight_quant → layers.6.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.6.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.6.post_attention_layernorm.weight' → 'layers.6.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.6.pre_feedforward_layernorm.weight' → 'layers.6.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_6_mlp_gate_up_proj_MatMul_weight_quant → layers.6.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.6.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_6_mlp_down_proj_MatMul_weight_quant → layers.6.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.6.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.6.post_feedforward_layernorm.weight' → 'layers.6.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_6_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.6.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.6.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_6_per_layer_per_layer_projection_MatMul_weight_quant → layers.6.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.6.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.6.post_per_layer_input_norm.weight' → 'layers.6.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.7.input_layernorm.weight' → 'layers.7.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [onnx] node 300/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.7/input_layernorm/output_0
+    in[1]=model_layers_7_attn_q_proj_MatMul_weight_quant
+    in[2]=model_layers_7_attn_q_proj_MatMul_weight_scales
+    in[3]=model_layers_7_attn_q_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_7_attn_q_proj_MatMul_weight_quant → layers.7.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.7.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_7_attn_k_proj_MatMul_weight_quant → layers.7.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.7.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_7_attn_v_proj_MatMul_weight_quant → layers.7.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.7.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.7.attn.q_norm.layernorm.weight' → 'layers.7.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.7.attn.k_norm.layernorm.weight' → 'layers.7.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.7/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_7_attn_o_proj_MatMul_weight_quant → layers.7.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.7.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.7.post_attention_layernorm.weight' → 'layers.7.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.7.pre_feedforward_layernorm.weight' → 'layers.7.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_7_mlp_gate_up_proj_MatMul_weight_quant → layers.7.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.7.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_7_mlp_down_proj_MatMul_weight_quant → layers.7.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.7.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.7.post_feedforward_layernorm.weight' → 'layers.7.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_7_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.7.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.7.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_7_per_layer_per_layer_projection_MatMul_weight_quant → layers.7.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.7.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.7.post_per_layer_input_norm.weight' → 'layers.7.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.8.input_layernorm.weight' → 'layers.8.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_8_attn_q_proj_MatMul_weight_quant → layers.8.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.8.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_8_attn_k_proj_MatMul_weight_quant → layers.8.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.8.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_8_attn_v_proj_MatMul_weight_quant → layers.8.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.8.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.8.attn.q_norm.layernorm.weight' → 'layers.8.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.8.attn.k_norm.layernorm.weight' → 'layers.8.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.8/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 350/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.8/attn/GroupQueryAttention/output_0
+    in[1]=model_layers_8_attn_o_proj_MatMul_weight_quant
+    in[2]=model_layers_8_attn_o_proj_MatMul_weight_scales
+    in[3]=model_layers_8_attn_o_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_8_attn_o_proj_MatMul_weight_quant → layers.8.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.8.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.8.post_attention_layernorm.weight' → 'layers.8.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.8.pre_feedforward_layernorm.weight' → 'layers.8.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_8_mlp_gate_up_proj_MatMul_weight_quant → layers.8.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.8.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_8_mlp_down_proj_MatMul_weight_quant → layers.8.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.8.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.8.post_feedforward_layernorm.weight' → 'layers.8.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_8_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.8.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.8.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_8_per_layer_per_layer_projection_MatMul_weight_quant → layers.8.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.8.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.8.post_per_layer_input_norm.weight' → 'layers.8.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.9.input_layernorm.weight' → 'layers.9.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_9_attn_q_proj_MatMul_weight_quant → layers.9.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.9.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_9_attn_k_proj_MatMul_weight_quant → layers.9.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.9.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_9_attn_v_proj_MatMul_weight_quant → layers.9.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.9.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.9.attn.q_norm.layernorm.weight' → 'layers.9.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.9.attn.k_norm.layernorm.weight' → 'layers.9.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.9/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_9_attn_o_proj_MatMul_weight_quant → layers.9.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.9.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.9.post_attention_layernorm.weight' → 'layers.9.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.9.pre_feedforward_layernorm.weight' → 'layers.9.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_9_mlp_gate_up_proj_MatMul_weight_quant → layers.9.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.9.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_9_mlp_down_proj_MatMul_weight_quant → layers.9.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.9.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.9.post_feedforward_layernorm.weight' → 'layers.9.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_9_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.9.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.9.ple.gate.weight: has non-8 zero points!
+  [onnx] node 400/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.9/per_layer/gate_mul/Mul/output_0
+    in[1]=model_layers_9_per_layer_per_layer_projection_MatMul_weight_quant
+    in[2]=model_layers_9_per_layer_per_layer_projection_MatMul_weight_scales
+    in[3]=model_layers_9_per_layer_per_layer_projection_MatMul_weight_zp
+  [MatMulNBits] model_layers_9_per_layer_per_layer_projection_MatMul_weight_quant → layers.9.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.9.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.9.post_per_layer_input_norm.weight' → 'layers.9.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.10.input_layernorm.weight' → 'layers.10.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_10_attn_q_proj_MatMul_weight_quant → layers.10.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.10.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_10_attn_k_proj_MatMul_weight_quant → layers.10.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.10.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_10_attn_v_proj_MatMul_weight_quant → layers.10.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.10.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.10.attn.q_norm.layernorm.weight' → 'layers.10.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.10.attn.k_norm.layernorm.weight' → 'layers.10.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.10/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_10_attn_o_proj_MatMul_weight_quant → layers.10.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.10.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.10.post_attention_layernorm.weight' → 'layers.10.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.10.pre_feedforward_layernorm.weight' → 'layers.10.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_10_mlp_gate_up_proj_MatMul_weight_quant → layers.10.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.10.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_10_mlp_down_proj_MatMul_weight_quant → layers.10.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.10.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.10.post_feedforward_layernorm.weight' → 'layers.10.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_10_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.10.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.10.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_10_per_layer_per_layer_projection_MatMul_weight_quant → layers.10.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.10.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.10.post_per_layer_input_norm.weight' → 'layers.10.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.11.input_layernorm.weight' → 'layers.11.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_11_attn_q_proj_MatMul_weight_quant → layers.11.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.11.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.11.attn.q_norm.layernorm.weight' → 'layers.11.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_11_attn_k_proj_MatMul_weight_quant → layers.11.self_attn.k_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.11.self_attn.k_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.11.attn.k_norm.layernorm.weight' → 'layers.11.k_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [onnx] node 450/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.11/input_layernorm/output_0
+    in[1]=model_layers_11_attn_v_proj_MatMul_weight_quant
+    in[2]=model_layers_11_attn_v_proj_MatMul_weight_scales
+    in[3]=model_layers_11_attn_v_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_11_attn_v_proj_MatMul_weight_quant → layers.11.self_attn.v_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.11.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] '/model/layers.11/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_11_attn_o_proj_MatMul_weight_quant → layers.11.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.11.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.11.post_attention_layernorm.weight' → 'layers.11.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.11.pre_feedforward_layernorm.weight' → 'layers.11.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_11_mlp_gate_up_proj_MatMul_weight_quant → layers.11.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.11.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_11_mlp_down_proj_MatMul_weight_quant → layers.11.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.11.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.11.post_feedforward_layernorm.weight' → 'layers.11.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_11_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.11.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.11.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_11_per_layer_per_layer_projection_MatMul_weight_quant → layers.11.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.11.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.11.post_per_layer_input_norm.weight' → 'layers.11.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.12.input_layernorm.weight' → 'layers.12.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [onnx] node 500/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.12/input_layernorm/output_0
+    in[1]=model_layers_12_attn_q_proj_MatMul_weight_quant
+    in[2]=model_layers_12_attn_q_proj_MatMul_weight_scales
+    in[3]=model_layers_12_attn_q_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_12_attn_q_proj_MatMul_weight_quant → layers.12.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.12.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_12_attn_k_proj_MatMul_weight_quant → layers.12.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.12.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_12_attn_v_proj_MatMul_weight_quant → layers.12.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.12.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.12.attn.q_norm.layernorm.weight' → 'layers.12.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.12.attn.k_norm.layernorm.weight' → 'layers.12.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.12/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_12_attn_o_proj_MatMul_weight_quant → layers.12.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.12.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.12.post_attention_layernorm.weight' → 'layers.12.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.12.pre_feedforward_layernorm.weight' → 'layers.12.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_12_mlp_gate_up_proj_MatMul_weight_quant → layers.12.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.12.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_12_mlp_down_proj_MatMul_weight_quant → layers.12.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.12.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.12.post_feedforward_layernorm.weight' → 'layers.12.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_12_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.12.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.12.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_12_per_layer_per_layer_projection_MatMul_weight_quant → layers.12.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.12.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.12.post_per_layer_input_norm.weight' → 'layers.12.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.13.input_layernorm.weight' → 'layers.13.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_13_attn_q_proj_MatMul_weight_quant → layers.13.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.13.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_13_attn_k_proj_MatMul_weight_quant → layers.13.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.13.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_13_attn_v_proj_MatMul_weight_quant → layers.13.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.13.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.13.attn.q_norm.layernorm.weight' → 'layers.13.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.13.attn.k_norm.layernorm.weight' → 'layers.13.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.13/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 550/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.13/attn/GroupQueryAttention/output_0
+    in[1]=model_layers_13_attn_o_proj_MatMul_weight_quant
+    in[2]=model_layers_13_attn_o_proj_MatMul_weight_scales
+    in[3]=model_layers_13_attn_o_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_13_attn_o_proj_MatMul_weight_quant → layers.13.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.13.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.13.post_attention_layernorm.weight' → 'layers.13.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.13.pre_feedforward_layernorm.weight' → 'layers.13.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_13_mlp_gate_up_proj_MatMul_weight_quant → layers.13.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.13.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_13_mlp_down_proj_MatMul_weight_quant → layers.13.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.13.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.13.post_feedforward_layernorm.weight' → 'layers.13.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_13_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.13.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.13.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_13_per_layer_per_layer_projection_MatMul_weight_quant → layers.13.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.13.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.13.post_per_layer_input_norm.weight' → 'layers.13.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.14.input_layernorm.weight' → 'layers.14.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_14_attn_q_proj_MatMul_weight_quant → layers.14.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.14.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_14_attn_k_proj_MatMul_weight_quant → layers.14.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.14.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_14_attn_v_proj_MatMul_weight_quant → layers.14.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.14.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.14.attn.q_norm.layernorm.weight' → 'layers.14.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.14.attn.k_norm.layernorm.weight' → 'layers.14.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.14/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_14_attn_o_proj_MatMul_weight_quant → layers.14.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.14.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.14.post_attention_layernorm.weight' → 'layers.14.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.14.pre_feedforward_layernorm.weight' → 'layers.14.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_14_mlp_gate_up_proj_MatMul_weight_quant → layers.14.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.14.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_14_mlp_down_proj_MatMul_weight_quant → layers.14.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.14.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.14.post_feedforward_layernorm.weight' → 'layers.14.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_14_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.14.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.14.ple.gate.weight: has non-8 zero points!
+  [onnx] node 600/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.14/per_layer/gate_mul/Mul/output_0
+    in[1]=model_layers_14_per_layer_per_layer_projection_MatMul_weight_quant
+    in[2]=model_layers_14_per_layer_per_layer_projection_MatMul_weight_scales
+    in[3]=model_layers_14_per_layer_per_layer_projection_MatMul_weight_zp
+  [MatMulNBits] model_layers_14_per_layer_per_layer_projection_MatMul_weight_quant → layers.14.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.14.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.14.post_per_layer_input_norm.weight' → 'layers.14.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.15.input_layernorm.weight' → 'layers.15.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_15_attn_q_proj_MatMul_weight_quant → layers.15.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.15.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_15_attn_k_proj_MatMul_weight_quant → layers.15.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.15.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_15_attn_v_proj_MatMul_weight_quant → layers.15.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.15.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.15.attn.q_norm.layernorm.weight' → 'layers.15.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.15.attn.k_norm.layernorm.weight' → 'layers.15.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.15/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_15_attn_o_proj_MatMul_weight_quant → layers.15.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.15.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.15.post_attention_layernorm.weight' → 'layers.15.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.15.pre_feedforward_layernorm.weight' → 'layers.15.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_15_mlp_gate_up_proj_MatMul_weight_quant → layers.15.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.15.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_15_mlp_down_proj_MatMul_weight_quant → layers.15.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.15.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.15.post_feedforward_layernorm.weight' → 'layers.15.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_15_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.15.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.15.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_15_per_layer_per_layer_projection_MatMul_weight_quant → layers.15.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.15.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.15.post_per_layer_input_norm.weight' → 'layers.15.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.16.input_layernorm.weight' → 'layers.16.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_16_attn_q_proj_MatMul_weight_quant → layers.16.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.16.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_16_attn_k_proj_MatMul_weight_quant → layers.16.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.16.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_16_attn_v_proj_MatMul_weight_quant → layers.16.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.16.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.16.attn.q_norm.layernorm.weight' → 'layers.16.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.16.attn.k_norm.layernorm.weight' → 'layers.16.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 650/1615: op=RotaryEmbedding inputs=4 outputs=1
+    in[0]=/model/layers.16/attn/k_norm/Reshape_2/output_0
+    in[1]=position_ids
+    in[2]=cos_cache_local
+    in[3]=sin_cache_local
+  [norm-node] '/model/layers.16/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_16_attn_o_proj_MatMul_weight_quant → layers.16.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.16.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.16.post_attention_layernorm.weight' → 'layers.16.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.16.pre_feedforward_layernorm.weight' → 'layers.16.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_16_mlp_gate_up_proj_MatMul_weight_quant → layers.16.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.16.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_16_mlp_down_proj_MatMul_weight_quant → layers.16.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.16.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.16.post_feedforward_layernorm.weight' → 'layers.16.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_16_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.16.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.16.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_16_per_layer_per_layer_projection_MatMul_weight_quant → layers.16.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.16.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.16.post_per_layer_input_norm.weight' → 'layers.16.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.17.input_layernorm.weight' → 'layers.17.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_17_attn_q_proj_MatMul_weight_quant → layers.17.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.17.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.17.attn.q_norm.layernorm.weight' → 'layers.17.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_17_attn_k_proj_MatMul_weight_quant → layers.17.self_attn.k_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.17.self_attn.k_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.17.attn.k_norm.layernorm.weight' → 'layers.17.k_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_17_attn_v_proj_MatMul_weight_quant → layers.17.self_attn.v_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.17.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] '/model/layers.17/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[512]
+  [onnx] node 700/1615: op=Unsqueeze inputs=2 outputs=1
+    in[0]=present.17.value
+    in[1]=/model/constants/INT64/[2]
+  [MatMulNBits] model_layers_17_attn_o_proj_MatMul_weight_quant → layers.17.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.17.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.17.post_attention_layernorm.weight' → 'layers.17.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.17.pre_feedforward_layernorm.weight' → 'layers.17.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_17_mlp_gate_up_proj_MatMul_weight_quant → layers.17.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.17.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_17_mlp_down_proj_MatMul_weight_quant → layers.17.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.17.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.17.post_feedforward_layernorm.weight' → 'layers.17.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_17_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.17.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.17.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_17_per_layer_per_layer_projection_MatMul_weight_quant → layers.17.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.17.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.17.post_per_layer_input_norm.weight' → 'layers.17.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.18.input_layernorm.weight' → 'layers.18.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_18_attn_q_proj_MatMul_weight_quant → layers.18.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.18.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_18_attn_k_proj_MatMul_weight_quant → layers.18.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.18.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_18_attn_v_proj_MatMul_weight_quant → layers.18.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.18.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.18.attn.q_norm.layernorm.weight' → 'layers.18.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.18.attn.k_norm.layernorm.weight' → 'layers.18.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.18/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 750/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.18/attn/GroupQueryAttention/output_0
+    in[1]=model_layers_18_attn_o_proj_MatMul_weight_quant
+    in[2]=model_layers_18_attn_o_proj_MatMul_weight_scales
+    in[3]=model_layers_18_attn_o_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_18_attn_o_proj_MatMul_weight_quant → layers.18.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.18.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.18.post_attention_layernorm.weight' → 'layers.18.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.18.pre_feedforward_layernorm.weight' → 'layers.18.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_18_mlp_gate_up_proj_MatMul_weight_quant → layers.18.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.18.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_18_mlp_down_proj_MatMul_weight_quant → layers.18.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.18.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.18.post_feedforward_layernorm.weight' → 'layers.18.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_18_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.18.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.18.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_18_per_layer_per_layer_projection_MatMul_weight_quant → layers.18.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.18.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.18.post_per_layer_input_norm.weight' → 'layers.18.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.19.input_layernorm.weight' → 'layers.19.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_19_attn_q_proj_MatMul_weight_quant → layers.19.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.19.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_19_attn_k_proj_MatMul_weight_quant → layers.19.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.19.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_19_attn_v_proj_MatMul_weight_quant → layers.19.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.19.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.19.attn.q_norm.layernorm.weight' → 'layers.19.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.19.attn.k_norm.layernorm.weight' → 'layers.19.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.19/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_19_attn_o_proj_MatMul_weight_quant → layers.19.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.19.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.19.post_attention_layernorm.weight' → 'layers.19.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.19.pre_feedforward_layernorm.weight' → 'layers.19.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_19_mlp_gate_up_proj_MatMul_weight_quant → layers.19.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.19.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_19_mlp_down_proj_MatMul_weight_quant → layers.19.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.19.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.19.post_feedforward_layernorm.weight' → 'layers.19.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_19_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.19.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.19.ple.gate.weight: has non-8 zero points!
+  [onnx] node 800/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.19/per_layer/gate_mul/Mul/output_0
+    in[1]=model_layers_19_per_layer_per_layer_projection_MatMul_weight_quant
+    in[2]=model_layers_19_per_layer_per_layer_projection_MatMul_weight_scales
+    in[3]=model_layers_19_per_layer_per_layer_projection_MatMul_weight_zp
+  [MatMulNBits] model_layers_19_per_layer_per_layer_projection_MatMul_weight_quant → layers.19.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.19.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.19.post_per_layer_input_norm.weight' → 'layers.19.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.20.input_layernorm.weight' → 'layers.20.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_20_attn_q_proj_MatMul_weight_quant → layers.20.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.20.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_20_attn_k_proj_MatMul_weight_quant → layers.20.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.20.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_20_attn_v_proj_MatMul_weight_quant → layers.20.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.20.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.20.attn.q_norm.layernorm.weight' → 'layers.20.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.20.attn.k_norm.layernorm.weight' → 'layers.20.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.20/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_20_attn_o_proj_MatMul_weight_quant → layers.20.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.20.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.20.post_attention_layernorm.weight' → 'layers.20.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.20.pre_feedforward_layernorm.weight' → 'layers.20.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_20_mlp_gate_up_proj_MatMul_weight_quant → layers.20.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.20.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_20_mlp_down_proj_MatMul_weight_quant → layers.20.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.20.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.20.post_feedforward_layernorm.weight' → 'layers.20.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_20_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.20.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.20.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_20_per_layer_per_layer_projection_MatMul_weight_quant → layers.20.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.20.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.20.post_per_layer_input_norm.weight' → 'layers.20.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.21.input_layernorm.weight' → 'layers.21.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_21_attn_q_proj_MatMul_weight_quant → layers.21.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.21.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_21_attn_k_proj_MatMul_weight_quant → layers.21.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.21.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_21_attn_v_proj_MatMul_weight_quant → layers.21.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.21.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.21.attn.q_norm.layernorm.weight' → 'layers.21.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.21.attn.k_norm.layernorm.weight' → 'layers.21.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 850/1615: op=RotaryEmbedding inputs=4 outputs=1
+    in[0]=/model/layers.21/attn/k_norm/Reshape_2/output_0
+    in[1]=position_ids
+    in[2]=cos_cache_local
+    in[3]=sin_cache_local
+  [norm-node] '/model/layers.21/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_21_attn_o_proj_MatMul_weight_quant → layers.21.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.21.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.21.post_attention_layernorm.weight' → 'layers.21.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.21.pre_feedforward_layernorm.weight' → 'layers.21.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_21_mlp_gate_up_proj_MatMul_weight_quant → layers.21.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.21.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_21_mlp_down_proj_MatMul_weight_quant → layers.21.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.21.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.21.post_feedforward_layernorm.weight' → 'layers.21.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_21_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.21.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.21.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_21_per_layer_per_layer_projection_MatMul_weight_quant → layers.21.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.21.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.21.post_per_layer_input_norm.weight' → 'layers.21.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.22.input_layernorm.weight' → 'layers.22.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_22_attn_q_proj_MatMul_weight_quant → layers.22.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.22.self_attn.q_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_22_attn_k_proj_MatMul_weight_quant → layers.22.self_attn.k_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.22.self_attn.k_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_22_attn_v_proj_MatMul_weight_quant → layers.22.self_attn.v_proj.weight (K=2560 N=512 bits=4 bs=32)
+  [ZP] layers.22.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.22.attn.q_norm.layernorm.weight' → 'layers.22.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] 'model.layers.22.attn.k_norm.layernorm.weight' → 'layers.22.k_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [norm-node] '/model/layers.22/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_22_attn_o_proj_MatMul_weight_quant → layers.22.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.22.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.22.post_attention_layernorm.weight' → 'layers.22.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.22.pre_feedforward_layernorm.weight' → 'layers.22.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_22_mlp_gate_up_proj_MatMul_weight_quant → layers.22.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.22.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_22_mlp_down_proj_MatMul_weight_quant → layers.22.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.22.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.22.post_feedforward_layernorm.weight' → 'layers.22.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [onnx] node 900/1615: op=Add inputs=2 outputs=1
+    in[0]=/model/layers.22/Add_1/output_0
+    in[1]=/model/layers.22/post_feedforward_layernorm/output_0
+  [MatMulNBits] model_layers_22_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.22.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.22.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_22_per_layer_per_layer_projection_MatMul_weight_quant → layers.22.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.22.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.22.post_per_layer_input_norm.weight' → 'layers.22.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.23.input_layernorm.weight' → 'layers.23.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_23_attn_q_proj_MatMul_weight_quant → layers.23.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.23.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.23.attn.q_norm.layernorm.weight' → 'layers.23.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_23_attn_k_proj_MatMul_weight_quant → layers.23.self_attn.k_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.23.self_attn.k_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.23.attn.k_norm.layernorm.weight' → 'layers.23.k_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_23_attn_v_proj_MatMul_weight_quant → layers.23.self_attn.v_proj.weight (K=2560 N=1024 bits=4 bs=32)
+  [ZP] layers.23.self_attn.v_proj.weight: has non-8 zero points!
+  [norm-node] '/model/layers.23/attn/v_norm/ones_weight' → '' op=SimplifiedLayerNormalization dims=[512]
+  [onnx] node 950/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.23/attn/manual/output/Reshape/output_0
+    in[1]=model_layers_23_attn_o_proj_MatMul_weight_quant
+    in[2]=model_layers_23_attn_o_proj_MatMul_weight_scales
+    in[3]=model_layers_23_attn_o_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_23_attn_o_proj_MatMul_weight_quant → layers.23.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.23.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.23.post_attention_layernorm.weight' → 'layers.23.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.23.pre_feedforward_layernorm.weight' → 'layers.23.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_23_mlp_gate_up_proj_MatMul_weight_quant → layers.23.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.23.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_23_mlp_down_proj_MatMul_weight_quant → layers.23.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.23.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.23.post_feedforward_layernorm.weight' → 'layers.23.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_23_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.23.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.23.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_23_per_layer_per_layer_projection_MatMul_weight_quant → layers.23.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.23.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.23.post_per_layer_input_norm.weight' → 'layers.23.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.24.input_layernorm.weight' → 'layers.24.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_24_attn_q_proj_MatMul_weight_quant → layers.24.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.24.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.24.attn.q_norm.layernorm.weight' → 'layers.24.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_24_attn_o_proj_MatMul_weight_quant → layers.24.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.24.self_attn.o_proj.weight: has non-8 zero points!
+  [onnx] node 1000/1615: op=SimplifiedLayerNormalization inputs=2 outputs=1
+    in[0]=/model/layers.24/attn/o_proj/MatMul/output_0
+    in[1]=model.layers.24.post_attention_layernorm.weight
+  [norm-node] 'model.layers.24.post_attention_layernorm.weight' → 'layers.24.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.24.pre_feedforward_layernorm.weight' → 'layers.24.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_24_mlp_gate_up_proj_MatMul_weight_quant → layers.24.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.24.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_24_mlp_down_proj_MatMul_weight_quant → layers.24.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.24.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.24.post_feedforward_layernorm.weight' → 'layers.24.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_24_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.24.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.24.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_24_per_layer_per_layer_projection_MatMul_weight_quant → layers.24.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.24.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.24.post_per_layer_input_norm.weight' → 'layers.24.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.25.input_layernorm.weight' → 'layers.25.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_25_attn_q_proj_MatMul_weight_quant → layers.25.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.25.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.25.attn.q_norm.layernorm.weight' → 'layers.25.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_25_attn_o_proj_MatMul_weight_quant → layers.25.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.25.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.25.post_attention_layernorm.weight' → 'layers.25.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.25.pre_feedforward_layernorm.weight' → 'layers.25.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_25_mlp_gate_up_proj_MatMul_weight_quant → layers.25.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.25.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_25_mlp_down_proj_MatMul_weight_quant → layers.25.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.25.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.25.post_feedforward_layernorm.weight' → 'layers.25.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_25_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.25.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.25.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_25_per_layer_per_layer_projection_MatMul_weight_quant → layers.25.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.25.ple.proj.weight: has non-8 zero points!
+  [onnx] node 1050/1615: op=SimplifiedLayerNormalization inputs=2 outputs=1
+    in[0]=/model/layers.25/per_layer/per_layer_projection/MatMul/output_0
+    in[1]=model.layers.25.post_per_layer_input_norm.weight
+  [norm-node] 'model.layers.25.post_per_layer_input_norm.weight' → 'layers.25.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.26.input_layernorm.weight' → 'layers.26.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_26_attn_q_proj_MatMul_weight_quant → layers.26.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.26.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.26.attn.q_norm.layernorm.weight' → 'layers.26.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_26_attn_o_proj_MatMul_weight_quant → layers.26.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.26.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.26.post_attention_layernorm.weight' → 'layers.26.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.26.pre_feedforward_layernorm.weight' → 'layers.26.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_26_mlp_gate_up_proj_MatMul_weight_quant → layers.26.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.26.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_26_mlp_down_proj_MatMul_weight_quant → layers.26.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.26.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.26.post_feedforward_layernorm.weight' → 'layers.26.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_26_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.26.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.26.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_26_per_layer_per_layer_projection_MatMul_weight_quant → layers.26.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.26.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.26.post_per_layer_input_norm.weight' → 'layers.26.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.27.input_layernorm.weight' → 'layers.27.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_27_attn_q_proj_MatMul_weight_quant → layers.27.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.27.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.27.attn.q_norm.layernorm.weight' → 'layers.27.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 1100/1615: op=Softmax inputs=1 outputs=1
+    in[0]=/model/layers.27/attn/shared/scores/Where_slide/output_0
+  [MatMulNBits] model_layers_27_attn_o_proj_MatMul_weight_quant → layers.27.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.27.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.27.post_attention_layernorm.weight' → 'layers.27.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.27.pre_feedforward_layernorm.weight' → 'layers.27.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_27_mlp_gate_up_proj_MatMul_weight_quant → layers.27.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.27.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_27_mlp_down_proj_MatMul_weight_quant → layers.27.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.27.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.27.post_feedforward_layernorm.weight' → 'layers.27.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_27_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.27.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.27.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_27_per_layer_per_layer_projection_MatMul_weight_quant → layers.27.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.27.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.27.post_per_layer_input_norm.weight' → 'layers.27.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.28.input_layernorm.weight' → 'layers.28.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_28_attn_q_proj_MatMul_weight_quant → layers.28.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.28.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.28.attn.q_norm.layernorm.weight' → 'layers.28.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_28_attn_o_proj_MatMul_weight_quant → layers.28.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.28.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.28.post_attention_layernorm.weight' → 'layers.28.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.28.pre_feedforward_layernorm.weight' → 'layers.28.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_28_mlp_gate_up_proj_MatMul_weight_quant → layers.28.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.28.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_28_mlp_down_proj_MatMul_weight_quant → layers.28.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.28.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.28.post_feedforward_layernorm.weight' → 'layers.28.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [onnx] node 1150/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.28/Add_2/output_0
+    in[1]=model_layers_28_per_layer_per_layer_input_gate_MatMul_weight_quant
+    in[2]=model_layers_28_per_layer_per_layer_input_gate_MatMul_weight_scales
+    in[3]=model_layers_28_per_layer_per_layer_input_gate_MatMul_weight_zp
+  [MatMulNBits] model_layers_28_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.28.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.28.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_28_per_layer_per_layer_projection_MatMul_weight_quant → layers.28.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.28.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.28.post_per_layer_input_norm.weight' → 'layers.28.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.29.input_layernorm.weight' → 'layers.29.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_29_attn_q_proj_MatMul_weight_quant → layers.29.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.29.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.29.attn.q_norm.layernorm.weight' → 'layers.29.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_29_attn_o_proj_MatMul_weight_quant → layers.29.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.29.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.29.post_attention_layernorm.weight' → 'layers.29.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.29.pre_feedforward_layernorm.weight' → 'layers.29.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_29_mlp_gate_up_proj_MatMul_weight_quant → layers.29.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.29.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_29_mlp_down_proj_MatMul_weight_quant → layers.29.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.29.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.29.post_feedforward_layernorm.weight' → 'layers.29.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_29_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.29.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.29.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_29_per_layer_per_layer_projection_MatMul_weight_quant → layers.29.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.29.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.29.post_per_layer_input_norm.weight' → 'layers.29.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.30.input_layernorm.weight' → 'layers.30.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_30_attn_q_proj_MatMul_weight_quant → layers.30.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.30.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.30.attn.q_norm.layernorm.weight' → 'layers.30.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 1200/1615: op=MatMul inputs=2 outputs=1
+    in[0]=/model/layers.30/attn/shared/q_transpose/output_0
+    in[1]=/model/layers.30/attn/shared/k_transpose/output_0
+  [MatMulNBits] model_layers_30_attn_o_proj_MatMul_weight_quant → layers.30.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.30.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.30.post_attention_layernorm.weight' → 'layers.30.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.30.pre_feedforward_layernorm.weight' → 'layers.30.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_30_mlp_gate_up_proj_MatMul_weight_quant → layers.30.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.30.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_30_mlp_down_proj_MatMul_weight_quant → layers.30.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.30.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.30.post_feedforward_layernorm.weight' → 'layers.30.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_30_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.30.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.30.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_30_per_layer_per_layer_projection_MatMul_weight_quant → layers.30.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.30.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.30.post_per_layer_input_norm.weight' → 'layers.30.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.31.input_layernorm.weight' → 'layers.31.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_31_attn_q_proj_MatMul_weight_quant → layers.31.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.31.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.31.attn.q_norm.layernorm.weight' → 'layers.31.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_31_attn_o_proj_MatMul_weight_quant → layers.31.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.31.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.31.post_attention_layernorm.weight' → 'layers.31.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.31.pre_feedforward_layernorm.weight' → 'layers.31.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_31_mlp_gate_up_proj_MatMul_weight_quant → layers.31.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.31.mlp.gate_up_proj.weight: has non-8 zero points!
+  [onnx] node 1250/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.31/mlp/Mul/output_0
+    in[1]=model_layers_31_mlp_down_proj_MatMul_weight_quant
+    in[2]=model_layers_31_mlp_down_proj_MatMul_weight_scales
+    in[3]=model_layers_31_mlp_down_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_31_mlp_down_proj_MatMul_weight_quant → layers.31.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.31.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.31.post_feedforward_layernorm.weight' → 'layers.31.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_31_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.31.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.31.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_31_per_layer_per_layer_projection_MatMul_weight_quant → layers.31.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.31.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.31.post_per_layer_input_norm.weight' → 'layers.31.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.32.input_layernorm.weight' → 'layers.32.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_32_attn_q_proj_MatMul_weight_quant → layers.32.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.32.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.32.attn.q_norm.layernorm.weight' → 'layers.32.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_32_attn_o_proj_MatMul_weight_quant → layers.32.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.32.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.32.post_attention_layernorm.weight' → 'layers.32.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.32.pre_feedforward_layernorm.weight' → 'layers.32.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_32_mlp_gate_up_proj_MatMul_weight_quant → layers.32.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.32.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_32_mlp_down_proj_MatMul_weight_quant → layers.32.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.32.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.32.post_feedforward_layernorm.weight' → 'layers.32.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_32_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.32.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.32.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_32_per_layer_per_layer_projection_MatMul_weight_quant → layers.32.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.32.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.32.post_per_layer_input_norm.weight' → 'layers.32.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.33.input_layernorm.weight' → 'layers.33.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_33_attn_q_proj_MatMul_weight_quant → layers.33.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.33.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.33.attn.q_norm.layernorm.weight' → 'layers.33.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 1300/1615: op=Reshape inputs=2 outputs=1
+    in[0]=/model/layers.33/attn/shared/q_norm/SimplifiedLayerNormalization/output_0
+    in[1]=/model/constants/INT64/[0, -1, 2048]
+  [MatMulNBits] model_layers_33_attn_o_proj_MatMul_weight_quant → layers.33.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.33.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.33.post_attention_layernorm.weight' → 'layers.33.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.33.pre_feedforward_layernorm.weight' → 'layers.33.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_33_mlp_gate_up_proj_MatMul_weight_quant → layers.33.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.33.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_33_mlp_down_proj_MatMul_weight_quant → layers.33.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.33.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.33.post_feedforward_layernorm.weight' → 'layers.33.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_33_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.33.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.33.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_33_per_layer_per_layer_projection_MatMul_weight_quant → layers.33.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.33.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.33.post_per_layer_input_norm.weight' → 'layers.33.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.34.input_layernorm.weight' → 'layers.34.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_34_attn_q_proj_MatMul_weight_quant → layers.34.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.34.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.34.attn.q_norm.layernorm.weight' → 'layers.34.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_34_attn_o_proj_MatMul_weight_quant → layers.34.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.34.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.34.post_attention_layernorm.weight' → 'layers.34.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [onnx] node 1350/1615: op=SimplifiedLayerNormalization inputs=2 outputs=1
+    in[0]=/model/layers.34/Add_1/output_0
+    in[1]=model.layers.34.pre_feedforward_layernorm.weight
+  [norm-node] 'model.layers.34.pre_feedforward_layernorm.weight' → 'layers.34.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_34_mlp_gate_up_proj_MatMul_weight_quant → layers.34.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.34.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_34_mlp_down_proj_MatMul_weight_quant → layers.34.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.34.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.34.post_feedforward_layernorm.weight' → 'layers.34.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_34_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.34.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.34.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_34_per_layer_per_layer_projection_MatMul_weight_quant → layers.34.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.34.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.34.post_per_layer_input_norm.weight' → 'layers.34.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.35.input_layernorm.weight' → 'layers.35.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_35_attn_q_proj_MatMul_weight_quant → layers.35.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.35.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.35.attn.q_norm.layernorm.weight' → 'layers.35.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_35_attn_o_proj_MatMul_weight_quant → layers.35.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.35.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.35.post_attention_layernorm.weight' → 'layers.35.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.35.pre_feedforward_layernorm.weight' → 'layers.35.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_35_mlp_gate_up_proj_MatMul_weight_quant → layers.35.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.35.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_35_mlp_down_proj_MatMul_weight_quant → layers.35.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.35.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.35.post_feedforward_layernorm.weight' → 'layers.35.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_35_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.35.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.35.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_35_per_layer_per_layer_projection_MatMul_weight_quant → layers.35.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.35.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.35.post_per_layer_input_norm.weight' → 'layers.35.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.36.input_layernorm.weight' → 'layers.36.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [onnx] node 1400/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.36/input_layernorm/output_0
+    in[1]=model_layers_36_attn_q_proj_MatMul_weight_quant
+    in[2]=model_layers_36_attn_q_proj_MatMul_weight_scales
+    in[3]=model_layers_36_attn_q_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_36_attn_q_proj_MatMul_weight_quant → layers.36.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.36.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.36.attn.q_norm.layernorm.weight' → 'layers.36.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_36_attn_o_proj_MatMul_weight_quant → layers.36.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.36.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.36.post_attention_layernorm.weight' → 'layers.36.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.36.pre_feedforward_layernorm.weight' → 'layers.36.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_36_mlp_gate_up_proj_MatMul_weight_quant → layers.36.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.36.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_36_mlp_down_proj_MatMul_weight_quant → layers.36.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.36.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.36.post_feedforward_layernorm.weight' → 'layers.36.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_36_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.36.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.36.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_36_per_layer_per_layer_projection_MatMul_weight_quant → layers.36.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.36.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.36.post_per_layer_input_norm.weight' → 'layers.36.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.37.input_layernorm.weight' → 'layers.37.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_37_attn_q_proj_MatMul_weight_quant → layers.37.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.37.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.37.attn.q_norm.layernorm.weight' → 'layers.37.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 1450/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.37/attn/shared/output/Reshape/output_0
+    in[1]=model_layers_37_attn_o_proj_MatMul_weight_quant
+    in[2]=model_layers_37_attn_o_proj_MatMul_weight_scales
+    in[3]=model_layers_37_attn_o_proj_MatMul_weight_zp
+  [MatMulNBits] model_layers_37_attn_o_proj_MatMul_weight_quant → layers.37.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.37.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.37.post_attention_layernorm.weight' → 'layers.37.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.37.pre_feedforward_layernorm.weight' → 'layers.37.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_37_mlp_gate_up_proj_MatMul_weight_quant → layers.37.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.37.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_37_mlp_down_proj_MatMul_weight_quant → layers.37.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.37.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.37.post_feedforward_layernorm.weight' → 'layers.37.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_37_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.37.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.37.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_37_per_layer_per_layer_projection_MatMul_weight_quant → layers.37.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.37.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.37.post_per_layer_input_norm.weight' → 'layers.37.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.38.input_layernorm.weight' → 'layers.38.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_38_attn_q_proj_MatMul_weight_quant → layers.38.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.38.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.38.attn.q_norm.layernorm.weight' → 'layers.38.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_38_attn_o_proj_MatMul_weight_quant → layers.38.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.38.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.38.post_attention_layernorm.weight' → 'layers.38.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.38.pre_feedforward_layernorm.weight' → 'layers.38.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_38_mlp_gate_up_proj_MatMul_weight_quant → layers.38.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.38.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_38_mlp_down_proj_MatMul_weight_quant → layers.38.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.38.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.38.post_feedforward_layernorm.weight' → 'layers.38.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_38_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.38.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.38.ple.gate.weight: has non-8 zero points!
+  [onnx] node 1500/1615: op=MatMulNBits inputs=4 outputs=1
+    in[0]=/model/layers.38/per_layer/gate_mul/Mul/output_0
+    in[1]=model_layers_38_per_layer_per_layer_projection_MatMul_weight_quant
+    in[2]=model_layers_38_per_layer_per_layer_projection_MatMul_weight_scales
+    in[3]=model_layers_38_per_layer_per_layer_projection_MatMul_weight_zp
+  [MatMulNBits] model_layers_38_per_layer_per_layer_projection_MatMul_weight_quant → layers.38.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.38.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.38.post_per_layer_input_norm.weight' → 'layers.38.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.39.input_layernorm.weight' → 'layers.39.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_39_attn_q_proj_MatMul_weight_quant → layers.39.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.39.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.39.attn.q_norm.layernorm.weight' → 'layers.39.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [MatMulNBits] model_layers_39_attn_o_proj_MatMul_weight_quant → layers.39.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.39.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.39.post_attention_layernorm.weight' → 'layers.39.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.39.pre_feedforward_layernorm.weight' → 'layers.39.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_39_mlp_gate_up_proj_MatMul_weight_quant → layers.39.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.39.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_39_mlp_down_proj_MatMul_weight_quant → layers.39.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.39.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.39.post_feedforward_layernorm.weight' → 'layers.39.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_39_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.39.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.39.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_39_per_layer_per_layer_projection_MatMul_weight_quant → layers.39.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.39.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.39.post_per_layer_input_norm.weight' → 'layers.39.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.40.input_layernorm.weight' → 'layers.40.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_40_attn_q_proj_MatMul_weight_quant → layers.40.self_attn.q_proj.weight (K=2560 N=2048 bits=4 bs=32)
+  [ZP] layers.40.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.40.attn.q_norm.layernorm.weight' → 'layers.40.q_norm.weight' op=SimplifiedLayerNormalization dims=[256]
+  [onnx] node 1550/1615: op=Where inputs=3 outputs=1
+    in[0]=/model/shared_donor.22/mask/slide_unsq/output_0
+    in[1]=/model/layers.40/attn/shared/scores/Where/output_0
+    in[2]=/model/constants/FLOAT16/-65504.0
+  [MatMulNBits] model_layers_40_attn_o_proj_MatMul_weight_quant → layers.40.self_attn.o_proj.weight (K=2048 N=2560 bits=4 bs=32)
+  [ZP] layers.40.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.40.post_attention_layernorm.weight' → 'layers.40.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.40.pre_feedforward_layernorm.weight' → 'layers.40.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_40_mlp_gate_up_proj_MatMul_weight_quant → layers.40.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.40.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_40_mlp_down_proj_MatMul_weight_quant → layers.40.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.40.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.40.post_feedforward_layernorm.weight' → 'layers.40.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_40_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.40.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.40.ple.gate.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_40_per_layer_per_layer_projection_MatMul_weight_quant → layers.40.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.40.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.40.post_per_layer_input_norm.weight' → 'layers.40.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.41.input_layernorm.weight' → 'layers.41.input_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_41_attn_q_proj_MatMul_weight_quant → layers.41.self_attn.q_proj.weight (K=2560 N=4096 bits=4 bs=32)
+  [ZP] layers.41.self_attn.q_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.41.attn.q_norm.layernorm.weight' → 'layers.41.q_norm.weight' op=SimplifiedLayerNormalization dims=[512]
+  [MatMulNBits] model_layers_41_attn_o_proj_MatMul_weight_quant → layers.41.self_attn.o_proj.weight (K=4096 N=2560 bits=4 bs=32)
+  [ZP] layers.41.self_attn.o_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.41.post_attention_layernorm.weight' → 'layers.41.post_attention_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.41.pre_feedforward_layernorm.weight' → 'layers.41.pre_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_41_mlp_gate_up_proj_MatMul_weight_quant → layers.41.mlp.gate_up_proj.weight (K=2560 N=20480 bits=4 bs=32)
+  [ZP] layers.41.mlp.gate_up_proj.weight: has non-8 zero points!
+  [MatMulNBits] model_layers_41_mlp_down_proj_MatMul_weight_quant → layers.41.mlp.down_proj.weight (K=10240 N=2560 bits=4 bs=32)
+  [ZP] layers.41.mlp.down_proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.41.post_feedforward_layernorm.weight' → 'layers.41.post_feedforward_layernorm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] model_layers_41_per_layer_per_layer_input_gate_MatMul_weight_quant → layers.41.ple.gate.weight (K=2560 N=256 bits=4 bs=32)
+  [ZP] layers.41.ple.gate.weight: has non-8 zero points!
+  [onnx] node 1600/1615: op=Gelu inputs=1 outputs=1
+    in[0]=/model/layers.41/per_layer/per_layer_input_gate/MatMul/output_0
+  [MatMulNBits] model_layers_41_per_layer_per_layer_projection_MatMul_weight_quant → layers.41.ple.proj.weight (K=256 N=2560 bits=4 bs=32)
+  [ZP] layers.41.ple.proj.weight: has non-8 zero points!
+  [norm-node] 'model.layers.41.post_per_layer_input_norm.weight' → 'layers.41.ple_norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [norm-node] 'model.layers.42.final_norm_layernorm.weight' → 'norm.weight' op=SimplifiedLayerNormalization dims=[2560]
+  [MatMulNBits] lm_head_MatMul_weight_quant → lm_head.weight (K=2560 N=262144 bits=4 bs=32)
+  [ZP] lm_head.weight: has non-8 zero points!
+[onnx] loadOnnx complete
