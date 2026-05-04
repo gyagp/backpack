@@ -1226,9 +1226,8 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         std::vector<int32_t> w(std::min(promptLen, 32), 0);
         int32_t t = st->runner.prefillBatched(w.data(), (uint32_t)w.size(), 0);
         st->gpu->writeBuffer(st->runner.argmaxResultBuf, &t, 4);
-        int n = std::min(DEPTH, 4);
-        for (int i = 0; i < n; i++) st->runner.submitDecode((uint32_t)(w.size()+i), i);
-        for (int i = 0; i < n; i++) st->runner.readArgmax(i);
+        for (int i = 0; i < DEPTH; i++) st->runner.submitDecode((uint32_t)(w.size()+i), i);
+        for (int i = 0; i < DEPTH; i++) st->runner.readArgmax(i);
         st->Reset();
         st->benchWarmupDone = true;
     }

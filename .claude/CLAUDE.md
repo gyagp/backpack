@@ -1,12 +1,11 @@
 # Autopo test Session
 
 ## Work Unit
-Add fence-wait-time instrumentation to measure time spent in completeAsyncMapI32/waitForQueue
+Build backpack runtime with latest changes (lm_session.cpp modified)
 
 ## Acceptance Criteria
-- readArgmax records time spent blocking in completeAsyncMapI32
-- Cumulative fence wait time is reported in benchmark output (ms total and % of decode time)
-- Build succeeds
+- scripts/build_backpack.bat succeeds
+- runtime/build/backpack_llm.exe is updated with latest changes
 
 ## Rules
 # Rules
