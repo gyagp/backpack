@@ -858,6 +858,7 @@ void ModelRunner::buildDecodePipeline() {
     auto& plRmsNorm    = getKernel("rms_norm");
     auto& plAddRmsNorm = getKernel("add_rms_norm");
     auto& plQ8Matmul   = getKernel("q8_matmul");
+    auto& plQ8MatmulNorm = getKernel("q8_matmul_norm");
 
     // K-quant kernel selection
     bool useKQ = (weightQuantType == GGUF_TYPE_Q4_K ||
@@ -920,6 +921,13 @@ void ModelRunner::buildDecodePipeline() {
         return buf;
     };
     auto q8QkvParams   = makeQ8Params("p_qkv", cfg.nEmbd, qkvOut);
+    GPUBuffer q8QkvNormParams;
+    {
+        uint32_t data[4] = {cfg.nEmbd, qkvOut, 0, 0};
+        float eps = cfg.rmsNormEps; memcpy(&data[3], &eps, 4);
+        q8QkvNormParams = gpu->createBuffer("p_qkv_norm", 16);
+        gpu->writeBuffer(q8QkvNormParams, data, 16);
+    }
     auto q8OprojParams = makeQ8Params("p_oproj", qDim, cfg.nEmbd);
     auto q8GuParams    = makeQ8Params("p_gu", cfg.nEmbd, 2 * cfg.intermediateSize);
     // Fused down+silu params: [K=IM, N=E, IM, 0]
@@ -1071,8 +1079,8 @@ void ModelRunner::buildDecodePipeline() {
         auto& vbg = decodeVariantBGs[i];
         std::string L = "L" + std::to_string(i) + "/";
 
-        // 1. RMSNorm
-        if (i == 0) {
+        // 1. RMSNorm (only for KQ path — Q8 path uses fused q8_matmul_norm)
+        if (i == 0 && useKQ) {
             auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, lw.inputNorm},
                 {3, rstdBuf}, {4, rmsParams}});
@@ -1089,18 +1097,12 @@ void ModelRunner::buildDecodePipeline() {
                 allDecodeDispatches.push_back({plKQ->pipeline, bg,
                     1, (qkvOut + 7) / 8, 1, L+"kq_qkv"});
             } else {
-                vbg.qkvBase = makeBG(plQ8Matmul, {
-                    {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
-                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
-                if (decodeFastVariantsAvailable) {
-                    vbg.qkvFast = makeBG(plQ8Fast, {
-                        {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
-                        {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvParams}});
-                }
-                auto bg = tuning.decodeUseFastQkv && vbg.qkvFast ? vbg.qkvFast : vbg.qkvBase;
-                auto pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
+                vbg.qkvBase = makeBG(plQ8MatmulNorm, {
+                    {0, xBuf}, {1, lw.qkvW}, {2, lw.qkvS},
+                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvNormParams},
+                    {6, lw.inputNorm}});
                 di.qkv = (int)allDecodeDispatches.size();
-                allDecodeDispatches.push_back({pipeline, bg,
+                allDecodeDispatches.push_back({plQ8MatmulNorm.pipeline, vbg.qkvBase,
                     1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_qkv"});
             }
         }
@@ -1244,8 +1246,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // 10. RMSNorm for next layer
-        if (i < cfg.nLayer - 1) {
+        // 10. RMSNorm for next layer (only needed for KQ path — Q8 path uses fused kernel)
+        if (i < cfg.nLayer - 1 && useKQ) {
             auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, layerWeights[i+1].inputNorm},
                 {3, rstdBuf}, {4, rmsParams}});
@@ -1739,6 +1741,7 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
     tuning.decodeUseFastGateup = useFastGateup && decodeFastVariantsAvailable;
 
     const auto& plQ8Matmul = getKernel("q8_matmul");
+    const auto& plQ8MatmulNorm = getKernel("q8_matmul_norm");
     const auto& plQ8Fast = getKernel("q8_matmul_fast");
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         auto& di = decodeDispatchIndices[i];
@@ -1746,7 +1749,7 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
 
         if (di.qkv >= 0) {
             auto& d = allDecodeDispatches[di.qkv];
-            d.pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
+            d.pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8MatmulNorm.pipeline;
             d.bindGroup = tuning.decodeUseFastQkv && vbg.qkvFast ? vbg.qkvFast : vbg.qkvBase;
             autoDecodeDispatches[di.qkv + 1] = d;
         }

@@ -1,12 +1,12 @@
-# Autopo execute Session
+# Autopo review Session
 
 ## Work Unit
-Extend Gemm op to use fp16_gemm packed path for non-transB cases or when subgroups unavailable
+Wire RMSNorm+QKV fused kernel into GGUF decode pipeline (Q8 path)
 
 ## Acceptance Criteria
-- Gemm with fp16 B weights uses packed u32 path even without subgroup support
-- Non-transB Gemm with fp16 weights avoids f32 conversion where possible
-- Fallback to f32 only when truly necessary
+- buildDecodePipeline() uses q8_matmul_norm for QKV projection instead of separate rms_norm + q8_matmul
+- Decode dispatch count reduced by 1 per layer (eliminates standalone rms_norm before QKV)
+- Build succeeds
 
 ## Rules
 # Rules

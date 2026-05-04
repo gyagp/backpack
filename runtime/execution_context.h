@@ -36,6 +36,15 @@ class GraphExecutor;
 struct OnnxInitData;
 enum class TensorDtype;
 
+// ─── Lifetime Interval ──────────────────────────────────────────────────────
+
+struct LifetimeInterval {
+    std::string name;
+    int firstUse;
+    int lastUse;
+    size_t sizeBytes;
+};
+
 // ─── ExecutionContext ────────────────────────────────────────────────────────
 
 struct ExecutionContext {

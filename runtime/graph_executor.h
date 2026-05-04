@@ -217,6 +217,9 @@ public:
     /// Detect fuseable patterns in the graph. Called once after Load().
     void DetectFusions();
 
+    /// Compute lifetime intervals for intermediate tensors.
+    const std::vector<LifetimeInterval>& computeLifetimeIntervals();
+
     /// Submit dispatches and wait.
     void Submit(const std::vector<Dispatch>& dispatches);
 
@@ -345,6 +348,10 @@ private:
 
     // Cached topo sort order (reused across Execute calls for the same graph)
     std::vector<size_t> cachedExecOrder_;
+
+    // Cached lifetime intervals (recomputed when execOrder changes)
+    std::vector<LifetimeInterval> cachedLifetimeIntervals_;
+    size_t lifetimeExecOrderSize_ = 0;
 
     // Fused op groups detected at graph analysis time.
     std::unordered_map<size_t, FusedGroup> fusedGroups_;

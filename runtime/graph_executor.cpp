@@ -1636,3 +1636,47 @@ void GraphExecutor::Execute(
 }
 
 // enableGpuProfiling() and printGpuProfileReport() are now in execution_context.cpp
+
+// ─── Lifetime Interval Analysis ─────────────────────────────────────────────
+
+const std::vector<LifetimeInterval>& GraphExecutor::computeLifetimeIntervals() {
+    if (cachedExecOrder_.empty()) return cachedLifetimeIntervals_;
+
+    if (cachedExecOrder_.size() == lifetimeExecOrderSize_ &&
+        !cachedLifetimeIntervals_.empty()) {
+        return cachedLifetimeIntervals_;
+    }
+
+    std::set<std::string> immortal;
+    for (auto& [name, _] : weightStore_) immortal.insert(name);
+    for (auto& [name, _] : graph_.initializers) immortal.insert(name);
+    for (auto& inp : graph_.inputs) immortal.insert(inp.name);
+    for (auto& out : graph_.outputs) immortal.insert(out.name);
+
+    std::unordered_map<std::string, int> firstUse, lastUse;
+
+    for (size_t step = 0; step < cachedExecOrder_.size(); ++step) {
+        auto& node = graph_.nodes[cachedExecOrder_[step]];
+        int s = static_cast<int>(step);
+
+        for (auto& name : node.inputs) {
+            if (name.empty() || immortal.count(name)) continue;
+            if (firstUse.find(name) == firstUse.end()) firstUse[name] = s;
+            lastUse[name] = s;
+        }
+        for (auto& name : node.outputs) {
+            if (name.empty() || immortal.count(name)) continue;
+            if (firstUse.find(name) == firstUse.end()) firstUse[name] = s;
+            lastUse[name] = s;
+        }
+    }
+
+    cachedLifetimeIntervals_.clear();
+    cachedLifetimeIntervals_.reserve(firstUse.size());
+    for (auto& [name, first] : firstUse) {
+        cachedLifetimeIntervals_.push_back({name, first, lastUse[name], 0});
+    }
+
+    lifetimeExecOrderSize_ = cachedExecOrder_.size();
+    return cachedLifetimeIntervals_;
+}
