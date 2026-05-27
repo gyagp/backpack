@@ -1,6 +1,7 @@
 #include "gpu_context.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <future>
@@ -180,13 +181,24 @@ bool GPUContext::init(WGPUBackendType backend) {
     tryFeat(supportsSubgroupMatrix, {0x00050034});
     tryFeat(supportsTimestampQuery, {0x09});
 
-    const char* devE[] = {"skip_validation", "disable_robustness",
-                          "d3d_disable_ieee_strictness"};
+    // Validation toggles: when BACKPACK_DEBUG_VALIDATE=1 in env, enable Dawn
+    // validation so bind group sizing / param errors surface as [DAWN Val] messages.
+    // Otherwise default to skip_validation for production perf.
+    bool debugValidate = std::getenv("BACKPACK_DEBUG_VALIDATE") != nullptr;
+    const char* devE_release[] = {"skip_validation", "disable_robustness",
+                                   "d3d_disable_ieee_strictness"};
+    const char* devE_debug[]   = {"disable_robustness",
+                                   "d3d_disable_ieee_strictness"};
+    const char** devE = debugValidate ? devE_debug : devE_release;
+    int devE_count   = debugValidate ? 2 : 3;
+    if (debugValidate) {
+        fprintf(stderr, "  BACKPACK_DEBUG_VALIDATE=1 — Dawn validation ENABLED\n");
+    }
     const char* devD[] = {"lazy_clear_resource_on_first_use",
                           "timestamp_quantization"};
     WGPUDawnTogglesDescriptor devT{};
     devT.chain.sType = static_cast<WGPUSType>(0x0005000A);
-    devT.enabledToggleCount = 3;  devT.enabledToggles = devE;
+    devT.enabledToggleCount = devE_count;  devT.enabledToggles = devE;
     devT.disabledToggleCount = 2; devT.disabledToggles = devD;
 
     WGPUDeviceDescriptor ddesc{};

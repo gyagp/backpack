@@ -511,6 +511,13 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     // Compute max per-layer dimensions for buffer allocation
     uint32_t maxQkvOut = qkvOutL;
     uint32_t maxIntermediateSize = cfg.intermediateSize;
+    // For MoE archs (qwen35moe) without dense ffn dim, fall back to moe dim.
+    if (maxIntermediateSize == 0 && cfg.moeIntermediateSize > 0) {
+        maxIntermediateSize = std::max(cfg.moeIntermediateSize, cfg.moeSharedIntermediateSize);
+        // For qwen35moe attention dispatch needs qDim_actual sized buffers too;
+        // use a generous bound to cover all temp buffer uses.
+        maxIntermediateSize = std::max(maxIntermediateSize, 4u * cfg.nEmbd);
+    }
     uint32_t maxQDim = qDim;
     for (auto& pl : cfg.perLayer) {
         uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
@@ -522,6 +529,8 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     // Zero bias buffers (sized to max across layers)
     uint32_t maxBias = std::max({cfg.nEmbd, maxQkvOut,
                                  2 * maxIntermediateSize, cfg.nVocab});
+    fprintf(stderr, "  zero-bias sizing: nEmbd=%u maxQkvOut=%u maxIntermediateSize=%u maxBias=%u\n",
+            cfg.nEmbd, maxQkvOut, maxIntermediateSize, maxBias);
     std::vector<float> zeros(maxBias, 0.0f);
     zeroBiasE   = gpu->createBuffer("zero_bias_E", cfg.nEmbd * 4);
     zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", maxQkvOut * 4);
@@ -689,18 +698,32 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     uint32_t qDim  = cfg.nHead * cfg.headDim;
     uint32_t kvDim = cfg.nKvHeads * cfg.headDim;
     uint32_t qkvOut = qDim + 2 * kvDim;
+    // For MoE archs (qwen35moe) without dense FFN dim, use moe dim + generous
+    // bound to cover qwen35moe attention temp buffers (qDim_actual up to 4*nEmbd).
+    uint32_t effIntermediate = cfg.intermediateSize;
+    if (effIntermediate == 0 && cfg.moeIntermediateSize > 0) {
+        effIntermediate = std::max(cfg.moeIntermediateSize, cfg.moeSharedIntermediateSize);
+        effIntermediate = std::max(effIntermediate, 4u * cfg.nEmbd);
+    }
+    uint32_t effQkvOut = qkvOut;
+    // For qwen35moe attention dispatch: needs qOutDim=4*nEmbd for joint Q+gate.
+    if (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0) {
+        effQkvOut = std::max(effQkvOut, 4u * cfg.nEmbd);
+    }
 
     // Zero bias buffers
-    uint32_t maxBias = std::max({cfg.nEmbd, qkvOut,
-                                 2 * cfg.intermediateSize, cfg.nVocab});
+    uint32_t maxBias = std::max({cfg.nEmbd, effQkvOut,
+                                 2 * effIntermediate, cfg.nVocab});
+    fprintf(stderr, "  zero-bias sizing (GGUF): nEmbd=%u effQkvOut=%u effIntermediate=%u maxBias=%u\n",
+            cfg.nEmbd, effQkvOut, effIntermediate, maxBias);
     std::vector<float> zeros(maxBias, 0.0f);
     zeroBiasE   = gpu->createBuffer("zero_bias_E", cfg.nEmbd * 4);
-    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", qkvOut * 4);
-    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * cfg.intermediateSize * 4);
+    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", effQkvOut * 4);
+    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * effIntermediate * 4);
     zeroBiasV   = gpu->createBuffer("zero_bias_V", cfg.nVocab * 4);
     gpu->writeBuffer(zeroBiasE,   zeros.data(), cfg.nEmbd * 4);
-    gpu->writeBuffer(zeroBiasQKV, zeros.data(), qkvOut * 4);
-    gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * cfg.intermediateSize * 4);
+    gpu->writeBuffer(zeroBiasQKV, zeros.data(), effQkvOut * 4);
+    gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * effIntermediate * 4);
     gpu->writeBuffer(zeroBiasV,   zeros.data(), cfg.nVocab * 4);
 
     // KV cache (fp16 — halves attention bandwidth)
