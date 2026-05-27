@@ -8121,7 +8121,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 
     let col = gid.x;  // output column (N dimension)
     let row = wid.y;   // token index (T dimension)
-    if (col >= N) { return; }
 
     let n_chunks = K / 32u;  // MXFP4 block size = 32
     let blocks_base = col * stride_blocks;
@@ -8198,7 +8197,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let row_stride_words = _params_[3];
     let y_offset = _params_[4];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -8792,7 +8790,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let y_offset       = _params_[4];
     let expert_row_off = _params_[5];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -8934,7 +8931,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let y_offset       = _params_[4];
     let expert_row_off = _params_[5];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -9054,7 +9050,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let y_offset       = _params_[4];
     let expert_row_off = _params_[5];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -9102,6 +9097,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [ssm] conv1d_decode — depthwise conv1d for SSM decode (Mamba)
 static const char* WGSL_SSM_CONV1D_DECODE = R"WGSL(
+@group(0) @binding(0) var<storage, read>       state:    array<f32>;
+@group(0) @binding(1) var<storage, read>       weights:  array<f32>;
 @group(0) @binding(2) var<storage, read>       bias:     array<f32>;
 @group(0) @binding(3) var<storage, read_write> out:      array<f32>;
 @group(0) @binding(4) var<storage, read>       _params_: array<u32>;
@@ -9121,10 +9118,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     out[c] = acc;
 }
+
 )WGSL";
 
 // [ssm] selective_scan_decode — Mamba recurrence per decode step
 static const char* WGSL_SSM_SELECTIVE_SCAN_DECODE = R"WGSL(
+@group(0) @binding(0) var<storage, read>       x_in:    array<f32>;
+@group(0) @binding(1) var<storage, read>       A_log:   array<f32>;
 @group(0) @binding(2) var<storage, read>       dt:      array<f32>;
 @group(0) @binding(3) var<storage, read>       B:       array<f32>;
 @group(0) @binding(4) var<storage, read>       C:       array<f32>;
@@ -9159,10 +9159,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     y_out[c] = acc;
 }
+
 )WGSL";
 
 // [ssm] dt_softplus — Mamba dt = softplus(proj + bias)
 static const char* WGSL_SSM_DT_SOFTPLUS = R"WGSL(
+@group(0) @binding(0) var<storage, read>       proj:    array<f32>;
+@group(0) @binding(1) var<storage, read>       bias:    array<f32>;
 @group(0) @binding(2) var<storage, read_write> dt_out:  array<f32>;
 @group(0) @binding(3) var<storage, read>       _params_: array<u32>;
 
@@ -9176,10 +9179,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let abs_z = abs(z);
     dt_out[c] = max(z, 0.0) + log(1.0 + exp(-abs_z));
 }
+
 )WGSL";
 
 // [ssm] conv_state_update — shift-in new sample
 static const char* WGSL_SSM_CONV_STATE_UPDATE = R"WGSL(
+@group(0) @binding(0) var<storage, read_write> state:   array<f32>;
+@group(0) @binding(1) var<storage, read>       x:       array<f32>;
 @group(0) @binding(2) var<storage, read>       _params_: array<u32>;
 
 @compute @workgroup_size(256)
@@ -9195,10 +9201,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     state[base + 0u] = x[c];
 }
+
 )WGSL";
 
 // [attn] gated_output — qwen35moe gated attention modulation
 static const char* WGSL_ATTN_GATED_OUTPUT = R"WGSL(
+@group(0) @binding(0) var<storage, read>       attn_out: array<f32>;
 @group(0) @binding(1) var<storage, read>       gate_in:  array<f32>;
 @group(0) @binding(2) var<storage, read_write> result:   array<f32>;
 @group(0) @binding(3) var<storage, read>       _params_: array<u32>;
@@ -9212,10 +9220,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sig = 1.0 / (1.0 + exp(-g));
     result[c] = attn_out[c] * sig;
 }
+
 )WGSL";
 
 // [moe] topk_softmax — top-k of N router logits + softmax
 static const char* WGSL_MOE_TOPK_SOFTMAX = R"WGSL(
+@group(0) @binding(0) var<storage, read>       logits:  array<f32>;
+@group(0) @binding(1) var<storage, read_write> idx_out: array<u32>;
 @group(0) @binding(2) var<storage, read_write> wt_out:  array<f32>;
 @group(0) @binding(3) var<storage, read>       _params_: array<u32>;
 
@@ -9267,10 +9278,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         wt_out[ki]  = values[ki] * inv;
     }
 }
+
 )WGSL";
 
 // [moe] weighted_accumulate_decode — per-expert MoE contribution add
 static const char* WGSL_MOE_WEIGHTED_ACCUMULATE = R"WGSL(
+@group(0) @binding(0) var<storage, read_write> out:      array<f32>;
 @group(0) @binding(1) var<storage, read>       src:      array<f32>;
 @group(0) @binding(2) var<storage, read>       weights:  array<f32>;
 @group(0) @binding(3) var<storage, read>       _params_: array<u32>;
@@ -9284,10 +9297,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = weights[k_slot];
     out[c] = out[c] + w * src[c];
 }
+
 )WGSL";
 
 // [moe] compute_offsets — expert indices → per-direction row offsets
 static const char* WGSL_MOE_COMPUTE_OFFSETS = R"WGSL(
+@group(0) @binding(0) var<storage, read>       indices:     array<u32>;
+@group(0) @binding(1) var<storage, read_write> gate_off:    array<u32>;
+@group(0) @binding(2) var<storage, read_write> up_off:      array<u32>;
+@group(0) @binding(3) var<storage, read_write> down_off:    array<u32>;
+@group(0) @binding(4) var<storage, read>       _params_:    array<u32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -9301,10 +9320,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     up_off[s]   = idx * IM_e;
     down_off[s] = idx * E;
 }
+
 )WGSL";
 
 // [quant_kq] iq3s_matmul_moe — IQ3_S indirect MoE matmul (offset from buffer)
 static const char* WGSL_IQ3S_MATMUL_MOE = R"WGSL(
+enable subgroups;
 
 @group(0) @binding(0) var<storage, read>       X:        array<f32>;
 @group(0) @binding(1) var<storage, read>       W_IQ3S:   array<u32>;
@@ -9375,7 +9396,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let expert_row_off = offsets[slot_idx];  // buffer-driven, set per-decode
 
     let col = col_base + warp_id;
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -9407,6 +9427,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         Y[y_offset + row * N + col] = warp_sum + Bias[col];
     }
 }
+
 )WGSL";
 
 // [quant_kq] iq2s_matmul_moe — IQ2_S indirect MoE matmul
@@ -9462,7 +9483,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let expert_row_off = offsets[slot_idx];
 
     let col = col_base + warp_id;
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -9515,10 +9535,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         Y[y_offset + row * N + col] = warp_sum + Bias[col];
     }
 }
+
 )WGSL";
 
 // [quant_kq] iq4xs_matmul_moe — IQ4_XS indirect MoE matmul
 static const char* WGSL_IQ4XS_MATMUL_MOE = R"WGSL(
+enable subgroups;
 
 @group(0) @binding(0) var<storage, read>       X:        array<f32>;
 @group(0) @binding(1) var<storage, read>       W_IQ4XS:  array<u32>;
@@ -9578,7 +9600,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let slot_idx       = _params_[5];
     let expert_row_off = offsets[slot_idx];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
@@ -9617,6 +9638,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         Y[y_offset + row * N + col] = warp_sum + Bias[col];
     }
 }
+
 )WGSL";
 
 // [shared] zero_init — fill buffer with zeros
@@ -9630,6 +9652,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i < N) { buf[i] = 0.0; }
 }
+
 )WGSL";
 
 // [shared] silu — standalone SiLU activation
@@ -9647,6 +9670,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sig = 1.0 / (1.0 + exp(-v));
     out[i] = v * sig;
 }
+
 )WGSL";
 
 // [shared] copy_buffer — f32 buffer copy with offsets
@@ -9664,6 +9688,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= N) { return; }
     dst[dst_off + i] = src[src_off + i];
 }
+
 )WGSL";
 
 // [shared] mul — elementwise multiply
@@ -9680,6 +9705,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= N) { return; }
     out[i] = a[i] * b[i];
 }
+
 )WGSL";
 // [quant_kq] q4k_down_silu_add — fused SiLU·mul + Q4_K matmul + residual add
 static const char* WGSL_Q4K_DOWN_SILU_ADD = R"WGSL(

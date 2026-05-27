@@ -60,7 +60,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let slot_idx       = _params_[5];
     let expert_row_off = offsets[slot_idx];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;

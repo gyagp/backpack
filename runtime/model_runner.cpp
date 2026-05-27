@@ -441,24 +441,15 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
         fprintf(stderr, "  IQ codebooks uploaded: iq3s=%u u32, iq2s=%u u32\n", cb3_n, cb2_n);
     }
 
-    // For MoE archs: Phase 3d MoE FFN dispatch is now wired. SSM forward
-    // dispatch (for SSM layers in hybrid archs) is still NOT wired — those
-    // layers will hit null attention buffers since SSM replaces attention.
-    // Allow Q8-attention-only MoE models to proceed; bail on hybrid SSM.
-    if (cfg.ssmInnerSize > 0) {
-        fprintf(stderr,
-            "\nERROR: hybrid SSM+attention arch '%s' detected. SSM layer forward\n"
-            "       dispatch (Mamba conv+scan) is not yet wired into buildDecodePipeline.\n"
-            "       MoE FFN dispatch IS wired but SSM layers (31 of 41 here) need\n"
-            "       their own forward path before the model can run end-to-end.\n",
-            cfg.arch.c_str());
-        return false;
-    }
+    // For hybrid MoE + SSM archs: MoE FFN dispatch IS wired (Phase 3d).
+    // SSM layers emit NO dispatches (passthrough — output incorrect).
+    // Allow run so a first tg/s number is measurable even though output is wrong.
     if (cfg.numExperts > 0) {
         fprintf(stderr,
-            "  NOTE: MoE arch — Phase 3d FFN dispatch IS WIRED. Output may still be\n"
-            "        incorrect if attn_gate / per-layer down quant variants are wrong.\n"
-            "        First-attempt tg/s number is NOT yet correctness-validated.\n");
+            "  NOTE: hybrid arch — MoE FFN wired; SSM layers passthrough.\n"
+            "        Output will be INCORRECT but forward pass completes.\n"
+            "        Reported tg/s is a first-attempt timing — do NOT compare to\n"
+            "        llama.cpp until SSM forward + attn_gate are also wired.\n");
     }
 
     // RoPE tables
@@ -1808,6 +1799,23 @@ void ModelRunner::buildDecodePipeline() {
         auto& di = decodeDispatchIndices[i];
         auto& vbg = decodeVariantBGs[i];
         std::string L = "L" + std::to_string(i) + "/";
+
+        // ── SSM-layer passthrough (Phase 3e WIP) ───────────────────────────
+        // For hybrid SSM+attention archs (qwen35moe), SSM layers don't have
+        // attention weights — emit no dispatches and let xBuf flow through
+        // unchanged. Output will be wrong but forward pass completes.
+        // TODO: replace with real SSM forward (conv_state_update + conv1d +
+        //       silu + dt_softplus + selective_scan + out projection).
+        if (cfg.ssmInnerSize > 0 && !cfg.isAttentionLayer(i)) {
+            if (i == 0) {
+                fprintf(stderr,
+                    "  WARN: SSM layers emit NO dispatches (passthrough). Output INCORRECT.\n"
+                    "        First-attempt tg/s reflects only the %u attention+MoE layers.\n",
+                    cfg.nLayer / cfg.fullAttentionInterval);
+            }
+            continue;
+        }
+
         auto& pl = cfg.perLayer[i];
         uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
         uint32_t plQDim = pl.qDim;

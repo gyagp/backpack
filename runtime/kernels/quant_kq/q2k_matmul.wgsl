@@ -61,7 +61,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let row_stride_w   = _params_[3];
     let y_offset       = _params_[4];
 
-    if (col >= N) { return; }
 
     let x_base = row * K;
     var acc: f32 = 0.0;
