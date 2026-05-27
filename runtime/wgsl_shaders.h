@@ -9204,6 +9204,66 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 )WGSL";
 
+// [ssm] delta_net_decode — DeltaNet matrix-state recurrence
+static const char* WGSL_SSM_DELTA_NET_DECODE = R"WGSL(
+@group(0) @binding(0) var<storage, read>       q:        array<f32>;
+@group(0) @binding(1) var<storage, read>       k:        array<f32>;
+@group(0) @binding(2) var<storage, read>       v:        array<f32>;
+@group(0) @binding(3) var<storage, read>       beta:     array<f32>;
+@group(0) @binding(4) var<storage, read>       decay:    array<f32>;
+@group(0) @binding(5) var<storage, read_write> state:    array<f32>;
+@group(0) @binding(6) var<storage, read_write> y:        array<f32>;
+@group(0) @binding(7) var<storage, read>       _params_: array<u32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nv      = _params_[0];  // num_v_heads
+    let nk      = _params_[1];  // num_k_heads
+    let dk      = _params_[2];  // head_k_dim
+    let dv      = _params_[3];  // head_v_dim
+    let head    = wid.x;        // v-head index
+    if (head >= nv) { return; }
+    let tid     = lid.x;
+
+    let k_head_idx = (head * nk) / nv;  // mapping v-head → k-head group
+
+    let q_base = head * dk;
+    let k_base = k_head_idx * dk;
+    let v_base = head * dv;
+    let state_base = head * dk * dv;
+
+    let bh = beta[head];
+    let dh = decay[head];
+
+    // Phase 1: update state. Each thread handles one row of state (one k_dim index).
+    // state[h, ki, vi] = state[h, ki, vi] * decay[h] + beta[h] * k[h, ki] * v[h, vi]
+    // Workgroup_size=128 = dk for qwen35moe; iterate over dv inside each thread.
+    let ki = tid;
+    if (ki < dk) {
+        let k_ki = k[k_base + ki];
+        let bk = bh * k_ki;
+        for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
+            let idx = state_base + ki * dv + vi;
+            state[idx] = state[idx] * dh + bk * v[v_base + vi];
+        }
+    }
+    workgroupBarrier();
+
+    // Phase 2: y[h, vi] = sum over ki of q[h, ki] * state[h, ki, vi]
+    // Re-use threads: each thread handles one vi (dv = dk = 128, so same threads).
+    let vi = tid;
+    if (vi < dv) {
+        var acc: f32 = 0.0;
+        for (var ki2: u32 = 0u; ki2 < dk; ki2 = ki2 + 1u) {
+            acc = acc + q[q_base + ki2] * state[state_base + ki2 * dv + vi];
+        }
+        y[v_base + vi] = acc;
+    }
+}
+
+)WGSL";
+
 // [attn] gated_output — qwen35moe gated attention modulation
 static const char* WGSL_ATTN_GATED_OUTPUT = R"WGSL(
 @group(0) @binding(0) var<storage, read>       attn_out: array<f32>;
@@ -9219,6 +9279,76 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = gate_in[c];
     let sig = 1.0 / (1.0 + exp(-g));
     result[c] = attn_out[c] * sig;
+}
+
+)WGSL";
+
+// [attn] rope_multi
+static const char* WGSL_ATTN_ROPE_MULTI = R"WGSL(
+@group(0) @binding(0) var<storage, read_write> X:        array<f32>;
+@group(0) @binding(1) var<storage, read>       cos_sin:  array<f32>;
+@group(0) @binding(2) var<storage, read>       _params_: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_head    = _params_[0];
+    let head_dim  = _params_[1];
+    let s0        = _params_[2];
+    let s1        = _params_[3];
+    let s2        = _params_[4];
+    let s3        = _params_[5];
+    // s0+s1+s2+s3 = rot_dim/2 (total pairs to rotate per head)
+
+    let head_idx = gid.y;
+    let pair_idx = gid.x;  // 0..(rot_dim/2)-1
+    if (head_idx >= n_head) { return; }
+    let total_pairs = s0 + s1 + s2 + s3;
+    if (pair_idx >= total_pairs) { return; }
+
+    // Find which axis-section this pair belongs to.
+    var section: u32 = 0u;
+    var local_idx: u32 = pair_idx;
+    if (local_idx >= s0) { local_idx = local_idx - s0; section = 1u; }
+    if (section == 1u && local_idx >= s1) { local_idx = local_idx - s1; section = 2u; }
+    if (section == 2u && local_idx >= s2) { local_idx = local_idx - s2; section = 3u; }
+
+    // cos/sin table is laid out per section: section i has 2*s_i floats (cos+sin alternating).
+    var sec_off: u32 = 0u;
+    if (section >= 1u) { sec_off = sec_off + 2u * s0; }
+    if (section >= 2u) { sec_off = sec_off + 2u * s1; }
+    if (section >= 3u) { sec_off = sec_off + 2u * s2; }
+    let c = cos_sin[sec_off + 2u * local_idx + 0u];
+    let s = cos_sin[sec_off + 2u * local_idx + 1u];
+
+    // Apply rotation to the pair (x_i, x_{i+total_pairs}) — neox-style
+    let base = head_idx * head_dim + pair_idx;
+    let x0 = X[base];
+    let x1 = X[base + total_pairs];
+    X[base]               = x0 * c - x1 * s;
+    X[base + total_pairs] = x0 * s + x1 * c;
+}
+
+)WGSL";
+
+// [attn] split_qg
+static const char* WGSL_ATTN_SPLIT_QG = R"WGSL(
+@group(0) @binding(0) var<storage, read>       Qfull:    array<f32>;
+@group(0) @binding(1) var<storage, read_write> Q_out:    array<f32>;
+@group(0) @binding(2) var<storage, read_write> gate_out: array<f32>;
+@group(0) @binding(3) var<storage, read>       _params_: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_head   = _params_[0];
+    let head_dim = _params_[1];
+    let total = n_head * head_dim;
+    let i = gid.x;
+    if (i >= total) { return; }
+    let head_idx  = i / head_dim;
+    let inner_idx = i % head_dim;
+    let src_base = head_idx * (head_dim * 2u);
+    Q_out[i]    = Qfull[src_base + inner_idx];
+    gate_out[i] = Qfull[src_base + head_dim + inner_idx];
 }
 
 )WGSL";
@@ -14485,7 +14615,10 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"ssm_selective_scan_decode", {WGSL_SSM_SELECTIVE_SCAN_DECODE, 9, false}},
         {"ssm_dt_softplus", {WGSL_SSM_DT_SOFTPLUS, 4, false}},
         {"ssm_conv_state_update", {WGSL_SSM_CONV_STATE_UPDATE, 3, false}},
+        {"ssm_delta_net_decode", {WGSL_SSM_DELTA_NET_DECODE, 8, false}},
         {"attn_gated_output", {WGSL_ATTN_GATED_OUTPUT, 4, false}},
+        {"attn_rope_multi", {WGSL_ATTN_ROPE_MULTI, 3, false}},
+        {"attn_split_qg", {WGSL_ATTN_SPLIT_QG, 4, false}},
         {"moe_topk_softmax", {WGSL_MOE_TOPK_SOFTMAX, 4, false}},
         {"moe_weighted_accumulate_decode", {WGSL_MOE_WEIGHTED_ACCUMULATE, 4, false}},
         {"moe_compute_offsets", {WGSL_MOE_COMPUTE_OFFSETS, 5, false}},
