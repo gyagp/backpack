@@ -441,24 +441,24 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
         fprintf(stderr, "  IQ codebooks uploaded: iq3s=%u u32, iq2s=%u u32\n", cb3_n, cb2_n);
     }
 
-    // qwen35moe is a hybrid Mamba + gated-attention + MoE architecture.
-    // Backpack does not yet support: SSM/Mamba kernels (ssm_conv1d, ssm_a,
-    // ssm_dt, ssm_alpha/beta, ssm_norm, ssm_out), gated-attention output
-    // (uses attn_gate instead of attn_output), or MoE forward dispatch.
-    // Loader has been wired to load weights for the supported pieces but
-    // the forward path can't run — bail cleanly with full status.
-    if (cfg.numExperts > 0) {
+    // For MoE archs: Phase 3d MoE FFN dispatch is now wired. SSM forward
+    // dispatch (for SSM layers in hybrid archs) is still NOT wired — those
+    // layers will hit null attention buffers since SSM replaces attention.
+    // Allow Q8-attention-only MoE models to proceed; bail on hybrid SSM.
+    if (cfg.ssmInnerSize > 0) {
         fprintf(stderr,
-            "\nERROR: '%s' is a hybrid Mamba+gated-attention+MoE architecture.\n"
-            "       backpack has loaded the supported tensors (router, shared expert,\n"
-            "       attn_qkv, attn_gate, post_attention_norm, routed experts as raw IQ\n"
-            "       bytes on GPU, IQ codebooks) but the forward dispatch needs:\n"
-            "         - SSM/Mamba kernel suite (selective scan, conv1d, dt/alpha/beta)\n"
-            "         - Gated-attention output path (no attn_output.weight in this arch)\n"
-            "         - MoE FFN dispatch (Phase 3d in plan)\n"
-            "       Plan: C:/Users/ygu/.claude/plans/effervescent-percolating-hoare.md\n",
+            "\nERROR: hybrid SSM+attention arch '%s' detected. SSM layer forward\n"
+            "       dispatch (Mamba conv+scan) is not yet wired into buildDecodePipeline.\n"
+            "       MoE FFN dispatch IS wired but SSM layers (31 of 41 here) need\n"
+            "       their own forward path before the model can run end-to-end.\n",
             cfg.arch.c_str());
         return false;
+    }
+    if (cfg.numExperts > 0) {
+        fprintf(stderr,
+            "  NOTE: MoE arch — Phase 3d FFN dispatch IS WIRED. Output may still be\n"
+            "        incorrect if attn_gate / per-layer down quant variants are wrong.\n"
+            "        First-attempt tg/s number is NOT yet correctness-validated.\n");
     }
 
     // RoPE tables
@@ -1983,21 +1983,199 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg, 1, 1, 1, L+"add_rms"});
         }
 
-        // ── MoE FFN dispatch (Phase 3d, work in progress) ───────────────────
+        // ── MoE FFN dispatch (Phase 3d) ─────────────────────────────────────
+        // Sequence per MoE layer per decode step:
+        //   router_matmul  → moeRouterOutBuf
+        //   topk_softmax   → moeIndicesBuf, moeWeightsBuf
+        //   compute_offsets → moeGateOffsets, moeUpOffsets, moeDownOffsets
+        //   for k in 0..numExpertsPerTok:
+        //     iq2s_matmul_moe(slot=k, gate_offsets) → moeRoutedGateBuf
+        //     iq2s_matmul_moe(slot=k, up_offsets)   → moeRoutedUpBuf
+        //     silu_mul(gate,up)                     → moeRoutedActBuf
+        //     iq3s_matmul_moe(slot=k, down_offsets) → moeExpertOutBuf
+        //     weighted_accumulate(slot=k)           : xBuf += w[k] * moeExpertOutBuf
+        //   shared_expert: 4 Q8 dispatches + add into xBuf
         if (cfg.numExperts > 0) {
-            // Per-layer router params [K=nEmbd, N=numExperts]
-            uint32_t routerData[4] = {cfg.nEmbd, cfg.numExperts, 0, 0};
-            GPUBuffer layerRouterP = gpu->createBuffer("p_router_" + std::to_string(i), 16);
-            gpu->writeBuffer(layerRouterP, routerData, 16);
-            // Q8 matmul: normOutBuf @ routerW.T → moeRouterOutBuf
-            auto bgRouter = makeBG(plQ8Matmul, {
-                {0, normOutBuf}, {1, lw.routerW}, {2, lw.routerS},
-                {3, zeroBiasV}, {4, moeRouterOutBuf}, {5, layerRouterP}});
-            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgRouter,
-                1, (cfg.numExperts + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_router"});
-            // di.gateup stays at -1; autotune skips it (guarded at line 2876).
-            // TODO(Phase 3d): emit moe_gate + per-expert + shared expert + residual_add.
-            continue;
+            // ── per-layer buffers we need that aren't in member state ──
+            // These persist for the life of this build (each layer gets its own).
+            uint32_t IMe = cfg.moeIntermediateSize;
+            uint32_t IMs = cfg.moeSharedIntermediateSize;
+            uint32_t topk = cfg.numExpertsPerTok;
+
+            // 3 per-direction offset buffers (k slots each, u32 each = 4*k bytes)
+            GPUBuffer gateOffsets = gpu->createBuffer("moe_gate_off_L"+std::to_string(i), topk*4);
+            GPUBuffer upOffsets   = gpu->createBuffer("moe_up_off_L"+std::to_string(i),   topk*4);
+            GPUBuffer downOffsets = gpu->createBuffer("moe_down_off_L"+std::to_string(i), topk*4);
+
+            // Param buffers (16 B each)
+            auto mkP = [&](const std::string& name, std::initializer_list<uint32_t> data) -> GPUBuffer {
+                uint32_t buf[8] = {0};
+                size_t i2 = 0; for (uint32_t v : data) { buf[i2++] = v; }
+                auto b = gpu->createBuffer(name, 32);
+                gpu->writeBuffer(b, buf, 32);
+                return b;
+            };
+
+            // 1. Router matmul (Q8): normOutBuf @ routerW → moeRouterOutBuf
+            {
+                auto p = mkP("p_router_L"+std::to_string(i), {cfg.nEmbd, cfg.numExperts});
+                auto bg = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.routerW}, {2, lw.routerS},
+                    {3, zeroBiasV}, {4, moeRouterOutBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (cfg.numExperts + Q8_TILE - 1) / Q8_TILE, 1, L+"moe_router"});
+            }
+
+            // 2. topk_softmax: moeRouterOutBuf → moeIndicesBuf, moeWeightsBuf
+            {
+                auto& plTopK = getKernel("moe_topk_softmax");
+                auto p = mkP("p_topk_L"+std::to_string(i), {cfg.numExperts, topk, 1u});
+                auto bg = makeBG(plTopK, {
+                    {0, moeRouterOutBuf}, {1, moeIndicesBuf}, {2, moeWeightsBuf}, {3, p}});
+                allDecodeDispatches.push_back({plTopK.pipeline, bg, 1, 1, 1, L+"moe_topk"});
+            }
+
+            // 3. compute_offsets: moeIndicesBuf → gate/up/down offsets
+            {
+                auto& plCO = getKernel("moe_compute_offsets");
+                auto p = mkP("p_co_L"+std::to_string(i), {topk, IMe, cfg.nEmbd});
+                auto bg = makeBG(plCO, {
+                    {0, moeIndicesBuf}, {1, gateOffsets}, {2, upOffsets}, {3, downOffsets}, {4, p}});
+                allDecodeDispatches.push_back({plCO.pipeline, bg, 1, 1, 1, L+"moe_co"});
+            }
+
+            // 4. Per-expert loop (8 slots)
+            // For each slot, dispatch: gate (IQ2_S), up (IQ2_S), silu_mul, down, accumulate.
+            // We assume gate/up are IQ2_S and down is IQ3_S — most layers in this model.
+            // (TODO: per-layer down quant detection; this hardcodes IQ3_S which is wrong
+            //  for layers 34, 38, 39 where down is IQ4_XS.)
+            auto& plIQ2Moe = getKernel("iq2s_matmul_moe");
+            auto& plIQ3Moe = getKernel("iq3s_matmul_moe");
+            auto& plSiluMul = getKernel("silu_mul_fused");  // existing fused kernel
+            auto& plWAcc = getKernel("moe_weighted_accumulate_decode");
+
+            // Compute n_blocks + row_stride for the fused expert buffers.
+            // For IQ2_S blocks of 82 bytes padded to 84 = 21 words; rowStride = 21*nBlocks.
+            // K-dim of gate/up = nEmbd = 2048; K/QK_K = 8 blocks per row → rowStride=168 words.
+            uint32_t iq2_nBlocks_e   = cfg.nEmbd / 256u;            // K dim is nEmbd for gate/up
+            uint32_t iq2_rowStride_e = iq2_nBlocks_e * 21u;
+            uint32_t iq3_nBlocks_im  = IMe / 256u;                  // K dim is IMe for down
+            uint32_t iq3_rowStride_im= iq3_nBlocks_im * 28u;
+
+            for (uint32_t k = 0; k < topk; k++) {
+                std::string ks = std::to_string(k);
+                // 4a. gate: normOutBuf @ expertsGateW(slot=k) → moeRoutedGateBuf
+                {
+                    auto p = mkP("p_gate_L"+std::to_string(i)+"_s"+ks,
+                                 {cfg.nEmbd, IMe, iq2_nBlocks_e, iq2_rowStride_e, 0u, k});
+                    auto bg = makeBG(plIQ2Moe, {
+                        {0, normOutBuf}, {1, lw.expertsGateW}, {2, iq2sCodebookBuf},
+                        {3, zeroBiasGU}, {4, moeRoutedGateBuf}, {5, gateOffsets}, {6, p}});
+                    allDecodeDispatches.push_back({plIQ2Moe.pipeline, bg,
+                        1, (IMe + 8u - 1u) / 8u, 1, L+"moe_gate_s"+ks});
+                }
+                // 4b. up: → moeRoutedUpBuf
+                {
+                    auto p = mkP("p_up_L"+std::to_string(i)+"_s"+ks,
+                                 {cfg.nEmbd, IMe, iq2_nBlocks_e, iq2_rowStride_e, 0u, k});
+                    auto bg = makeBG(plIQ2Moe, {
+                        {0, normOutBuf}, {1, lw.expertsUpW}, {2, iq2sCodebookBuf},
+                        {3, zeroBiasGU}, {4, moeRoutedUpBuf}, {5, upOffsets}, {6, p}});
+                    allDecodeDispatches.push_back({plIQ2Moe.pipeline, bg,
+                        1, (IMe + 8u - 1u) / 8u, 1, L+"moe_up_s"+ks});
+                }
+                // 4c. silu_mul(gate, up) → moeRoutedActBuf
+                {
+                    auto p = mkP("p_silumul_L"+std::to_string(i)+"_s"+ks, {IMe});
+                    // silu_mul_fused expects [gate, up] packed in gateUpBuf typically;
+                    // for MoE we pass them as separate inputs. The kernel signature
+                    // may differ — using shared_silu + shared_mul as fallback.
+                    auto& plSilu = getKernel("shared_silu");
+                    auto& plMul  = getKernel("shared_mul");
+                    auto bgSilu = makeBG(plSilu,
+                        {{0, moeRoutedGateBuf}, {1, moeRoutedGateBuf}, {2, p}});
+                    allDecodeDispatches.push_back({plSilu.pipeline, bgSilu,
+                        (IMe + 255) / 256, 1, 1, L+"moe_silu_s"+ks});
+                    auto bgMul = makeBG(plMul,
+                        {{0, moeRoutedGateBuf}, {1, moeRoutedUpBuf}, {2, moeRoutedActBuf}, {3, p}});
+                    allDecodeDispatches.push_back({plMul.pipeline, bgMul,
+                        (IMe + 255) / 256, 1, 1, L+"moe_mul_s"+ks});
+                }
+                // 4d. down: moeRoutedActBuf @ expertsDownW(slot=k) → moeExpertOutBuf
+                {
+                    auto p = mkP("p_down_L"+std::to_string(i)+"_s"+ks,
+                                 {IMe, cfg.nEmbd, iq3_nBlocks_im, iq3_rowStride_im, 0u, k});
+                    auto bg = makeBG(plIQ3Moe, {
+                        {0, moeRoutedActBuf}, {1, lw.expertsDownW}, {2, iq3sCodebookBuf},
+                        {3, zeroBiasE}, {4, moeExpertOutBuf}, {5, downOffsets}, {6, p}});
+                    allDecodeDispatches.push_back({plIQ3Moe.pipeline, bg,
+                        1, (cfg.nEmbd + 8u - 1u) / 8u, 1, L+"moe_down_s"+ks});
+                }
+                // 4e. weighted_accumulate: xBuf += weights[k] * moeExpertOutBuf
+                {
+                    auto p = mkP("p_wacc_L"+std::to_string(i)+"_s"+ks, {cfg.nEmbd, k});
+                    auto bg = makeBG(plWAcc,
+                        {{0, xBuf}, {1, moeExpertOutBuf}, {2, moeWeightsBuf}, {3, p}});
+                    allDecodeDispatches.push_back({plWAcc.pipeline, bg,
+                        (cfg.nEmbd + 255) / 256, 1, 1, L+"moe_wacc_s"+ks});
+                }
+            }
+
+            // 5. Shared expert (Q8 dense)
+            {
+                auto pGate = mkP("p_sh_gate_L"+std::to_string(i), {cfg.nEmbd, IMs});
+                auto bgGate = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.shexpGateW}, {2, lw.shexpGateS},
+                    {3, zeroBiasGU}, {4, moeShexpGateUpBuf}, {5, pGate}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgGate,
+                    1, (IMs + Q8_TILE - 1) / Q8_TILE, 1, L+"shexp_gate"});
+
+                // up writes to moeShexpGateUpBuf offset IMs — but our buffer alloc is 2*IMs.
+                // For simplicity we use a separate small slice via creating another buffer.
+                // (Could pack via y_offset param; using moeShexpActBuf as up temp for now.)
+                auto pUp = mkP("p_sh_up_L"+std::to_string(i), {cfg.nEmbd, IMs});
+                auto bgUp = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.shexpUpW}, {2, lw.shexpUpS},
+                    {3, zeroBiasGU}, {4, moeShexpActBuf}, {5, pUp}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgUp,
+                    1, (IMs + Q8_TILE - 1) / Q8_TILE, 1, L+"shexp_up"});
+
+                // silu(gate) * up → gate buf (in-place)
+                auto pSiluP = mkP("p_sh_silu_L"+std::to_string(i), {IMs});
+                auto& plSilu = getKernel("shared_silu");
+                auto& plMul  = getKernel("shared_mul");
+                auto bgSilu = makeBG(plSilu,
+                    {{0, moeShexpGateUpBuf}, {1, moeShexpGateUpBuf}, {2, pSiluP}});
+                allDecodeDispatches.push_back({plSilu.pipeline, bgSilu,
+                    (IMs + 255) / 256, 1, 1, L+"shexp_silu"});
+                auto bgMul = makeBG(plMul,
+                    {{0, moeShexpGateUpBuf}, {1, moeShexpActBuf},
+                     {2, moeShexpGateUpBuf}, {3, pSiluP}});
+                allDecodeDispatches.push_back({plMul.pipeline, bgMul,
+                    (IMs + 255) / 256, 1, 1, L+"shexp_mul"});
+
+                // down: moeShexpGateUpBuf @ shexpDownW → moeExpertOutBuf, then add to xBuf
+                auto pDn = mkP("p_sh_dn_L"+std::to_string(i), {IMs, cfg.nEmbd});
+                auto bgDn = makeBG(plQ8Matmul, {
+                    {0, moeShexpGateUpBuf}, {1, lw.shexpDownW}, {2, lw.shexpDownS},
+                    {3, zeroBiasE}, {4, moeExpertOutBuf}, {5, pDn}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgDn,
+                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"shexp_dn"});
+
+                // residual add: xBuf += moeExpertOutBuf (use a constant-weight accumulator)
+                auto pAdd = mkP("p_sh_add_L"+std::to_string(i), {cfg.nEmbd, 0u});
+                // Reuse plWAcc but with a "weights" buffer that's 1.0 at index 0.
+                // For simplicity create a tiny [1] buffer with value 1.0.
+                GPUBuffer one = gpu->createBuffer("one_L"+std::to_string(i), 4);
+                float oneF = 1.0f;
+                gpu->writeBuffer(one, &oneF, 4);
+                auto bgAdd = makeBG(plWAcc,
+                    {{0, xBuf}, {1, moeExpertOutBuf}, {2, one}, {3, pAdd}});
+                allDecodeDispatches.push_back({plWAcc.pipeline, bgAdd,
+                    (cfg.nEmbd + 255) / 256, 1, 1, L+"shexp_add"});
+            }
+
+            continue;  // skip the dense FFN block below
         }
 
         {
