@@ -9407,6 +9407,8 @@ static const char* WGSL_ATTN_HEAD_RMSNORM = R"WGSL(
 @group(0) @binding(1) var<storage, read>       W:        array<f32>;
 @group(0) @binding(2) var<storage, read>       _params_: array<u32>;
 
+var<workgroup> sm: array<f32, 64>;
+
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -9419,14 +9421,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let base = head_idx * head_dim;
     let tid  = lid.x;
 
-    // RMS = sqrt(mean(x^2) + eps)
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < head_dim; j = j + 64u) {
         let v = X[base + j];
         sum_sq = sum_sq + v * v;
     }
-    // Workgroup reduction via shared memory
-    var<workgroup> sm: array<f32, 64>;
     sm[tid] = sum_sq;
     workgroupBarrier();
     if (tid < 32u) { sm[tid] = sm[tid] + sm[tid + 32u]; } workgroupBarrier();
