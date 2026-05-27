@@ -1805,119 +1805,41 @@ void ModelRunner::buildDecodePipeline() {
         auto& vbg = decodeVariantBGs[i];
         std::string L = "L" + std::to_string(i) + "/";
 
-        // ── SSM-layer forward dispatch (qwen35moe Mamba) ───────────────────
-        // For hybrid SSM+attention archs: SSM layers replace the attention
-        // block with a Mamba-style scan. This emits a best-effort sequence
-        // using backpack's SSM kernels; exact qwen35moe parameterization
-        // (attn_qkv/attn_gate/ssm_alpha/ssm_beta) may not match perfectly —
-        // output may be wrong but forward completes and provides a realistic
-        // tg/s lower bound for the full SSM compute path.
+        // ── DeltaNet layer passthrough (qwen35moe linear-attention layers) ──
+        // CORRECTNESS NOTE: qwen35moe's "SSM" layers are actually DeltaNet
+        // (linear attention with delta rule, NOT standard Mamba). My earlier
+        // implementation using Mamba selective_scan was architecturally wrong.
+        // Reverting to passthrough until proper DeltaNet kernels exist:
+        //
+        // DeltaNet forward (per layer):
+        //   qkvz   = qkvz_proj(x)               -- combined Q/K/V/Z projection
+        //   beta   = sigmoid(beta_proj(x))      -- delta gate
+        //   alpha  = softplus(alpha_proj(x) + ssm_dt)
+        //   gate   = exp(-A_log) * alpha        -- ssm_a is small [dt_rank]
+        //   conv_out = silu(ssm_conv(qkv_mixed, conv1d))
+        //   q, k, v = extract from conv_out
+        //   state' = state * exp(gate) + beta * (k ⊗ v)   -- matrix-state recurrence
+        //   y      = q ⊗ state'                            -- matrix-state @ vec
+        //   y      = ssm_norm * y * silu(z)
+        //   out    = ssm_out @ y                           -- residual add
+        //
+        // Reference: github.com/ggml-org/llama.cpp src/models/qwen35.cpp
+        //   `build_layer_attn_linear` + `build_delta_net_*`
+        //
+        // Needed but NOT in backpack today: matrix-state recurrence kernel,
+        // proper Q/K/V/Z extraction from conv output, delta rule kernel.
+        // (~1-2 weeks of focused work to implement correctly.)
+        //
+        // Also: attention layers use multi-axis RoPE (MRoPE) which backpack
+        // doesn't support either — those layers' attention is also wrong.
         if (cfg.ssmInnerSize > 0 && !cfg.isAttentionLayer(i)) {
             if (i == 0) {
                 fprintf(stderr,
-                    "  SSM forward wired: %u SSM layers dispatch conv1d + selective_scan\n"
-                    "  (parameterization may be approximate — output not yet validated)\n",
+                    "  DeltaNet layers passthrough (%u layers). Output WILL BE WRONG.\n"
+                    "  Proper DeltaNet impl needs matrix-state recurrence kernel.\n",
                     cfg.nLayer - cfg.nLayer / cfg.fullAttentionInterval);
             }
-
-            // Per-layer SSM params buffer maker
-            auto mkP = [&](const std::string& name, std::initializer_list<uint32_t> data) -> GPUBuffer {
-                uint32_t buf[8] = {0};
-                size_t i2 = 0; for (uint32_t v : data) { buf[i2++] = v; }
-                auto b = gpu->createBuffer(name, 32);
-                gpu->writeBuffer(b, buf, 32);
-                return b;
-            };
-
-            auto& plConvUpd = getKernel("ssm_conv_state_update");
-            auto& plConv1d  = getKernel("ssm_conv1d_decode");
-            auto& plSilu    = getKernel("shared_silu");
-            auto& plDtSoft  = getKernel("ssm_dt_softplus");
-            auto& plScan    = getKernel("ssm_selective_scan_decode");
-            auto& plMul     = getKernel("shared_mul");
-
-            uint32_t d_inner = cfg.ssmInnerSize;
-            uint32_t d_state = cfg.ssmStateSize;
-            uint32_t conv_k  = cfg.ssmConvKernel;
-
-            // We don't have separate buffers for dt/B/C/D projections —
-            // use existing intermediate buffers as scratch where possible.
-            // (TODO: allocate dedicated SSM scratch buffers for correctness.)
-
-            // 1. conv_state_update: shift in normOutBuf (treating as SSM input)
-            //    For Mamba the input would be the result of an x_proj — we use
-            //    normOutBuf directly as an approximation.
-            {
-                auto p = mkP("p_ssm_csu_L"+std::to_string(i), {d_inner, conv_k});
-                auto bg = makeBG(plConvUpd, {
-                    {0, ssmConvState[i]}, {1, normOutBuf}, {2, p}});
-                allDecodeDispatches.push_back({plConvUpd.pipeline, bg,
-                    (d_inner + 255) / 256, 1, 1, L+"ssm_csu"});
-            }
-            // 2. conv1d_decode: state @ weights → moeShexpActBuf (scratch)
-            {
-                auto p = mkP("p_ssm_conv_L"+std::to_string(i), {d_inner, conv_k});
-                auto bg = makeBG(plConv1d, {
-                    {0, ssmConvState[i]}, {1, lw.ssmConv1dW}, {2, zeroBiasE},
-                    {3, moeShexpActBuf}, {4, p}});
-                allDecodeDispatches.push_back({plConv1d.pipeline, bg,
-                    (d_inner + 255) / 256, 1, 1, L+"ssm_conv1d"});
-            }
-            // 3. silu(conv_out) → moeShexpActBuf (in place)
-            {
-                auto p = mkP("p_ssm_silu_L"+std::to_string(i), {d_inner});
-                auto bg = makeBG(plSilu,
-                    {{0, moeShexpActBuf}, {1, moeShexpActBuf}, {2, p}});
-                allDecodeDispatches.push_back({plSilu.pipeline, bg,
-                    (d_inner + 255) / 256, 1, 1, L+"ssm_silu"});
-            }
-            // 4. dt_softplus: lw.ssmDtBias only (no proj for simplicity) → moeRoutedGateBuf
-            //    Real impl needs a linear dt_proj first; we use bias directly as dt.
-            //    (TODO: add dt_proj matmul if backpack identifies the weight tensor.)
-            {
-                auto p = mkP("p_ssm_dt_L"+std::to_string(i), {d_inner});
-                // Use moeShexpActBuf as "proj" input (same as conv output as proxy)
-                auto bg = makeBG(plDtSoft, {
-                    {0, moeShexpActBuf}, {1, lw.ssmDtBias},
-                    {2, moeRoutedGateBuf}, {3, p}});
-                allDecodeDispatches.push_back({plDtSoft.pipeline, bg,
-                    (d_inner + 255) / 256, 1, 1, L+"ssm_dt"});
-            }
-            // 5. selective_scan: writes to moeExpertOutBuf as y
-            //    Bindings: x_in, A_log, dt, B, C, D, h_state, y_out, params
-            //    We use ssmA as A_log, ssmAlpha as B, ssmBeta as C, zero as D.
-            //    Real qwen35moe parameterization differs; this is approximate.
-            {
-                auto p = mkP("p_ssm_scan_L"+std::to_string(i), {d_inner, d_state});
-                auto bg = makeBG(plScan, {
-                    {0, moeShexpActBuf},    // x_in (post-silu)
-                    {1, lw.ssmA},           // A_log
-                    {2, moeRoutedGateBuf},  // dt (softplus output)
-                    {3, lw.ssmAlphaW},      // B (approximate)
-                    {4, lw.ssmBetaW},       // C (approximate)
-                    {5, zeroBiasE},         // D (skip-connection scale, zero for now)
-                    {6, ssmHState[i]},      // h_state (recurrent)
-                    {7, moeExpertOutBuf},   // y_out
-                    {8, p}});
-                allDecodeDispatches.push_back({plScan.pipeline, bg,
-                    (d_inner + 255) / 256, 1, 1, L+"ssm_scan"});
-            }
-            // 6. SSM out projection — use Q8 matmul on ssmOut.
-            //    For now skip (ssmOutW load type unknown). Use weighted_accumulate
-            //    to add scan output to residual stream.
-            {
-                auto& plWAcc = getKernel("moe_weighted_accumulate_decode");
-                auto p = mkP("p_ssm_add_L"+std::to_string(i), {cfg.nEmbd, 0u});
-                GPUBuffer one = gpu->createBuffer("ssm_one_L"+std::to_string(i), 4);
-                float oneF = 1.0f;
-                gpu->writeBuffer(one, &oneF, 4);
-                auto bg = makeBG(plWAcc,
-                    {{0, xBuf}, {1, moeExpertOutBuf}, {2, one}, {3, p}});
-                allDecodeDispatches.push_back({plWAcc.pipeline, bg,
-                    (cfg.nEmbd + 255) / 256, 1, 1, L+"ssm_add"});
-            }
-
-            continue;  // skip dense attention/FFN
+            continue;
         }
 
         auto& pl = cfg.perLayer[i];
