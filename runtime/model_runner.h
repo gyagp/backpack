@@ -42,6 +42,12 @@ struct ModelRunner {
     GPUBuffer moeRoutedUpBuf;    // [IM_e] f32 — one routed-expert up output
     GPUBuffer moeRoutedActBuf;   // [IM_e] f32 — silu(gate)*up for one expert
 
+    // Per-layer routed-expert quant types (set during weight load).
+    // Used at dispatch time to pick iq2s_matmul_moe vs iq3s_matmul_moe vs iq4xs_matmul_moe.
+    std::vector<uint32_t> moeExpertsGateType;
+    std::vector<uint32_t> moeExpertsUpType;
+    std::vector<uint32_t> moeExpertsDownType;
+
     // ── SSM persistent state (per layer, allocated when cfg.ssmInnerSize > 0) ──
     // conv state: rolling buffer of last conv_kernel input vectors per channel
     // h_state:    Mamba recurrent state [d_inner, d_state]
