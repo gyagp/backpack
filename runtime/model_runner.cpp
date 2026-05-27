@@ -1842,6 +1842,34 @@ void ModelRunner::buildDecodePipeline() {
             continue;
         }
 
+        // ── qwen35moe attention-layer correctness wiring (WIP scaffold) ────
+        // For qwen35moe attention layers, the dense Q dispatch is JOINT Q+gate
+        // (output is 2x qDim per head: first half = Q, second half = gate).
+        // We need split_qg → QK-norm on Q → MRoPE on Q/K → attention →
+        // attn_out * sigmoid(gate) → wo → residual.
+        //
+        // The existing dense path already runs (incorrect output). This block
+        // emits ADDITIONAL split/MRoPE/gated_output dispatches as scaffolding;
+        // full correctness requires replacing the dense path entirely (the
+        // existing QKV fuse + standard RoPE produce wrong intermediate state).
+        //
+        // NOT YET WIRED — kept as a documentation comment until the dense
+        // path can be cleanly replaced with the correct qwen35moe-specific
+        // attention sequence. Wiring this naively (adding to dense) would
+        // double-rotate and produce worse output than just running dense.
+        //
+        // Wiring steps needed:
+        //   1. Skip backpack's fuse-Q/K/V loader for qwen35moe attn layers
+        //      (Q is 2x sized; fuse pack assumes Q sized = qDim)
+        //   2. Emit 3 separate matmul dispatches: Q (2x), K, V
+        //   3. attn_split_qg: split Q+gate from joint matmul output
+        //   4. QK-norm on Q half, K-norm on K
+        //   5. attn_rope_multi on Q and K (replace standard RoPE)
+        //   6. Reuse existing attention compute (flash attention OK)
+        //   7. attn_gated_output: attn_out * sigmoid(gate)
+        //   8. wo matmul → projOutBuf (existing dense oproj path works)
+        //   9. Residual add to xBuf
+
         auto& pl = cfg.perLayer[i];
         uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
         uint32_t plQDim = pl.qDim;
