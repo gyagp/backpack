@@ -221,6 +221,75 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
                                      it->second.numBindings);
 }
 
+// ─── Patch SiLU→GELU in kernel source ───────────────────────────────────────
+
+static std::string patchSiluToGelu(const std::string& source) {
+    std::string s = source;
+
+    // Replace inline SiLU: gate / (1.0 + exp(-gate)) → GELU approximation
+    // The GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    // For fused down+act+add kernels, the pattern is:
+    //   let silu_gate = gate / (1.0 + exp(-gate));
+    // or inline:
+    //   gate / (1.0 + exp(-gate)) * up
+
+    // Helper function approach: inject a GELU function and replace SiLU calls
+    // First, replace the "silu_gate" named pattern
+    {
+        std::string pat = "gate / (1.0 + exp(-gate))";
+        std::string rep = "(gate * 0.5 * (1.0 + tanh(0.7978845608 * (gate + 0.044715 * gate * gate * gate))))";
+        size_t pos = 0;
+        while ((pos = s.find(pat, pos)) != std::string::npos) {
+            s.replace(pos, pat.size(), rep);
+            pos += rep.size();
+        }
+    }
+    // Also handle the f16 variant
+    {
+        std::string pat = "f16(gate / (1.0 + exp(-gate)) * up)";
+        std::string rep = "f16(gate * 0.5 * (1.0 + tanh(0.7978845608 * (gate + 0.044715 * gate * gate * gate))) * up)";
+        size_t pos = 0;
+        while ((pos = s.find(pat, pos)) != std::string::npos) {
+            s.replace(pos, pat.size(), rep);
+            pos += rep.size();
+        }
+    }
+
+    // Replace kernel description comments
+    {
+        std::string pat = "SiLU";
+        std::string rep = "GELU";
+        size_t pos = 0;
+        while ((pos = s.find(pat, pos)) != std::string::npos) {
+            s.replace(pos, pat.size(), rep);
+            pos += rep.size();
+        }
+    }
+
+    return s;
+}
+
+const CompiledPipeline& ModelRunner::getKernelGelu(const std::string& siluName) {
+    std::string geluName = siluName;
+    // Replace "silu" with "gelu" in the kernel name
+    size_t pos = geluName.find("silu");
+    if (pos != std::string::npos)
+        geluName.replace(pos, 4, "gelu");
+    else
+        geluName += "_gelu";
+
+    auto& kernels = getEmbeddedKernels();
+    auto it = kernels.find(siluName);
+    if (it == kernels.end()) {
+        fprintf(stderr, "Kernel not found for GELU patching: %s\n", siluName.c_str());
+        exit(1);
+    }
+
+    std::string patchedSource = patchSiluToGelu(it->second.source);
+    return gpu->getOrCreatePipeline(geluName, patchedSource,
+                                     it->second.numBindings);
+}
+
 // ─── fp16 conversion helpers ─────────────────────────────────────────────────
 
 static float fp16_to_f32(uint16_t h) {
@@ -278,6 +347,49 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     // Extract model config from GGUF metadata
     cfg = extractModelConfig(gguf);
     fprintf(stderr, "  [runner.load] config extracted: arch=%s nLayer=%u\n", cfg.arch.c_str(), cfg.nLayer); fflush(stderr);
+    if (cfg.numExperts > 0) {
+        fprintf(stderr, "  [runner.load] MoE detected: %u experts, top-%u active, expert FFN dim=%u\n",
+                cfg.numExperts, cfg.numExpertsPerTok, cfg.moeIntermediateSize);
+    }
+
+    // ─── Early support gate ────────────────────────────────────────────────
+    // Reject combinations that backpack cannot decode at all. MoE archs
+    // proceed through loading (small weights are uploaded); the forward path
+    // will refuse cleanly if expert dispatch isn't wired up yet.
+    {
+        // Unsupported GGUF quant formats (have no dequantizer yet).
+        auto quantName = [](uint32_t t) -> const char* {
+            switch (t) {
+                case 16: return "IQ2_XXS";  // not yet ported
+                case 19: return "IQ1_S";    // not yet ported
+                case 29: return "IQ1_M";    // not yet ported
+                case 34: return "TQ1_0";    // not yet ported
+                case 35: return "TQ2_0";    // not yet ported
+                default: return nullptr;
+            }
+        };
+        const char* probeNames[] = {
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down_exps.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_qkv.weight",
+        };
+        for (auto* n : probeNames) {
+            auto it = gguf.tensor_index.find(n);
+            if (it == gguf.tensor_index.end()) continue;
+            uint32_t t = (uint32_t)gguf.tensors[it->second].type;
+            if (auto* qn = quantName(t)) {
+                fprintf(stderr,
+                    "\nERROR: GGUF quant format '%s' (type=%u) is not yet supported by backpack.\n"
+                    "       Probed tensor: %s\n",
+                    qn, t, n);
+                return false;
+            }
+        }
+    }
+
     fprintf(stderr, "  [runner.load] printing model info...\n"); fflush(stderr);
 
     fprintf(stderr, "Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u)\n",
@@ -286,6 +398,18 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     fprintf(stderr, "  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
            cfg.ropeTheta, cfg.rmsNormEps,
            cfg.hasQkNorm ? "yes" : "no");
+    if (cfg.numExperts > 0) {
+        fprintf(stderr, "  MoE: %u experts, top-%u active per token, expert FFN dim=%u, shared FFN dim=%u\n",
+                cfg.numExperts, cfg.numExpertsPerTok, cfg.moeIntermediateSize, cfg.moeSharedIntermediateSize);
+    }
+    if (cfg.ssmInnerSize > 0) {
+        fprintf(stderr, "  SSM (Mamba): d_inner=%u, d_state=%u, conv_k=%u, groups=%u, dt_rank=%u%s\n",
+                cfg.ssmInnerSize, cfg.ssmStateSize, cfg.ssmConvKernel,
+                cfg.ssmGroupCount, cfg.ssmTimeStepRank,
+                cfg.fullAttentionInterval > 0
+                    ? (std::string(" (full-attn every ") + std::to_string(cfg.fullAttentionInterval) + " layers)").c_str()
+                    : "");
+    }
 
     // Single compute pass for all backends — Dawn handles barriers internally
     passPerDispatch = false;
@@ -301,12 +425,49 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
 
     // Load weights
     loadWeights(gguf, ggufMap.data);
+    fprintf(stderr, "  [runner.load] weights loaded\n"); fflush(stderr);
+
+    // Upload IQ codebook buffers (small — 2 KB + 8 KB — once per session).
+    // Only needed when iq3s_matmul / iq2s_matmul kernels will be dispatched,
+    // i.e. MoE archs whose routed-expert weights are IQ-quantized. Skipping
+    // for non-MoE / dense models saves ~10 KB GPU memory.
+    if (cfg.numExperts > 0) {
+        uint32_t cb3_n = 0; const uint32_t* cb3 = getIq3sGrid(&cb3_n);
+        uint32_t cb2_n = 0; const uint32_t* cb2 = getIq2sGridU32(&cb2_n);
+        iq3sCodebookBuf = gpu->createBuffer("iq3s_codebook", cb3_n * 4);
+        iq2sCodebookBuf = gpu->createBuffer("iq2s_codebook", cb2_n * 4);
+        gpu->writeBuffer(iq3sCodebookBuf, cb3, cb3_n * 4);
+        gpu->writeBuffer(iq2sCodebookBuf, cb2, cb2_n * 4);
+        fprintf(stderr, "  IQ codebooks uploaded: iq3s=%u u32, iq2s=%u u32\n", cb3_n, cb2_n);
+    }
+
+    // qwen35moe is a hybrid Mamba + gated-attention + MoE architecture.
+    // Backpack does not yet support: SSM/Mamba kernels (ssm_conv1d, ssm_a,
+    // ssm_dt, ssm_alpha/beta, ssm_norm, ssm_out), gated-attention output
+    // (uses attn_gate instead of attn_output), or MoE forward dispatch.
+    // Loader has been wired to load weights for the supported pieces but
+    // the forward path can't run — bail cleanly with full status.
+    if (cfg.numExperts > 0) {
+        fprintf(stderr,
+            "\nERROR: '%s' is a hybrid Mamba+gated-attention+MoE architecture.\n"
+            "       backpack has loaded the supported tensors (router, shared expert,\n"
+            "       attn_qkv, attn_gate, post_attention_norm, routed experts as raw IQ\n"
+            "       bytes on GPU, IQ codebooks) but the forward dispatch needs:\n"
+            "         - SSM/Mamba kernel suite (selective scan, conv1d, dt/alpha/beta)\n"
+            "         - Gated-attention output path (no attn_output.weight in this arch)\n"
+            "         - MoE FFN dispatch (Phase 3d in plan)\n"
+            "       Plan: C:/Users/ygu/.claude/plans/effervescent-percolating-hoare.md\n",
+            cfg.arch.c_str());
+        return false;
+    }
 
     // RoPE tables
     computeRopeTables();
+    fprintf(stderr, "  [runner.load] RoPE tables computed\n"); fflush(stderr);
 
     // Build decode pipeline
     buildDecodePipeline();
+    fprintf(stderr, "  [runner.load] decode pipeline built\n"); fflush(stderr);
 
     return true;
 }
@@ -356,28 +517,51 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     uint32_t kvDimL = cfg.nKvHeads * cfg.headDim;
     uint32_t qkvOutL = qDimL + 2 * kvDimL;
 
-    // Zero bias buffers
-    uint32_t maxBias = std::max({cfg.nEmbd, qkvOutL,
-                                 2 * cfg.intermediateSize, cfg.nVocab});
+    // Compute max per-layer dimensions for buffer allocation
+    uint32_t maxQkvOut = qkvOutL;
+    uint32_t maxIntermediateSize = cfg.intermediateSize;
+    uint32_t maxQDim = qDim;
+    for (auto& pl : cfg.perLayer) {
+        uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
+        if (plQkvOut > maxQkvOut) maxQkvOut = plQkvOut;
+        if (pl.intermediateSize > maxIntermediateSize) maxIntermediateSize = pl.intermediateSize;
+        if (pl.qDim > maxQDim) maxQDim = pl.qDim;
+    }
+
+    // Zero bias buffers (sized to max across layers)
+    uint32_t maxBias = std::max({cfg.nEmbd, maxQkvOut,
+                                 2 * maxIntermediateSize, cfg.nVocab});
     std::vector<float> zeros(maxBias, 0.0f);
     zeroBiasE   = gpu->createBuffer("zero_bias_E", cfg.nEmbd * 4);
-    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", qkvOutL * 4);
-    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * cfg.intermediateSize * 4);
+    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", maxQkvOut * 4);
+    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * maxIntermediateSize * 4);
     zeroBiasV   = gpu->createBuffer("zero_bias_V", cfg.nVocab * 4);
     gpu->writeBuffer(zeroBiasE,   zeros.data(), cfg.nEmbd * 4);
-    gpu->writeBuffer(zeroBiasQKV, zeros.data(), qkvOutL * 4);
-    gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * cfg.intermediateSize * 4);
+    gpu->writeBuffer(zeroBiasQKV, zeros.data(), maxQkvOut * 4);
+    gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * maxIntermediateSize * 4);
     gpu->writeBuffer(zeroBiasV,   zeros.data(), cfg.nVocab * 4);
 
     // KV cache
     kvCache.resize(cfg.nLayer);
-    uint64_t kvSize = (uint64_t)maxSeqLen * cfg.nKvHeads * cfg.headDim * 2;
+    uint64_t totalKvBytes = 0;
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
-        kvCache[i].K = gpu->createBuffer("kv_K_" + std::to_string(i), kvSize);
-        kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
-        kvCache[i].len = 0;
+        auto& pl = cfg.perLayer[i];
+        if (pl.kvSourceLayer >= 0) {
+            // Shared KV: reuse source layer's buffers
+            kvCache[i].K = kvCache[pl.kvSourceLayer].K;
+            kvCache[i].V = kvCache[pl.kvSourceLayer].V;
+            kvCache[i].len = 0;
+        } else {
+            uint32_t layerKvDim = pl.kvDim > 0 ? pl.kvDim : cfg.nKvHeads * cfg.headDim;
+            uint64_t kvSize = (uint64_t)maxSeqLen * layerKvDim * 2;  // fp16
+            kvCache[i].K = gpu->createBuffer("kv_K_" + std::to_string(i), kvSize);
+            kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
+            kvCache[i].len = 0;
+            totalKvBytes += kvSize * 2;
+        }
     }
-    fprintf(stderr, "  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
+    fprintf(stderr, "  KV cache: %.0f MB (fp16, %u shared)\n",
+            totalKvBytes / 1048576.0, cfg.sharedKvLayers);
 
     // Per-layer weights
     layerWeights.resize(cfg.nLayer);
@@ -566,6 +750,42 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         gpu->writeBuffer(buf, kq.data.data(), bytes);
     };
 
+    // Helper: repack any quantized tensor to Q8_0 format for GPU
+    // For Q8_0: direct repack. For other types: dequant→fp32→quantize→Q8.
+    auto repackToQ8 = [&](const uint8_t* data, uint32_t N, uint32_t K, GGUFType type) -> Q8Repacked {
+        if (type == GGUF_TYPE_Q8_0) {
+            return repack_q8_0(data, N, K);
+        }
+        // Dequantize to fp32 then quantize to Q8_0
+        std::vector<float> fp32((size_t)N * K);
+        dequant_tensor(data, fp32.data(), N, K, type);
+        // Quantize fp32 → Q8_0 blocks then repack
+        uint32_t nBlocksPerRow = K / 32;
+        size_t totalBlocks = (size_t)N * nBlocksPerRow;
+        std::vector<Q8_0Block> blocks(totalBlocks);
+        for (uint32_t r = 0; r < N; r++) {
+            for (uint32_t b = 0; b < nBlocksPerRow; b++) {
+                auto& blk = blocks[r * nBlocksPerRow + b];
+                float amax = 0;
+                for (int j = 0; j < 32; j++) {
+                    float v = fp32[r * K + b * 32 + j];
+                    if (fabsf(v) > amax) amax = fabsf(v);
+                }
+                float d = amax / 127.0f;
+                float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+                blk.d = f32_to_fp16(d);
+                for (int j = 0; j < 32; j++) {
+                    float v = fp32[r * K + b * 32 + j];
+                    int q = (int)roundf(v * id);
+                    if (q > 127) q = 127;
+                    if (q < -128) q = -128;
+                    blk.qs[j] = (int8_t)q;
+                }
+            }
+        }
+        return repack_q8_0(blocks.data(), N, K);
+    };
+
     // Helper: fuse multiple K-quant tensors vertically (concat rows)
     auto fuseKQ = [](const KQuantPacked& a, const KQuantPacked& b) -> KQuantPacked {
         KQuantPacked fused;
@@ -580,13 +800,37 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     };
 
     // Detect weight quantization type from first weight tensor
+    // For mixed-quant models (Q4_K_M), use Q8 pipeline (dequant all to Q8)
     {
         auto it = gguf.tensor_index.find("blk.0.attn_q.weight");
+        if (it == gguf.tensor_index.end())
+            it = gguf.tensor_index.find("blk.0.attn_qkv.weight");
+        if (it == gguf.tensor_index.end())
+            it = gguf.tensor_index.find("blk.0.ffn_gate.weight");
+        if (it == gguf.tensor_index.end())
+            it = gguf.tensor_index.find("blk.0.ffn_down.weight");
         if (it != gguf.tensor_index.end()) {
             weightQuantType = (GGUFType)gguf.tensors[it->second].type;
         }
     }
-    bool isKQuant = (weightQuantType == GGUF_TYPE_Q4_K ||
+    // Only use K-quant pipeline if ALL primary weight tensors are K-quant
+    // Check multiple tensor types to detect mixed quantization
+    bool allSameKQ = true;
+    {
+        const char* checkNames[] = {"blk.0.attn_q.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight"};
+        for (auto name : checkNames) {
+            auto it = gguf.tensor_index.find(name);
+            if (it != gguf.tensor_index.end()) {
+                auto t = (GGUFType)gguf.tensors[it->second].type;
+                if (t != GGUF_TYPE_Q4_K && t != GGUF_TYPE_Q5_K && t != GGUF_TYPE_Q6_K) {
+                    allSameKQ = false;
+                    break;
+                }
+            }
+        }
+    }
+    bool isKQuant = allSameKQ &&
+                    (weightQuantType == GGUF_TYPE_Q4_K ||
                      weightQuantType == GGUF_TYPE_Q5_K ||
                      weightQuantType == GGUF_TYPE_Q6_K);
     auto packKQ = [&](const void* data, uint32_t N, uint32_t K) -> KQuantPacked {
@@ -602,34 +846,145 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                          (weightQuantType == GGUF_TYPE_Q6_K) ? "Q6_K" : "Q8_0";
     fprintf(stderr, "  Weight format: %s\n", kqName);
 
+    // Infer per-layer dimensions from tensor shapes (Gemma 4 has variable dims)
+    cfg.perLayer.resize(cfg.nLayer);
+    cfg.hasPerLayerDims = false;
+    for (uint32_t i = 0; i < cfg.nLayer; i++) {
+        auto pfx = "blk." + std::to_string(i) + ".";
+        auto& pl = cfg.perLayer[i];
+        pl.headDim = cfg.headDim;
+        pl.qDim = cfg.nHead * cfg.headDim;
+        pl.kvDim = cfg.nKvHeads * cfg.headDim;
+        pl.intermediateSize = cfg.intermediateSize;
+        pl.kvSourceLayer = -1;
+
+        // Infer from Q tensor shape: Q=[E, qDim] or fused QKV=[E, qDim+2*kvDim]
+        auto qi = gguf.tensor_index.find(pfx + "attn_q.weight");
+        if (qi != gguf.tensor_index.end()) {
+            auto& qt = gguf.tensors[qi->second];
+            if (qt.shape.size() >= 2) {
+                pl.qDim = (uint32_t)qt.shape[1];
+                pl.headDim = pl.qDim / cfg.nHead;
+            }
+        } else {
+            // Try fused QKV: qkv=[E, qDim + 2*kvDim]
+            auto qkvi = gguf.tensor_index.find(pfx + "attn_qkv.weight");
+            if (qkvi != gguf.tensor_index.end()) {
+                auto& qt = gguf.tensors[qkvi->second];
+                if (qt.shape.size() >= 2) {
+                    // qkvOut = qDim + 2*kvDim; keep defaults since we can't decompose
+                }
+            }
+        }
+        auto ki = gguf.tensor_index.find(pfx + "attn_k.weight");
+        if (ki != gguf.tensor_index.end()) {
+            auto& kt = gguf.tensors[ki->second];
+            if (kt.shape.size() >= 2)
+                pl.kvDim = (uint32_t)kt.shape[1];
+        }
+        auto gi = gguf.tensor_index.find(pfx + "ffn_gate.weight");
+        if (gi != gguf.tensor_index.end()) {
+            auto& gt = gguf.tensors[gi->second];
+            if (gt.shape.size() >= 2)
+                pl.intermediateSize = (uint32_t)gt.shape[1];
+        }
+
+        if (i > 0 && (pl.qDim != cfg.perLayer[0].qDim ||
+                      pl.kvDim != cfg.perLayer[0].kvDim ||
+                      pl.intermediateSize != cfg.perLayer[0].intermediateSize))
+            cfg.hasPerLayerDims = true;
+    }
+
+    // Shared KV mapping
+    if (cfg.sharedKvLayers > 0) {
+        uint32_t kvStart = cfg.nLayer - cfg.sharedKvLayers;
+        // Find the last non-shared sliding and global layers
+        int lastSliding = -1, lastGlobal = -1;
+        for (uint32_t i = 0; i < kvStart; i++) {
+            if (!cfg.layerAttnTypes.empty() && i < cfg.layerAttnTypes.size() &&
+                cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow)
+                lastSliding = (int)i;
+            else
+                lastGlobal = (int)i;
+        }
+        for (uint32_t i = kvStart; i < cfg.nLayer; i++) {
+            bool isSWA = !cfg.layerAttnTypes.empty() && i < cfg.layerAttnTypes.size() &&
+                         cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
+            cfg.perLayer[i].kvSourceLayer = isSWA ? lastSliding : lastGlobal;
+        }
+        fprintf(stderr, "  Shared KV: %u layers (from layer %u), sliding→L%d, global→L%d\n",
+                cfg.sharedKvLayers, kvStart, lastSliding, lastGlobal);
+    }
+
+    if (cfg.hasPerLayerDims)
+        fprintf(stderr, "  Variable per-layer dims detected\n");
+    if (cfg.hasSandwichNorm)
+        fprintf(stderr, "  Sandwich norms: 4 norms per layer\n");
+    if (cfg.pleSize > 0)
+        fprintf(stderr, "  PLE: dim=%u\n", cfg.pleSize);
+
     // Per-layer weights
     layerWeights.resize(cfg.nLayer);
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         auto pfx = "blk." + std::to_string(i) + ".";
         auto& lw = layerWeights[i];
+        auto& pl = cfg.perLayer[i];
+        uint32_t layerQDim = pl.qDim;
+        uint32_t layerKvDim = pl.kvDim;
+        uint32_t layerQkvOut = layerQDim + 2 * layerKvDim;
+        uint32_t layerIM = pl.intermediateSize;
 
-        // Fuse Q/K/V into single QKV
+        // Fuse Q/K/V into single QKV (or load pre-fused attn_qkv.weight for archs that ship it)
         {
             auto qi = gguf.tensor_index.find(pfx + "attn_q.weight");
             auto ki = gguf.tensor_index.find(pfx + "attn_k.weight");
             auto vi = gguf.tensor_index.find(pfx + "attn_v.weight");
-            if (qi != gguf.tensor_index.end()) {
+            auto qkvi_pre = gguf.tensor_index.find(pfx + "attn_qkv.weight");
+            if (qi == gguf.tensor_index.end() && qkvi_pre != gguf.tensor_index.end()) {
+                // Pre-fused QKV (qwen35moe / some MoE archs)
+                auto& qkvt = gguf.tensors[qkvi_pre->second];
+                uint32_t qkvN = (uint32_t)qkvt.shape[1];  // out-dim = qDim + 2*kvDim
+                bool tensorIsKQ = (qkvt.type == GGUF_TYPE_Q4_K || qkvt.type == GGUF_TYPE_Q5_K || qkvt.type == GGUF_TYPE_Q6_K);
+                const uint8_t* src = fileData + gguf.data_offset + qkvt.offset;
+                if (tensorIsKQ) {
+                    KQuantPacked kq;
+                    switch ((GGUFType)qkvt.type) {
+                        case GGUF_TYPE_Q4_K: kq = pack_q4k(src, qkvN, cfg.nEmbd); break;
+                        case GGUF_TYPE_Q5_K: kq = pack_q5k(src, qkvN, cfg.nEmbd); break;
+                        case GGUF_TYPE_Q6_K: kq = pack_q6k(src, qkvN, cfg.nEmbd); break;
+                        default: break;
+                    }
+                    if (i == 0) { kqQkvNBlocks = kq.nBlocks; kqQkvRowStride = kq.rowStrideWords; }
+                    uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", kq, lw.qkvKQ);
+                } else {
+                    auto rep = repackToQ8(src, qkvN, cfg.nEmbd, (GGUFType)qkvt.type);
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", rep, lw.qkvW, lw.qkvS);
+                }
+                if (i == 0) {
+                    fprintf(stderr, "  Pre-fused attn_qkv loaded: %u x %u, type=%u, %s path\n",
+                            qkvN, cfg.nEmbd, (unsigned)qkvt.type, tensorIsKQ ? "K-quant" : "Q8");
+                }
+            } else if (qi != gguf.tensor_index.end()) {
                 auto& qt = gguf.tensors[qi->second];
                 auto& kt = gguf.tensors[ki->second];
                 auto& vt = gguf.tensors[vi->second];
-                if (isKQuant) {
-                    auto qp = packKQ(fileData + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
-                    auto kp = packKQ(fileData + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
-                    auto vp = packKQ(fileData + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
+                bool allKQ = isKQuant &&
+                    (qt.type == GGUF_TYPE_Q4_K || qt.type == GGUF_TYPE_Q5_K || qt.type == GGUF_TYPE_Q6_K) &&
+                    (kt.type == GGUF_TYPE_Q4_K || kt.type == GGUF_TYPE_Q5_K || kt.type == GGUF_TYPE_Q6_K) &&
+                    (vt.type == GGUF_TYPE_Q4_K || vt.type == GGUF_TYPE_Q5_K || vt.type == GGUF_TYPE_Q6_K);
+                if (allKQ) {
+                    auto qp = packKQ(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd);
+                    auto kp = packKQ(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd);
+                    auto vp = packKQ(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd);
                     auto fused = fuseKQ(fuseKQ(qp, kp), vp);
                     if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
                 } else {
-                    auto qr = repack_q8_0(fileData + gguf.data_offset + qt.offset, qDim, cfg.nEmbd);
-                    auto kr = repack_q8_0(fileData + gguf.data_offset + kt.offset, kvDim, cfg.nEmbd);
-                    auto vr = repack_q8_0(fileData + gguf.data_offset + vt.offset, kvDim, cfg.nEmbd);
+                    auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
+                    auto kr = repackToQ8(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
+                    auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
                     Q8Repacked fused;
-                    fused.N = qkvOut; fused.K = cfg.nEmbd;
+                    fused.N = layerQkvOut; fused.K = cfg.nEmbd;
                     fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
                     fused.weights.insert(fused.weights.end(), qr.weights.begin(), qr.weights.end());
                     fused.weights.insert(fused.weights.end(), kr.weights.begin(), kr.weights.end());
@@ -648,13 +1003,14 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "attn_output.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                if (isKQuant) {
-                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, qDim);
+                bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                if (tensorIsKQ) {
+                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim);
                     if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
                 } else {
-                    auto rep = repack_q8_0(fileData + gguf.data_offset + ti.offset,
-                                            cfg.nEmbd, qDim);
+                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                            cfg.nEmbd, layerQDim, (GGUFType)ti.type);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
                 }
             }
@@ -667,19 +1023,22 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (gi != gguf.tensor_index.end() && ui != gguf.tensor_index.end()) {
                 auto& gt = gguf.tensors[gi->second];
                 auto& ut = gguf.tensors[ui->second];
-                if (isKQuant) {
-                    auto gp = packKQ(fileData + gguf.data_offset + gt.offset, cfg.intermediateSize, cfg.nEmbd);
-                    auto up = packKQ(fileData + gguf.data_offset + ut.offset, cfg.intermediateSize, cfg.nEmbd);
+                bool bothKQ = isKQuant &&
+                    (gt.type == GGUF_TYPE_Q4_K || gt.type == GGUF_TYPE_Q5_K || gt.type == GGUF_TYPE_Q6_K) &&
+                    (ut.type == GGUF_TYPE_Q4_K || ut.type == GGUF_TYPE_Q5_K || ut.type == GGUF_TYPE_Q6_K);
+                if (bothKQ) {
+                    auto gp = packKQ(fileData + gguf.data_offset + gt.offset, layerIM, cfg.nEmbd);
+                    auto up = packKQ(fileData + gguf.data_offset + ut.offset, layerIM, cfg.nEmbd);
                     auto fused = fuseKQ(gp, up);
                     if (i == 0) { kqGuNBlocks = fused.nBlocks; kqGuRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".gu_kq", fused, lw.guKQ);
                 } else {
-                    auto gr = repack_q8_0(fileData + gguf.data_offset + gt.offset,
-                                           cfg.intermediateSize, cfg.nEmbd);
-                    auto ur = repack_q8_0(fileData + gguf.data_offset + ut.offset,
-                                           cfg.intermediateSize, cfg.nEmbd);
+                    auto gr = repackToQ8(fileData + gguf.data_offset + gt.offset,
+                                           layerIM, cfg.nEmbd, (GGUFType)gt.type);
+                    auto ur = repackToQ8(fileData + gguf.data_offset + ut.offset,
+                                           layerIM, cfg.nEmbd, (GGUFType)ut.type);
                     Q8Repacked fused;
-                    fused.N = 2 * cfg.intermediateSize; fused.K = cfg.nEmbd;
+                    fused.N = 2 * layerIM; fused.K = cfg.nEmbd;
                     fused.weights.reserve(gr.weights.size() + ur.weights.size());
                     fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
                     fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
@@ -696,13 +1055,14 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "ffn_down.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                if (isKQuant) {
-                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, cfg.intermediateSize);
+                bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                if (tensorIsKQ) {
+                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM);
                     if (i == 0) { kqDnNBlocks = kq.nBlocks; kqDnRowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".dn_kq", kq, lw.dnKQ);
                 } else {
-                    auto rep = repack_q8_0(fileData + gguf.data_offset + ti.offset,
-                                            cfg.nEmbd, cfg.intermediateSize);
+                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                            cfg.nEmbd, layerIM, (GGUFType)ti.type);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
                 }
             }
@@ -710,9 +1070,195 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
         // Norm weights
         loadNorm(pfx + "attn_norm.weight", lw.inputNorm);
-        loadNorm(pfx + "ffn_norm.weight", lw.postAttnNorm);
+        if (cfg.hasSandwichNorm) {
+            // Gemma 4: 4-norm sandwich pattern
+            loadNorm(pfx + "ffn_norm.weight", lw.ffnNorm);  // pre-FFN norm
+            loadNorm(pfx + "post_norm.weight", lw.postNorm); // post-attention sandwich
+            if (!lw.postNorm.handle)
+                loadNorm(pfx + "attn_post_norm.weight", lw.postNorm);
+            loadNorm(pfx + "post_ffw_norm.weight", lw.postFfwNorm); // post-FFN sandwich
+            if (!lw.postFfwNorm.handle)
+                loadNorm(pfx + "ffn_post_norm.weight", lw.postFfwNorm);
+        } else {
+            // Standard: 2-norm (pre-attn + pre-FFN fused with residual add)
+            loadNorm(pfx + "ffn_norm.weight", lw.postAttnNorm);
+            // Fallback for archs (qwen35moe / hybrid Mamba-MoE) that use
+            // post_attention_norm.weight instead of ffn_norm.weight.
+            if (!lw.postAttnNorm.handle)
+                loadNorm(pfx + "post_attention_norm.weight", lw.postAttnNorm);
+        }
         loadNorm(pfx + "attn_q_norm.weight", lw.qNorm);
         loadNorm(pfx + "attn_k_norm.weight", lw.kNorm);
+
+        // PLE weights (Gemma 4)
+        if (cfg.pleSize > 0) {
+            auto loadWeight = [&](const std::string& name, uint32_t N, uint32_t K,
+                                   GPUBuffer& wBuf, GPUBuffer& sBuf) {
+                auto it = gguf.tensor_index.find(name);
+                if (it != gguf.tensor_index.end()) {
+                    auto& ti = gguf.tensors[it->second];
+                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                           N, K, (GGUFType)ti.type);
+                    uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                }
+            };
+            loadWeight(pfx + "inp_gate.weight", cfg.pleSize, cfg.nEmbd,
+                        lw.pleInpGateW, lw.pleInpGateS);
+            loadWeight(pfx + "proj.weight", cfg.nEmbd, cfg.pleSize,
+                        lw.pleProjW, lw.pleProjS);
+            loadNorm(pfx + "per_layer_post_norm.weight", lw.plePostNorm);
+            if (!lw.plePostNorm.handle)
+                loadNorm(pfx + "post_norm_ple.weight", lw.plePostNorm);
+        }
+
+        // Per-layer output scale
+        {
+            auto it = gguf.tensor_index.find(pfx + "layer_output_scale.weight");
+            if (it != gguf.tensor_index.end()) {
+                auto& ti = gguf.tensors[it->second];
+                const uint8_t* data = fileData + gguf.data_offset + ti.offset;
+                float scale;
+                if (ti.type == GGUF_TYPE_F32) {
+                    memcpy(&scale, data, 4);
+                } else if (ti.type == GGUF_TYPE_F16) {
+                    uint16_t h; memcpy(&h, data, 2);
+                    uint32_t sign=(h>>15)&1, exp=(h>>10)&0x1F, mant=h&0x3FF, f;
+                    if(exp==0)f=(sign<<31)|(mant<<13);
+                    else if(exp==31)f=(sign<<31)|0x7F800000|(mant<<13);
+                    else f=(sign<<31)|((exp+112)<<23)|(mant<<13);
+                    memcpy(&scale, &f, 4);
+                } else {
+                    scale = 1.0f;
+                }
+                lw.outScale = gpu->createBuffer("L" + std::to_string(i) + ".out_scale", 4);
+                gpu->writeBuffer(lw.outScale, &scale, 4);
+            }
+        }
+
+        // ── MoE weights (qwen35moe and similar) ─────────────────────────────
+        // Loads the small, always-resident MoE weights (router, shared expert,
+        // attention gate). The large 3D routed-expert tensors are intentionally
+        // NOT uploaded here — they need a native IQ GPU decode path (Phase 4)
+        // because dequantizing them to Q8 would expand the model from 13 GiB
+        // to ~31 GiB which won't fit on a 16 GiB GPU. A separate loader pass
+        // (TODO) will keep them in their native IQ format as raw GPU bytes.
+        if (cfg.numExperts > 0) {
+            auto loadMoeSmall = [&](const std::string& name, uint32_t N, uint32_t K,
+                                     GPUBuffer& wBuf, GPUBuffer& sBuf) -> bool {
+                auto it = gguf.tensor_index.find(name);
+                if (it == gguf.tensor_index.end()) return false;
+                auto& ti = gguf.tensors[it->second];
+                auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                       N, K, (GGUFType)ti.type);
+                uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                return true;
+            };
+            // Router: [nExperts, E]
+            loadMoeSmall(pfx + "ffn_gate_inp.weight", cfg.numExperts, cfg.nEmbd,
+                          lw.routerW, lw.routerS);
+            // Shared-expert router (gating scalar) — shape varies; try common forms
+            loadMoeSmall(pfx + "ffn_gate_inp_shexp.weight", 1, cfg.nEmbd,
+                          lw.shexpRouterW, lw.shexpRouterS);
+            // Shared expert (always active). IM_s = moeIntermediateSize for now;
+            // the actual tensor shape will override if different (TODO: read shape).
+            uint32_t IMs = cfg.moeSharedIntermediateSize;
+            loadMoeSmall(pfx + "ffn_gate_shexp.weight", IMs, cfg.nEmbd,
+                          lw.shexpGateW, lw.shexpGateS);
+            loadMoeSmall(pfx + "ffn_up_shexp.weight",   IMs, cfg.nEmbd,
+                          lw.shexpUpW,   lw.shexpUpS);
+            loadMoeSmall(pfx + "ffn_down_shexp.weight", cfg.nEmbd, IMs,
+                          lw.shexpDownW, lw.shexpDownS);
+            // Attention gate (Qwen3.6 gated attention output)
+            loadMoeSmall(pfx + "attn_gate.weight", cfg.nEmbd, cfg.nEmbd,
+                          lw.attnGateW, lw.attnGateS);
+            if (i == 0) {
+                fprintf(stderr, "  MoE small weights loaded for layer 0 "
+                        "(router%s, shexp%s, attn_gate%s)\n",
+                        lw.routerW.handle ? "=ok" : "=MISSING",
+                        lw.shexpGateW.handle ? "=ok" : "=MISSING",
+                        lw.attnGateW.handle ? "=ok" : "=MISSING");
+            }
+
+            // ── Routed-expert weights (3D tensors, native IQ format on GPU) ─
+            // Keep raw IQ bytes packed per-block (no dequant) so 13 GiB model
+            // fits in 16 GiB VRAM. Shapes per llama.cpp / GGUF convention:
+            //   ffn_gate_exps.weight: [nExperts, IM_e, E]
+            //   ffn_up_exps.weight:   [nExperts, IM_e, E]
+            //   ffn_down_exps.weight: [nExperts, E, IM_e]
+            auto loadExpertsRaw = [&](const std::string& name,
+                                       uint32_t rows_per_expert, uint32_t cols_per_expert,
+                                       GPUBuffer& wBuf) -> bool {
+                auto it = gguf.tensor_index.find(name);
+                if (it == gguf.tensor_index.end()) return false;
+                auto& ti = gguf.tensors[it->second];
+                const uint8_t* src = fileData + gguf.data_offset + ti.offset;
+                // Total rows = nExperts * rows_per_expert (flatten expert dim into row dim)
+                uint32_t total_rows = cfg.numExperts * rows_per_expert;
+                KQuantPacked packed;
+                switch ((GGUFType)ti.type) {
+                    case GGUF_TYPE_IQ3_S: packed = pack_iq3s(src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_IQ2_S: packed = pack_iq2s(src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_IQ4_XS:packed = pack_iq4xs(src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_Q2_K:  packed = pack_q2k (src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_Q3_K:  packed = pack_q3k (src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_Q4_K:  packed = pack_q4k (src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_Q5_K:  packed = pack_q5k (src, total_rows, cols_per_expert); break;
+                    case GGUF_TYPE_Q6_K:  packed = pack_q6k (src, total_rows, cols_per_expert); break;
+                    default:
+                        fprintf(stderr, "  WARN: routed-expert quant type %u not handled for %s\n",
+                                (unsigned)ti.type, name.c_str());
+                        return false;
+                }
+                size_t bytes = (size_t)packed.data.size() * 4;
+                wBuf = gpu->createBuffer(name, bytes);
+                gpu->writeBuffer(wBuf, packed.data.data(), bytes);
+                if (i == 0) {
+                    fprintf(stderr, "    %s: %u rows × %u cols, type=%u, %.1f MB on GPU\n",
+                            name.c_str(), total_rows, cols_per_expert,
+                            (unsigned)ti.type, bytes / 1048576.0);
+                }
+                return true;
+            };
+            uint32_t IMe = cfg.moeIntermediateSize;
+            loadExpertsRaw(pfx + "ffn_gate_exps.weight", IMe, cfg.nEmbd, lw.expertsGateW);
+            loadExpertsRaw(pfx + "ffn_up_exps.weight",   IMe, cfg.nEmbd, lw.expertsUpW);
+            loadExpertsRaw(pfx + "ffn_down_exps.weight", cfg.nEmbd, IMe, lw.expertsDownW);
+        }
+
+        // ── SSM (Mamba) weights for hybrid archs ────────────────────────────
+        // Loaded as raw fp16/Q8 buffers. Forward dispatch (selective scan + conv1d +
+        // dt/alpha/beta projections) is a separate multi-week sub-project.
+        // For hybrid archs: only SSM-only layers actually have these tensors —
+        // attention layers (every Nth per full_attention_interval) skip.
+        if (cfg.ssmInnerSize > 0 && !cfg.isAttentionLayer(i)) {
+            auto loadRaw = [&](const std::string& name, GPUBuffer& buf) -> bool {
+                auto it = gguf.tensor_index.find(name);
+                if (it == gguf.tensor_index.end()) return false;
+                auto& ti = gguf.tensors[it->second];
+                uint32_t nel = 1;
+                for (auto d : ti.shape) nel *= (uint32_t)d;
+                // Dequant to fp32 (small tensors; SSM weights aren't huge)
+                std::vector<float> fp32((size_t)nel);
+                dequant_tensor(fileData + gguf.data_offset + ti.offset,
+                               fp32.data(), 1, nel, (GGUFType)ti.type);
+                size_t bytes = (size_t)nel * 4;
+                buf = gpu->createBuffer(name, bytes);
+                gpu->writeBuffer(buf, fp32.data(), bytes);
+                return true;
+            };
+            int loaded = 0;
+            if (loadRaw(pfx + "ssm_conv1d.weight", lw.ssmConv1dW)) loaded++;
+            if (loadRaw(pfx + "ssm_dt.bias",       lw.ssmDtBias))  loaded++;
+            if (loadRaw(pfx + "ssm_a",             lw.ssmA))       loaded++;
+            // Beta/alpha may be quantized; for now also dequant to fp32 (TODO: keep Q8)
+            if (loadRaw(pfx + "ssm_beta.weight",   lw.ssmBetaW))   loaded++;
+            if (loadRaw(pfx + "ssm_alpha.weight",  lw.ssmAlphaW))  loaded++;
+            if (loadRaw(pfx + "ssm_norm.weight",   lw.ssmNorm))    loaded++;
+            if (loadRaw(pfx + "ssm_out.weight",    lw.ssmOutW))    loaded++;
+            if (i == 0) {
+                fprintf(stderr, "  SSM weights loaded for layer 0: %d/7 tensors\n", loaded);
+            }
+        }
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
             fprintf(stderr, "  loaded layer %u/%u\n", i + 1, cfg.nLayer);
@@ -804,6 +1350,70 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         }
     }
 
+    // ─── PLE global weight loading ──────────────────────────────────────
+    if (cfg.pleSize > 0) {
+        // per_layer_token_embd.weight — massive per-layer embedding table
+        // Shape: [pleSize * nLayer, nVocab] — dequant to fp32 for CPU lookup
+        auto it = gguf.tensor_index.find("per_layer_token_embd.weight");
+        if (it != gguf.tensor_index.end()) {
+            auto& ti = gguf.tensors[it->second];
+            uint32_t rows = 1, cols = 1;
+            if (ti.shape.size() >= 2) { cols = (uint32_t)ti.shape[0]; rows = (uint32_t)ti.shape[1]; }
+            else if (ti.shape.size() == 1) { cols = (uint32_t)ti.shape[0]; }
+            pleEmbCPU.resize((size_t)rows * cols);
+            dequant_tensor(fileData + gguf.data_offset + ti.offset,
+                           pleEmbCPU.data(), rows, cols, (GGUFType)ti.type);
+            fprintf(stderr, "  PLE embedding: %u × %u (%zu MB fp32)\n",
+                    rows, cols, (size_t)rows * cols * 4 / 1048576);
+        }
+
+        // per_layer_model_proj.weight — Q8 repack for GPU
+        {
+            auto it2 = gguf.tensor_index.find("per_layer_model_proj.weight");
+            if (it2 != gguf.tensor_index.end()) {
+                auto& ti = gguf.tensors[it2->second];
+                uint32_t N = (ti.shape.size() >= 2) ? (uint32_t)ti.shape[1] : 0;
+                uint32_t K = (ti.shape.size() >= 2) ? (uint32_t)ti.shape[0] : 0;
+                if (N > 0 && K > 0) {
+                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                           N, K, (GGUFType)ti.type);
+                    uploadQ8Weight(*gpu, "ple_model_proj", rep, pleModelProjW, pleModelProjS);
+                }
+            }
+        }
+
+        // per_layer_proj_norm.weight
+        loadNorm("per_layer_proj_norm.weight", pleProjNormW);
+    }
+
+    // ─── MTP weight loading ──────────────────────────────────────────────
+    if (cfg.hasMtp) {
+        auto hasT = [&](const std::string& name) {
+            return gguf.tensor_index.count(name) > 0;
+        };
+
+        if (hasT("blk.0.nextn.eh_proj.weight")) {
+            mtpCfg.type = MTPType::Gemma4;
+            uint32_t nMtp = 0;
+            while (hasT("blk." + std::to_string(nMtp) + ".nextn.eh_proj.weight"))
+                nMtp++;
+            mtpCfg.numLayers = nMtp;
+            mtpCfg.numDraftTokens = 1;
+            fprintf(stderr, "  MTP: Gemma4 style, %u layers\n", nMtp);
+        } else if (hasT("blk.0.nextn.enorm.weight")) {
+            mtpCfg.type = MTPType::Qwen36;
+            uint32_t nMtp = 0;
+            while (hasT("blk." + std::to_string(nMtp) + ".nextn.enorm.weight"))
+                nMtp++;
+            mtpCfg.numLayers = nMtp;
+            mtpCfg.numDraftTokens = 1;
+            fprintf(stderr, "  MTP: Qwen3.6 style, %u layers\n", nMtp);
+        } else {
+            fprintf(stderr, "  MTP: detected but tensor naming not recognized\n");
+            cfg.hasMtp = false;
+        }
+    }
+
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     fprintf(stderr, "  Weights loaded in %lldms\n", (long long)ms);
@@ -832,6 +1442,31 @@ void ModelRunner::computeRopeTables() {
 }
 
 // ─── Build decode pipeline ───────────────────────────────────────────────────
+
+// MoE FFN dispatch helper (Phase 3d stub).
+// Returns false; appended dispatches happen in this function once wired.
+bool ModelRunner::appendMoeFfnDispatches(uint32_t layerIdx, GPUBuffer xIn, GPUBuffer xOut) {
+    (void)layerIdx; (void)xIn; (void)xOut;
+    // Pre-flight: required tensors must be loaded.
+    if (layerIdx >= layerWeights.size()) return false;
+    auto& lw = layerWeights[layerIdx];
+    if (!lw.routerW.handle || !lw.expertsGateW.handle ||
+        !lw.expertsUpW.handle || !lw.expertsDownW.handle) {
+        return false;
+    }
+    // TODO(Phase 3d): emit the per-token MoE FFN dispatch sequence:
+    //   1. router matmul: xIn @ routerW.T → moeRouterOutBuf
+    //   2. moe_gate (top-k softmax) → moeIndicesBuf / moeWeightsBuf
+    //   3. for k in 0..numExpertsPerTok:
+    //        idx = moeIndices[k], w = moeWeights[k]
+    //        gate = xIn @ expertsGateW[idx]   (indirect IQ matmul w/ expert_row_off)
+    //        up   = xIn @ expertsUpW[idx]     (indirect IQ matmul)
+    //        act  = silu(gate) * up
+    //        down = act @ expertsDownW[idx]   (indirect IQ matmul)
+    //        xOut += w * down
+    //   4. shared expert: xOut += silu(xIn@shexpGate)*shexpUp @ shexpDown
+    return false;
+}
 
 void ModelRunner::buildDecodePipeline() {
     qDim = cfg.nHead * cfg.headDim;
@@ -882,13 +1517,18 @@ void ModelRunner::buildDecodePipeline() {
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
     auto& plFusedRope  = getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope");
-    auto& plChunkP1    = getKernelHD("gqa_chunked_pass1");
-    auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
+    const bool useLargeHDAttn = (cfg.headDim > 128 && cfg.headDim % 32 == 0);
+    auto& plChunkP1    = useLargeHDAttn ? getKernelHD("gqa_chunked_pass1_large_hd")
+                                         : getKernelHD("gqa_chunked_pass1");
+    auto& plChunkP2    = useLargeHDAttn ? getKernelHD("gqa_chunked_pass2_large_hd")
+                                         : getKernelHD("gqa_chunked_pass2");
     auto& plFp16Gemm   = getKernel("fp16_gemm");
     auto& plFp16Wide   = getKernel("fp16_gemm_wide");
     auto& plArgmax     = getKernel("argmax");
     auto& plEmbGather  = getKernel("embed_gather");
-    auto& plDownSilu   = getKernel("q8_down_silu_add");
+    const bool useGelu = (cfg.activation == ActivationType::GELU);
+    auto& plDownSilu   = useGelu ? getKernelGelu("q8_down_silu_add")
+                                 : getKernel("q8_down_silu_add");
 
     tuning.decodeUseFastQkv = decodeFastQ8Eligible;
     tuning.decodeUseFastGateup = decodeFastQ8Eligible;
@@ -930,6 +1570,35 @@ void ModelRunner::buildDecodePipeline() {
     }
     auto q8OprojParams = makeQ8Params("p_oproj", qDim, cfg.nEmbd);
     auto q8GuParams    = makeQ8Params("p_gu", cfg.nEmbd, 2 * cfg.intermediateSize);
+
+    // Per-layer param buffers for variable-dim models
+    std::vector<GPUBuffer> perLayerQkvParams, perLayerQkvNormParams;
+    std::vector<GPUBuffer> perLayerOprojParams, perLayerGuParams, perLayerDnSiluParams;
+    if (cfg.hasPerLayerDims) {
+        perLayerQkvParams.resize(cfg.nLayer);
+        perLayerQkvNormParams.resize(cfg.nLayer);
+        perLayerOprojParams.resize(cfg.nLayer);
+        perLayerGuParams.resize(cfg.nLayer);
+        perLayerDnSiluParams.resize(cfg.nLayer);
+        for (uint32_t li = 0; li < cfg.nLayer; li++) {
+            auto& pl = cfg.perLayer[li];
+            uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
+            perLayerQkvParams[li] = makeQ8Params("p_qkv_" + std::to_string(li), cfg.nEmbd, plQkvOut);
+            {
+                uint32_t data[4] = {cfg.nEmbd, plQkvOut, 0, 0};
+                float eps = cfg.rmsNormEps; memcpy(&data[3], &eps, 4);
+                perLayerQkvNormParams[li] = gpu->createBuffer("p_qkv_norm_" + std::to_string(li), 16);
+                gpu->writeBuffer(perLayerQkvNormParams[li], data, 16);
+            }
+            perLayerOprojParams[li] = makeQ8Params("p_oproj_" + std::to_string(li), pl.qDim, cfg.nEmbd);
+            perLayerGuParams[li] = makeQ8Params("p_gu_" + std::to_string(li), cfg.nEmbd, 2 * pl.intermediateSize);
+            {
+                uint32_t data[4] = {pl.intermediateSize, cfg.nEmbd, pl.intermediateSize, 0};
+                perLayerDnSiluParams[li] = gpu->createBuffer("p_dn_silu_" + std::to_string(li), 16);
+                gpu->writeBuffer(perLayerDnSiluParams[li], data, 16);
+            }
+        }
+    }
     // Fused down+silu params: [K=IM, N=E, IM, 0]
     GPUBuffer q8DnSiluParams;
     {
@@ -1040,21 +1709,72 @@ void ModelRunner::buildDecodePipeline() {
     // Shared argmax result buffer
     argmaxResultBuf = gpu->createBuffer("argmax_result", 4);
 
+    // PLE buffers
+    if (cfg.pleSize > 0) {
+        pleBuf = gpu->createBuffer("ple_buf", cfg.pleSize * 4);
+        pleOutBuf = gpu->createBuffer("ple_out", cfg.nEmbd * 4);
+        pleSliceBufs.resize(cfg.nLayer);
+        for (uint32_t li = 0; li < cfg.nLayer; li++)
+            pleSliceBufs[li] = gpu->createBuffer("ple_slice_" + std::to_string(li), cfg.pleSize * 4);
+    }
+
     // ─── Single set of intermediate buffers ───────────────────────────────
-    // GPU queue executes CBs in submission order — no WAR hazards between
-    // consecutive decode steps. Only staging buffers need per-slot copies.
+    // Sized to max per-layer dimensions for variable-dim models (Gemma 4).
+    uint32_t maxQkvOutBuf = qkvOut;
+    uint32_t maxQDimBuf = qDim;
+    uint32_t maxIMBuf = cfg.intermediateSize;
+    for (auto& pl : cfg.perLayer) {
+        uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
+        if (plQkvOut > maxQkvOutBuf) maxQkvOutBuf = plQkvOut;
+        if (pl.qDim > maxQDimBuf) maxQDimBuf = pl.qDim;
+        if (pl.intermediateSize > maxIMBuf) maxIMBuf = pl.intermediateSize;
+    }
     xBuf          = gpu->createBuffer("x", cfg.nEmbd * 4);
     normOutBuf    = gpu->createBuffer("norm_out", cfg.nEmbd * 4);
-    qkvBuf        = gpu->createBuffer("qkv_out", qkvOut * 4);
-    qRotBuf       = gpu->createBuffer("q_rot", qDim * 4);
-    attnOutBuf    = gpu->createBuffer("attn_out", qDim * 4);
+    qkvBuf        = gpu->createBuffer("qkv_out", maxQkvOutBuf * 4);
+    qRotBuf       = gpu->createBuffer("q_rot", maxQDimBuf * 4);
+    attnOutBuf    = gpu->createBuffer("attn_out", maxQDimBuf * 4);
     projOutBuf    = gpu->createBuffer("proj_out", cfg.nEmbd * 4);
-    gateUpBuf     = gpu->createBuffer("gate_up", 2 * cfg.intermediateSize * 4);
+    gateUpBuf     = gpu->createBuffer("gate_up", 2 * maxIMBuf * 4);
+
+    // MoE intermediate buffers (allocate when MoE arch detected)
+    if (cfg.numExperts > 0) {
+        moeRouterOutBuf  = gpu->createBuffer("moe_router_out", cfg.numExperts * 4);
+        moeIndicesBuf    = gpu->createBuffer("moe_indices",    cfg.numExpertsPerTok * 4);
+        moeWeightsBuf    = gpu->createBuffer("moe_weights",    cfg.numExpertsPerTok * 4);
+        moeExpertOutBuf  = gpu->createBuffer("moe_expert_out", cfg.nEmbd * 4);
+        moeShexpGateUpBuf= gpu->createBuffer("moe_shexp_gu",   2 * cfg.moeIntermediateSize * 4);
+        moeShexpActBuf   = gpu->createBuffer("moe_shexp_act",  cfg.moeIntermediateSize * 4);
+        moeRoutedGateBuf = gpu->createBuffer("moe_routed_gate", cfg.moeIntermediateSize * 4);
+        moeRoutedUpBuf   = gpu->createBuffer("moe_routed_up",   cfg.moeIntermediateSize * 4);
+        moeRoutedActBuf  = gpu->createBuffer("moe_routed_act",  cfg.moeIntermediateSize * 4);
+        fprintf(stderr, "  MoE intermediate buffers allocated: router=%uB indices=%uB weights=%uB expert_out=%uB shexp_gu=%uB shexp_act=%uB routed=3x%uB\n",
+                cfg.numExperts * 4u, cfg.numExpertsPerTok * 4u, cfg.numExpertsPerTok * 4u,
+                cfg.nEmbd * 4u, 2 * cfg.moeIntermediateSize * 4u, cfg.moeIntermediateSize * 4u,
+                cfg.moeIntermediateSize * 4u);
+    }
+    // SSM persistent buffers per layer (only for SSM layers in hybrid archs)
+    if (cfg.ssmInnerSize > 0) {
+        ssmConvState.resize(cfg.nLayer);
+        ssmHState.resize(cfg.nLayer);
+        size_t convBytes = (size_t)cfg.ssmInnerSize * cfg.ssmConvKernel * 4;
+        size_t hBytes    = (size_t)cfg.ssmInnerSize * cfg.ssmStateSize * 4;
+        uint32_t ssmLayerCount = 0;
+        for (uint32_t li = 0; li < cfg.nLayer; li++) {
+            if (cfg.isAttentionLayer(li)) continue;
+            ssmConvState[li] = gpu->createBuffer("ssm_conv_state_L" + std::to_string(li), convBytes);
+            ssmHState[li]    = gpu->createBuffer("ssm_h_state_L"    + std::to_string(li), hBytes);
+            ssmLayerCount++;
+        }
+        fprintf(stderr, "  SSM state buffers: %u SSM layers x (conv=%zuB + h=%zuB) = %zu MB total\n",
+                ssmLayerCount, convBytes, hBytes,
+                (size_t)ssmLayerCount * (convBytes + hBytes) / (1024 * 1024));
+    }
 
     // K-quant needs a separate SiLU-mul output buffer (used for down proj input)
     GPUBuffer siluMulOutBuf;
     if (useKQ) {
-        siluMulOutBuf = gpu->createBuffer("silu_mul_out", cfg.intermediateSize * 4);
+        siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
     }
 
     rstdBuf       = gpu->createBuffer("rstd", 16);
@@ -1067,6 +1787,13 @@ void ModelRunner::buildDecodePipeline() {
     gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
     chunkedAttnParamsBuf = gpu->createBuffer("p_cattn", 32);
     gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
+
+    // Sliding window attention: separate param buffer with clamped T_total
+    bool hasSWA = !cfg.layerAttnTypes.empty() && cfg.slidingWindow > 0;
+    if (hasSWA) {
+        chunkedAttnParamsBufSWA = gpu->createBuffer("p_cattn_swa", 32);
+        gpu->writeBuffer(chunkedAttnParamsBufSWA, chunkedAttnParamData.data(), 32);
+    }
 
     // ─── Build dispatch list (single — identical for every token) ─────────
     allDecodeDispatches.reserve(cfg.nLayer * 11 + 2);
@@ -1081,6 +1808,18 @@ void ModelRunner::buildDecodePipeline() {
         auto& di = decodeDispatchIndices[i];
         auto& vbg = decodeVariantBGs[i];
         std::string L = "L" + std::to_string(i) + "/";
+        auto& pl = cfg.perLayer[i];
+        uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
+        uint32_t plQDim = pl.qDim;
+        uint32_t plIM = pl.intermediateSize;
+        auto& layerQkvP = cfg.hasPerLayerDims ? perLayerQkvParams[i] : q8QkvParams;
+        auto& layerQkvNP = cfg.hasPerLayerDims ? perLayerQkvNormParams[i] : q8QkvNormParams;
+        auto& layerOpP = cfg.hasPerLayerDims ? perLayerOprojParams[i] : q8OprojParams;
+        auto& layerGuP = cfg.hasPerLayerDims ? perLayerGuParams[i] : q8GuParams;
+        auto& layerDnP = cfg.hasPerLayerDims ? perLayerDnSiluParams[i] : q8DnSiluParams;
+
+        // Shared KV: attention reads from source layer's cache
+        uint32_t kvCacheLayer = (pl.kvSourceLayer >= 0) ? (uint32_t)pl.kvSourceLayer : i;
 
         // 1. RMSNorm (only for KQ path — Q8 path uses fused q8_matmul_norm)
         if (i == 0 && useKQ) {
@@ -1098,22 +1837,22 @@ void ModelRunner::buildDecodePipeline() {
                     {3, qkvBuf}, {4, kqQkvParams}});
                 di.qkv = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plKQ->pipeline, bg,
-                    1, (qkvOut + 7) / 8, 1, L+"kq_qkv"});
+                    1, (plQkvOut + 7) / 8, 1, L+"kq_qkv"});
             } else {
                 vbg.qkvBase = makeBG(plQ8MatmulNorm, {
                     {0, xBuf}, {1, lw.qkvW}, {2, lw.qkvS},
-                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, q8QkvNormParams},
+                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, layerQkvNP},
                     {6, lw.inputNorm}});
                 di.qkv = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plQ8MatmulNorm.pipeline, vbg.qkvBase,
-                    1, (qkvOut + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_qkv"});
+                    1, (plQkvOut + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_qkv"});
             }
         }
 
         {
             auto bg = makeBG(plFusedRope, {
                 {0, qkvBuf}, {1, qRotBuf},
-                {2, kvCache[i].K}, {3, kvCache[i].V},
+                {2, kvCache[kvCacheLayer].K}, {3, kvCache[kvCacheLayer].V},
                 {4, ropeCosBuf}, {5, ropeSinBuf},
                 {6, lw.qNorm}, {7, lw.kNorm},
                 {8, fusedRopeParamsBuf}});
@@ -1123,18 +1862,24 @@ void ModelRunner::buildDecodePipeline() {
         }
 
         {
+            bool isSWA = hasSWA && i < cfg.layerAttnTypes.size() &&
+                         cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
+            auto& attnParams = isSWA ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf;
             auto bg = makeBG(plChunkP1, {
-                {0, qRotBuf}, {1, kvCache[i].K}, {2, kvCache[i].V},
-                {3, attnPartialsBuf}, {4, chunkedAttnParamsBuf}});
+                {0, qRotBuf}, {1, kvCache[kvCacheLayer].K}, {2, kvCache[kvCacheLayer].V},
+                {3, attnPartialsBuf}, {4, attnParams}});
             attnP1DispatchIndices[i] = (int)allDecodeDispatches.size();
             allDecodeDispatches.push_back({plChunkP1.pipeline, bg,
                 cfg.nHead, maxChunks, 1, L+"attn_p1"});
         }
 
         {
+            bool isSWA2 = hasSWA && i < cfg.layerAttnTypes.size() &&
+                          cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
+            auto& attnParams2 = isSWA2 ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf;
             auto bg = makeBG(plChunkP2, {
                 {0, attnPartialsBuf}, {1, attnOutBuf},
-                {2, chunkedAttnParamsBuf}});
+                {2, attnParams2}});
             attnP2DispatchIndices[i] = (int)allDecodeDispatches.size();
             allDecodeDispatches.push_back({plChunkP2.pipeline, bg,
                 cfg.nHead, 1, 1, L+"attn_p2"});
@@ -1151,11 +1896,11 @@ void ModelRunner::buildDecodePipeline() {
             } else {
                 vbg.oprojBase = makeBG(plQ8Matmul, {
                     {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
-                    {3, zeroBiasE}, {4, projOutBuf}, {5, q8OprojParams}});
+                    {3, zeroBiasE}, {4, projOutBuf}, {5, layerOpP}});
                 if (decodeFastVariantsAvailable) {
                     vbg.oprojFast = makeBG(plQ8Fast, {
                         {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
-                        {3, zeroBiasE}, {4, projOutBuf}, {5, q8OprojParams}});
+                        {3, zeroBiasE}, {4, projOutBuf}, {5, layerOpP}});
                 }
                 auto bg = tuning.decodeUseFastOproj && vbg.oprojFast ? vbg.oprojFast : vbg.oprojBase;
                 auto pipeline = tuning.decodeUseFastOproj && vbg.oprojFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
@@ -1165,11 +1910,94 @@ void ModelRunner::buildDecodePipeline() {
             }
         }
 
-        {
+        // Post-attention: either fused add+norm (standard) or sandwich norms (Gemma 4)
+        if (cfg.hasSandwichNorm && lw.postNorm.handle) {
+            // Sandwich: RMSNorm(projOutBuf) in-place, then xBuf += projOutBuf, then norm for FFN
+            static const char* RMS_NORM_INPLACE_WGSL = R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = _p_[0];
+    let eps = bitcast<f32>(_p_[1]);
+    let tid = lid.x;
+    var sum_sq: f32 = 0.0;
+    for (var i = tid; i < N; i += 256u) { let v = X[i]; sum_sq += v * v; }
+    let warp_sum = subgroupAdd(sum_sq);
+    let total = subgroupBroadcastFirst(warp_sum);
+    let rms = 1.0 / sqrt(total / f32(N) + eps);
+    for (var i = tid; i < N; i += 256u) { X[i] = X[i] * rms * W[i]; }
+}
+)";
+            auto& plRmsIP = gpu->getOrCreatePipeline("rms_norm_inplace",
+                std::string(RMS_NORM_INPLACE_WGSL), 3);
+            GPUBuffer rmsIPParams;
+            {
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
+                rmsIPParams = gpu->createBuffer("p_rmsip_post_" + std::to_string(i), 16);
+                gpu->writeBuffer(rmsIPParams, data, 16);
+            }
+            // Post-attention sandwich norm (in-place on projOutBuf)
+            auto bgPostNorm = makeBG(plRmsIP, {
+                {0, projOutBuf}, {1, lw.postNorm}, {2, rmsIPParams}});
+            allDecodeDispatches.push_back({plRmsIP.pipeline, bgPostNorm, 1, 1, 1, L+"post_norm"});
+
+            // Residual add: xBuf += projOutBuf
+            static const char* ADD_INPLACE_WGSL2 = R"(
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0];
+    let i = gid.x;
+    if (i < N) { dst[i] = dst[i] + src[i]; }
+}
+)";
+            auto& plAddIP = gpu->getOrCreatePipeline("add_inplace_sw",
+                std::string(ADD_INPLACE_WGSL2), 3);
+            GPUBuffer addParams;
+            {
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                addParams = gpu->createBuffer("p_add_post_" + std::to_string(i), 16);
+                gpu->writeBuffer(addParams, data, 16);
+            }
+            auto bgAdd = makeBG(plAddIP, {
+                {0, xBuf}, {1, projOutBuf}, {2, addParams}});
+            allDecodeDispatches.push_back({plAddIP.pipeline, bgAdd,
+                (cfg.nEmbd + 255) / 256, 1, 1, L+"add_res1"});
+
+            // Pre-FFN RMSNorm (using ffnNorm)
+            auto bgFfnNorm = makeBG(plRmsNorm, {
+                {0, xBuf}, {1, normOutBuf}, {2, lw.ffnNorm},
+                {3, rstdBuf}, {4, rmsParams}});
+            allDecodeDispatches.push_back({plRmsNorm.pipeline, bgFfnNorm, 1, 1, 1, L+"ffn_norm"});
+        } else {
+            // Standard: fused residual-add + pre-FFN norm
             auto bg = makeBG(plAddRmsNorm, {
                 {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
                 {3, lw.postAttnNorm}, {4, rstdBuf}, {5, rmsParams}});
             allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg, 1, 1, 1, L+"add_rms"});
+        }
+
+        // ── MoE FFN dispatch (Phase 3d, work in progress) ───────────────────
+        if (cfg.numExperts > 0) {
+            // Per-layer router params [K=nEmbd, N=numExperts]
+            uint32_t routerData[4] = {cfg.nEmbd, cfg.numExperts, 0, 0};
+            GPUBuffer layerRouterP = gpu->createBuffer("p_router_" + std::to_string(i), 16);
+            gpu->writeBuffer(layerRouterP, routerData, 16);
+            // Q8 matmul: normOutBuf @ routerW.T → moeRouterOutBuf
+            auto bgRouter = makeBG(plQ8Matmul, {
+                {0, normOutBuf}, {1, lw.routerW}, {2, lw.routerS},
+                {3, zeroBiasV}, {4, moeRouterOutBuf}, {5, layerRouterP}});
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgRouter,
+                1, (cfg.numExperts + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_router"});
+            // di.gateup stays at -1; autotune skips it (guarded at line 2876).
+            // TODO(Phase 3d): emit moe_gate + per-expert + shared expert + residual_add.
+            continue;
         }
 
         {
@@ -1183,35 +2011,36 @@ void ModelRunner::buildDecodePipeline() {
             } else {
                 vbg.gateupBase = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
-                    {3, zeroBiasGU}, {4, gateUpBuf}, {5, q8GuParams}});
+                    {3, zeroBiasGU}, {4, gateUpBuf}, {5, layerGuP}});
                 if (decodeFastVariantsAvailable) {
                     vbg.gateupFast = makeBG(plQ8Fast, {
                         {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
-                        {3, zeroBiasGU}, {4, gateUpBuf}, {5, q8GuParams}});
+                        {3, zeroBiasGU}, {4, gateUpBuf}, {5, layerGuP}});
                 }
                 auto bg = tuning.decodeUseFastGateup && vbg.gateupFast ? vbg.gateupFast : vbg.gateupBase;
                 auto pipeline = tuning.decodeUseFastGateup && vbg.gateupFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
                 di.gateup = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({pipeline, bg,
-                    1, (2 * cfg.intermediateSize + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_gateup"});
+                    1, (2 * plIM + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_gateup"});
             }
         }
 
         // 9. Down projection + SiLU + residual add
         {
             if (useKQ) {
-                // K-quant: SiLU+mul → K-quant matmul → add residual (3 dispatches)
-                auto& plSiluMul = getKernel("silu_mul_fused");
+                // K-quant: activation+mul → K-quant matmul → add residual (3 dispatches)
+                auto& plActMul = useGelu ? getKernel("gelu_mul_fused")
+                                          : getKernel("silu_mul_fused");
                 GPUBuffer siluParams;
                 {
                     uint32_t data[4] = {cfg.intermediateSize, 0, 0, 0};
                     siluParams = gpu->createBuffer("p_silu_" + std::to_string(i), 16);
                     gpu->writeBuffer(siluParams, data, 16);
                 }
-                auto bgSilu = makeBG(plSiluMul, {
+                auto bgSilu = makeBG(plActMul, {
                     {0, gateUpBuf}, {1, siluMulOutBuf}, {2, siluParams}});
-                allDecodeDispatches.push_back({plSiluMul.pipeline, bgSilu,
-                    (cfg.intermediateSize + 255) / 256, 1, 1, L+"silu_mul"});
+                allDecodeDispatches.push_back({plActMul.pipeline, bgSilu,
+                    (cfg.intermediateSize + 127) / 128, 1, 1, L+"act_mul"});
 
                 auto bgDn = makeBG(*plKQ, {
                     {0, siluMulOutBuf}, {1, lw.dnKQ}, {2, zeroBiasE},
@@ -1239,17 +2068,269 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     addIPParams = gpu->createBuffer("p_addip_" + std::to_string(i), 16);
                     gpu->writeBuffer(addIPParams, data, 16);
                 }
+                // Post-FFN sandwich norm (before residual add)
+                if (cfg.hasSandwichNorm && lw.postFfwNorm.handle) {
+                    auto& plRmsIP2 = gpu->getOrCreatePipeline("rms_norm_inplace",
+                        std::string(R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
+    var sum_sq: f32 = 0.0;
+    for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
+    let total = subgroupAdd(sum_sq);
+    let rms = 1.0 / sqrt(subgroupBroadcastFirst(total) / f32(N) + eps);
+    for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
+}
+)"), 3);
+                    GPUBuffer rmsP;
+                    {
+                        uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                        float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
+                        rmsP = gpu->createBuffer("p_rmsip_ffw_" + std::to_string(i), 16);
+                        gpu->writeBuffer(rmsP, data, 16);
+                    }
+                    auto bgFfwNorm = makeBG(plRmsIP2, {
+                        {0, projOutBuf}, {1, lw.postFfwNorm}, {2, rmsP}});
+                    allDecodeDispatches.push_back({plRmsIP2.pipeline, bgFfwNorm,
+                        1, 1, 1, L+"post_ffw_norm"});
+                }
+
                 auto bgAdd = makeBG(plAddIP, {
                     {0, xBuf}, {1, projOutBuf}, {2, addIPParams}});
                 allDecodeDispatches.push_back({plAddIP.pipeline, bgAdd,
                     (cfg.nEmbd + 255) / 256, 1, 1, L+"residual_add"});
+            } else if (cfg.hasSandwichNorm && lw.postFfwNorm.handle) {
+                // Sandwich norm Q8 path: split into act → matmul → norm → add
+                // 1. Activation: gateUpBuf → siluMulOutBuf (reuse K-quant temp buffer)
+                if (!siluMulOutBuf.handle)
+                    siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
+                auto& plActMulSW = useGelu ? getKernel("gelu_mul_fused")
+                                            : getKernel("silu_mul_fused");
+                GPUBuffer actParams;
+                {
+                    uint32_t data[4] = {plIM, 0, 0, 0};
+                    actParams = gpu->createBuffer("p_act_sw_" + std::to_string(i), 16);
+                    gpu->writeBuffer(actParams, data, 16);
+                }
+                auto bgAct = makeBG(plActMulSW, {
+                    {0, gateUpBuf}, {1, siluMulOutBuf}, {2, actParams}});
+                allDecodeDispatches.push_back({plActMulSW.pipeline, bgAct,
+                    (plIM + 127) / 128, 1, 1, L+"act_mul_sw"});
+
+                // 2. Down matmul: siluMulOutBuf → projOutBuf (no residual add)
+                auto bgDn = makeBG(plQ8Matmul, {
+                    {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
+                    {3, zeroBiasE}, {4, projOutBuf}, {5, layerDnP}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgDn,
+                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_sw"});
+
+                // 3. Post-FFN sandwich norm (in-place on projOutBuf)
+                auto& plRmsIPfw = gpu->getOrCreatePipeline("rms_norm_inplace",
+                    std::string(R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
+    var sum_sq: f32 = 0.0;
+    for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
+    let total = subgroupAdd(sum_sq);
+    let rms = 1.0 / sqrt(subgroupBroadcastFirst(total) / f32(N) + eps);
+    for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
+}
+)"), 3);
+                GPUBuffer rmsP2;
+                {
+                    uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                    float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
+                    rmsP2 = gpu->createBuffer("p_rmsip_ffw2_" + std::to_string(i), 16);
+                    gpu->writeBuffer(rmsP2, data, 16);
+                }
+                auto bgFfwNorm = makeBG(plRmsIPfw, {
+                    {0, projOutBuf}, {1, lw.postFfwNorm}, {2, rmsP2}});
+                allDecodeDispatches.push_back({plRmsIPfw.pipeline, bgFfwNorm,
+                    1, 1, 1, L+"post_ffw_norm"});
+
+                // 4. Residual add: xBuf += projOutBuf
+                auto& plAddIPsw = gpu->getOrCreatePipeline("add_inplace",
+                    std::string(R"(
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0]; let i = gid.x;
+    if (i < N) { dst[i] = dst[i] + src[i]; }
+}
+)"), 3);
+                GPUBuffer addP2;
+                {
+                    uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                    addP2 = gpu->createBuffer("p_add_ffw_" + std::to_string(i), 16);
+                    gpu->writeBuffer(addP2, data, 16);
+                }
+                auto bgAdd2 = makeBG(plAddIPsw, {
+                    {0, xBuf}, {1, projOutBuf}, {2, addP2}});
+                allDecodeDispatches.push_back({plAddIPsw.pipeline, bgAdd2,
+                    (cfg.nEmbd + 255) / 256, 1, 1, L+"add_res2"});
             } else {
                 auto bg = makeBG(plDnSilu, {
                     {0, gateUpBuf}, {1, lw.dnW}, {2, lw.dnS},
-                    {3, zeroBiasE}, {4, xBuf}, {5, q8DnSiluParams}});
+                    {3, zeroBiasE}, {4, xBuf}, {5, layerDnP}});
                 allDecodeDispatches.push_back({plDnSilu.pipeline, bg,
                     1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_silu_add"});
             }
+        }
+
+        // PLE (Per-Layer Embedding) injection
+        if (cfg.pleSize > 0 && lw.pleInpGateW.handle && lw.pleProjW.handle) {
+            uint32_t pleDim = cfg.pleSize;
+
+            // 1. inp_gate matmul: xBuf [E] → pleBuf [pleSize]
+            GPUBuffer pleGateP = makeQ8Params("p_ple_gate_" + std::to_string(i), cfg.nEmbd, pleDim);
+            auto bgGate = makeBG(plQ8Matmul, {
+                {0, xBuf}, {1, lw.pleInpGateW}, {2, lw.pleInpGateS},
+                {3, zeroBiasE}, {4, pleBuf}, {5, pleGateP}});
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgGate,
+                1, (pleDim + Q8_TILE - 1) / Q8_TILE, 1, L+"ple_gate"});
+
+            // 2. GELU activation (in-place on pleBuf)
+            static const char* GELU_INPLACE_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0]; let i = gid.x;
+    if (i >= N) { return; }
+    let x = X[i];
+    X[i] = x * 0.5 * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+}
+)";
+            auto& plGeluIP = gpu->getOrCreatePipeline("gelu_inplace",
+                std::string(GELU_INPLACE_WGSL), 2);
+            GPUBuffer geluP;
+            {
+                uint32_t data[4] = {pleDim, 0, 0, 0};
+                geluP = gpu->createBuffer("p_ple_gelu_" + std::to_string(i), 16);
+                gpu->writeBuffer(geluP, data, 16);
+            }
+            auto bgGelu = makeBG(plGeluIP, {
+                {0, pleBuf}, {1, geluP}});
+            allDecodeDispatches.push_back({plGeluIP.pipeline, bgGelu,
+                (pleDim + 255) / 256, 1, 1, L+"ple_gelu"});
+
+            // 3. Element-wise multiply: pleBuf *= pleSliceBufs[i]
+            static const char* EMUL_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0]; let i = gid.x;
+    if (i < N) { A[i] = A[i] * B[i]; }
+}
+)";
+            auto& plEMul = gpu->getOrCreatePipeline("elementwise_mul",
+                std::string(EMUL_WGSL), 3);
+            auto bgMul = makeBG(plEMul, {
+                {0, pleBuf}, {1, pleSliceBufs[i]}, {2, geluP}});
+            allDecodeDispatches.push_back({plEMul.pipeline, bgMul,
+                (pleDim + 255) / 256, 1, 1, L+"ple_mul"});
+
+            // 4. Back-projection: pleBuf [pleSize] → pleOutBuf [E]
+            GPUBuffer pleProjP = makeQ8Params("p_ple_proj_" + std::to_string(i), pleDim, cfg.nEmbd);
+            auto bgProj = makeBG(plQ8Matmul, {
+                {0, pleBuf}, {1, lw.pleProjW}, {2, lw.pleProjS},
+                {3, zeroBiasE}, {4, pleOutBuf}, {5, pleProjP}});
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgProj,
+                1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"ple_proj"});
+
+            // 5. RMSNorm on pleOutBuf (in-place)
+            if (lw.plePostNorm.handle) {
+                auto& plRmsIPple = gpu->getOrCreatePipeline("rms_norm_inplace",
+                    std::string(R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
+    var sum_sq: f32 = 0.0;
+    for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
+    let total = subgroupAdd(sum_sq);
+    let rms = 1.0 / sqrt(subgroupBroadcastFirst(total) / f32(N) + eps);
+    for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
+}
+)"), 3);
+                GPUBuffer rmsPlP;
+                {
+                    uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                    float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
+                    rmsPlP = gpu->createBuffer("p_ple_norm_" + std::to_string(i), 16);
+                    gpu->writeBuffer(rmsPlP, data, 16);
+                }
+                auto bgPleNorm = makeBG(plRmsIPple, {
+                    {0, pleOutBuf}, {1, lw.plePostNorm}, {2, rmsPlP}});
+                allDecodeDispatches.push_back({plRmsIPple.pipeline, bgPleNorm,
+                    1, 1, 1, L+"ple_norm"});
+            }
+
+            // 6. Residual add: xBuf += pleOutBuf
+            auto& plAddPLE = gpu->getOrCreatePipeline("add_inplace",
+                std::string(R"(
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0]; let i = gid.x;
+    if (i < N) { dst[i] = dst[i] + src[i]; }
+}
+)"), 3);
+            GPUBuffer addPleP;
+            {
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                addPleP = gpu->createBuffer("p_ple_add_" + std::to_string(i), 16);
+                gpu->writeBuffer(addPleP, data, 16);
+            }
+            auto bgPleAdd = makeBG(plAddPLE, {
+                {0, xBuf}, {1, pleOutBuf}, {2, addPleP}});
+            allDecodeDispatches.push_back({plAddPLE.pipeline, bgPleAdd,
+                (cfg.nEmbd + 255) / 256, 1, 1, L+"ple_add"});
+        }
+
+        // Per-layer output scale
+        if (lw.outScale.handle) {
+            static const char* SCALE_BUF_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> Scale: array<f32>;
+@group(0) @binding(2) var<storage, read> _p_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _p_[0];
+    let i = gid.x;
+    if (i < N) { X[i] = X[i] * Scale[0]; }
+}
+)";
+            auto& plScale = gpu->getOrCreatePipeline("scale_buf",
+                std::string(SCALE_BUF_WGSL), 3);
+            GPUBuffer scaleParams;
+            {
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                scaleParams = gpu->createBuffer("p_scale_" + std::to_string(i), 16);
+                gpu->writeBuffer(scaleParams, data, 16);
+            }
+            auto bgScale = makeBG(plScale, {
+                {0, xBuf}, {1, lw.outScale}, {2, scaleParams}});
+            allDecodeDispatches.push_back({plScale.pipeline, bgScale,
+                (cfg.nEmbd + 255) / 256, 1, 1, L+"out_scale"});
         }
 
         // 10. RMSNorm for next layer (only needed for KQ path — Q8 path uses fused kernel)
@@ -1293,6 +2374,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             1, (cfg.nVocab + FP16_TILE - 1) / FP16_TILE, 1, "lm_head"});
     }
 
+    // Logit softcapping (Gemma 2/4): tanh(logits/cap) * cap
+    if (cfg.logitSoftcap > 0.0f) {
+        static const char* LOGIT_SOFTCAP_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(1) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let cap = bitcast<f32>(_params_[1]);
+    let i = gid.x;
+    if (i >= N) { return; }
+    Y[i] = tanh(Y[i] / cap) * cap;
+}
+)";
+        auto& plSoftcap = gpu->getOrCreatePipeline("logit_softcap",
+            std::string(LOGIT_SOFTCAP_WGSL), 2);
+        GPUBuffer softcapParams;
+        {
+            uint32_t data[4] = {cfg.nVocab, 0, 0, 0};
+            memcpy(&data[1], &cfg.logitSoftcap, 4);
+            softcapParams = gpu->createBuffer("p_softcap", 16);
+            gpu->writeBuffer(softcapParams, data, 16);
+        }
+        auto bg = makeBG(plSoftcap, {
+            {0, logitsBuf}, {1, softcapParams}});
+        softcapPipeline = plSoftcap.pipeline;
+        softcapBG = bg;
+        softcapDispatchX = (cfg.nVocab + 255) / 256;
+        allDecodeDispatches.push_back({softcapPipeline, bg,
+            softcapDispatchX, 1, 1, "logit_softcap"});
+    }
+
     // GPU argmax
     {
         auto bg = makeBG(plArgmax, {
@@ -1308,6 +2421,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         autoDecodeDispatches.clear();
         autoDecodeDispatches.push_back({plEmbGather.pipeline, bg,
             (cfg.nEmbd + 255) / 256, 1, 1, "embed_gather"});
+
+        // Embedding scaling (Gemma: multiply by sqrt(n_embd))
+        if (cfg.embeddingScale > 0.0f) {
+            static const char* SCALE_INPLACE_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0];
+    let scale = bitcast<f32>(_params_[1]);
+    let i = gid.x;
+    if (i >= N) { return; }
+    X[i] = X[i] * scale;
+}
+)";
+            auto& plScale = gpu->getOrCreatePipeline("scale_inplace",
+                std::string(SCALE_INPLACE_WGSL), 2);
+            GPUBuffer scaleParams;
+            {
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                memcpy(&data[1], &cfg.embeddingScale, 4);
+                scaleParams = gpu->createBuffer("p_emb_scale", 16);
+                gpu->writeBuffer(scaleParams, data, 16);
+            }
+            auto scaleBg = makeBG(plScale, {
+                {0, xBuf}, {1, scaleParams}});
+            autoDecodeDispatches.push_back({plScale.pipeline, scaleBg,
+                (cfg.nEmbd + 255) / 256, 1, 1, "embed_scale"});
+        }
+
         autoDecodeDispatches.insert(autoDecodeDispatches.end(),
             allDecodeDispatches.begin(), allDecodeDispatches.end());
     }
@@ -1334,14 +2477,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ps.attnParamsBuf = gpu->createBuffer(std::string(al), 32);
         gpu->writeBuffer(ps.attnParamsBuf, chunkedAttnParamData.data(), 32);
 
+        // SWA per-slot param buffer
+        if (hasSWA) {
+            char sl[32]; snprintf(sl, 32, "p_cattn_swa_%d", s);
+            ps.attnParamsBufSWA = gpu->createBuffer(std::string(sl), 32);
+            gpu->writeBuffer(ps.attnParamsBufSWA, chunkedAttnParamData.data(), 32);
+        }
+
         // Clone autoDecodeDispatches with per-slot bind groups for
         // dispatches that reference dynamic param buffers.
         ps.dispatches = autoDecodeDispatches;
+        // Prefix dispatches before allDecodeDispatches: embed_gather [+ embed_scale]
+        autoDecodePrefixCount = (cfg.embeddingScale > 0.0f) ? 2 : 1;
+        int prefixCount = autoDecodePrefixCount;
         for (uint32_t layer = 0; layer < cfg.nLayer; layer++) {
-            // +1 offset: autoDecodeDispatches[0] is embed_gather
-            int ropeIdx = ropeDispatchIndices[layer] + 1;
-            int p1Idx   = attnP1DispatchIndices[layer] + 1;
-            int p2Idx   = attnP2DispatchIndices[layer] + 1;
+            int ropeIdx = ropeDispatchIndices[layer] + prefixCount;
+            int p1Idx   = attnP1DispatchIndices[layer] + prefixCount;
+            int p2Idx   = attnP2DispatchIndices[layer] + prefixCount;
 
             ps.dispatches[ropeIdx].bindGroup = makeBG(plFusedRope, {
                 {0, qkvBuf}, {1, qRotBuf},
@@ -1350,13 +2502,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {6, layerWeights[layer].qNorm}, {7, layerWeights[layer].kNorm},
                 {8, ps.ropeParamsBuf}});
 
+            bool layerIsSWA = hasSWA && layer < cfg.layerAttnTypes.size() &&
+                             cfg.layerAttnTypes[layer] == AttnLayerType::SlidingWindow;
+            auto& slotAttnBuf = layerIsSWA ? ps.attnParamsBufSWA : ps.attnParamsBuf;
+
             ps.dispatches[p1Idx].bindGroup = makeBG(plChunkP1, {
                 {0, qRotBuf}, {1, kvCache[layer].K}, {2, kvCache[layer].V},
-                {3, attnPartialsBuf}, {4, ps.attnParamsBuf}});
+                {3, attnPartialsBuf}, {4, slotAttnBuf}});
 
             ps.dispatches[p2Idx].bindGroup = makeBG(plChunkP2, {
                 {0, attnPartialsBuf}, {1, attnOutBuf},
-                {2, ps.attnParamsBuf}});
+                {2, slotAttnBuf}});
         }
 
         refillCBPool(s);
@@ -1383,6 +2539,7 @@ void ModelRunner::initPrefillResources() {
     uint32_t qDimL  = cfg.nHead * cfg.headDim;
     uint32_t kvDimL = cfg.nKvHeads * cfg.headDim;
     uint32_t qkvOutL = qDimL + 2 * kvDimL;
+    const bool useGelu = (cfg.activation == ActivationType::GELU);
     uint32_t Q8_TILE = 8;
 
     // Intermediate buffers sized to maxSeqLen
@@ -1487,7 +2644,7 @@ void ModelRunner::initPrefillResources() {
                                             : "q8_down_silu_add_d3d12");
     const char* attnKernel = useMMA ? "flash_attn_vulkan" : "causal_attn";
     const CompiledPipeline* kQuant = usePrequant ? &getKernel("quantize_fp32_rows_d3d12") : nullptr;
-    const CompiledPipeline* kSiluQ = usePrequant ? &getKernel("silu_quantize_rows_d3d12") : nullptr;
+    const CompiledPipeline* kSiluQ = usePrequant ? &(useGelu ? getKernelGelu("silu_quantize_rows_d3d12") : getKernel("silu_quantize_rows_d3d12")) : nullptr;
     const CompiledPipeline* kMatWide = tuning.prefillUseWidePrequant
         ? &getKernel(wideMatKernel)
         : nullptr;
@@ -1495,7 +2652,7 @@ void ModelRunner::initPrefillResources() {
         ? &getKernel(wideAddKernel)
         : nullptr;
     auto& kMat     = getKernel(matKernel);
-    auto& kDnSilu  = getKernel(dnSiluKernel);
+    auto& kDnSilu  = useGelu ? getKernelGelu(dnSiluKernel) : getKernel(dnSiluKernel);
     auto& kAttn    = getKernelHD(attnKernel);
     fprintf(stderr, "  Prefill tuning: mat=%s qkv/gateup=%s down=%s attn=%s tiles=%ux%u wide=%ux%u pool=%d\n",
            matKernel,
@@ -1511,6 +2668,10 @@ void ModelRunner::initPrefillResources() {
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
         auto& lw = layerWeights[li];
         auto& bg = pfCache.layerBGs[li];
+
+        if (!lw.qkvW.handle && !lw.qkvKQ.handle) {
+            continue;
+        }
 
         bg.rms = makeBG(kRmsB, {
             {0, pfCache.pX}, {1, pfCache.pNorm}, {2, lw.inputNorm},
@@ -1593,11 +2754,13 @@ void ModelRunner::initPrefillResources() {
             {3, zeroBiasV}, {4, logitsBuf}, {5, pfCache.pLmP}});
     }
 
-    // Argmax bind group (reuses existing argmax kernel + result buffer)
+    // Argmax bind group
     {
-        auto argmaxParams = gpu->getBuffer("p_argmax");
+        GPUBuffer argmaxP = gpu->createBuffer("pf_argmax_p", 16);
+        uint32_t p[4] = {cfg.nVocab, 0, 0, 0};
+        gpu->writeBuffer(argmaxP, p, 16);
         pfCache.argmaxBG = makeBG(getKernel("argmax"), {
-            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxParams}});
+            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxP}});
     }
 
     // ── Build pre-recorded indirect dispatch table ───────────────────
@@ -1793,19 +2956,19 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
             auto& d = allDecodeDispatches[di.qkv];
             d.pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8MatmulNorm.pipeline;
             d.bindGroup = tuning.decodeUseFastQkv && vbg.qkvFast ? vbg.qkvFast : vbg.qkvBase;
-            autoDecodeDispatches[di.qkv + 1] = d;
+            autoDecodeDispatches[di.qkv + autoDecodePrefixCount] = d;
         }
         if (di.oproj >= 0) {
             auto& d = allDecodeDispatches[di.oproj];
             d.pipeline = tuning.decodeUseFastOproj && vbg.oprojFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
             d.bindGroup = tuning.decodeUseFastOproj && vbg.oprojFast ? vbg.oprojFast : vbg.oprojBase;
-            autoDecodeDispatches[di.oproj + 1] = d;
+            autoDecodeDispatches[di.oproj + autoDecodePrefixCount] = d;
         }
         if (di.gateup >= 0) {
             auto& d = allDecodeDispatches[di.gateup];
             d.pipeline = tuning.decodeUseFastGateup && vbg.gateupFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
             d.bindGroup = tuning.decodeUseFastGateup && vbg.gateupFast ? vbg.gateupFast : vbg.gateupBase;
-            autoDecodeDispatches[di.gateup + 1] = d;
+            autoDecodeDispatches[di.gateup + autoDecodePrefixCount] = d;
         }
     }
 
@@ -1815,11 +2978,11 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
             for (uint32_t i = 0; i < cfg.nLayer; i++) {
                 auto& di = decodeDispatchIndices[i];
                 if (di.qkv >= 0)
-                    ps.dispatches[di.qkv + 1] = autoDecodeDispatches[di.qkv + 1];
+                    ps.dispatches[di.qkv + autoDecodePrefixCount] = autoDecodeDispatches[di.qkv + autoDecodePrefixCount];
                 if (di.oproj >= 0)
-                    ps.dispatches[di.oproj + 1] = autoDecodeDispatches[di.oproj + 1];
+                    ps.dispatches[di.oproj + autoDecodePrefixCount] = autoDecodeDispatches[di.oproj + autoDecodePrefixCount];
                 if (di.gateup >= 0)
-                    ps.dispatches[di.gateup + 1] = autoDecodeDispatches[di.gateup + 1];
+                    ps.dispatches[di.gateup + autoDecodePrefixCount] = autoDecodeDispatches[di.gateup + autoDecodePrefixCount];
             }
         }
         refillCBPool(s);
@@ -2041,7 +3204,36 @@ void ModelRunner::destroy() {
 void ModelRunner::uploadEmbedding(int32_t tokenId) {
     if (tokenId < 0 || (uint32_t)tokenId >= cfg.nVocab) tokenId = 0;
     const float* emb = embeddingCPU.data() + tokenId * cfg.nEmbd;
-    gpu->writeBuffer(xBuf, emb, cfg.nEmbd * 4);
+    if (cfg.embeddingScale > 0.0f) {
+        std::vector<float> scaled(cfg.nEmbd);
+        for (uint32_t i = 0; i < cfg.nEmbd; i++)
+            scaled[i] = emb[i] * cfg.embeddingScale;
+        gpu->writeBuffer(xBuf, scaled.data(), cfg.nEmbd * 4);
+    } else {
+        gpu->writeBuffer(xBuf, emb, cfg.nEmbd * 4);
+    }
+
+    // PLE: compute per-layer embedding slices for this token
+    if (cfg.pleSize > 0 && !pleEmbCPU.empty() && !pleSliceBufs.empty()) {
+        uint32_t pleDim = cfg.pleSize;
+        uint32_t totalPleDim = pleDim * cfg.nLayer;
+        float pleScale = sqrtf((float)pleDim);
+        float embInvScale = 1.0f / sqrtf((float)cfg.nEmbd);
+
+        // 1. Look up per-layer token embeddings: pleEmbCPU[tokenId * totalPleDim .. +totalPleDim]
+        //    Shape: [totalPleDim] = [nLayer * pleDim]
+        std::vector<float> pleEmbs(totalPleDim);
+        if ((size_t)tokenId * totalPleDim + totalPleDim <= pleEmbCPU.size()) {
+            for (uint32_t j = 0; j < totalPleDim; j++)
+                pleEmbs[j] = pleEmbCPU[(size_t)tokenId * totalPleDim + j] * pleScale;
+        }
+
+        // 2. Upload per-layer slices to GPU
+        for (uint32_t li = 0; li < cfg.nLayer && li < (uint32_t)pleSliceBufs.size(); li++) {
+            gpu->writeBuffer(pleSliceBufs[li],
+                             pleEmbs.data() + li * pleDim, pleDim * 4);
+        }
+    }
 }
 
 void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
@@ -2056,6 +3248,18 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
     cp[2] = T_total;
     cp[4] = n_chunks;
     gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
+
+    // SWA: clamp T_total to sliding window size
+    if (chunkedAttnParamsBufSWA.handle && cfg.slidingWindow > 0) {
+        uint32_t T_swa = std::min(T_total, cfg.slidingWindow);
+        uint32_t n_chunks_swa = (T_swa + gqaChunkSize - 1) / gqaChunkSize;
+        uint8_t swaData[32];
+        memcpy(swaData, chunkedAttnParamData.data(), 32);
+        auto* sp = reinterpret_cast<uint32_t*>(swaData);
+        sp[2] = T_swa;
+        sp[4] = n_chunks_swa;
+        gpu->writeBuffer(chunkedAttnParamsBufSWA, swaData, 32);
+    }
 }
 
 void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot) {
@@ -2075,6 +3279,18 @@ void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot)
     cp[2] = T_total;
     cp[4] = n_chunks;
     gpu->writeBuffer(ps.attnParamsBuf, localAttn, 32);
+
+    // SWA per-slot param buffers
+    if (ps.attnParamsBufSWA.handle && cfg.slidingWindow > 0) {
+        uint32_t T_swa = std::min(T_total, cfg.slidingWindow);
+        uint32_t n_chunks_swa = (T_swa + gqaChunkSize - 1) / gqaChunkSize;
+        uint8_t swaAttn[32];
+        memcpy(swaAttn, chunkedAttnParamData.data(), 32);
+        auto* sp = reinterpret_cast<uint32_t*>(swaAttn);
+        sp[2] = T_swa;
+        sp[4] = n_chunks_swa;
+        gpu->writeBuffer(ps.attnParamsBufSWA, swaAttn, 32);
+    }
 }
 
 std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
@@ -2164,9 +3380,6 @@ void ModelRunner::prefillStep(int32_t tokenId, uint32_t posOffset) {
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
-    // Fire-and-forget: submit dispatches, no readback.
-    // GPU queue processes in order, so the next step's writeBuffer
-    // won't execute until this CB finishes.
     gpu->submitOnly(allDecodeDispatches, !passPerDispatch);
 
     for (uint32_t i = 0; i < cfg.nLayer; i++)
@@ -2199,9 +3412,10 @@ int32_t ModelRunner::prefillBatched(
             auto logits = decode(tokenIds[0], posOffset);
             return argmax(logits);
         }
-        for (uint32_t t = 0; t + 1 < T; t++)
-            prefillStep(tokenIds[t], posOffset + t);
-        auto logits = prefillFinish(tokenIds[T - 1], posOffset + T - 1);
+        // Use synchronous decode for each token (safer than fire-and-forget prefillStep)
+        std::vector<float> logits;
+        for (uint32_t t = 0; t < T; t++)
+            logits = decode(tokenIds[t], posOffset + t);
         return argmax(logits);
     }
 
@@ -2222,6 +3436,10 @@ int32_t ModelRunner::prefillBatched(
                       ? tokenIds[t] : 0;
         memcpy(embData.data() + t * cfg.nEmbd,
                embeddingCPU.data() + tok * cfg.nEmbd, cfg.nEmbd * 4);
+    }
+    if (cfg.embeddingScale > 0.0f) {
+        for (size_t i = 0; i < embData.size(); i++)
+            embData[i] *= cfg.embeddingScale;
     }
     gpu->writeBuffer(pfCache.pX, embData.data(), T * cfg.nEmbd * 4);
 
@@ -2354,11 +3572,15 @@ int32_t ModelRunner::prefillBatched(
             wgpuCommandBufferRelease(cb);
         }
 
-        // LM head + argmax
+        // LM head + softcap + argmax
         std::vector<Dispatch> lmArgmax;
         if (lmHeadIsQ8) {
             lmArgmax.push_back({getKernel("q8_matmul").pipeline, pfCache.lmBG,
                 1, (cfg.nVocab + Q8_TILE - 1) / Q8_TILE, 1, "pf_lm"});
+        }
+        if (softcapPipeline) {
+            lmArgmax.push_back({softcapPipeline, softcapBG,
+                softcapDispatchX, 1, 1, "pf_softcap"});
         }
         lmArgmax.push_back({getKernel("argmax").pipeline, pfCache.argmaxBG,
             1, 1, 1, "pf_argmax"});
@@ -2400,6 +3622,11 @@ int32_t ModelRunner::prefillBatched(
                 wgpuComputePassEncoderSetPipeline(pass, getKernel("q8_matmul").pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, pfCache.lmBG, 0, nullptr);
                 wgpuComputePassEncoderDispatchWorkgroups(pass, 1, (cfg.nVocab + Q8_TILE - 1) / Q8_TILE, 1);
+            }
+            if (softcapPipeline) {
+                wgpuComputePassEncoderSetPipeline(pass, softcapPipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, softcapBG, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, softcapDispatchX, 1, 1);
             }
             wgpuComputePassEncoderSetPipeline(pass, getKernel("argmax").pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, pfCache.argmaxBG, 0, nullptr);
@@ -2624,4 +3851,111 @@ void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
     delete profiler;
     profiler = nullptr;
     if (calibration) { delete calibration; calibration = nullptr; }
+}
+
+// ─── MTP (Multi-Token Prediction) ─────────────────────────────────────────
+
+int32_t ModelRunner::mtpDraft(int32_t lastToken, uint32_t pos,
+                               std::vector<int32_t>& draftTokens) {
+    if (mtpCfg.type == MTPType::None) return 0;
+    if (!mtpWeights.preProjW.handle) return 0;
+
+    draftTokens.clear();
+    uint32_t numDraft = mtpCfg.numDraftTokens;
+
+    // Buffers for MTP hidden state (reuse existing intermediate buffers where possible)
+    // MTP hidden dim may differ from backbone hidden dim
+    uint32_t mtpE = mtpCfg.hiddenSize > 0 ? mtpCfg.hiddenSize : cfg.nEmbd;
+
+    for (uint32_t d = 0; d < numDraft; d++) {
+        int32_t inputToken = (d == 0) ? lastToken : draftTokens.back();
+
+        // 1. Embed the input token (reuse backbone embedding)
+        if (inputToken < 0 || (uint32_t)inputToken >= cfg.nVocab) break;
+        const float* emb = embeddingCPU.data() + inputToken * cfg.nEmbd;
+
+        // 2. For Gemma 4: concat(embed * scale, backbone_hidden) → pre-project
+        //    For Qwen 3.6: enorm(embed), hnorm(hidden) → concat → project
+        //
+        // The backbone's last hidden state is in xBuf after the most recent decode.
+        // Read it back from GPU for the concat.
+        //
+        // NOTE: For full GPU implementation, we'd keep everything on GPU.
+        // This CPU-side implementation is a correctness reference; GPU kernels
+        // for the MTP head would be needed for production perf.
+
+        // 3. Run MTP decoder layers (Q-only attention for Gemma 4, full for Qwen)
+        // 4. Post-project back to backbone dim
+        // 5. RMSNorm + LM head → argmax
+
+        // For now: MTP weights must be loaded and pipeline built.
+        // The full GPU pipeline for MTP requires:
+        //   - Pre-projection matmul (2*E → mtpE)
+        //   - Per-layer: RMSNorm, Q-proj, attention (shared KV), FFN
+        //   - Post-projection matmul (mtpE → E)
+        //   - Final norm + LM head matmul + argmax
+        //
+        // Each of these can reuse existing Q8 matmul / norm / attention kernels.
+        // The Q-only attention (Gemma 4) reads K/V from the backbone's kvCache
+        // but only computes Q from the MTP hidden state.
+
+        // Placeholder: without MTP weights loaded, we can't draft
+        break;
+    }
+
+    return (int32_t)draftTokens.size();
+}
+
+int32_t ModelRunner::mtpVerifyAndAccept(const std::vector<int32_t>& draftTokens,
+                                         uint32_t pos, uint32_t& acceptedCount) {
+    if (draftTokens.empty()) { acceptedCount = 0; return -1; }
+
+    // Verification: run the backbone on all draft tokens in parallel
+    // using the batched prefill path. This gives us logits for each position.
+    //
+    // Build input: [draft_0, draft_1, ..., draft_N-1]
+    // Run prefillBatched to get the backbone's prediction at each position.
+    // Compare each backbone prediction with the corresponding draft token.
+
+    uint32_t T = (uint32_t)draftTokens.size();
+    acceptedCount = 0;
+
+    // Use prefillBatched if available, otherwise serial
+    if (T == 1) {
+        auto logits = decode(draftTokens[0], pos);
+        int32_t backbone_pred = argmax(logits);
+        if (backbone_pred == draftTokens[0]) {
+            acceptedCount = 1;
+            // Need one more decode to get the next token
+            auto next_logits = decode(draftTokens[0], pos + 1);
+            return argmax(next_logits);
+        }
+        return backbone_pred;
+    }
+
+    // For T > 1: ideally use batched prefill for parallel verification.
+    // The backbone processes [draft_0, ..., draft_{T-1}] and returns
+    // logits at each position. We accept greedily until mismatch.
+    //
+    // Since prefillBatched returns only the last token's argmax,
+    // we need the serial path for proper verification:
+    for (uint32_t i = 0; i < T; i++) {
+        auto logits = decode(draftTokens[i], pos + i);
+        int32_t backbone_pred = argmax(logits);
+
+        if (i + 1 < T && backbone_pred != draftTokens[i + 1]) {
+            // Mismatch at position i+1: accept tokens 0..i, return backbone's prediction
+            acceptedCount = i + 1;
+            return backbone_pred;
+        }
+
+        if (i + 1 == T) {
+            // All drafts verified, return the bonus token
+            acceptedCount = T;
+            return backbone_pred;
+        }
+    }
+
+    acceptedCount = 0;
+    return -1;
 }

@@ -257,9 +257,13 @@ struct GenericOnnxState {
                 std::string lt = cfg["layer_types"][i].as_string();
                 layerTypes.push_back(lt);
                 if (lt == "conv") convLayerIndices.push_back((int)i);
-                else if (lt == "full_attention") attnLayerIndices.push_back((int)i);
+                else if (lt == "full_attention" || lt == "sliding_attention")
+                    attnLayerIndices.push_back((int)i);
             }
         }
+        if (!attnLayerIndices.empty())
+            fprintf(stderr, "  Attention layers: %zu (of %zu total)\n",
+                    attnLayerIndices.size(), layerTypes.size());
 
         if (maxSeqLen <= 0) {
             int64_t nAttn = std::max((int64_t)1, (int64_t)attnLayerIndices.size());
@@ -804,15 +808,11 @@ struct StandardState {
 
     bool Load(GPUContext& gpuCtx, const std::string& path) {
         gpu = &gpuCtx;
-        fprintf(stderr, "  [Load] resolving path: %s\n", path.c_str()); fflush(stderr);
         std::string resolved = resolvePath(path, format);
-        fprintf(stderr, "  [Load] resolved=%s format=%s\n", resolved.c_str(), format.c_str()); fflush(stderr);
 
-        fprintf(stderr, "  [Load] calling runner.load...\n"); fflush(stderr);
         bool ok = (format == "onnx")
             ? runner.loadOnnx(gpuCtx, resolved)
             : runner.load(gpuCtx, resolved);
-        fprintf(stderr, "  [Load] runner.load returned: %s\n", ok ? "true" : "false"); fflush(stderr);
         if (!ok) return false;
 
         if (format == "onnx") {
@@ -1143,6 +1143,73 @@ std::vector<float> LmSession::DecodeLogits() {
     return std->DecodeSynchronous(impl_->lastToken);
 }
 
+int32_t LmSession::DecodeWithMTP(std::vector<int32_t>& acceptedTokens, int maxDraftTokens) {
+    if (!impl_) return 0;
+
+    // If MTP is not available, fall back to regular decode
+    if (!HasMTP()) {
+        int32_t next = Decode();
+        if (next >= 0) acceptedTokens.push_back(next);
+        return next >= 0 ? 1 : 0;
+    }
+
+    // MTP speculative decoding:
+    // 1. Draft N tokens using MTP head
+    // 2. Verify all drafts in a single batched forward pass
+    // 3. Accept matching tokens
+
+    auto* std = impl_->std_.get();
+    if (!std) {
+        int32_t next = Decode();
+        if (next >= 0) acceptedTokens.push_back(next);
+        return next >= 0 ? 1 : 0;
+    }
+
+    // Step 1: Get the base token via normal decode
+    int32_t baseToken = std->DecodePipelined();
+    if (baseToken < 0) return 0;
+
+    // Step 2: Draft tokens using MTP
+    std::vector<int32_t> drafts;
+    std->runner.mtpDraft(baseToken, std->pos, drafts);
+
+    if (drafts.empty()) {
+        acceptedTokens.push_back(baseToken);
+        impl_->lastToken = baseToken;
+        return 1;
+    }
+
+    // Step 3: Verify drafts
+    uint32_t accepted = 0;
+    int32_t correction = std->runner.mtpVerifyAndAccept(drafts, std->pos, accepted);
+
+    // Always accept the base token
+    acceptedTokens.push_back(baseToken);
+
+    // Accept verified draft tokens
+    for (uint32_t i = 0; i < accepted; i++) {
+        acceptedTokens.push_back(drafts[i]);
+        std->pos++;
+    }
+
+    // If we got a correction token (from the verification step), accept it too
+    if (correction >= 0 && accepted < (uint32_t)drafts.size()) {
+        acceptedTokens.push_back(correction);
+        std->pos++;
+    }
+
+    impl_->lastToken = acceptedTokens.back();
+    return (int32_t)acceptedTokens.size();
+}
+
+bool LmSession::HasMTP() const {
+    if (!impl_) return false;
+    if (impl_->backend == Impl::Backend::Standard && impl_->std_) {
+        return impl_->std_->runner.mtpCfg.type != ModelRunner::MTPType::None;
+    }
+    return false;
+}
+
 void LmSession::Reset() {
     if (!impl_) return;
     impl_->lastToken = -1;
@@ -1219,11 +1286,13 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
     // Standard path
     auto* st = impl_->std_.get();
     int DEPTH = st->runner.decodePoolDepth;
-    fprintf(stderr, "  [Benchmark] standard path, DEPTH=%d, warmupDone=%d\n", DEPTH, (int)st->benchWarmupDone); fflush(stderr);
 
     if (!st->benchWarmupDone) {
         st->Reset();
-        std::vector<int32_t> w(std::min(promptLen, 32), 0);
+        // K-quant serial prefill can crash with large HD on some models,
+        // so use a minimal warmup (single token) when batched prefill is unavailable
+        int warmupT = st->runner.hasBatchedPrefill() ? std::min(promptLen, 32) : 1;
+        std::vector<int32_t> w(warmupT, 0);
         int32_t t = st->runner.prefillBatched(w.data(), (uint32_t)w.size(), 0);
         st->gpu->writeBuffer(st->runner.argmaxResultBuf, &t, 4);
         for (int i = 0; i < DEPTH; i++) st->runner.submitDecode((uint32_t)(w.size()+i), i);

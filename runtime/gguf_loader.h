@@ -28,6 +28,10 @@ enum GGUFType : uint32_t {
     GGUF_TYPE_Q2_K = 10, GGUF_TYPE_Q3_K = 11,
     GGUF_TYPE_Q4_K = 12, GGUF_TYPE_Q5_K = 13,
     GGUF_TYPE_Q6_K = 14, GGUF_TYPE_IQ2_XXS = 16,
+    GGUF_TYPE_IQ2_XS = 17, GGUF_TYPE_IQ3_XXS = 18,
+    GGUF_TYPE_IQ1_S = 19, GGUF_TYPE_IQ4_NL = 20,
+    GGUF_TYPE_IQ3_S = 21, GGUF_TYPE_IQ2_S = 22,
+    GGUF_TYPE_IQ4_XS = 23,
     GGUF_TYPE_BF16 = 30,
 };
 
@@ -106,9 +110,43 @@ KQuantPacked pack_q5k(const void* raw_data, uint32_t N, uint32_t K);
 /// Pads row stride to 4-byte alignment since 210 is not word-aligned.
 KQuantPacked pack_q6k(const void* raw_data, uint32_t N, uint32_t K);
 
+/// Pack Q2_K (84 bytes / 256 elements) — already u32-aligned, 21 words/block.
+KQuantPacked pack_q2k(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Pack Q3_K (110 bytes / 256 elements) — padded per-block to 112 bytes (28 words).
+KQuantPacked pack_q3k(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Pack IQ2_S (82 bytes / 256 elements) — padded per-block to 84 bytes (21 words).
+KQuantPacked pack_iq2s(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Pack IQ3_S (110 bytes / 256 elements) — padded per-block to 112 bytes (28 words).
+KQuantPacked pack_iq3s(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Pack IQ4_XS (136 bytes / 256 elements) — already u32-aligned, 34 words/block.
+KQuantPacked pack_iq4xs(const void* raw_data, uint32_t N, uint32_t K);
+
+/// Accessors for IQ codebook arrays (used to upload to GPU).
+const uint32_t* getIq3sGrid(uint32_t* out_count);  // returns array of 512 u32
+const uint32_t* getIq2sGridU32(uint32_t* out_count);  // returns array of 2048 u32 (1024 u64 entries as u32 pairs)
+
 /// Dequantize K-quant block data to fp32 for CPU-side use (e.g., embedding lookup).
 /// Supports Q4_K, Q5_K, Q6_K. Returns N*K floats.
 void dequant_kquant(const void* raw_data, float* out, uint32_t N, uint32_t K, GGUFType type);
+
+/// Dequantize any supported quantized type to fp32.
+/// Supports Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16, F32.
+void dequant_tensor(const void* raw_data, float* out, uint32_t N, uint32_t K, GGUFType type);
+
+enum class ActivationType { SiLU, GELU };
+enum class AttnLayerType : uint8_t { Global, SlidingWindow };
+
+struct PerLayerConfig {
+    uint32_t qDim = 0;            // Q output dim (nHead * headDim_layer)
+    uint32_t kvDim = 0;           // KV dim (nKvHeads * headDim_layer)
+    uint32_t headDim = 0;         // head dimension for this layer
+    uint32_t intermediateSize = 0;
+    int kvSourceLayer = -1;       // -1 = own KV cache, >=0 = reuse from this layer
+};
 
 struct ModelConfig {
     std::string arch;
@@ -119,10 +157,60 @@ struct ModelConfig {
     uint32_t intermediateSize = 0;
     uint32_t nVocab = 0;
     uint32_t headDim = 0;
+    uint32_t kvHeadDim = 0;       // K/V per-head dim — may differ from headDim
+                                  // for archs that decouple it (e.g. qwen35moe
+                                  // sets attention.key_length=256 vs headDim=64).
+                                  // Defaults to headDim if not specified.
     float rmsNormEps = 1e-6f;
     float ropeTheta = 1e6f;
     bool tieWordEmbeddings = true;
     bool hasQkNorm = false;
+
+    // Gemma family extensions
+    ActivationType activation = ActivationType::SiLU;
+    float embeddingScale = 0.0f;
+    float logitSoftcap = 0.0f;
+    uint32_t slidingWindow = 0;
+    std::vector<AttnLayerType> layerAttnTypes;
+
+    // Per-layer dimensions (populated during weight loading for variable-dim models)
+    std::vector<PerLayerConfig> perLayer;
+    bool hasPerLayerDims = false;  // true if perLayer is populated
+
+    // Sandwich norms (Gemma 4)
+    bool hasSandwichNorm = false;
+
+    // Per-Layer Embedding (Gemma 4)
+    uint32_t pleSize = 0;         // 0 = disabled, >0 = PLE embedding dim
+    uint32_t sharedKvLayers = 0;  // number of layers sharing KV from earlier layers
+
+    // MTP (Multi-Token Prediction) head
+    bool hasMtp = false;
+    uint32_t mtpNumLayers = 0;
+
+    // Mixture-of-Experts (qwen35moe, qwen3moe, deepseek, mixtral, …)
+    uint32_t numExperts = 0;           // total experts (e.g. 128)
+    uint32_t numExpertsPerTok = 0;     // active per token (e.g. 8)
+    uint32_t moeIntermediateSize = 0;  // per-expert FFN dim (routed experts)
+    uint32_t moeSharedIntermediateSize = 0;  // shared expert FFN dim (may equal moeIntermediateSize)
+
+    // State-space model (Mamba) — used by hybrid SSM+attention archs (qwen35moe).
+    // When ssmInnerSize > 0, some/all layers use SSM instead of attention.
+    uint32_t ssmInnerSize = 0;          // d_inner — internal SSM state dim
+    uint32_t ssmStateSize = 0;          // d_state — SSM state vector size
+    uint32_t ssmConvKernel = 0;         // conv1d kernel size (typically 4)
+    uint32_t ssmGroupCount = 0;         // number of SSM groups
+    uint32_t ssmTimeStepRank = 0;       // dt projection rank
+    uint32_t fullAttentionInterval = 0; // every N-th layer is attention, others SSM (0 = all attention)
+
+    /// For hybrid SSM+attention archs (qwen35moe): returns true if layer `i`
+    /// uses the attention path, false if it's an SSM-only layer.
+    /// With fullAttentionInterval=4: layers 3, 7, 11, 15, … are attention,
+    /// all others are SSM. With interval=0: all layers are attention.
+    bool isAttentionLayer(uint32_t i) const {
+        if (fullAttentionInterval == 0) return true;
+        return ((i + 1) % fullAttentionInterval) == 0;
+    }
 };
 
 ModelConfig extractModelConfig(const GGUFFile& gguf);

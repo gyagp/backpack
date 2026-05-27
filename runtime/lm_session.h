@@ -114,6 +114,14 @@ public:
     /// Decode one step: return raw logits (vocabSize floats).
     std::vector<float> DecodeLogits();
 
+    /// Decode with MTP speculative decoding: draft N tokens, verify, return accepted tokens.
+    /// Returns number of tokens accepted (1 = no speculation benefit, >1 = speedup).
+    /// Accepted tokens are appended to `acceptedTokens`.
+    int32_t DecodeWithMTP(std::vector<int32_t>& acceptedTokens, int maxDraftTokens = 3);
+
+    /// Check if MTP is available for the loaded model.
+    bool HasMTP() const;
+
     /// Reset KV cache / internal state for a new conversation.
     void Reset();
 

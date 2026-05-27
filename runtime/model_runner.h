@@ -30,10 +30,28 @@ struct ModelRunner {
     // duplication for async readback.
     GPUBuffer xBuf, normOutBuf, qkvBuf, qRotBuf, attnOutBuf;
     GPUBuffer projOutBuf, gateUpBuf, rstdBuf, logitsBuf;
+
+    // ── MoE intermediate buffers (allocated when cfg.numExperts > 0) ──────
+    GPUBuffer moeRouterOutBuf;   // [nExperts] f32 — router logits per token
+    GPUBuffer moeIndicesBuf;     // [k] u32 — top-k expert indices
+    GPUBuffer moeWeightsBuf;     // [k] f32 — top-k expert weights (softmaxed)
+    GPUBuffer moeExpertOutBuf;   // [E] f32 — one expert's down-projection output
+    GPUBuffer moeShexpGateUpBuf; // [2*IM_s] f32 — shared expert gate+up output
+    GPUBuffer moeShexpActBuf;    // [IM_s] f32 — silu(gate)*up for shared expert
+    GPUBuffer moeRoutedGateBuf;  // [IM_e] f32 — one routed-expert gate output
+    GPUBuffer moeRoutedUpBuf;    // [IM_e] f32 — one routed-expert up output
+    GPUBuffer moeRoutedActBuf;   // [IM_e] f32 — silu(gate)*up for one expert
+
+    // ── SSM persistent state (per layer, allocated when cfg.ssmInnerSize > 0) ──
+    // conv state: rolling buffer of last conv_kernel input vectors per channel
+    // h_state:    Mamba recurrent state [d_inner, d_state]
+    std::vector<GPUBuffer> ssmConvState;
+    std::vector<GPUBuffer> ssmHState;
     GPUBuffer attnPartialsBuf;
 
     // Dynamic params (single set — writeBuffer is queue-sequenced)
     GPUBuffer fusedRopeParamsBuf, chunkedAttnParamsBuf;
+    GPUBuffer chunkedAttnParamsBufSWA; // sliding window layers (separate T_total)
 
     // Pre-built dispatch lists (single — identical for every token)
     std::vector<Dispatch> allDecodeDispatches;
@@ -62,6 +80,7 @@ struct ModelRunner {
         // Per-slot param buffers — allow writing next token's params
         // while GPU still reads current token's params.
         GPUBuffer ropeParamsBuf, attnParamsBuf;
+        GPUBuffer attnParamsBufSWA; // sliding window layers
         // Per-slot dispatch list (cloned from autoDecodeDispatches with
         // per-slot bind groups for param-referencing dispatches).
         std::vector<Dispatch> dispatches;
@@ -89,6 +108,45 @@ struct ModelRunner {
         GPUBuffer qNorm, kNorm;
         // K-quant: single buffer per weight (raw block data as u32)
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
+        // Sandwich norms (Gemma 4)
+        GPUBuffer postNorm;        // post-attention norm (sandwich, before residual)
+        GPUBuffer ffnNorm;         // pre-FFN norm (separate from postAttnNorm)
+        GPUBuffer postFfwNorm;     // post-FFN norm (sandwich, before residual)
+        // PLE (Per-Layer Embedding)
+        GPUBuffer pleInpGateW, pleInpGateS;  // [E, pleSize] gate projection
+        GPUBuffer pleProjW, pleProjS;        // [pleSize, E] back-projection
+        GPUBuffer plePostNorm;               // RMSNorm on PLE output
+        // Per-layer output scale
+        GPUBuffer outScale;        // scalar [1]
+        // Custom RoPE frequencies
+        GPUBuffer ropeFreqs;
+
+        // ── MoE expert weights (qwen35moe and similar) ──────────────────────
+        // Routed experts: 3D tensors [nExperts, dim_out, dim_in] dequantized
+        // and uploaded as flat Q8 (or kept as raw IQ bytes once GPU IQ kernels exist).
+        GPUBuffer routerW, routerS;        // ffn_gate_inp.weight [nExperts, E]
+        GPUBuffer expertsGateW, expertsGateS;  // ffn_gate_exps.weight [nExperts, IM_e, E]
+        GPUBuffer expertsUpW, expertsUpS;      // ffn_up_exps.weight   [nExperts, IM_e, E]
+        GPUBuffer expertsDownW, expertsDownS;  // ffn_down_exps.weight [nExperts, E, IM_e]
+        // Shared expert (always active, no routing)
+        GPUBuffer shexpGateW, shexpGateS;  // ffn_gate_shexp.weight [IM_s, E]
+        GPUBuffer shexpUpW, shexpUpS;      // ffn_up_shexp.weight   [IM_s, E]
+        GPUBuffer shexpDownW, shexpDownS;  // ffn_down_shexp.weight [E, IM_s]
+        GPUBuffer shexpRouterW, shexpRouterS;  // ffn_gate_inp_shexp.weight (gating scalar?)
+        // Attention gate (Qwen3.6 / qwen35moe gated attention output)
+        GPUBuffer attnGateW, attnGateS;    // attn_gate.weight
+
+        // ── SSM / Mamba per-layer weights (hybrid archs like qwen35moe) ─────
+        // 31 of 41 qwen35moe layers are SSM-only (full_attention_interval=4).
+        // Tensor names: ssm_conv1d.weight, ssm_dt.bias, ssm_a, ssm_beta.weight,
+        // ssm_alpha.weight, ssm_norm.weight, ssm_out.weight.
+        GPUBuffer ssmConv1dW;       // [d_inner, conv_k] depthwise conv1d
+        GPUBuffer ssmDtBias;        // [d_inner] bias for dt projection
+        GPUBuffer ssmA;             // [d_inner, d_state] state matrix (init log-space)
+        GPUBuffer ssmBetaW, ssmBetaS;    // beta projection (Q8 if quantized)
+        GPUBuffer ssmAlphaW, ssmAlphaS;  // alpha projection
+        GPUBuffer ssmNorm;          // [d_inner] RMSNorm weight
+        GPUBuffer ssmOutW, ssmOutS; // output projection
     };
     std::vector<LayerWeights> layerWeights;
     GPUBuffer finalNormW;
@@ -97,7 +155,16 @@ struct ModelRunner {
     GPUBuffer lmHeadKQ;          // K-quant LM head
     bool lmHeadIsQ8 = false;
     bool lmHeadIsKQ = false;
-    GGUFType weightQuantType = GGUF_TYPE_Q8_0;  // detected from first weight tensor
+    GGUFType weightQuantType = GGUF_TYPE_Q8_0;
+
+    // PLE (Per-Layer Embedding) global buffers
+    std::vector<float> pleEmbCPU;     // per-layer token embeddings (CPU)
+    GPUBuffer pleModelProjW, pleModelProjS;  // [E, pleSize*nLayer] projection
+    GPUBuffer pleProjNormW;           // RMSNorm weights [pleSize]
+    GPUBuffer pleBuf;                 // intermediate [pleSize] for PLE computation
+    GPUBuffer pleOutBuf;              // intermediate [E] for PLE output
+    std::vector<GPUBuffer> pleSliceBufs;  // per-layer PLE slice [pleSize]
+
     // K-quant params per projection type (shared across layers)
     uint32_t kqQkvNBlocks = 0, kqQkvRowStride = 0;
     uint32_t kqONBlocks = 0, kqORowStride = 0;
@@ -118,10 +185,22 @@ struct ModelRunner {
     uint32_t maxSeqLen = 4096;
     uint32_t gqaChunkSize = 64;
 
+    // IQ-quant codebooks uploaded once and bound to IQ matmul kernels.
+    // iq3sCodebookBuf: 512 u32  (2 KB)  for iq3s_matmul
+    // iq2sCodebookBuf: 2048 u32 (8 KB)  for iq2s_matmul (each iq2s_grid entry = 2 u32)
+    GPUBuffer iq3sCodebookBuf;
+    GPUBuffer iq2sCodebookBuf;
+
     // Pass mode: false = single compute pass (faster on D3D12)
     bool passPerDispatch = true;
     bool useMMA = false;   // true on Vulkan with subgroup_matrix support
     bool useDP4A = false;  // true when dot4I8Packed is available (D3D12)
+    int autoDecodePrefixCount = 1;  // dispatches before allDecodeDispatches in autoDecodeDispatches
+
+    // Logit softcapping (Gemma): applied between LM head and argmax
+    WGPUComputePipeline softcapPipeline = nullptr;
+    WGPUBindGroup softcapBG = nullptr;
+    uint32_t softcapDispatchX = 0;
     struct KernelTuning {
         bool decodeUseFastQkv = false;
         bool decodeUseFastOproj = false;
@@ -200,16 +279,72 @@ struct ModelRunner {
     bool loadDecodeAutotuneCache();
     void saveDecodeAutotuneCache() const;
     void printActiveDecodeTuning(const char* prefix = "  Active decode tuning") const;
+    bool hasBatchedPrefill() const { return pfCache.ready; }
     void destroy();
+
+    // ─── MTP (Multi-Token Prediction) ────────────────────────────────────
+    // Supports Gemma 4 (Q-only attention, shared KV) and Qwen 3.6 (full decoder block)
+    enum class MTPType { None, Gemma4, Qwen36 };
+    struct MTPConfig {
+        MTPType type = MTPType::None;
+        uint32_t numLayers = 0;      // number of MTP decoder layers
+        uint32_t hiddenSize = 0;     // MTP hidden dim (may differ from backbone)
+        uint32_t numDraftTokens = 1; // max draft tokens per step
+    };
+    MTPConfig mtpCfg;
+
+    struct MTPWeights {
+        // Pre-projection: concat(emb, hidden) → mtp_hidden
+        GPUBuffer preProjW, preProjS;  // Linear(2*E, mtp_hidden)
+        // Per MTP layer
+        struct Layer {
+            GPUBuffer inputNorm;    // RMSNorm
+            GPUBuffer qW, qS;      // Q projection (Gemma4: Q-only)
+            GPUBuffer oW, oS;      // Output projection
+            GPUBuffer qNorm;        // Q head norm
+            GPUBuffer ffnNorm;      // FFN pre-norm
+            GPUBuffer guW, guS;     // gate_up
+            GPUBuffer dnW, dnS;     // down
+            GPUBuffer postAttnNorm; // post-attention norm
+            GPUBuffer postFfnNorm;  // post-FFN norm
+            // Qwen3.6: also has K/V projections
+            GPUBuffer kW, kS, vW, vS;
+            GPUBuffer enorm, hnorm; // DeepSeek/Qwen: separate norms
+        };
+        std::vector<Layer> layers;
+        // Post-projection: mtp_hidden → backbone_hidden
+        GPUBuffer postProjW, postProjS;
+        GPUBuffer finalNorm;        // final RMSNorm before LM head
+    };
+    MTPWeights mtpWeights;
+
+    // MTP inference
+    int32_t mtpDraft(int32_t lastToken, uint32_t pos, std::vector<int32_t>& draftTokens);
+    int32_t mtpVerifyAndAccept(const std::vector<int32_t>& draftTokens,
+                               uint32_t pos, uint32_t& acceptedCount);
 
 private:
     void loadWeights(const GGUFFile& gguf, const uint8_t* fileData);
     void buildDecodePipeline();
+
+    // Append MoE FFN dispatches for layer `layerIdx` into allDecodeDispatches.
+    // Reads x_in (normed input) and writes the residual update into x_out.
+    // Returns false if the layer's weights are missing (handled gracefully).
+    //
+    // Dispatches inserted (per-token decode):
+    //   1× router matmul         (Q8 small)         → moeRouterOutBuf [nExperts]
+    //   1× moe_gate              (top-k softmax)    → moeIndicesBuf, moeWeightsBuf
+    //   N× per-expert {gate, up, silu+mul, down}    → moeRoutedActBuf, accumulate
+    //   3× shared expert {gate, up, silu+mul, down} → moeShexpActBuf, accumulate
+    //
+    // (Phase 3d, currently a stub — returns false until implemented.)
+    bool appendMoeFfnDispatches(uint32_t layerIdx, GPUBuffer xIn, GPUBuffer xOut);
     void computeRopeTables();
     void initPrefillResources();
 
     const CompiledPipeline& getKernel(const std::string& name);
     const CompiledPipeline& getKernelHD(const std::string& name);
+    const CompiledPipeline& getKernelGelu(const std::string& siluName);
     std::string patchShaderHD(const char* source) const;
     WGPUBindGroup makeBG(const CompiledPipeline& pl,
                          const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
