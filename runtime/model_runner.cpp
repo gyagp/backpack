@@ -2063,6 +2063,13 @@ void ModelRunner::buildDecodePipeline() {
         //   7. attn_gated_output: attn_out * sigmoid(gate)
         //   8. wo matmul → projOutBuf (existing dense oproj path works)
         //   9. Residual add to xBuf
+        //
+        // TODO: skip dense attention for qwen35moe attn layers. Naive brace
+        // wrap scopes `pl`/`plIM`/`layerDnP` away from MoE FFN dispatch.
+        // Real fix needs variable-hoist refactor or splitting MoE FFN into
+        // a helper that takes pl by value. For now both dense AND new q35
+        // dispatches run — Dawn flags null qkvW/qkvKQ binds but the run
+        // continues with garbage attention output.
 
         auto& pl = cfg.perLayer[i];
         uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
