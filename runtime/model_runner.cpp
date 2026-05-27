@@ -925,7 +925,37 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         uint32_t layerQkvOut = layerQDim + 2 * layerKvDim;
         uint32_t layerIM = pl.intermediateSize;
 
+        // qwen35moe attention layer: load Q/K/V SEPARATELY (no fuse) so Q can be
+        // joint Q+gate (2x normal Q dim). Skip the fuse path below.
+        bool isQ35AttnLayer = (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0 &&
+                               cfg.isAttentionLayer(i));
+        if (isQ35AttnLayer) {
+            auto qi = gguf.tensor_index.find(pfx + "attn_q.weight");
+            auto ki = gguf.tensor_index.find(pfx + "attn_k.weight");
+            auto vi = gguf.tensor_index.find(pfx + "attn_v.weight");
+            if (qi != gguf.tensor_index.end() && ki != gguf.tensor_index.end() && vi != gguf.tensor_index.end()) {
+                auto& qt = gguf.tensors[qi->second];
+                auto& kt = gguf.tensors[ki->second];
+                auto& vt = gguf.tensors[vi->second];
+                // Native output dims from tensor shapes
+                uint32_t qOutDim = (uint32_t)qt.shape[1];   // 2*qDim (joint Q+gate)
+                uint32_t kOutDim = (uint32_t)kt.shape[1];   // kvDim (decoupled key_length)
+                uint32_t vOutDim = (uint32_t)vt.shape[1];   // value_length
+                auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset, qOutDim, cfg.nEmbd, (GGUFType)qt.type);
+                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qj", qr, lw.qjW, lw.qjS);
+                auto kr = repackToQ8(fileData + gguf.data_offset + kt.offset, kOutDim, cfg.nEmbd, (GGUFType)kt.type);
+                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".kSep", kr, lw.kSepW, lw.kSepS);
+                auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, vOutDim, cfg.nEmbd, (GGUFType)vt.type);
+                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".vSep", vr, lw.vSepW, lw.vSepS);
+                if (i == 3) {
+                    fprintf(stderr, "  qwen35moe attn layer %u: Q(2x)=%u K=%u V=%u (E=%u)\n",
+                            i, qOutDim, kOutDim, vOutDim, cfg.nEmbd);
+                }
+            }
+        }
+
         // Fuse Q/K/V into single QKV (or load pre-fused attn_qkv.weight for archs that ship it)
+        if (!isQ35AttnLayer) {
         {
             auto qi = gguf.tensor_index.find(pfx + "attn_q.weight");
             auto ki = gguf.tensor_index.find(pfx + "attn_k.weight");
@@ -988,6 +1018,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 }
             }
         }
+        }  // close if (!isQ35AttnLayer)
 
         // O projection
         {

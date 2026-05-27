@@ -142,6 +142,14 @@ struct ModelRunner {
         // Attention gate (Qwen3.6 / qwen35moe gated attention output)
         GPUBuffer attnGateW, attnGateS;    // attn_gate.weight
 
+        // ── qwen35moe attention-layer separate Q/K/V (step 1 of correctness wiring)
+        // For qwen35moe attention layers, the standard fuse-Q/K/V loader path
+        // is wrong because attn_q.weight produces joint Q+gate (2x qDim).
+        // These slots hold the un-fused weights for the separate-dispatch path.
+        GPUBuffer qjW, qjS;    // joint Q+gate (size [2*qDim, E])
+        GPUBuffer kSepW, kSepS; // K alone (size [kvDim, E])
+        GPUBuffer vSepW, vSepS; // V alone (size [kvDim, E])
+
         // ── SSM / Mamba per-layer weights (hybrid archs like qwen35moe) ─────
         // 31 of 41 qwen35moe layers are SSM-only (full_attention_interval=4).
         // Tensor names: ssm_conv1d.weight, ssm_dt.bias, ssm_a, ssm_beta.weight,
