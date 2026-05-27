@@ -48,6 +48,15 @@ struct ModelRunner {
     std::vector<uint32_t> moeExpertsUpType;
     std::vector<uint32_t> moeExpertsDownType;
 
+    // ── qwen35moe attention intermediate buffers (allocated when needed) ──
+    GPUBuffer q35QjBuf;       // [2*qDim_actual] joint Q+gate output
+    GPUBuffer q35QBuf;        // [qDim_actual] post-split Q
+    GPUBuffer q35GateBuf;     // [qDim_actual] post-split gate
+    GPUBuffer q35KBuf;        // [kvDim_actual] K (separate from fused)
+    GPUBuffer q35VBuf;        // [kvDim_actual] V
+    GPUBuffer q35AttnOutBuf;  // [qDim_actual] attention output (pre-gated)
+    GPUBuffer q35CosSinBuf;   // [4 sections × max_pairs × 2] MRoPE cos/sin table
+
     // ── SSM persistent state (per layer, allocated when cfg.ssmInnerSize > 0) ──
     // conv state: rolling buffer of last conv_kernel input vectors per channel
     // h_state:    Mamba recurrent state [d_inner, d_state]

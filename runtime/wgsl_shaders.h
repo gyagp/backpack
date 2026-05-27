@@ -9353,6 +9353,97 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 )WGSL";
 
+// [attn] rope_multi_partial — partial-rotation MRoPE for head_dim > rope_dim
+static const char* WGSL_ATTN_ROPE_MULTI_PARTIAL = R"WGSL(
+@group(0) @binding(0) var<storage, read_write> X:        array<f32>;
+@group(0) @binding(1) var<storage, read>       cos_sin:  array<f32>;
+@group(0) @binding(2) var<storage, read>       _params_: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_head    = _params_[0];
+    let head_dim  = _params_[1];
+    let s0        = _params_[2];
+    let s1        = _params_[3];
+    let s2        = _params_[4];
+    let s3        = _params_[5];
+    let total_pairs = s0 + s1 + s2 + s3;
+    let rope_dim    = 2u * total_pairs;
+
+    let head_idx = gid.y;
+    let pair_idx = gid.x;
+    if (head_idx >= n_head) { return; }
+    if (pair_idx >= total_pairs) { return; }
+
+    // Determine axis-section
+    var section: u32 = 0u;
+    var local_idx: u32 = pair_idx;
+    if (local_idx >= s0) { local_idx = local_idx - s0; section = 1u; }
+    if (section == 1u && local_idx >= s1) { local_idx = local_idx - s1; section = 2u; }
+    if (section == 2u && local_idx >= s2) { local_idx = local_idx - s2; section = 3u; }
+
+    var sec_off: u32 = 0u;
+    if (section >= 1u) { sec_off = sec_off + 2u * s0; }
+    if (section >= 2u) { sec_off = sec_off + 2u * s1; }
+    if (section >= 3u) { sec_off = sec_off + 2u * s2; }
+    let c = cos_sin[sec_off + 2u * local_idx + 0u];
+    let s = cos_sin[sec_off + 2u * local_idx + 1u];
+
+    // Apply rotation to first rope_dim elements of this head only.
+    // pair (x_i, x_{i + total_pairs}) — neox-style — within first rope_dim of head.
+    let head_base = head_idx * head_dim;
+    let x0 = X[head_base + pair_idx];
+    let x1 = X[head_base + pair_idx + total_pairs];
+    X[head_base + pair_idx]               = x0 * c - x1 * s;
+    X[head_base + pair_idx + total_pairs] = x0 * s + x1 * c;
+    // Elements [rope_dim .. head_dim) per head are untouched.
+}
+
+)WGSL";
+
+// [attn] head_rmsnorm — per-head RMSNorm (attn_q_norm / attn_k_norm)
+static const char* WGSL_ATTN_HEAD_RMSNORM = R"WGSL(
+@group(0) @binding(0) var<storage, read_write> X:        array<f32>;
+@group(0) @binding(1) var<storage, read>       W:        array<f32>;
+@group(0) @binding(2) var<storage, read>       _params_: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let n_head   = _params_[0];
+    let head_dim = _params_[1];
+    let eps      = bitcast<f32>(_params_[2]);
+    let head_idx = wid.x;
+    if (head_idx >= n_head) { return; }
+
+    let base = head_idx * head_dim;
+    let tid  = lid.x;
+
+    // RMS = sqrt(mean(x^2) + eps)
+    var sum_sq: f32 = 0.0;
+    for (var j = tid; j < head_dim; j = j + 64u) {
+        let v = X[base + j];
+        sum_sq = sum_sq + v * v;
+    }
+    // Workgroup reduction via shared memory
+    var<workgroup> sm: array<f32, 64>;
+    sm[tid] = sum_sq;
+    workgroupBarrier();
+    if (tid < 32u) { sm[tid] = sm[tid] + sm[tid + 32u]; } workgroupBarrier();
+    if (tid < 16u) { sm[tid] = sm[tid] + sm[tid + 16u]; } workgroupBarrier();
+    if (tid < 8u)  { sm[tid] = sm[tid] + sm[tid + 8u];  } workgroupBarrier();
+    if (tid < 4u)  { sm[tid] = sm[tid] + sm[tid + 4u];  } workgroupBarrier();
+    if (tid < 2u)  { sm[tid] = sm[tid] + sm[tid + 2u];  } workgroupBarrier();
+    if (tid < 1u)  { sm[tid] = sm[tid] + sm[tid + 1u];  } workgroupBarrier();
+
+    let inv_rms = 1.0 / sqrt(sm[0] / f32(head_dim) + eps);
+    for (var j = tid; j < head_dim; j = j + 64u) {
+        X[base + j] = X[base + j] * inv_rms * W[j];
+    }
+}
+
+)WGSL";
+
 // [moe] topk_softmax — top-k of N router logits + softmax
 static const char* WGSL_MOE_TOPK_SOFTMAX = R"WGSL(
 @group(0) @binding(0) var<storage, read>       logits:  array<f32>;
@@ -14619,6 +14710,8 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"attn_gated_output", {WGSL_ATTN_GATED_OUTPUT, 4, false}},
         {"attn_rope_multi", {WGSL_ATTN_ROPE_MULTI, 3, false}},
         {"attn_split_qg", {WGSL_ATTN_SPLIT_QG, 4, false}},
+        {"attn_rope_multi_partial", {WGSL_ATTN_ROPE_MULTI_PARTIAL, 3, false}},
+        {"attn_head_rmsnorm", {WGSL_ATTN_HEAD_RMSNORM, 3, false}},
         {"moe_topk_softmax", {WGSL_MOE_TOPK_SOFTMAX, 4, false}},
         {"moe_weighted_accumulate_decode", {WGSL_MOE_WEIGHTED_ACCUMULATE, 4, false}},
         {"moe_compute_offsets", {WGSL_MOE_COMPUTE_OFFSETS, 5, false}},

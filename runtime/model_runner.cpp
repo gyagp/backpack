@@ -1798,6 +1798,27 @@ void ModelRunner::buildDecodePipeline() {
                 (size_t)ssmLayerCount * (convBytes + hBytes) / (1024 * 1024));
     }
 
+    // qwen35moe attention intermediate buffers (sized for actual Q/K/V dims)
+    if (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0) {
+        // Discover sizes from first attention layer's qjW buffer.
+        // qjW is sized [qOutDim * cfg.nEmbd] in Q8 (1 byte/elem + scale per 32);
+        // qOutDim = 2 * qDim_actual. We use a generous bound: 2 * 4 * cfg.nEmbd
+        // (covers qOutDim up to 4x nEmbd, fits qwen35moe's 8192 with nEmbd=2048).
+        uint32_t maxQjDim = 4u * cfg.nEmbd;          // bound on 2*qDim_actual
+        uint32_t maxQDim  = maxQjDim / 2u;
+        uint32_t maxKvDim = 2u * cfg.nEmbd;          // bound on kvDim_actual
+        q35QjBuf      = gpu->createBuffer("q35_qj", maxQjDim * 4);
+        q35QBuf       = gpu->createBuffer("q35_q",  maxQDim * 4);
+        q35GateBuf    = gpu->createBuffer("q35_gate", maxQDim * 4);
+        q35KBuf       = gpu->createBuffer("q35_k",  maxKvDim * 4);
+        q35VBuf       = gpu->createBuffer("q35_v",  maxKvDim * 4);
+        q35AttnOutBuf = gpu->createBuffer("q35_attn_out", maxQDim * 4);
+        // Cos/sin table for MRoPE: 4 sections × max 16 pairs × 2 (cos,sin) = 128 floats
+        q35CosSinBuf  = gpu->createBuffer("q35_cossin", 128 * 4);
+        fprintf(stderr, "  qwen35moe attn buffers: qj=%uB q=%uB gate=%uB k=%uB v=%uB attn=%uB\n",
+                maxQjDim*4u, maxQDim*4u, maxQDim*4u, maxKvDim*4u, maxKvDim*4u, maxQDim*4u);
+    }
+
     // K-quant needs a separate SiLU-mul output buffer (used for down proj input)
     GPUBuffer siluMulOutBuf;
     if (useKQ) {
