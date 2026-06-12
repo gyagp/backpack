@@ -1,4 +1,4 @@
-// @meta triton=true
+// @meta generated=true
 enable f16;
 enable subgroups;
 
@@ -39,13 +39,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
     let head_idx = i32(wid.x);
     let d = i32(lid.x);  // 0..127 = element within head
+    if (u32(d) >= HD) {
+        return;
+    }
 
     let is_q = head_idx < params.n_head;
     let kv_head = head_idx - params.n_head;
 
     // Source offset into QKV buffer
-    let q_off = head_idx * 128;
-    let k_off = params.q_size + kv_head * 128;
+    let q_off = head_idx * i32(HD);
+    let k_off = params.q_size + kv_head * i32(HD);
     let src_off = select(k_off, q_off, is_q);
 
     // Load value
@@ -81,14 +84,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
     // Write Q output
     if (is_q) {
-        buf1[u32(head_idx * 128 + d)] = rotated;
+        buf1[u32(head_idx * i32(HD) + d)] = rotated;
     }
 
     // Write K/V to cache
     if (!is_q) {
-        buf2[u32(params.cache_offset + kv_head * 128 + d)] = f16(rotated);
+        buf2[u32(params.cache_offset + kv_head * i32(HD) + d)] = f16(rotated);
         // V: straight copy, no RoPE
-        let v_off = params.q_size + params.kv_size + kv_head * 128 + d;
-        buf3[u32(params.cache_offset + kv_head * 128 + d)] = f16(buf0[u32(v_off)]);
+        let v_off = params.q_size + params.kv_size + kv_head * i32(HD) + d;
+        buf3[u32(params.cache_offset + kv_head * i32(HD) + d)] = f16(buf0[u32(v_off)]);
     }
 }

@@ -36,10 +36,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL" CACHE STRING "MSVC runtime")
 
 # Dawn paths (relative to runtime/)
-set(DAWN_SRC "${CMAKE_SOURCE_DIR}/../third_party/dawn" CACHE PATH "Dawn source")
+set(DAWN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/dawn" CACHE PATH "Dawn source")
 set(DAWN_BUILD "${DAWN_SRC}/build" CACHE PATH "Dawn build (gen headers)")
-set(DAWN_LIB "${CMAKE_SOURCE_DIR}/../third_party/triton-windows/third_party/webgpu/dawn/build"
-    CACHE PATH "Dawn shared library")
+set(DAWN_LIB "${DAWN_BUILD}" CACHE PATH "Dawn shared library")
 
 # ─── Internal object library (shared between DLL and internal CLI) ───────────
 
@@ -100,7 +99,7 @@ target_include_directories(backpack_runtime PRIVATE
 
 # ─── LLM application (uses runtime API + internal LLM logic) ─────────────────
 
-set(BACKPACK_LLM_APP "${CMAKE_SOURCE_DIR}/../apps/llm/main.cpp")
+set(BACKPACK_LLM_APP "${CMAKE_CURRENT_SOURCE_DIR}/../apps/llm/main.cpp")
 if(EXISTS ${BACKPACK_LLM_APP})
     add_executable(backpack_llm ${BACKPACK_LLM_APP})
     target_link_libraries(backpack_llm PRIVATE backpack)
@@ -114,7 +113,7 @@ endif()
 
 # ─── Image generation application ────────────────────────────────────────────
 
-set(BACKPACK_IMAGE_APP "${CMAKE_SOURCE_DIR}/../apps/image/main.cpp")
+set(BACKPACK_IMAGE_APP "${CMAKE_CURRENT_SOURCE_DIR}/../apps/image/main.cpp")
 if(EXISTS ${BACKPACK_IMAGE_APP})
     add_executable(backpack_image ${BACKPACK_IMAGE_APP} $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_image PRIVATE backpack)
@@ -128,7 +127,7 @@ endif()
 
 # ─── ASR (speech-to-text) application ────────────────────────────────────────
 
-set(BACKPACK_ASR_APP "${CMAKE_SOURCE_DIR}/../apps/asr/main.cpp")
+set(BACKPACK_ASR_APP "${CMAKE_CURRENT_SOURCE_DIR}/../apps/asr/main.cpp")
 if(EXISTS ${BACKPACK_ASR_APP})
     add_executable(backpack_asr ${BACKPACK_ASR_APP} $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_asr PRIVATE backpack)

@@ -37,7 +37,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     var q: array<f32, HD_PER_THREAD>;
     for (var e = 0u; e < HD_PER_THREAD; e++) {
-        q[e] = Q[q_base + lane * HD_PER_THREAD + e];
+        let d = lane * HD_PER_THREAD + e;
+        q[e] = 0.0;
+        if (d < HD) {
+            q[e] = Q[q_base + d];
+        }
     }
 
     var acc: array<f32, HD_PER_THREAD>;
@@ -50,7 +54,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let k_base = select(0u, t * kv_stride + kv_off, valid);
         var dot_partial: f32 = 0.0;
         for (var e = 0u; e < HD_PER_THREAD; e++) {
-            let k = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + e]), valid);
+            let d = lane * HD_PER_THREAD + e;
+            var k = 0.0;
+            if (valid && d < HD) {
+                k = f32(K_cache[k_base + d]);
+            }
             dot_partial += q[e] * k;
         }
         let dot_qk = subgroupAdd(dot_partial);
@@ -64,7 +72,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let w = exp_score / max(l_new, 1e-10);
 
         for (var e = 0u; e < HD_PER_THREAD; e++) {
-            let v = select(0.0, f32(V_cache[k_base + lane * HD_PER_THREAD + e]), valid);
+            let d = lane * HD_PER_THREAD + e;
+            var v = 0.0;
+            if (valid && d < HD) {
+                v = f32(V_cache[k_base + d]);
+            }
             acc[e] = acc[e] * rescale + v * w;
         }
 
@@ -73,6 +85,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
 
     for (var e = 0u; e < HD_PER_THREAD; e++) {
-        Out[head * HD + lane * HD_PER_THREAD + e] = acc[e];
+        let d = lane * HD_PER_THREAD + e;
+        if (d < HD) {
+            Out[head * HD + d] = acc[e];
+        }
     }
 }

@@ -1,7 +1,0 @@
-{
-  "name": "backpack",
-  "private": true,
-  "scripts": {
-    "test": "npx vitest run"
-  }
-}

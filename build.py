@@ -8,14 +8,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent.resolve()
 THIRD_PARTY = ROOT_DIR / "third_party"
 DAWN_DIR = THIRD_PARTY / "dawn"
-TRITON_DIR = THIRD_PARTY / "triton-windows"
 DAWN_BUILD = DAWN_DIR / "build"
-MODELS_DIR = ROOT_DIR / "models"
-DAWN_DLL_DIR = TRITON_DIR / "third_party" / "webgpu" / "dawn" / "build"
+DAWN_DLL_DIR = DAWN_BUILD
+RUNTIME_DIR = ROOT_DIR / "runtime"
+RUNTIME_BUILD = ROOT_DIR / "gitignore" / "runtime" / "build"
 
 DAWN_REPO = "https://dawn.googlesource.com/dawn"
-TRITON_REPO = "https://github.com/gyagp/triton-windows.git"
-TRITON_BRANCH = "webgpu"
 
 def write_step(msg):
     print(f"\n\033[36m=== {msg} ===\033[0m\n")
@@ -31,13 +29,13 @@ def write_error(msg):
 
 def run_cmd(cmd, cwd=None, env=None, check=True):
     try:
-        subprocess.run(cmd, cwd=cwd, env=env, check=check, shell=True)
+        result = subprocess.run(cmd, cwd=cwd, env=env, check=check, shell=True)
     except subprocess.CalledProcessError as e:
         if check:
             sys.exit(e.returncode)
         else:
             return False
-    return True
+    return result.returncode == 0
 
 def assert_command(cmd, hint):
     if shutil.which(cmd) is None:
@@ -46,7 +44,7 @@ def assert_command(cmd, hint):
 
 def invoke_deps():
     write_step("Installing Python dependencies")
-    run_cmd(f"{sys.executable} -m pip install setuptools wheel cmake ninja pybind11 lit")
+    run_cmd(f"{sys.executable} -m pip install setuptools wheel cmake ninja")
     run_cmd(f"{sys.executable} -m pip install numpy tiktoken requests")
     write_ok("Python dependencies installed")
 
@@ -59,13 +57,6 @@ def invoke_clone():
         print("  Cloning Dawn...")
         run_cmd(f"git clone {DAWN_REPO} {DAWN_DIR}")
         write_ok("Dawn cloned")
-
-    if (TRITON_DIR / ".git").exists():
-        write_skip(f"triton-windows already cloned at {TRITON_DIR}")
-    else:
-        print(f"  Cloning triton-windows (branch: {TRITON_BRANCH})...")
-        run_cmd(f"git clone -b {TRITON_BRANCH} {TRITON_REPO} {TRITON_DIR}")
-        write_ok("triton-windows cloned")
 
 def invoke_msvc():
     write_step("Loading MSVC environment")
@@ -209,72 +200,55 @@ def invoke_dawn_deploy():
         if not src.exists():
             write_error(f"{dll} not found in {DAWN_BUILD}. Build Dawn first.")
             sys.exit(1)
-        shutil.copy2(src, DAWN_DLL_DIR / dll)
+        dst = DAWN_DLL_DIR / dll
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
         write_ok(f"Deployed {dll}")
 
-def invoke_install():
-    write_step("Installing triton on Python path (lightweight)")
-    try:
-        import site
-        site_dir = Path(site.getusersitepackages())
-    except Exception as e:
-        write_error(f"Failed to get site packages directory: {e}")
-        sys.exit(1)
+def invoke_verify():
+    invoke_runtime()
 
-    site_dir.mkdir(parents=True, exist_ok=True)
-
-    pth_content = f"import os; os.environ.setdefault('TRITON_BACKENDS_IN_TREE', '1')\n{str(TRITON_DIR.as_posix())}/python\n"
-    pth_path = site_dir / "triton-backpack.pth"
-    pth_path.write_text(pth_content, encoding="utf-8")
-    write_ok(f"Wrote {pth_path}")
-
-    os.environ["TRITON_BACKENDS_IN_TREE"] = "1"
-    if not run_cmd(f'{sys.executable} -c "import triton; print(\'triton loaded from:\', triton.__file__)"', check=False):
-        print("  \033[33m[WARN]\033[0m triton import check failed")
-    else:
-        run_cmd(f'{sys.executable} -c "from triton.backends import backends; print(\'Backends:\', list(backends.keys()))"')
-        write_ok("triton registered with webgpu backend")
-
-def invoke_triton():
+def invoke_runtime():
     invoke_msvc()
     assert_command("cmake", "Install via: pip install cmake")
     assert_command("ninja", "Install via: pip install ninja")
 
-    if not (TRITON_DIR / ".git").exists():
-        write_error("triton-windows not cloned. Run: python build.py clone")
+    dawn_import_lib = DAWN_BUILD / "src" / "dawn" / "native" / "webgpu_dawn.lib"
+    missing = [
+        path for path in [
+            DAWN_DLL_DIR / "webgpu_dawn.dll",
+            DAWN_DLL_DIR / "dxcompiler.dll",
+            DAWN_DLL_DIR / "dxil.dll",
+            dawn_import_lib,
+        ]
+        if not path.exists()
+    ]
+    if missing:
+        write_error("Dawn artifacts are missing. Run: python build.py dawn")
+        for path in missing:
+            print(f"  missing: {path}")
         sys.exit(1)
 
-    write_step("Building triton-windows (this may take 15-45 minutes on first build)")
-
-    env = os.environ.copy()
-    env["TRITON_BUILD_PROTON"] = "0"
-    env["TRITON_BUILD_UT"] = "0"
-    env["TRITON_BUILD_BINARY"] = "0"
-
-    pip_install_ok = run_cmd(f"{sys.executable} -m pip install --no-build-isolation --verbose -e .", cwd=TRITON_DIR, env=env, check=False)
-
-    if not pip_install_ok:
-        print("  \033[33m[WARN]\033[0m pip editable install failed, falling back to .pth install")
-        invoke_install()
-        return
-
-    env["TRITON_BACKENDS_IN_TREE"] = "1"
-    if not run_cmd(f'{sys.executable} -c "import triton; print(\'triton loaded from:\', triton.__file__)"', env=env, check=False):
-        print("  \033[33m[WARN]\033[0m triton import failed after install")
-    else:
-        write_ok("triton-windows installed")
-
-def invoke_verify():
-    write_step("Running GPT-2 verification")
-    env = os.environ.copy()
-    env["TRITON_BACKENDS_IN_TREE"] = "1"
-
-    gpt2_verify = MODELS_DIR / "gpt-2" / "model.py"
-    if run_cmd(f"{sys.executable} {gpt2_verify} --verify", env=env, check=False):
-        write_ok("Verification passed")
-    else:
-        write_error("Verification failed")
+    write_step("Configuring runtime")
+    RUNTIME_BUILD.mkdir(parents=True, exist_ok=True)
+    configure_cmd = (
+        f"cmake -S {RUNTIME_DIR} -B {RUNTIME_BUILD} -G Ninja "
+        f"-DCMAKE_BUILD_TYPE=Release "
+        f"-DDAWN_SRC={DAWN_DIR} "
+        f"-DDAWN_BUILD={DAWN_BUILD} "
+        f"-DDAWN_LIB={DAWN_DLL_DIR}"
+    )
+    if not run_cmd(configure_cmd, check=False):
+        write_error("Runtime CMake configure failed")
         sys.exit(1)
+    write_ok(f"Runtime configured at {RUNTIME_BUILD}")
+
+    write_step("Building runtime")
+    build_cmd = f"cmake --build {RUNTIME_BUILD} --target backpack_runtime --target backpack_llm"
+    if not run_cmd(build_cmd, check=False):
+        write_error("Runtime build failed")
+        sys.exit(1)
+    write_ok("Runtime build complete")
 
 def invoke_setup():
     write_step("Backpack full setup")
@@ -284,49 +258,40 @@ def invoke_setup():
     invoke_deps()
     invoke_clone()
     invoke_dawn()
-    invoke_triton()
+    invoke_runtime()
 
     print("\n\033[32m============================================\033[0m")
     print("\033[32m  Backpack setup complete!\033[0m")
     print("\033[32m============================================\033[0m\n")
     print("  Verify:  python build.py verify")
-    print("  Run:     python models/gpt-2/model.py --prompt \"The future of AI is\"\n")
+    print("  Run:     gitignore\\runtime\\build\\backpack_llm.exe <model.gguf>\n")
 
 def invoke_dawn_clean():
     write_step("Cleaning Dawn build")
     if DAWN_BUILD.exists():
         shutil.rmtree(DAWN_BUILD, ignore_errors=True)
-    if DAWN_DLL_DIR.exists():
-        shutil.rmtree(DAWN_DLL_DIR, ignore_errors=True)
     write_ok("Dawn build cleaned")
-
-def invoke_triton_clean():
-    write_step("Cleaning triton build")
-    triton_build = TRITON_DIR / "build"
-    if triton_build.exists():
-        shutil.rmtree(triton_build, ignore_errors=True)
-    libtriton = TRITON_DIR / "python" / "triton" / "_C" / "libtriton.pyd"
-    if libtriton.exists():
-        libtriton.unlink()
-    write_ok("Triton build cleaned")
 
 def invoke_clean():
     invoke_dawn_clean()
-    invoke_triton_clean()
+    write_step("Cleaning runtime build")
+    if RUNTIME_BUILD.exists():
+        shutil.rmtree(RUNTIME_BUILD, ignore_errors=True)
+    write_ok("Runtime build cleaned")
 
 def invoke_info():
     print("\n\033[36mBackpack Build Info\033[0m")
     print("===================")
     print(f"  ROOT_DIR:     {ROOT_DIR}")
     print(f"  DAWN_DIR:     {DAWN_DIR}")
-    print(f"  TRITON_DIR:   {TRITON_DIR}")
     print(f"  DAWN_DLL_DIR: {DAWN_DLL_DIR}\n")
+    print(f"  RUNTIME_BUILD:{RUNTIME_BUILD}")
 
     dawn_dll = DAWN_DLL_DIR / "webgpu_dawn.dll"
-    libtriton = TRITON_DIR / "python" / "triton" / "_C" / "libtriton.pyd"
+    runtime_exe = RUNTIME_BUILD / "backpack_runtime.exe"
 
     print(f"  Dawn DLL:     {'BUILT' if dawn_dll.exists() else 'NOT BUILT'}")
-    print(f"  libtriton:    {'BUILT' if libtriton.exists() else 'NOT BUILT'}")
+    print(f"  Runtime:      {'BUILT' if runtime_exe.exists() else 'NOT BUILT'}")
     print(f"  MSVC (cl):    {'Available' if shutil.which('cl') else 'Not loaded'}\n")
 
     run_cmd(f"{sys.executable} --version", check=False)
@@ -336,8 +301,7 @@ def main():
     parser = argparse.ArgumentParser(description="Backpack build script")
     parser.add_argument("target", nargs="?", default="setup",
                         choices=["setup", "deps", "clone", "msvc", "dawn", "dawn-deploy",
-                                 "triton", "install", "verify", "clean", "dawn-clean",
-                                 "triton-clean", "info", "help"],
+                                 "runtime", "verify", "clean", "dawn-clean", "info", "help"],
                         help="Build target to run")
 
     args = parser.parse_args()
@@ -345,18 +309,16 @@ def main():
     if args.target == "help":
         parser.print_help()
         print("\nTargets:")
-        print("  setup         Full provision: deps + clone + dawn + triton (default)")
+        print("  setup         Full provision: deps + clone + dawn (default)")
         print("  deps          Install Python dependencies")
-        print("  clone         Clone Dawn and triton-windows repos")
+        print("  clone         Clone Dawn")
         print("  msvc          Load MSVC compiler environment")
         print("  dawn          Build Dawn WebGPU runtime from source")
         print("  dawn-deploy   Deploy Dawn DLLs (after manual Dawn build)")
-        print("  triton        Build triton-windows from source (pip editable)")
-        print("  install       Install triton using .pth link (skips full rebuild)")
-        print("  verify        Run GPT-2 pipeline verification")
-        print("  clean         Clean Dawn and triton builds")
+        print("  runtime       Configure and build C++ runtime")
+        print("  verify        Build C++ runtime")
+        print("  clean         Clean Dawn and runtime builds")
         print("  dawn-clean    Clean Dawn build only")
-        print("  triton-clean  Clean triton build only")
         print("  info          Show build environment and status")
         return
 
@@ -371,12 +333,10 @@ def main():
         "msvc": invoke_msvc,
         "dawn": invoke_dawn,
         "dawn-deploy": invoke_dawn_deploy,
-        "triton": invoke_triton,
-        "install": invoke_install,
+        "runtime": invoke_runtime,
         "verify": invoke_verify,
         "clean": invoke_clean,
         "dawn-clean": invoke_dawn_clean,
-        "triton-clean": invoke_triton_clean,
         "info": invoke_info
     }
 

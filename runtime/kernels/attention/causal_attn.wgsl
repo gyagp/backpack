@@ -51,15 +51,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     let q_idx = q_block * QUERIES_PER_WG + warp_id;
     let q_abs_pos = cache_offset + q_idx;
+    let q_valid = q_idx < params.T_prefill;
 
     let q_base = q_idx * n_head_total * HD + head * HD;
-    let q0 = Q[q_base + lane * HD_PER_THREAD];
-    let q1 = Q[q_base + lane * HD_PER_THREAD + 1u];
-    let q2 = Q[q_base + lane * HD_PER_THREAD + 2u];
-    let q3 = Q[q_base + lane * HD_PER_THREAD + 3u];
+    var q: array<f32, HD_PER_THREAD>;
+    for (var e = 0u; e < HD_PER_THREAD; e++) {
+        let d = lane * HD_PER_THREAD + e;
+        q[e] = 0.0;
+        if (q_valid && d < HD) {
+            q[e] = Q[q_base + d];
+        }
+    }
 
-    var acc0: f32 = 0.0; var acc1: f32 = 0.0;
-    var acc2: f32 = 0.0; var acc3: f32 = 0.0;
+    var acc: array<f32, HD_PER_THREAD>;
+    for (var e = 0u; e < HD_PER_THREAD; e++) {
+        acc[e] = 0.0;
+    }
     var m_prev: f32 = neg_inf;
     var l_prev: f32 = 0.0;
 
@@ -67,16 +74,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let max_causal = min(cache_offset + q_block * QUERIES_PER_WG + QUERIES_PER_WG, T_total);
 
     for (var t = 0u; t < max_causal; t = t + 1u) {
-        let causal_valid = t <= q_abs_pos;
+        let causal_valid = q_valid && t <= q_abs_pos;
 
         let k_base = t * kv_stride + kv_off;
         let k_off = k_base + lane * HD_PER_THREAD;
-        let k0 = select(0.0, f32(K_cache[k_off]), causal_valid);
-        let k1 = select(0.0, f32(K_cache[k_off + 1u]), causal_valid);
-        let k2 = select(0.0, f32(K_cache[k_off + 2u]), causal_valid);
-        let k3 = select(0.0, f32(K_cache[k_off + 3u]), causal_valid);
 
-        let partial = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
+        var partial = 0.0;
+        for (var e = 0u; e < HD_PER_THREAD; e++) {
+            let d = lane * HD_PER_THREAD + e;
+            var k = 0.0;
+            if (causal_valid && d < HD) {
+                k = f32(K_cache[k_off + e]);
+            }
+            partial += q[e] * k;
+        }
         let dot_qk = subgroupAdd(partial);
         let score = select(neg_inf, dot_qk * scale, causal_valid);
 
@@ -88,23 +99,24 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let w = exp_score / max(l_new, 1e-10);
 
         let v_off = k_base + lane * HD_PER_THREAD;
-        let v0 = select(0.0, f32(V_cache[v_off]), causal_valid);
-        let v1 = select(0.0, f32(V_cache[v_off + 1u]), causal_valid);
-        let v2 = select(0.0, f32(V_cache[v_off + 2u]), causal_valid);
-        let v3 = select(0.0, f32(V_cache[v_off + 3u]), causal_valid);
-
-        acc0 = acc0 * rescale + v0 * w;
-        acc1 = acc1 * rescale + v1 * w;
-        acc2 = acc2 * rescale + v2 * w;
-        acc3 = acc3 * rescale + v3 * w;
+        for (var e = 0u; e < HD_PER_THREAD; e++) {
+            let d = lane * HD_PER_THREAD + e;
+            var v = 0.0;
+            if (causal_valid && d < HD) {
+                v = f32(V_cache[v_off + e]);
+            }
+            acc[e] = acc[e] * rescale + v * w;
+        }
 
         m_prev = m_new;
         l_prev = l_new;
     }
 
     let out_base = q_idx * n_head_total * HD + head * HD;
-    Out[out_base + lane * HD_PER_THREAD]      = acc0;
-    Out[out_base + lane * HD_PER_THREAD + 1u] = acc1;
-    Out[out_base + lane * HD_PER_THREAD + 2u] = acc2;
-    Out[out_base + lane * HD_PER_THREAD + 3u] = acc3;
+    for (var e = 0u; e < HD_PER_THREAD; e++) {
+        let d = lane * HD_PER_THREAD + e;
+        if (q_valid && d < HD) {
+            Out[out_base + d] = acc[e];
+        }
+    }
 }

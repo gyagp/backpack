@@ -120,22 +120,18 @@ std::string ModelRunner::patchShaderHD(const char* source) const {
             s.replace(pos, strlen(pat), rep);
     }
 
-    // HD_PER_THREAD: for 32-thread kernels, HD/32. Must divide evenly.
-    if (hd % 32 == 0) {
-        uint32_t hpt = hd / 32;
-        {
-            const char* pat = "const HD_PER_THREAD: u32 = 4u;";
-            std::string rep = "const HD_PER_THREAD: u32 = " + std::to_string(hpt) + "u;";
-            auto pos = s.find(pat);
-            if (pos != std::string::npos)
-                s.replace(pos, strlen(pat), rep);
+    // HD_PER_THREAD: for 32-thread kernels, ceil(HD/32). Kernels that use this
+    // constant must bounds-check each element so head_dim=80 covers all 80
+    // elements without reading/writing the padded 16 lanes.
+    {
+        uint32_t hpt = (hd + 31u) / 32u;
+        const char* pat = "const HD_PER_THREAD: u32 = 4u;";
+        std::string rep = "const HD_PER_THREAD: u32 = " + std::to_string(hpt) + "u;";
+        size_t pos = 0;
+        while ((pos = s.find(pat, pos)) != std::string::npos) {
+            s.replace(pos, strlen(pat), rep);
+            pos += rep.size();
         }
-
-        // For unrolled 4-element load/store patterns, replace with loop.
-        // Pattern: "let q0 = Q[...]; let q1 = Q[... + 1u]; let q2 = Q[... + 2u]; let q3 = Q[... + 3u];"
-        // Replace with HD_PER_THREAD-element loop.
-        // This is complex to do via string replacement, so for HD_PER_THREAD != 4,
-        // we use the generic gqa_fused_attn kernel instead of gqa_chunked.
     }
 
     // HD_TILES = HD / 16 (flash_attn_vulkan)
@@ -180,7 +176,7 @@ std::string ModelRunner::patchShaderHD(const char* source) const {
             s.replace(pos, strlen(pat), rep);
     }
 
-    // Triton-generated kernel: literal "* 128;" and "f32(128.0)"
+    // Generated WGSL kernel: literal "* 128;" and "f32(128.0)"
     {
         std::string pat1 = "* 128;";
         std::string rep1 = "* " + std::to_string(hd) + ";";
@@ -489,10 +485,10 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
            cfg.hasQkNorm ? "yes" : "no");
     if (rotaryDim > 0 && rotaryDim != cfg.headDim)
         fprintf(stderr, "  Partial RoPE: rotary_dim=%u (head_dim=%u)\n", rotaryDim, cfg.headDim);
-    if (cfg.headDim != 128 && cfg.headDim % 32 == 0)
+    if (cfg.headDim != 128)
         fprintf(stderr, "  Note: head_dim=%u (attention kernels will be HD-patched)\n", cfg.headDim);
-    if (cfg.headDim % 32 != 0) {
-        fprintf(stderr, "Error: head_dim=%u is not a multiple of 32\n", cfg.headDim);
+    if (cfg.headDim % 2 != 0) {
+        fprintf(stderr, "Error: odd head_dim=%u is unsupported by RoPE\n", cfg.headDim);
         return false;
     }
 

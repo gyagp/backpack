@@ -30,10 +30,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let kv_off = kv_head * HD;
     let q_base = head * HD;
 
-    // Load Q into local array
+    // Load Q into local array. HD_PER_THREAD may be ceil(HD / 32), so the
+    // final lanes are padding for head_dim values like 80.
     var q: array<f32, HD_PER_THREAD>;
     for (var e = 0u; e < HD_PER_THREAD; e++) {
-        q[e] = Q[q_base + lane * HD_PER_THREAD + e];
+        let d = lane * HD_PER_THREAD + e;
+        q[e] = 0.0;
+        if (d < HD) {
+            q[e] = Q[q_base + d];
+        }
     }
 
     let t_start = chunk_id * CHUNK;
@@ -50,7 +55,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let k_base = select(0u, t * kv_stride + kv_off, valid);
         var dot_partial: f32 = 0.0;
         for (var e = 0u; e < HD_PER_THREAD; e++) {
-            let k = select(0.0, f32(K_cache[k_base + lane * HD_PER_THREAD + e]), valid);
+            let d = lane * HD_PER_THREAD + e;
+            var k = 0.0;
+            if (valid && d < HD) {
+                k = f32(K_cache[k_base + d]);
+            }
             dot_partial += q[e] * k;
         }
         let dot = subgroupAdd(dot_partial);
@@ -66,7 +75,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         let v_base = select(0u, t * kv_stride + kv_off, valid);
         for (var e = 0u; e < HD_PER_THREAD; e++) {
-            let v = select(0.0, f32(V_cache[v_base + lane * HD_PER_THREAD + e]), valid);
+            let d = lane * HD_PER_THREAD + e;
+            var v = 0.0;
+            if (valid && d < HD) {
+                v = f32(V_cache[v_base + d]);
+            }
             acc[e] = acc[e] * rescale + v * w;
         }
 
@@ -84,7 +97,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             Partials[base + 1u] = l_prev;
         }
         for (var e = 0u; e < HD_PER_THREAD; e++) {
-            Partials[base + 2u + lane * HD_PER_THREAD + e] = acc[e];
+            let d = lane * HD_PER_THREAD + e;
+            if (d < HD) {
+                Partials[base + 2u + d] = acc[e];
+            }
         }
     }
 }

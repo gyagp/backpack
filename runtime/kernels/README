@@ -26,7 +26,7 @@
 #
 # Metadata:
 #   Optional first-line comment for codegen hints:
-#     // @meta bindings=6 triton=true registry=custom_name noregistry=true
+#     // @meta bindings=6 generated=true registry=custom_name noregistry=true
 #   If omitted, bindings are auto-counted from @binding(N) annotations.
 #
 # To add a new kernel:

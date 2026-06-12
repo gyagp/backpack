@@ -1,223 +1,66 @@
 # Backpack
 
-LLM inference engine powered by Triton kernels compiled to WebGPU (WGSL) and executed on Dawn.
+Backpack is a C++ WebGPU inference runtime for LLM and multimodal workloads. The runtime owns the model execution code, manually written WGSL kernels, profiling, and tests. Applications live under `apps/`, and performance experiments live under `benchmarks/`.
 
 ## Architecture
 
 ```
-Triton Kernel → TTIR → TTGIR → LLIR (SPIR-V triple) → WGSL → Dawn
+GGUF / ONNX weights -> Backpack runtime ops -> WGSL kernels -> Dawn WebGPU
 ```
 
-Unlike llama.cpp which uses hand-written kernel implementations, Backpack writes kernels in Triton, then leverages [triton-windows](https://github.com/gyagp/triton-windows) to convert LLVM IR to WGSL (WebGPU Shading Language), and runs them on [Dawn](https://dawn.googlesource.com/dawn) (Google's WebGPU implementation).
-
-## Supported Models
-
-All models run fully on Triton WebGPU — no PyTorch at inference time.
-
-| Model | Type | Params | Real Weights | Status | Performance |
-|-------|------|--------|:------------:|--------|-------------|
-| **GPT-2** | LLM | 124M | ✅ | ✅ Shipping | 60ms TTFT, 97.5 tok/s decode |
-| **Phi-4** | LLM | 3.8B | ✅ | ✅ Shipping | 458ms TTFT, 124.6 tok/s decode, INT4 |
-| **Qwen 2.5** | LLM | 0.5B–1.5B | ✅ | ✅ Shipping | GQA, RoPE, SwiGLU |
-| **Qwen 3.5** | LLM | 27B | ✅ | ✅ Shipping | 919 tok/s (bench), INT4, Mamba-2 hybrid |
-| **SmolLM2** | LLM | 1.7B | ✅ | ✅ Shipping | 136ms TTFT, 209 tok/s decode, INT4 |
-| **GPT-OSS** | LLM (MoE) | — | ✅ | ✅ Shipping | MXFP4 quantized, MoE routing |
-| **Whisper** | Speech-to-Text | 39M | ✅ | ✅ Shipping | 160ms encoder, 30 tok/s decode, 0.9s total |
-| **SAM3** | Segmentation | 31M | ✅ | ✅ Shipping | 2.3s encoder + 33ms decoder (1024×1024) |
-| **Flux-Klein** | Image Gen | — | — | ✅ Verified | DiT architecture |
-| **SD-Turbo** | Image Gen | — | — | ✅ Verified | UNet, 1-step distilled |
-| **SDXL** | Image Gen | — | — | ✅ Verified | UNet, cross-attention |
-
-**Legend:** ✅ Real Weights = runs with real HuggingFace weights end-to-end. ✅ Verified = passes correctness test with random weights.
+Backpack no longer depends on Triton. Kernels are authored and maintained directly under `runtime/kernels/`, embedded into C++ with `runtime/gen_wgsl_shaders.py`, and executed through Dawn.
 
 ## Project Structure
 
 ```
 backpack/
-├── models/           # Model implementations
-│   ├── common/       # Shared kernels, base classes, utilities
-│   ├── gpt2/         # GPT-2 inference
-│   ├── gemma/        # Google Gemma
-│   ├── phi4/         # Microsoft Phi-4
-│   ├── qwen2.5/      # Alibaba Qwen 2.5
-│   └── ...           # More models
-├── docs/             # Documentation
-├── third_party/
-│   ├── triton-windows/   # Triton compiler with WebGPU backend (webgpu branch)
-│   └── dawn/             # Google's WebGPU implementation
+├── runtime/       # C++ runtime, ops, WGSL kernels, profiling, tests
+├── apps/          # C++ applications such as LLM chat, ASR, and image generation
+├── benchmarks/    # Performance tuning scripts and comparisons
+├── docs/          # Design notes, investigations, and optimization notes
+├── scripts/       # Helper scripts
+├── third_party/   # External dependencies such as Dawn
+└── gitignore/     # Local generated files, build output, models, logs, traces
 ```
 
-## Third-Party Dependencies
+## Prerequisites
 
-- **triton-windows** ([webgpu branch](https://github.com/gyagp/triton-windows/tree/webgpu)): Triton compiler fork with WebGPU backend support, based on [triton-lang/triton-windows](https://github.com/triton-lang/triton-windows) `release/3.6.x-windows`
-- **Dawn**: Google's native WebGPU implementation providing D3D12/Vulkan/Metal backends
+| Tool | Notes |
+|------|-------|
+| Windows 10/11 | x86-64 |
+| Python 3.13+ | Used for provisioning scripts and shader embedding |
+| MSVC v143+ | Visual Studio 2022 Build Tools or Community |
+| CMake + Ninja | `pip install cmake ninja` is sufficient |
+| Git | Required to clone Dawn |
 
-## Getting Started
+## Build
 
-### Prerequisites
-
-| Tool | Version | Notes |
-|------|---------|-------|
-| **OS** | Windows 10/11 | x86-64 only |
-| **Python** | 3.13+ | Disable path length limit during install |
-| **MSVC** | v143+ (VS 2022) | [Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe) or Community edition |
-| **CMake** | 3.20+ | `pip install cmake` or system install |
-| **Ninja** | 1.11+ | `pip install ninja` |
-| **Git** | any | Required for Dawn dependency fetching |
-
-### Quick Start (recommended)
+Use the Python build entry point from a normal PowerShell. It loads MSVC if needed and writes runtime build output to `gitignore/runtime/build/`.
 
 ```powershell
-git clone https://github.com/gyagp/backpack.git
-cd backpack
-.\build.ps1          # Full setup: deps, clone, build Dawn, build triton
-.\build.ps1 verify   # Verify the pipeline works
+python build.py setup
+python build.py runtime
 ```
 
-The build script automates everything — MSVC detection, repo cloning, Dawn build, triton build, and deployment. It skips steps that are already done, so it's safe to re-run.
-
-Individual targets are available for partial builds:
+Common targets:
 
 ```powershell
-.\build.ps1 help           # Show all targets
-.\build.ps1 dawn           # Rebuild Dawn only
-.\build.ps1 triton         # Rebuild triton only
-.\build.ps1 clean          # Remove all build artifacts
-.\build.ps1 info           # Show build status
+python build.py deps
+python build.py clone
+python build.py dawn
+python build.py runtime
+python build.py info
+python build.py clean
 ```
 
-### Manual Steps (if not using build.ps1)
+GNU Make users can call the same targets through `make`, for example `make runtime`.
 
-<details>
-<summary>Click to expand manual setup steps</summary>
+## Kernels
 
-#### Step 1: Clone the Repository
+All runtime WGSL sources live in `runtime/kernels/`. Regenerate embedded shader constants after editing kernels:
 
 ```powershell
-git clone https://github.com/gyagp/backpack.git
-cd backpack
+python runtime/gen_wgsl_shaders.py
 ```
 
-#### Step 2: Clone Third-Party Dependencies
-
-```powershell
-# Dawn (WebGPU runtime)
-git clone https://dawn.googlesource.com/dawn third_party/dawn
-
-# triton-windows (Triton compiler with WebGPU backend)
-git clone -b webgpu https://github.com/gyagp/triton-windows.git third_party/triton-windows
-```
-
-#### Step 3: Load MSVC Environment
-
-Open **"x64 Native Tools Command Prompt for VS 2022"**, or from PowerShell:
-
-```powershell
-cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 && set' | ForEach-Object {
-    if ($_ -match '^([^=]+)=(.*)$') {
-        [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
-    }
-}
-
-# Verify: should print "Microsoft (R) C/C++ Optimizing Compiler ..."
-cl 2>&1 | Select-Object -First 1
-```
-
-#### Step 4: Install Python Dependencies
-
-```powershell
-pip install setuptools wheel cmake ninja pybind11 lit
-pip install numpy tiktoken requests
-```
-
-#### Step 5: Build Dawn
-
-Dawn produces `webgpu_dawn.dll` (the WebGPU runtime) plus DXC shader compiler DLLs.
-
-```powershell
-cd third_party/dawn
-
-# Configure (fetches third-party deps automatically)
-cmake -S . -B build -G Ninja `
-    -DCMAKE_BUILD_TYPE=Release `
-    -DDAWN_FETCH_DEPENDENCIES=ON `
-    -DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED `
-    -DBUILD_SHARED_LIBS=OFF `
-    -DDAWN_USE_BUILT_DXC=ON `
-    -DDAWN_ENABLE_D3D12=ON `
-    -DDAWN_ENABLE_D3D11=ON `
-    -DDAWN_ENABLE_VULKAN=ON `
-    -DDAWN_ENABLE_NULL=ON `
-    -DDAWN_ENABLE_INSTALL=ON `
-    -DDAWN_FORCE_SYSTEM_COMPONENT_LOAD=ON `
-    -DDAWN_ENABLE_DESKTOP_GL=OFF `
-    -DDAWN_ENABLE_OPENGLES=OFF `
-    -DDAWN_ENABLE_SWIFTSHADER=OFF `
-    -DDAWN_BUILD_SAMPLES=OFF `
-    -DDAWN_BUILD_TESTS=OFF `
-    -DDAWN_BUILD_BENCHMARKS=OFF `
-    -DDAWN_BUILD_NODE_BINDINGS=OFF `
-    -DDAWN_BUILD_PROTOBUF=OFF `
-    -DDAWN_WERROR=OFF `
-    -DTINT_BUILD_CMD_TOOLS=OFF `
-    -DTINT_BUILD_TESTS=OFF
-
-# Build (10-30 minutes)
-cmake --build build --target webgpu_dawn --target dxcompiler
-cmake --build build --target third_party/copy_dxil_dll
-
-cd ../..
-```
-
-#### Step 6: Deploy Dawn DLLs
-
-The `dawn_runner.py` searches for DLLs at `triton-windows/third_party/webgpu/dawn/build/`:
-
-```powershell
-$dawn_dll_dir = "third_party/triton-windows/third_party/webgpu/dawn/build"
-New-Item -ItemType Directory -Path $dawn_dll_dir -Force | Out-Null
-
-Copy-Item third_party/dawn/build/webgpu_dawn.dll $dawn_dll_dir/
-Copy-Item third_party/dawn/build/dxcompiler.dll   $dawn_dll_dir/
-Copy-Item third_party/dawn/build/dxil.dll         $dawn_dll_dir/
-```
-
-#### Step 7: Build & Install triton-windows
-
-```powershell
-$env:TRITON_BUILD_PROTON = "0"
-$env:TRITON_BUILD_UT = "0"
-
-cd third_party/triton-windows
-pip install --no-build-isolation --verbose -e .
-cd ../..
-```
-
-> **Note:** The first build downloads a pre-compiled LLVM (~1 GB) and compiles the Triton C++ core (~15-45 min). Subsequent builds are incremental.
-
-#### Step 8: Verify
-
-```powershell
-# Quick pipeline verification with random weights (no download needed)
-python models/gpt2/model.py --verify
-
-# Full GPT-2 text generation (downloads ~500 MB weights on first run)
-python models/gpt2/model.py --prompt "The future of AI is"
-```
-
-</details>
-
-### Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `No module named 'triton'` | Re-run Step 7, or set `TRITON_BACKENDS_IN_TREE=1` |
-| `No CMAKE_CXX_COMPILER found` | Load MSVC environment (Step 3) |
-| `DynamicLib.Open: dxil.dll Error 126` | Re-run Step 6 to deploy DXC DLLs |
-| `Failed to create Dawn WebGPU device` | Check GPU drivers; Dawn needs D3D12 or Vulkan capable GPU |
-| `0 compatible backends for target (webgpu)` | Ensure `third_party/webgpu/backend/` exists in triton-windows |
-| `LLVM pre-compiled image is not available` | Use `release/3.6.x-windows` branch or `webgpu` branch from gyagp fork |
-
-## Documentation
-
-See [docs/triton-webgpu.md](docs/triton-webgpu.md) for architecture details and [docs/opt-guide.md](docs/opt-guide.md) for optimization guidance.
+Generated and temporary files belong under `gitignore/`; downloaded models should use `gitignore/models/` or another explicitly external model cache.

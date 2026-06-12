@@ -30,8 +30,7 @@ if exist _build\webgpu_dawn.dll (
     copy /Y _build\src\dawn\native\webgpu_dawn.lib build\src\dawn\native\webgpu_dawn.lib
     xcopy /Y /S _build\gen\include\dawn\* build\gen\include\dawn\ >nul 2>&1
 
-    REM Copy to triton-windows path (where backpack CMakeLists copies DLL from)
-    copy /Y _build\webgpu_dawn.dll ..\triton-windows\third_party\webgpu\dawn\build\webgpu_dawn.dll
+    REM Backpack CMake now copies Dawn DLLs directly from third_party\dawn\build.
 
     echo Done.
 ) else (

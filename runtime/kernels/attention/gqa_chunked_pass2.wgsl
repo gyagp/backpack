@@ -40,7 +40,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             let w = l_chunk * exp_chunk / max(l_new, 1e-10);
 
             for (var e = 0u; e < HD_PER_THREAD; e++) {
-                let v = Partials[base + 2u + lane * HD_PER_THREAD + e];
+                let d = lane * HD_PER_THREAD + e;
+                var v = 0.0;
+                if (d < HD) {
+                    v = Partials[base + 2u + d];
+                }
                 acc[e] = acc[e] * rescale + v * w;
             }
 
@@ -50,6 +54,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
 
     for (var e = 0u; e < HD_PER_THREAD; e++) {
-        Out[head * HD + lane * HD_PER_THREAD + e] = acc[e];
+        let d = lane * HD_PER_THREAD + e;
+        if (d < HD) {
+            Out[head * HD + d] = acc[e];
+        }
     }
 }

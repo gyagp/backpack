@@ -4,8 +4,8 @@
 
 - `runtime/` — C++ runtime (WebGPU inference engine, WGSL kernels, ops, profiling, tests)
 - `apps/` — C++ applications (LLM chat/benchmark, image generation)
-- `compiler/` — Python compiler (Triton kernels, ONNX graph compilation)
-- `third_party/` — External dependencies (Dawn, Triton)
+- `benchmarks/` — Performance tuning scripts and llama.cpp/ORT comparison harnesses
+- `third_party/` — External dependencies (Dawn and other vendored libraries)
 
 ## Rules
 

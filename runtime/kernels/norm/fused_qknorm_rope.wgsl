@@ -1,4 +1,4 @@
-// @meta triton=true
+// @meta generated=true
 enable f16;
 enable subgroups;
 
@@ -39,7 +39,7 @@ struct Params {
 @group(0) @binding(8) var<storage, read> params: Params;
 
 const HD: u32 = 128u;
-const EPT: u32 = HD / WG_SIZE;  // elements per thread
+const EPT: u32 = (HD + WG_SIZE - 1u) / WG_SIZE;  // elements per thread
 
 @compute @workgroup_size(128)
 fn main(

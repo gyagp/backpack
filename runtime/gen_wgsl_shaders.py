@@ -14,10 +14,10 @@ Template kernels (containing ${T} markers) produce two constants:
 Non-template .wgsl files produce just WGSL_<NAME>.
 
 Metadata can be specified in .wgsl files via a comment on the first line:
-  // @meta bindings=6 triton=true registry=custom_name noregistry=true
+  // @meta bindings=6 generated=true registry=custom_name noregistry=true
 
 If 'bindings' is not specified, it is auto-counted from @binding(N) annotations.
-If 'triton' is not specified, defaults to false.
+If 'generated' is not specified, defaults to false.
 If 'registry' is specified, the kernel uses that name as the registry key.
 If 'noregistry=true', the kernel is excluded from getEmbeddedKernels().
 
@@ -87,7 +87,7 @@ def count_bindings(src: str) -> int:
 
 def parse_meta(src: str):
     """Parse // @meta key=value from first few lines."""
-    meta = {"bindings": None, "triton": False, "registry": None, "noregistry": False}
+    meta = {"bindings": None, "generated": False, "registry": None, "noregistry": False}
     for line in src.split("\n")[:5]:
         m = re.match(r'//\s*@meta\s+(.*)', line)
         if m:
@@ -96,8 +96,8 @@ def parse_meta(src: str):
                     k, v = token.split("=", 1)
                     if k == "bindings":
                         meta["bindings"] = int(v)
-                    elif k == "triton":
-                        meta["triton"] = v.lower() == "true"
+                    elif k == "generated":
+                        meta["generated"] = v.lower() == "true"
                     elif k == "registry":
                         meta["registry"] = v
                     elif k == "noregistry":
@@ -160,12 +160,12 @@ def main():
     lines.append('struct ShaderInfo {')
     lines.append('    const char* source;')
     lines.append('    uint32_t numBindings;')
-    lines.append('    bool isTritonGenerated;  // true = Triton-compiled, false = hand-written WGSL')
+    lines.append('    bool isGenerated;  // true = generated WGSL, false = hand-written WGSL')
     lines.append('};')
     lines.append('')
 
     # Track registry entries
-    registry_entries = []  # (key, var_name, bindings, triton)
+    registry_entries = []  # (key, var_name, bindings, generated)
 
     total_constants = 0
 
@@ -220,7 +220,7 @@ def main():
             if should_register(name, meta, tmpl):
                 reg_key = meta.get("registry") or name
                 reg_var = var_name  # always point to the base constant (not _T)
-                registry_entries.append((reg_key, reg_var, bindings, meta["triton"]))
+                registry_entries.append((reg_key, reg_var, bindings, meta["generated"]))
 
     # Sort registry entries by key for stable output
     registry_entries.sort(key=lambda e: e[0])
@@ -230,9 +230,9 @@ def main():
     lines.append('')
     lines.append('inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {')
     lines.append('    static const std::unordered_map<std::string, ShaderInfo> kernels = {')
-    for reg_key, reg_var, bindings, triton in registry_entries:
-        triton_str = "true" if triton else "false"
-        lines.append(f'        {{"{reg_key}", {{{reg_var}, {bindings}, {triton_str}}}}},')
+    for reg_key, reg_var, bindings, generated in registry_entries:
+        generated_str = "true" if generated else "false"
+        lines.append(f'        {{"{reg_key}", {{{reg_var}, {bindings}, {generated_str}}}}},')
     lines.append('    };')
     lines.append('    return kernels;')
     lines.append('}')

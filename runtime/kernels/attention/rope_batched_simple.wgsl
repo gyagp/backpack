@@ -26,6 +26,9 @@ enable subgroups;
 const HD: u32 = 128u;
 const HALF: u32 = 64u;
 
+var<workgroup> smem_q: array<f32, 4>;
+var<workgroup> smem_k: array<f32, 4>;
+
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -57,14 +60,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         }
         // Warp reduce
         let warp_sum = subgroupAdd(sum_sq);
-        var smem: array<f32, 4>;
         let warp_id = tid / 32u;
         let lane = tid % 32u;
-        if (lane == 0u) { smem[warp_id] = warp_sum; }
+        if (lane == 0u) { smem_q[warp_id] = warp_sum; }
         workgroupBarrier();
-        var ss: f32 = 0.0;
-        if (tid < 4u) { ss = smem[tid]; }
-        let final_sq = subgroupAdd(ss);
+        let final_sq = smem_q[0] + smem_q[1] + smem_q[2] + smem_q[3];
         let rstd = 1.0 / sqrt(final_sq / f32(HD) + eps);
 
         // Apply norm + RoPE, write to QRot
@@ -97,14 +97,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             sum_sq += v * v;
         }
         let warp_sum = subgroupAdd(sum_sq);
-        var smem2: array<f32, 4>;
         let warp_id = tid / 32u;
         let lane = tid % 32u;
-        if (lane == 0u) { smem2[warp_id] = warp_sum; }
+        if (lane == 0u) { smem_k[warp_id] = warp_sum; }
         workgroupBarrier();
-        var ss: f32 = 0.0;
-        if (tid < 4u) { ss = smem2[tid]; }
-        let final_sq = subgroupAdd(ss);
+        let final_sq = smem_k[0] + smem_k[1] + smem_k[2] + smem_k[3];
         let rstd = 1.0 / sqrt(final_sq / f32(HD) + eps);
 
         // KV cache layout: [MAX_SEQ × n_kv × HD]
