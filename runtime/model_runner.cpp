@@ -843,8 +843,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     (weightQuantType == GGUF_TYPE_Q4_K ||
                      weightQuantType == GGUF_TYPE_Q5_K ||
                      weightQuantType == GGUF_TYPE_Q6_K);
-    auto packKQ = [&](const void* data, uint32_t N, uint32_t K) -> KQuantPacked {
-        switch (weightQuantType) {
+    auto packKQ = [&](const void* data, uint32_t N, uint32_t K, GGUFType type) -> KQuantPacked {
+        switch (type) {
             case GGUF_TYPE_Q4_K: return pack_q4k(data, N, K);
             case GGUF_TYPE_Q5_K: return pack_q5k(data, N, K);
             case GGUF_TYPE_Q6_K: return pack_q6k(data, N, K);
@@ -1013,9 +1013,9 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     (kt.type == GGUF_TYPE_Q4_K || kt.type == GGUF_TYPE_Q5_K || kt.type == GGUF_TYPE_Q6_K) &&
                     (vt.type == GGUF_TYPE_Q4_K || vt.type == GGUF_TYPE_Q5_K || vt.type == GGUF_TYPE_Q6_K);
                 if (allKQ) {
-                    auto qp = packKQ(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd);
-                    auto kp = packKQ(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd);
-                    auto vp = packKQ(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd);
+                    auto qp = packKQ(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
+                    auto kp = packKQ(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
+                    auto vp = packKQ(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
                     auto fused = fuseKQ(fuseKQ(qp, kp), vp);
                     if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
@@ -1046,7 +1046,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& ti = gguf.tensors[it->second];
                 bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
                 if (tensorIsKQ) {
-                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim);
+                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim, (GGUFType)ti.type);
                     if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
                 } else {
@@ -1068,8 +1068,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     (gt.type == GGUF_TYPE_Q4_K || gt.type == GGUF_TYPE_Q5_K || gt.type == GGUF_TYPE_Q6_K) &&
                     (ut.type == GGUF_TYPE_Q4_K || ut.type == GGUF_TYPE_Q5_K || ut.type == GGUF_TYPE_Q6_K);
                 if (bothKQ) {
-                    auto gp = packKQ(fileData + gguf.data_offset + gt.offset, layerIM, cfg.nEmbd);
-                    auto up = packKQ(fileData + gguf.data_offset + ut.offset, layerIM, cfg.nEmbd);
+                    auto gp = packKQ(fileData + gguf.data_offset + gt.offset, layerIM, cfg.nEmbd, (GGUFType)gt.type);
+                    auto up = packKQ(fileData + gguf.data_offset + ut.offset, layerIM, cfg.nEmbd, (GGUFType)ut.type);
                     auto fused = fuseKQ(gp, up);
                     if (i == 0) { kqGuNBlocks = fused.nBlocks; kqGuRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".gu_kq", fused, lw.guKQ);
@@ -1098,7 +1098,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& ti = gguf.tensors[it->second];
                 bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
                 if (tensorIsKQ) {
-                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM);
+                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM, (GGUFType)ti.type);
                     if (i == 0) { kqDnNBlocks = kq.nBlocks; kqDnRowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".dn_kq", kq, lw.dnKQ);
                 } else {
@@ -1359,7 +1359,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 if (isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K ||
                                  ti.type == GGUF_TYPE_Q6_K)) {
                     // Upload as K-quant on GPU
-                    auto kq = packKQ(data, cfg.nVocab, cfg.nEmbd);
+                    auto kq = packKQ(data, cfg.nVocab, cfg.nEmbd, (GGUFType)ti.type);
                     kqLmNBlocks = kq.nBlocks;
                     kqLmRowStride = kq.rowStrideWords;
                     uploadKQWeight("lm_head_kq", kq, lmHeadKQ);
@@ -1688,11 +1688,18 @@ void ModelRunner::buildDecodePipeline() {
         gpu->writeBuffer(lmheadParams, fp, 16);
     }
 
+    uint32_t argmaxNumWg = std::max(1u, (cfg.nVocab + 1023u) / 1024u);
     GPUBuffer argmaxParams;
     {
-        uint32_t p[4] = {cfg.nVocab, 0, 0, 0};
+        uint32_t p[4] = {cfg.nVocab, argmaxNumWg, 0, 0};
         argmaxParams = gpu->createBuffer("p_argmax", 16);
         gpu->writeBuffer(argmaxParams, p, 16);
+    }
+    GPUBuffer argmaxReduceParams;
+    {
+        uint32_t p[4] = {argmaxNumWg, 0, 0, 0};
+        argmaxReduceParams = gpu->createBuffer("p_argmax_reduce", 16);
+        gpu->writeBuffer(argmaxReduceParams, p, 16);
     }
 
     GPUBuffer embedParams;
@@ -1754,6 +1761,7 @@ void ModelRunner::buildDecodePipeline() {
 
     // Shared argmax result buffer
     argmaxResultBuf = gpu->createBuffer("argmax_result", 4);
+    argmaxPartialsBuf = gpu->createBuffer("argmax_partials", argmaxNumWg * 2u * 4u);
 
     // PLE buffers
     if (cfg.pleSize > 0) {
@@ -2861,9 +2869,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // GPU argmax
     {
+        auto& plArgmaxReduce = getKernel("argmax_reduce");
         auto bg = makeBG(plArgmax, {
-            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxParams}});
-        allDecodeDispatches.push_back({plArgmax.pipeline, bg, 1, 1, 1, "argmax"});
+            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxParams}, {3, argmaxPartialsBuf}});
+        allDecodeDispatches.push_back({plArgmax.pipeline, bg, argmaxNumWg, 1, 1, "argmax"});
+        auto bgReduce = makeBG(plArgmaxReduce, {
+            {0, argmaxPartialsBuf}, {1, argmaxResultBuf}, {2, argmaxReduceParams}});
+        allDecodeDispatches.push_back({plArgmaxReduce.pipeline, bgReduce, 1, 1, 1, "argmax_reduce"});
     }
 
     // Auto-decode: embed_gather + full pipeline

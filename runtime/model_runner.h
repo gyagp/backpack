@@ -80,6 +80,7 @@ struct ModelRunner {
 
     // Shared argmax result buffer
     GPUBuffer argmaxResultBuf;
+    GPUBuffer argmaxPartialsBuf;
 
     // --- Staging pool for pipelined async readback ---
     // Each pool slot has its own staging buffer + pre-recorded CBs.

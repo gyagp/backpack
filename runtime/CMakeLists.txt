@@ -77,9 +77,6 @@ set_target_properties(backpack_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(backpack SHARED backpack.cpp lm_session.cpp $<TARGET_OBJECTS:backpack_core>)
 target_compile_definitions(backpack PRIVATE BACKPACK_BUILDING)
-set_target_properties(backpack PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
-)
 target_include_directories(backpack PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${DAWN_SRC}/include
