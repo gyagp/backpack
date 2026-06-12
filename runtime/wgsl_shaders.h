@@ -16949,35 +16949,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // [ssm] delta_net_decode
 static const char* WGSL_DELTA_NET_DECODE = R"WGSL(
-// DeltaNet decode step — matrix-state recurrence for qwen35moe linear attention
+// DeltaNet decode step — matrix-state recurrence for qwen35 linear attention
 //
 // Per-head state is a matrix [head_k_dim, head_v_dim]. Per decode step:
-//   state[h] = state[h] * decay[h]  +  beta[h] * outer(k[h], v[h])
-//   y[h]     = q[h] @ state[h]                   // [head_k] · [head_k, head_v] = [head_v]
+//   kv      = dot(k[h], exp(g[h]) * state[h, :, v_col])
+//   delta   = (v[h, v_col] - kv) * beta[h]
+//   state'  = exp(g[h]) * state + outer(k[h], delta)
+//   y       = q[h] @ state'
 //
 // Heads layout: num_v_heads outputs; K is shared in groups (num_k_heads <= num_v_heads).
-// For qwen35moe: num_v_heads=32, num_k_heads=16, head_k_dim=128, head_v_dim=128.
+// Q and K are num_k_heads-wide; Q/K head index is derived from the V head.
 //
 // Bindings:
-//   0: q       [num_v_heads * head_k_dim]      f32
+//   0: q       [num_k_heads * head_k_dim]      f32
 //   1: k       [num_k_heads * head_k_dim]      f32  (shared groups of v_heads / k_heads)
 //   2: v       [num_v_heads * head_v_dim]      f32
 //   3: beta    [num_v_heads]                   f32
-//   4: decay   [num_v_heads]                   f32  (already exp'd by host)
+//   4: gate    [num_v_heads]                   f32  (exp applied in-kernel)
 //   5: state   [num_v_heads * head_k_dim * head_v_dim]  f32  (read+write)
 //   6: y       [num_v_heads * head_v_dim]      f32  (write)
 //   7: _params_                                — [num_v_heads, num_k_heads, head_k_dim, head_v_dim]
 //
-// Workgroup: one workgroup per (head, v_dim_chunk). Threads cooperate on k_dim reduction.
+// Grid: one workgroup per V head. Workgroup size is 128, matching qwen35 head_k_dim.
 
 @group(0) @binding(0) var<storage, read>       q:        array<f32>;
 @group(0) @binding(1) var<storage, read>       k:        array<f32>;
 @group(0) @binding(2) var<storage, read>       v:        array<f32>;
 @group(0) @binding(3) var<storage, read>       beta:     array<f32>;
-@group(0) @binding(4) var<storage, read>       decay:    array<f32>;
+@group(0) @binding(4) var<storage, read>       gate:     array<f32>;
 @group(0) @binding(5) var<storage, read_write> state:    array<f32>;
 @group(0) @binding(6) var<storage, read_write> y:        array<f32>;
 @group(0) @binding(7) var<storage, read>       _params_: array<u32>;
+
+var<workgroup> scratch: array<f32, 128>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -16992,37 +16996,49 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
     let k_head_idx = (head * nk) / nv;  // mapping v-head → k-head group
 
-    let q_base = head * dk;
+    let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
     let v_base = head * dv;
     let state_base = head * dk * dv;
 
     let bh = beta[head];
-    let dh = decay[head];
-
-    // Phase 1: update state. Each thread handles one row of state (one k_dim index).
-    // state[h, ki, vi] = state[h, ki, vi] * decay[h] + beta[h] * k[h, ki] * v[h, vi]
-    // Workgroup_size=128 = dk for qwen35moe; iterate over dv inside each thread.
+    let gh = exp(gate[head]);
     let ki = tid;
-    if (ki < dk) {
-        let k_ki = k[k_base + ki];
-        let bk = bh * k_ki;
-        for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
-            let idx = state_base + ki * dv + vi;
-            state[idx] = state[idx] * dh + bk * v[v_base + vi];
-        }
-    }
-    workgroupBarrier();
 
-    // Phase 2: y[h, vi] = sum over ki of q[h, ki] * state[h, ki, vi]
-    // Re-use threads: each thread handles one vi (dv = dk = 128, so same threads).
-    let vi = tid;
-    if (vi < dv) {
-        var acc: f32 = 0.0;
-        for (var ki2: u32 = 0u; ki2 < dk; ki2 = ki2 + 1u) {
-            acc = acc + q[q_base + ki2] * state[state_base + ki2 * dv + vi];
+    for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
+        var partial: f32 = 0.0;
+        if (ki < dk) {
+            partial = gh * state[state_base + ki * dv + vi] * k[k_base + ki];
         }
-        y[v_base + vi] = acc;
+        scratch[ki] = partial;
+        workgroupBarrier();
+        for (var stride: u32 = 64u; stride > 0u; stride = stride / 2u) {
+            if (ki < stride) {
+                scratch[ki] = scratch[ki] + scratch[ki + stride];
+            }
+            workgroupBarrier();
+        }
+        let delta = (v[v_base + vi] - scratch[0]) * bh;
+
+        var attn_partial: f32 = 0.0;
+        if (ki < dk) {
+            let idx = state_base + ki * dv + vi;
+            let s_new = gh * state[idx] + k[k_base + ki] * delta;
+            state[idx] = s_new;
+            attn_partial = s_new * q[q_base + ki];
+        }
+        scratch[ki] = attn_partial;
+        workgroupBarrier();
+        for (var stride2: u32 = 64u; stride2 > 0u; stride2 = stride2 / 2u) {
+            if (ki < stride2) {
+                scratch[ki] = scratch[ki] + scratch[ki + stride2];
+            }
+            workgroupBarrier();
+        }
+        if (ki == 0u) {
+            y[v_base + vi] = scratch[0];
+        }
+        workgroupBarrier();
     }
 }
 )WGSL";
@@ -17055,6 +17071,169 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // softplus, numerically stable: max(z, 0) + log(1 + exp(-|z|))
     let abs_z = abs(z);
     dt_out[c] = max(z, 0.0) + log(1.0 + exp(-abs_z));
+}
+)WGSL";
+
+// [ssm] qwen35_alpha_beta_gate
+static const char* WGSL_QWEN35_ALPHA_BETA_GATE = R"WGSL(
+// qwen35 DeltaNet scalar gates:
+//   beta = sigmoid(beta_proj)
+//   gate = softplus(alpha_proj + dt_bias) * ssm_a
+//
+// Bindings:
+//   0: beta_proj  [num_v_heads]
+//   1: alpha_proj [num_v_heads]
+//   2: dt_bias    [num_v_heads]
+//   3: ssm_a      [num_v_heads]
+//   4: beta_out   [num_v_heads]
+//   5: gate_out   [num_v_heads]
+//   6: _params_   [num_v_heads]
+
+@group(0) @binding(0) var<storage, read>       beta_proj:  array<f32>;
+@group(0) @binding(1) var<storage, read>       alpha_proj: array<f32>;
+@group(0) @binding(2) var<storage, read>       dt_bias:    array<f32>;
+@group(0) @binding(3) var<storage, read>       ssm_a:      array<f32>;
+@group(0) @binding(4) var<storage, read_write> beta_out:   array<f32>;
+@group(0) @binding(5) var<storage, read_write> gate_out:   array<f32>;
+@group(0) @binding(6) var<storage, read>       _params_:   array<u32>;
+
+fn softplus(x: f32) -> f32 {
+    return max(x, 0.0) + log(1.0 + exp(-abs(x)));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = _params_[0];
+    let i = gid.x;
+    if (i >= n) { return; }
+    let b = beta_proj[i];
+    beta_out[i] = 1.0 / (1.0 + exp(-b));
+    gate_out[i] = softplus(alpha_proj[i] + dt_bias[i]) * ssm_a[i];
+}
+)WGSL";
+
+// [ssm] qwen35_norm_gated
+static const char* WGSL_QWEN35_NORM_GATED = R"WGSL(
+// Per-head RMSNorm over DeltaNet output, then gate with silu(z).
+//
+// Bindings:
+//   0: y        [num_v_heads * head_v_dim]
+//   1: norm_w   [head_v_dim]
+//   2: z        [num_v_heads * head_v_dim]
+//   3: out      [num_v_heads * head_v_dim]
+//   4: _params_ [num_v_heads, head_v_dim, eps_bits]
+
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read>       y:       array<f32>;
+@group(0) @binding(1) var<storage, read>       norm_w:  array<f32>;
+@group(0) @binding(2) var<storage, read>       z:       array<f32>;
+@group(0) @binding(3) var<storage, read_write> out:     array<f32>;
+@group(0) @binding(4) var<storage, read>       _params_: array<u32>;
+
+const WG: u32 = 128u;
+
+fn silu(x: f32) -> f32 {
+    return x / (1.0 + exp(-x));
+}
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nv = _params_[0];
+    let dv = _params_[1];
+    let eps = bitcast<f32>(_params_[2]);
+    let h = wid.x;
+    let tid = lid.x;
+    if (h >= nv) { return; }
+
+    var sum_sq: f32 = 0.0;
+    for (var d = tid; d < dv; d = d + WG) {
+        let v = y[h * dv + d];
+        sum_sq = sum_sq + v * v;
+    }
+    let total = subgroupAdd(sum_sq);
+    let scale = 1.0 / sqrt(total / f32(dv) + eps);
+    for (var d = tid; d < dv; d = d + WG) {
+        let idx = h * dv + d;
+        out[idx] = y[idx] * scale * norm_w[d] * silu(z[idx]);
+    }
+}
+)WGSL";
+
+// [ssm] qwen35_split_qkv_l2
+static const char* WGSL_QWEN35_SPLIT_QKV_L2 = R"WGSL(
+// Split qwen35 convolved Q/K/V and L2-normalize Q and K per head.
+//
+// conv_out layout:
+//   Q [num_k_heads * head_dim]
+//   K [num_k_heads * head_dim]
+//   V [num_v_heads * head_v_dim]
+//
+// Bindings:
+//   0: conv_out [conv_channels]
+//   1: q_out    [num_k_heads * head_dim]
+//   2: k_out    [num_k_heads * head_dim]
+//   3: v_out    [num_v_heads * head_v_dim]
+//   4: _params_ [num_k_heads, num_v_heads, head_dim, head_v_dim, eps_bits]
+
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read>       conv_out: array<f32>;
+@group(0) @binding(1) var<storage, read_write> q_out:    array<f32>;
+@group(0) @binding(2) var<storage, read_write> k_out:    array<f32>;
+@group(0) @binding(3) var<storage, read_write> v_out:    array<f32>;
+@group(0) @binding(4) var<storage, read>       _params_: array<u32>;
+
+const WG: u32 = 128u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nk = _params_[0];
+    let nv = _params_[1];
+    let dk = _params_[2];
+    let dv = _params_[3];
+    let eps = bitcast<f32>(_params_[4]);
+    let tid = lid.x;
+
+    let q_size = nk * dk;
+    let k_base = q_size;
+    let v_base = q_size * 2u;
+
+    if (wid.x == 0u) {
+        let h = wid.y;
+        if (h >= nk) { return; }
+        var sum_sq: f32 = 0.0;
+        for (var d = tid; d < dk; d = d + WG) {
+            let v = conv_out[h * dk + d];
+            sum_sq = sum_sq + v * v;
+        }
+        let total = subgroupAdd(sum_sq);
+        let rms = 1.0 / sqrt(max(total, eps));
+        for (var d = tid; d < dk; d = d + WG) {
+            q_out[h * dk + d] = conv_out[h * dk + d] * rms;
+        }
+    } else if (wid.x == 1u) {
+        let h = wid.y;
+        if (h >= nk) { return; }
+        var sum_sq: f32 = 0.0;
+        for (var d = tid; d < dk; d = d + WG) {
+            let v = conv_out[k_base + h * dk + d];
+            sum_sq = sum_sq + v * v;
+        }
+        let total = subgroupAdd(sum_sq);
+        let rms = 1.0 / sqrt(max(total, eps));
+        for (var d = tid; d < dk; d = d + WG) {
+            k_out[h * dk + d] = conv_out[k_base + h * dk + d] * rms;
+        }
+    } else {
+        let h = wid.y;
+        if (h >= nv) { return; }
+        for (var d = tid; d < dv; d = d + WG) {
+            v_out[h * dv + d] = conv_out[v_base + h * dv + d];
+        }
+    }
 }
 )WGSL";
 
@@ -17261,6 +17440,9 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"q8_matmul_vulkan", {WGSL_Q8_MATMUL_VULKAN, 6, false}},
         {"qmoe_matmul_q4", {WGSL_QMOE_MATMUL_Q4, 6, false}},
         {"quantize_fp32_rows_d3d12", {WGSL_QUANTIZE_FP32_ROWS_D3D12, 4, false}},
+        {"qwen35_alpha_beta_gate", {WGSL_QWEN35_ALPHA_BETA_GATE, 7, false}},
+        {"qwen35_norm_gated", {WGSL_QWEN35_NORM_GATED, 5, false}},
+        {"qwen35_split_qkv_l2", {WGSL_QWEN35_SPLIT_QKV_L2, 5, false}},
         {"resize_nearest", {WGSL_RESIZE_NEAREST, 3, false}},
         {"rms_norm", {WGSL_RMS_NORM, 5, true}},
         {"rms_norm_batched", {WGSL_RMS_NORM_BATCHED, 5, false}},

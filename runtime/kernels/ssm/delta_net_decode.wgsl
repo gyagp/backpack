@@ -1,32 +1,36 @@
-// DeltaNet decode step — matrix-state recurrence for qwen35moe linear attention
+// DeltaNet decode step — matrix-state recurrence for qwen35 linear attention
 //
 // Per-head state is a matrix [head_k_dim, head_v_dim]. Per decode step:
-//   state[h] = state[h] * decay[h]  +  beta[h] * outer(k[h], v[h])
-//   y[h]     = q[h] @ state[h]                   // [head_k] · [head_k, head_v] = [head_v]
+//   kv      = dot(k[h], exp(g[h]) * state[h, :, v_col])
+//   delta   = (v[h, v_col] - kv) * beta[h]
+//   state'  = exp(g[h]) * state + outer(k[h], delta)
+//   y       = q[h] @ state'
 //
 // Heads layout: num_v_heads outputs; K is shared in groups (num_k_heads <= num_v_heads).
-// For qwen35moe: num_v_heads=32, num_k_heads=16, head_k_dim=128, head_v_dim=128.
+// Q and K are num_k_heads-wide; Q/K head index is derived from the V head.
 //
 // Bindings:
-//   0: q       [num_v_heads * head_k_dim]      f32
+//   0: q       [num_k_heads * head_k_dim]      f32
 //   1: k       [num_k_heads * head_k_dim]      f32  (shared groups of v_heads / k_heads)
 //   2: v       [num_v_heads * head_v_dim]      f32
 //   3: beta    [num_v_heads]                   f32
-//   4: decay   [num_v_heads]                   f32  (already exp'd by host)
+//   4: gate    [num_v_heads]                   f32  (exp applied in-kernel)
 //   5: state   [num_v_heads * head_k_dim * head_v_dim]  f32  (read+write)
 //   6: y       [num_v_heads * head_v_dim]      f32  (write)
 //   7: _params_                                — [num_v_heads, num_k_heads, head_k_dim, head_v_dim]
 //
-// Workgroup: one workgroup per (head, v_dim_chunk). Threads cooperate on k_dim reduction.
+// Grid: one workgroup per V head. Workgroup size is 128, matching qwen35 head_k_dim.
 
 @group(0) @binding(0) var<storage, read>       q:        array<f32>;
 @group(0) @binding(1) var<storage, read>       k:        array<f32>;
 @group(0) @binding(2) var<storage, read>       v:        array<f32>;
 @group(0) @binding(3) var<storage, read>       beta:     array<f32>;
-@group(0) @binding(4) var<storage, read>       decay:    array<f32>;
+@group(0) @binding(4) var<storage, read>       gate:     array<f32>;
 @group(0) @binding(5) var<storage, read_write> state:    array<f32>;
 @group(0) @binding(6) var<storage, read_write> y:        array<f32>;
 @group(0) @binding(7) var<storage, read>       _params_: array<u32>;
+
+var<workgroup> scratch: array<f32, 128>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -41,36 +45,48 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
     let k_head_idx = (head * nk) / nv;  // mapping v-head → k-head group
 
-    let q_base = head * dk;
+    let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
     let v_base = head * dv;
     let state_base = head * dk * dv;
 
     let bh = beta[head];
-    let dh = decay[head];
-
-    // Phase 1: update state. Each thread handles one row of state (one k_dim index).
-    // state[h, ki, vi] = state[h, ki, vi] * decay[h] + beta[h] * k[h, ki] * v[h, vi]
-    // Workgroup_size=128 = dk for qwen35moe; iterate over dv inside each thread.
+    let gh = exp(gate[head]);
     let ki = tid;
-    if (ki < dk) {
-        let k_ki = k[k_base + ki];
-        let bk = bh * k_ki;
-        for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
-            let idx = state_base + ki * dv + vi;
-            state[idx] = state[idx] * dh + bk * v[v_base + vi];
-        }
-    }
-    workgroupBarrier();
 
-    // Phase 2: y[h, vi] = sum over ki of q[h, ki] * state[h, ki, vi]
-    // Re-use threads: each thread handles one vi (dv = dk = 128, so same threads).
-    let vi = tid;
-    if (vi < dv) {
-        var acc: f32 = 0.0;
-        for (var ki2: u32 = 0u; ki2 < dk; ki2 = ki2 + 1u) {
-            acc = acc + q[q_base + ki2] * state[state_base + ki2 * dv + vi];
+    for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
+        var partial: f32 = 0.0;
+        if (ki < dk) {
+            partial = gh * state[state_base + ki * dv + vi] * k[k_base + ki];
         }
-        y[v_base + vi] = acc;
+        scratch[ki] = partial;
+        workgroupBarrier();
+        for (var stride: u32 = 64u; stride > 0u; stride = stride / 2u) {
+            if (ki < stride) {
+                scratch[ki] = scratch[ki] + scratch[ki + stride];
+            }
+            workgroupBarrier();
+        }
+        let delta = (v[v_base + vi] - scratch[0]) * bh;
+
+        var attn_partial: f32 = 0.0;
+        if (ki < dk) {
+            let idx = state_base + ki * dv + vi;
+            let s_new = gh * state[idx] + k[k_base + ki] * delta;
+            state[idx] = s_new;
+            attn_partial = s_new * q[q_base + ki];
+        }
+        scratch[ki] = attn_partial;
+        workgroupBarrier();
+        for (var stride2: u32 = 64u; stride2 > 0u; stride2 = stride2 / 2u) {
+            if (ki < stride2) {
+                scratch[ki] = scratch[ki] + scratch[ki + stride2];
+            }
+            workgroupBarrier();
+        }
+        if (ki == 0u) {
+            y[v_base + vi] = scratch[0];
+        }
+        workgroupBarrier();
     }
 }
