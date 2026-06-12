@@ -342,6 +342,8 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
 
     // Extract model config from GGUF metadata
     cfg = extractModelConfig(gguf);
+    rotaryDim = gguf.getU32(cfg.arch + ".rope.dimension_count", 0);
+    if (rotaryDim == cfg.headDim) rotaryDim = 0;
     fprintf(stderr, "  [runner.load] config extracted: arch=%s nLayer=%u\n", cfg.arch.c_str(), cfg.nLayer); fflush(stderr);
     if (cfg.numExperts > 0) {
         fprintf(stderr, "  [runner.load] MoE detected: %u experts, top-%u active, expert FFN dim=%u\n",
@@ -394,17 +396,26 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     fprintf(stderr, "  RoPE theta=%.0f, RMSNorm eps=%.1e, QK-norm=%s\n",
            cfg.ropeTheta, cfg.rmsNormEps,
            cfg.hasQkNorm ? "yes" : "no");
+    if (rotaryDim > 0)
+        fprintf(stderr, "  Partial RoPE: rotary_dim=%u (head_dim=%u)\n", rotaryDim, cfg.headDim);
     if (cfg.numExperts > 0) {
         fprintf(stderr, "  MoE: %u experts, top-%u active per token, expert FFN dim=%u, shared FFN dim=%u\n",
                 cfg.numExperts, cfg.numExpertsPerTok, cfg.moeIntermediateSize, cfg.moeSharedIntermediateSize);
     }
     if (cfg.ssmInnerSize > 0) {
-        fprintf(stderr, "  SSM (Mamba): d_inner=%u, d_state=%u, conv_k=%u, groups=%u, dt_rank=%u%s\n",
+        fprintf(stderr, "  SSM/linear attention: d_inner=%u, d_state=%u, conv_k=%u, groups=%u, dt_rank=%u%s\n",
                 cfg.ssmInnerSize, cfg.ssmStateSize, cfg.ssmConvKernel,
                 cfg.ssmGroupCount, cfg.ssmTimeStepRank,
                 cfg.fullAttentionInterval > 0
                     ? (std::string(" (full-attn every ") + std::to_string(cfg.fullAttentionInterval) + " layers)").c_str()
                     : "");
+    }
+    if (cfg.arch == "qwen35") {
+        fprintf(stderr,
+            "\nERROR: qwen35 GGUF detected, but the DeltaNet + partial-RoPE attention\n"
+            "       decode path is not fully implemented yet. Refusing to generate\n"
+            "       known-wrong output; correctness must be established before perf.\n");
+        return false;
     }
 
     // Single compute pass for all backends — Dawn handles barriers internally
@@ -703,7 +714,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     }
     uint32_t effQkvOut = qkvOut;
     // For qwen35moe attention dispatch: needs qOutDim=4*nEmbd for joint Q+gate.
-    if (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0) {
+    if ((cfg.arch == "qwen35" || cfg.numExperts > 0) && cfg.fullAttentionInterval > 0) {
         effQkvOut = std::max(effQkvOut, 4u * cfg.nEmbd);
     }
 
@@ -946,7 +957,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
         // qwen35moe attention layer: load Q/K/V SEPARATELY (no fuse) so Q can be
         // joint Q+gate (2x normal Q dim). Skip the fuse path below.
-        bool isQ35AttnLayer = (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0 &&
+        bool isQ35AttnLayer = ((cfg.arch == "qwen35" || cfg.numExperts > 0) && cfg.fullAttentionInterval > 0 &&
                                cfg.isAttentionLayer(i));
         if (isQ35AttnLayer) {
             auto qi = gguf.tensor_index.find(pfx + "attn_q.weight");
@@ -967,7 +978,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, vOutDim, cfg.nEmbd, (GGUFType)vt.type);
                 uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".vSep", vr, lw.vSepW, lw.vSepS);
                 if (i == 3) {
-                    fprintf(stderr, "  qwen35moe attn layer %u: Q(2x)=%u K=%u V=%u (E=%u)\n",
+                    fprintf(stderr, "  qwen35 attn layer %u: Q(2x)=%u K=%u V=%u (E=%u)\n",
                             i, qOutDim, kOutDim, vOutDim, cfg.nEmbd);
                 }
             }
@@ -1811,8 +1822,16 @@ void ModelRunner::buildDecodePipeline() {
     if (cfg.ssmInnerSize > 0) {
         ssmConvState.resize(cfg.nLayer);
         ssmHState.resize(cfg.nLayer);
-        size_t convBytes = (size_t)cfg.ssmInnerSize * cfg.ssmConvKernel * 4;
-        size_t hBytes    = (size_t)cfg.ssmInnerSize * cfg.ssmStateSize * 4;
+        size_t convChannels = (cfg.arch == "qwen35")
+            ? (size_t)cfg.ssmInnerSize + 2ull * cfg.ssmGroupCount * cfg.ssmStateSize
+            : (size_t)cfg.ssmInnerSize;
+        size_t convBytes = convChannels * cfg.ssmConvKernel * 4;
+        size_t hElems = (size_t)cfg.ssmInnerSize * cfg.ssmStateSize;
+        if (cfg.arch == "qwen35" && cfg.ssmTimeStepRank > 0) {
+            size_t headV = cfg.ssmInnerSize / cfg.ssmTimeStepRank;
+            hElems = (size_t)cfg.ssmTimeStepRank * headV * headV;
+        }
+        size_t hBytes = hElems * 4;
         uint32_t ssmLayerCount = 0;
         for (uint32_t li = 0; li < cfg.nLayer; li++) {
             if (cfg.isAttentionLayer(li)) continue;
@@ -1842,7 +1861,7 @@ void ModelRunner::buildDecodePipeline() {
         q35AttnOutBuf = gpu->createBuffer("q35_attn_out", maxQDim * 4);
         // Cos/sin table for MRoPE: 4 sections × max 16 pairs × 2 (cos,sin) = 128 floats
         q35CosSinBuf  = gpu->createBuffer("q35_cossin", 128 * 4);
-        fprintf(stderr, "  qwen35moe attn buffers: qj=%uB q=%uB gate=%uB k=%uB v=%uB attn=%uB\n",
+        fprintf(stderr, "  qwen35 attn buffers: qj=%uB q=%uB gate=%uB k=%uB v=%uB attn=%uB\n",
                 maxQjDim*4u, maxQDim*4u, maxQDim*4u, maxKvDim*4u, maxKvDim*4u, maxQDim*4u);
     }
 

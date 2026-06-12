@@ -162,12 +162,12 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
     cfg.ropeTheta       = gguf.getFloat(a + ".rope.freq_base", 1000000.0f);
     cfg.tieWordEmbeddings = !gguf.hasKey("output.weight");
 
-    // head_dim: either from rope.dimension_count or derived
-    uint32_t ropeDim = gguf.getU32(a + ".rope.dimension_count", 0);
-    cfg.headDim = ropeDim > 0 ? ropeDim : cfg.nEmbd / cfg.nHead;
-    // K/V per-head dim — separate from headDim for some archs (qwen35moe).
-    // attention.key_length holds the actual K/V per-head dim when present.
-    cfg.kvHeadDim = gguf.getU32(a + ".attention.key_length", cfg.headDim);
+    // attention.key_length is the actual Q/K/V head width for archs with
+    // partial RoPE (qwen35 has 256-wide heads and 64 rotated dims).  Do not
+    // use rope.dimension_count as headDim; it is only the rotary sub-dim.
+    uint32_t denseHeadDim = cfg.nHead > 0 ? cfg.nEmbd / cfg.nHead : 0;
+    cfg.kvHeadDim = gguf.getU32(a + ".attention.key_length", denseHeadDim);
+    cfg.headDim = cfg.kvHeadDim > 0 ? cfg.kvHeadDim : denseHeadDim;
 
     // n_vocab from embedding tensor shape
     auto it = gguf.tensor_index.find("token_embd.weight");
