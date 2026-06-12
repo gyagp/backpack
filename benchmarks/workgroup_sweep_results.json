@@ -1,0 +1,215 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "timestamp": "2026-05-05T02:57:19",
+  "kernels": {
+    "matmul": {
+      "sweep": [
+        {
+          "config": "128x128_bk32_wg64",
+          "bm": 128,
+          "bn": 128,
+          "bk": 32,
+          "workgroup_size": 64,
+          "wg_dims": [
+            8,
+            8
+          ],
+          "median_ms": 147.928,
+          "gflops": 116.1
+        },
+        {
+          "config": "64x64_bk32_wg64",
+          "bm": 64,
+          "bn": 64,
+          "bk": 32,
+          "workgroup_size": 64,
+          "wg_dims": [
+            8,
+            8
+          ],
+          "median_ms": 50.33,
+          "gflops": 341.3
+        },
+        {
+          "config": "128x128_bk32_wg128",
+          "bm": 128,
+          "bn": 128,
+          "bk": 32,
+          "workgroup_size": 128,
+          "wg_dims": [
+            8,
+            16
+          ],
+          "median_ms": 75.34,
+          "gflops": 228.0
+        },
+        {
+          "config": "64x128_bk32_wg128",
+          "bm": 64,
+          "bn": 128,
+          "bk": 32,
+          "workgroup_size": 128,
+          "wg_dims": [
+            8,
+            16
+          ],
+          "median_ms": 36.719,
+          "gflops": 467.9
+        },
+        {
+          "config": "64x64_bk16_wg256",
+          "bm": 64,
+          "bn": 64,
+          "bk": 16,
+          "workgroup_size": 256,
+          "wg_dims": [
+            16,
+            16
+          ],
+          "median_ms": 5.52,
+          "gflops": 3112.6
+        },
+        {
+          "config": "64x64_bk32_wg256",
+          "bm": 64,
+          "bn": 64,
+          "bk": 32,
+          "workgroup_size": 256,
+          "wg_dims": [
+            16,
+            16
+          ],
+          "median_ms": 6.455,
+          "gflops": 2661.6
+        },
+        {
+          "config": "128x128_bk16_wg256",
+          "bm": 128,
+          "bn": 128,
+          "bk": 16,
+          "workgroup_size": 256,
+          "wg_dims": [
+            16,
+            16
+          ],
+          "median_ms": 33.589,
+          "gflops": 511.5
+        },
+        {
+          "config": "128x128_bk32_wg256",
+          "bm": 128,
+          "bn": 128,
+          "bk": 32,
+          "workgroup_size": 256,
+          "wg_dims": [
+            16,
+            16
+          ],
+          "median_ms": 40.324,
+          "gflops": 426.0
+        },
+        {
+          "config": "256x128_bk16_wg256",
+          "bm": 256,
+          "bn": 128,
+          "bk": 16,
+          "workgroup_size": 256,
+          "wg_dims": [
+            16,
+            16
+          ],
+          "median_ms": 38.612,
+          "gflops": 444.9
+        },
+        {
+          "config": "128x128_bk32_wg512",
+          "bm": 128,
+          "bn": 128,
+          "bk": 32,
+          "workgroup_size": 512,
+          "wg_dims": [
+            16,
+            32
+          ],
+          "median_ms": 22.363,
+          "gflops": 768.2
+        },
+        {
+          "config": "256x128_bk16_wg512",
+          "bm": 256,
+          "bn": 128,
+          "bk": 16,
+          "workgroup_size": 512,
+          "wg_dims": [
+            16,
+            32
+          ],
+          "median_ms": 21.926,
+          "gflops": 783.5
+        }
+      ],
+      "best": {
+        "config": "64x64_bk16_wg256",
+        "bm": 64,
+        "bn": 64,
+        "bk": 16,
+        "workgroup_size": 256,
+        "wg_dims": [
+          16,
+          16
+        ],
+        "median_ms": 5.52,
+        "gflops": 3112.6
+      }
+    },
+    "rmsnorm": {
+      "sweep": [
+        {
+          "workgroup_size": 64,
+          "median_ms": 0.023
+        },
+        {
+          "workgroup_size": 128,
+          "median_ms": 0.023
+        },
+        {
+          "workgroup_size": 256,
+          "median_ms": 0.037
+        },
+        {
+          "workgroup_size": 512,
+          "median_ms": 0.048
+        }
+      ],
+      "best": {
+        "workgroup_size": 64,
+        "median_ms": 0.023
+      }
+    },
+    "attention": {
+      "sweep": [
+        {
+          "workgroup_size": 64,
+          "median_ms": 0.107
+        },
+        {
+          "workgroup_size": 128,
+          "median_ms": 0.109
+        },
+        {
+          "workgroup_size": 256,
+          "median_ms": 0.113
+        },
+        {
+          "workgroup_size": 512,
+          "median_ms": 0.123
+        }
+      ],
+      "best": {
+        "workgroup_size": 64,
+        "median_ms": 0.107
+      }
+    }
+  }
+}
