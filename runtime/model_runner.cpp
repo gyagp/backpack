@@ -1303,17 +1303,31 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 gpu->writeBuffer(buf, fp32.data(), bytes);
                 return true;
             };
+            auto loadProjQ8 = [&](const std::string& name, uint32_t N, uint32_t K,
+                                  GPUBuffer& wBuf, GPUBuffer& sBuf) -> bool {
+                auto it = gguf.tensor_index.find(name);
+                if (it == gguf.tensor_index.end()) return false;
+                auto& ti = gguf.tensors[it->second];
+                auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                      N, K, (GGUFType)ti.type);
+                uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                return true;
+            };
             int loaded = 0;
             if (loadRaw(pfx + "ssm_conv1d.weight", lw.ssmConv1dW)) loaded++;
             if (loadRaw(pfx + "ssm_dt.bias",       lw.ssmDtBias))  loaded++;
             if (loadRaw(pfx + "ssm_a",             lw.ssmA))       loaded++;
-            // Beta/alpha may be quantized; for now also dequant to fp32 (TODO: keep Q8)
-            if (loadRaw(pfx + "ssm_beta.weight",   lw.ssmBetaW))   loaded++;
-            if (loadRaw(pfx + "ssm_alpha.weight",  lw.ssmAlphaW))  loaded++;
             if (loadRaw(pfx + "ssm_norm.weight",   lw.ssmNorm))    loaded++;
-            if (loadRaw(pfx + "ssm_out.weight",    lw.ssmOutW))    loaded++;
+            if (loadProjQ8(pfx + "ssm_beta.weight", cfg.ssmTimeStepRank, cfg.nEmbd,
+                           lw.ssmBetaW, lw.ssmBetaS)) loaded++;
+            if (loadProjQ8(pfx + "ssm_alpha.weight", cfg.ssmTimeStepRank, cfg.nEmbd,
+                           lw.ssmAlphaW, lw.ssmAlphaS)) loaded++;
+            if (loadProjQ8(pfx + "ssm_out.weight", cfg.nEmbd, cfg.ssmInnerSize,
+                           lw.ssmOutW, lw.ssmOutS)) loaded++;
+            if (loadProjQ8(pfx + "attn_gate.weight", cfg.ssmInnerSize, cfg.nEmbd,
+                           lw.attnGateW, lw.attnGateS)) loaded++;
             if (i == 0) {
-                fprintf(stderr, "  SSM weights loaded for layer 0: %d/7 tensors\n", loaded);
+                fprintf(stderr, "  SSM/DeltaNet weights loaded for layer 0: %d/8 tensors\n", loaded);
             }
         }
 
