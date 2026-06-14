@@ -1770,7 +1770,8 @@ void ModelRunner::buildDecodePipeline() {
             perLayerGuParams[li] = makeQ8Params("p_gu_" + std::to_string(li), cfg.nEmbd, 2 * pl.intermediateSize);
             {
                 uint32_t data[4] = {pl.intermediateSize, cfg.nEmbd, pl.intermediateSize, 0};
-                perLayerDnSiluParams[li] = gpu->createBuffer("p_dn_silu_" + std::to_string(li), 16);
+                perLayerDnSiluParams[li] = gpu->createBuffer(
+                    "p_dn_silu_" + std::to_string(li), 16, BUF_UNIFORM | BUF_COPY_DST);
                 gpu->writeBuffer(perLayerDnSiluParams[li], data, 16);
             }
         }
@@ -1779,7 +1780,7 @@ void ModelRunner::buildDecodePipeline() {
     GPUBuffer q8DnSiluParams;
     {
         uint32_t data[4] = {cfg.intermediateSize, cfg.nEmbd, cfg.intermediateSize, 0};
-        q8DnSiluParams = gpu->createBuffer("p_dn_silu", 16);
+        q8DnSiluParams = gpu->createBuffer("p_dn_silu", 16, BUF_UNIFORM | BUF_COPY_DST);
         gpu->writeBuffer(q8DnSiluParams, data, 16);
     }
 

@@ -12381,18 +12381,24 @@ enable subgroups;
 //   2: Scales (read) — fp16 scales packed as u32
 //   3: Bias (read) — per-output bias (zeros for no bias)
 //   4: Y (read_write) — output += matmul result (residual add)
-//   5: _params_ — [K=IM, N=E, IM, 0]
+//   5: params — [K=IM, N=E, IM, 0]
 
 @group(0) @binding(0) var<storage, read_write> GateUp: array<f32>;
 @group(0) @binding(1) var<storage, read_write> W_Q8: array<u32>;
 @group(0) @binding(2) var<storage, read_write> Scales: array<u32>;
 @group(0) @binding(3) var<storage, read_write> Bias: array<f32>;
 @group(0) @binding(4) var<storage, read_write> Y: array<f32>;
-@group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
+
+struct Params {
+    K: u32,
+    N: u32,
+    IM: u32,
+    pad: u32,
+};
+@group(0) @binding(5) var<uniform> params: Params;
 
 const TILE_N: u32 = 8u;
 const STRIDE: u32 = 256u;
-const MAX_STRIDES: u32 = 64u;  // supports up to K=16384
 
 var<workgroup> smem_x: array<f32, 256>;
 
@@ -12403,9 +12409,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let tile_col = wid.y;
     let tid = lid.x;
 
-    let K = _params_[0];   // IM (intermediate_size)
-    let N = _params_[1];   // E (n_embd)
-    let IM = _params_[2];  // same as K, used for up offset
+    let K = params.K;    // IM (intermediate_size)
+    let N = params.N;    // E (n_embd)
+    let IM = params.IM;  // same as K, used for up offset
 
     let warp_id = tid / 32u;
     let lane = tid % 32u;
@@ -12415,24 +12421,28 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_blocks = K / 32u;
     let w_base = select(0u, col * stride_w, valid);
     let s_base = select(0u, col * n_blocks, valid);
+    let n_strides = (K + STRIDE - 1u) / STRIDE;
     var acc: f32 = 0.0;
 
-    for (var g = 0u; g < MAX_STRIDES; g = g + 1u) {
+    for (var g = 0u; g < n_strides; g = g + 1u) {
         let k_off = g * STRIDE;
-        let in_range = k_off < K;
+        let elem_in_range = k_off + tid < K;
 
         // Load gate and up values, apply silu·mul, store to shared memory
-        if (in_range) {
+        if (elem_in_range) {
             let idx = k_off + tid;
             let gate = GateUp[row * 2u * IM + idx];         // gate[idx]
             let up   = GateUp[row * 2u * IM + IM + idx];    // up[idx]
             // silu(gate) * up = gate / (1 + exp(-gate)) * up
             let silu_gate = gate / (1.0 + exp(-gate));
             smem_x[tid] = silu_gate * up;
+        } else {
+            smem_x[tid] = 0.0;
         }
         workgroupBarrier();
 
-        if (valid && in_range) {
+        let lane_in_range = k_off + lane * 8u < K;
+        if (valid && lane_in_range) {
             let k_base = lane * 8u;
             let xv0 = vec4<f32>(smem_x[k_base], smem_x[k_base+1u],
                                 smem_x[k_base+2u], smem_x[k_base+3u]);
