@@ -556,6 +556,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let neg_inf = bitcast<f32>(_params_[6]);
     let max_chunks = _params_[7];
 
+    if (chunk_id >= n_chunks) {
+        return;
+    }
+
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
     let q_base = head * HD;
@@ -617,20 +621,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         l_prev = l_new;
     }
 
-    // Use max_chunks for the stride to prevent overlapping writes
-    // across heads. Only write if this chunk is within n_chunks.
+    // Use max_chunks for the stride to prevent overlapping writes across heads.
     let partial_stride = HD + 2u;
     let base = head * max_chunks * partial_stride + chunk_id * partial_stride;
-    if (chunk_id < n_chunks) {
-        if (lane == 0u) {
-            Partials[base] = m_prev;
-            Partials[base + 1u] = l_prev;
-        }
-        for (var e = 0u; e < HD_PER_THREAD; e++) {
-            let d = lane * HD_PER_THREAD + e;
-            if (d < HD) {
-                Partials[base + 2u + d] = acc[e];
-            }
+    if (lane == 0u) {
+        Partials[base] = m_prev;
+        Partials[base + 1u] = l_prev;
+    }
+    for (var e = 0u; e < HD_PER_THREAD; e++) {
+        let d = lane * HD_PER_THREAD + e;
+        if (d < HD) {
+            Partials[base + 2u + d] = acc[e];
         }
     }
 }
