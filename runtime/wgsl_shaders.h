@@ -17372,7 +17372,7 @@ static const char* WGSL_QWEN35_ALPHA_BETA_GATE = R"WGSL(
 //   3: ssm_a      [num_v_heads]
 //   4: beta_out   [num_v_heads]
 //   5: gate_out   [num_v_heads]
-//   6: _params_   [num_v_heads]
+//   6: _params_   [num_v_heads, alpha_offset]
 
 @group(0) @binding(0) var<storage, read>       beta_proj:  array<f32>;
 @group(0) @binding(1) var<storage, read>       alpha_proj: array<f32>;
@@ -17389,11 +17389,12 @@ fn softplus(x: f32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = _params_[0];
+    let alpha_offset = _params_[1];
     let i = gid.x;
     if (i >= n) { return; }
     let b = beta_proj[i];
     beta_out[i] = 1.0 / (1.0 + exp(-b));
-    gate_out[i] = softplus(alpha_proj[i] + dt_bias[i]) * ssm_a[i];
+    gate_out[i] = softplus(alpha_proj[alpha_offset + i] + dt_bias[i]) * ssm_a[i];
 }
 )WGSL";
 

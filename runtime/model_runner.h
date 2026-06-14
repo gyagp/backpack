@@ -60,6 +60,7 @@ struct ModelRunner {
     GPUBuffer q35SsmQBuf;     // [ssm group_count * state_size] normalized Q
     GPUBuffer q35SsmKBuf;     // [ssm group_count * state_size] normalized K
     GPUBuffer q35SsmVBuf;     // [ssm inner_size] V
+    GPUBuffer q35SsmBetaAlphaBuf; // [2 * ssm time_step_rank], beta_proj || alpha_proj
     GPUBuffer q35SsmBetaBuf;  // [ssm time_step_rank]
     GPUBuffer q35SsmAlphaBuf; // [ssm time_step_rank]
     GPUBuffer q35SsmGateBuf;  // [ssm time_step_rank]
@@ -184,6 +185,7 @@ struct ModelRunner {
         GPUBuffer ssmConv1dW;       // [d_inner, conv_k] depthwise conv1d
         GPUBuffer ssmDtBias;        // [d_inner] bias for dt projection
         GPUBuffer ssmA;             // [d_inner, d_state] state matrix (init log-space)
+        GPUBuffer ssmBetaAlphaW, ssmBetaAlphaS; // fused beta || alpha projection
         GPUBuffer ssmBetaW, ssmBetaS;    // beta projection (Q8 if quantized)
         GPUBuffer ssmAlphaW, ssmAlphaS;  // alpha projection
         GPUBuffer ssmNorm;          // [d_inner] RMSNorm weight

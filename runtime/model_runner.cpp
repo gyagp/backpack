@@ -1403,15 +1403,50 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
                 return true;
             };
+            auto repackProjQ8 = [&](const std::string& name, uint32_t N, uint32_t K,
+                                    Q8Repacked& rep) -> bool {
+                auto it = gguf.tensor_index.find(name);
+                if (it == gguf.tensor_index.end()) return false;
+                auto& ti = gguf.tensors[it->second];
+                rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                 N, K, (GGUFType)ti.type);
+                return true;
+            };
             int loaded = 0;
             if (loadRaw(pfx + "ssm_conv1d.weight", lw.ssmConv1dW)) loaded++;
             if (loadRaw(pfx + "ssm_dt.bias",       lw.ssmDtBias))  loaded++;
             if (loadRaw(pfx + "ssm_a",             lw.ssmA))       loaded++;
             if (loadRaw(pfx + "ssm_norm.weight",   lw.ssmNorm))    loaded++;
-            if (loadProjQ8(pfx + "ssm_beta.weight", cfg.ssmTimeStepRank, cfg.nEmbd,
-                           lw.ssmBetaW, lw.ssmBetaS)) loaded++;
-            if (loadProjQ8(pfx + "ssm_alpha.weight", cfg.ssmTimeStepRank, cfg.nEmbd,
-                           lw.ssmAlphaW, lw.ssmAlphaS)) loaded++;
+            Q8Repacked betaRep, alphaRep;
+            bool haveBeta = repackProjQ8(pfx + "ssm_beta.weight", cfg.ssmTimeStepRank,
+                                         cfg.nEmbd, betaRep);
+            bool haveAlpha = repackProjQ8(pfx + "ssm_alpha.weight", cfg.ssmTimeStepRank,
+                                          cfg.nEmbd, alphaRep);
+            if (haveBeta && haveAlpha && betaRep.K == alphaRep.K) {
+                Q8Repacked fused;
+                fused.N = betaRep.N + alphaRep.N;
+                fused.K = betaRep.K;
+                fused.weights.reserve(betaRep.weights.size() + alphaRep.weights.size());
+                fused.weights.insert(fused.weights.end(), betaRep.weights.begin(), betaRep.weights.end());
+                fused.weights.insert(fused.weights.end(), alphaRep.weights.begin(), alphaRep.weights.end());
+                fused.scales.reserve(betaRep.scales.size() + alphaRep.scales.size());
+                fused.scales.insert(fused.scales.end(), betaRep.scales.begin(), betaRep.scales.end());
+                fused.scales.insert(fused.scales.end(), alphaRep.scales.begin(), alphaRep.scales.end());
+                uploadQ8Weight(*gpu, pfx + "ssm_beta_alpha.weight", fused,
+                               lw.ssmBetaAlphaW, lw.ssmBetaAlphaS);
+                loaded += 2;
+            } else {
+                if (haveBeta) {
+                    uploadQ8Weight(*gpu, pfx + "ssm_beta.weight", betaRep,
+                                   lw.ssmBetaW, lw.ssmBetaS);
+                    loaded++;
+                }
+                if (haveAlpha) {
+                    uploadQ8Weight(*gpu, pfx + "ssm_alpha.weight", alphaRep,
+                                   lw.ssmAlphaW, lw.ssmAlphaS);
+                    loaded++;
+                }
+            }
             if (loadProjQ8(pfx + "ssm_out.weight", cfg.nEmbd, cfg.ssmInnerSize,
                            lw.ssmOutW, lw.ssmOutS)) loaded++;
             if (loadProjQ8(pfx + "attn_gate.weight", cfg.ssmInnerSize, cfg.nEmbd,
@@ -1993,6 +2028,7 @@ void ModelRunner::buildDecodePipeline() {
             q35SsmQBuf     = gpu->createBuffer("q35_ssm_q", qkDim * 4);
             q35SsmKBuf     = gpu->createBuffer("q35_ssm_k", qkDim * 4);
             q35SsmVBuf     = gpu->createBuffer("q35_ssm_v", cfg.ssmInnerSize * 4);
+            q35SsmBetaAlphaBuf = gpu->createBuffer("q35_ssm_beta_alpha", 2u * cfg.ssmTimeStepRank * 4);
             q35SsmBetaBuf  = gpu->createBuffer("q35_ssm_beta", cfg.ssmTimeStepRank * 4);
             q35SsmAlphaBuf = gpu->createBuffer("q35_ssm_alpha", cfg.ssmTimeStepRank * 4);
             q35SsmGateBuf  = gpu->createBuffer("q35_ssm_gate", cfg.ssmTimeStepRank * 4);
@@ -2127,27 +2163,40 @@ void ModelRunner::buildDecodePipeline() {
                 allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
                     1, (cfg.ssmInnerSize + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_z"});
             }
-            {
-                auto p = mkP32("p_ssm_beta_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
+            bool useFusedBetaAlpha = lw.ssmBetaAlphaW.handle && lw.ssmBetaAlphaS.handle;
+            if (useFusedBetaAlpha) {
+                auto p = mkP32("p_ssm_beta_alpha_L"+std::to_string(i),
+                               {cfg.nEmbd, 2u * cfg.ssmTimeStepRank});
                 auto bg = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.ssmBetaAlphaW}, {2, lw.ssmBetaAlphaS},
+                    {3, zeroBiasQKV}, {4, q35SsmBetaAlphaBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (2u * cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1,
+                    L+"ssm_beta_alpha"});
+            } else {
+                auto pBeta = mkP32("p_ssm_beta_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
+                auto bgBeta = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.ssmBetaW}, {2, lw.ssmBetaS},
-                    {3, zeroBiasQKV}, {4, q35SsmBetaBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    {3, zeroBiasQKV}, {4, q35SsmBetaBuf}, {5, pBeta}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgBeta,
                     1, (cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_beta"});
-            }
-            {
-                auto p = mkP32("p_ssm_alpha_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
-                auto bg = makeBG(plQ8Matmul, {
+
+                auto pAlpha = mkP32("p_ssm_alpha_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
+                auto bgAlpha = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.ssmAlphaW}, {2, lw.ssmAlphaS},
-                    {3, zeroBiasQKV}, {4, q35SsmAlphaBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    {3, zeroBiasQKV}, {4, q35SsmAlphaBuf}, {5, pAlpha}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgAlpha,
                     1, (cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_alpha"});
             }
             {
                 auto& plGate = getKernel("qwen35_alpha_beta_gate");
-                auto p = mkP32("p_ssm_abg_L"+std::to_string(i), {cfg.ssmTimeStepRank});
+                auto p = mkP32("p_ssm_abg_L"+std::to_string(i),
+                               {cfg.ssmTimeStepRank,
+                                useFusedBetaAlpha ? cfg.ssmTimeStepRank : 0u});
+                const GPUBuffer& betaProj = useFusedBetaAlpha ? q35SsmBetaAlphaBuf : q35SsmBetaBuf;
+                const GPUBuffer& alphaProj = useFusedBetaAlpha ? q35SsmBetaAlphaBuf : q35SsmAlphaBuf;
                 auto bg = makeBG(plGate, {
-                    {0, q35SsmBetaBuf}, {1, q35SsmAlphaBuf}, {2, lw.ssmDtBias},
+                    {0, betaProj}, {1, alphaProj}, {2, lw.ssmDtBias},
                     {3, lw.ssmA}, {4, q35SsmBetaBuf}, {5, q35SsmGateBuf}, {6, p}});
                 allDecodeDispatches.push_back({plGate.pipeline, bg,
                     (cfg.ssmTimeStepRank + 63) / 64, 1, 1, L+"ssm_abg"});
