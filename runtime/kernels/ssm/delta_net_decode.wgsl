@@ -19,7 +19,9 @@
 //   6: y       [num_v_heads * head_v_dim]      f32  (write)
 //   7: _params_                                — [num_v_heads, num_k_heads, head_k_dim, head_v_dim]
 //
-// Grid: one workgroup per V head. Workgroup size is 128, matching qwen35 head_k_dim.
+// Grid: one workgroup per (V head, V column). Workgroup size is 128, matching
+// qwen35 head_k_dim. Columns are independent, so this exposes the V dimension
+// instead of looping it serially inside one workgroup.
 
 enable subgroups;
 
@@ -55,7 +57,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let dk      = _params_[2];  // head_k_dim
     let dv      = _params_[3];  // head_v_dim
     let head    = wid.x;        // v-head index
-    if (head >= nv) { return; }
+    let vi      = wid.y;        // v column within the head
+    if (head >= nv || vi >= dv) { return; }
     let tid     = lid.x;
 
     let k_head_idx = head % nk;  // mapping v-head -> repeated k/q head
@@ -76,25 +79,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         kv = k[k_base + ki];
     }
 
-    for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
-        var kv_partial: f32 = 0.0;
-        if (ki < dk) {
-            kv_partial = gh * state[state_base + ki * dv + vi] * kv;
-        }
-        let kv_dot = reduce_wg_128(kv_partial, ki);
-        let delta = (v[v_base + vi] - kv_dot) * bh;
+    var kv_partial: f32 = 0.0;
+    if (ki < dk) {
+        kv_partial = gh * state[state_base + ki * dv + vi] * kv;
+    }
+    let kv_dot = reduce_wg_128(kv_partial, ki);
+    let delta = (v[v_base + vi] - kv_dot) * bh;
 
-        var attn_partial: f32 = 0.0;
-        if (ki < dk) {
-            let idx = state_base + ki * dv + vi;
-            let s_new = gh * state[idx] + kv * delta;
-            state[idx] = s_new;
-            attn_partial = s_new * qv;
-        }
-        let attn = reduce_wg_128(attn_partial, ki);
-        if (ki == 0u) {
-            y[v_base + vi] = attn;
-        }
-        workgroupBarrier();
+    var attn_partial: f32 = 0.0;
+    if (ki < dk) {
+        let idx = state_base + ki * dv + vi;
+        let s_new = gh * state[idx] + kv * delta;
+        state[idx] = s_new;
+        attn_partial = s_new * qv;
+    }
+    let attn = reduce_wg_128(attn_partial, ki);
+    if (ki == 0u) {
+        y[v_base + vi] = attn;
     }
 }

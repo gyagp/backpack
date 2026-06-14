@@ -2193,7 +2193,7 @@ void ModelRunner::buildDecodePipeline() {
                     {3, q35SsmBetaBuf}, {4, q35SsmGateBuf}, {5, ssmHState[i]},
                     {6, q35SsmYBuf}, {7, p}});
                 allDecodeDispatches.push_back({plDelta.pipeline, bg,
-                    cfg.ssmTimeStepRank, 1, 1, L+"ssm_delta"});
+                    cfg.ssmTimeStepRank, headV, 1, L+"ssm_delta"});
             }
             {
                 auto& plNormGate = getKernel("qwen35_norm_gated");
