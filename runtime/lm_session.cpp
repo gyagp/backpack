@@ -882,7 +882,7 @@ struct StandardState {
         for (uint32_t i = 0; i < n; i++) logits = runner.decode(tokens[i], i);
         DumpTopLogits("prefill", logits);
         int32_t next = ModelRunner::argmax(logits);
-        gpu->writeBuffer(runner.argmaxResultBuf, &next, 4);
+        runner.seedDecodeTokenInputs(next);
         pos = n;
         return next;
     }
@@ -892,7 +892,8 @@ struct StandardState {
 
         if (pipelineInFlight == 0) {
             for (int i = 0; i < depth; i++) {
-                runner.submitDecode(pos + i, i);
+                int slot = (pos + i) % depth;
+                runner.submitDecode(pos + i, slot);
             }
             pipelineInFlight = depth;
             pipelineNextSubmitPos = pos + depth;
@@ -1158,11 +1159,14 @@ int32_t LmSession::Decode() {
         return next;
     }
 
-    // Qwen3.5 correctness currently depends on synchronous token-by-token
-    // decode. The generic pipelined path still has a Qwen3.5 state hazard.
+    // Qwen3.5 uses the queued decode path after fixing slot-local dynamic
+    // params and GPU embedding gather. Keep a synchronous fallback for
+    // validation or bisecting correctness regressions.
     auto* std = impl_->std_.get();
     int32_t next;
-    if (std->runner.cfg.arch == "qwen35") {
+    bool q35Sync = std->runner.cfg.arch == "qwen35" &&
+                   std::getenv("BP_Q35_SYNC") != nullptr;
+    if (q35Sync) {
         next = std->DecodeArgmaxSynchronous(impl_->lastToken);
     } else {
         next = std->DecodePipelined();

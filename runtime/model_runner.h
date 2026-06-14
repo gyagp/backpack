@@ -88,6 +88,10 @@ struct ModelRunner {
     std::vector<int> ropeDispatchIndices;   // fused_rope per layer
     std::vector<int> attnP1DispatchIndices; // gqa_chunked_pass1 per layer
     std::vector<int> attnP2DispatchIndices; // gqa_chunked_pass2 per layer
+    std::vector<int> q35QRoPEDispatchIndices; // Qwen3.5 Q RoPE per attention layer
+    std::vector<int> q35KvWriteDispatchIndices; // Qwen3.5 K RoPE + KV write per attention layer
+    int argmaxDispatchIndex = -1;
+    int argmaxReduceDispatchIndex = -1;
 
     // Shared argmax result buffer
     GPUBuffer argmaxResultBuf;
@@ -108,6 +112,8 @@ struct ModelRunner {
         // while GPU still reads current token's params.
         GPUBuffer ropeParamsBuf, attnParamsBuf;
         GPUBuffer attnParamsBufSWA; // sliding window layers
+        GPUBuffer q35RopeQParamsBuf, q35RopeKParamsBuf, q35KvWriteParamsBuf;
+        GPUBuffer tokenInBuf, tokenOutBuf;
         // Per-slot dispatch list (cloned from autoDecodeDispatches with
         // per-slot bind groups for param-referencing dispatches).
         std::vector<Dispatch> dispatches;
@@ -289,6 +295,7 @@ struct ModelRunner {
     void submitDecode(uint32_t posOffset, int slot);
     /// Wait for and read the argmax result from pool slot.
     int32_t readArgmax(int slot);
+    void seedDecodeTokenInputs(int32_t tokenId);
     /// Fire-and-forget prefill step: upload embedding + params, submit, no readback.
     /// GPU queue executes in order, so T sequential prefillStep calls are safe.
     void prefillStep(int32_t tokenId, uint32_t posOffset);

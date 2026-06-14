@@ -477,10 +477,12 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
                     ? (std::string(" (full-attn every ") + std::to_string(cfg.fullAttentionInterval) + " layers)").c_str()
                     : "");
     }
-    // Single compute pass for all backends — Dawn handles barriers internally
-    passPerDispatch = false;
-    fprintf(stderr, "  Backend: %s, single-pass dispatch\n",
-           gpu->backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan");
+    // Single compute pass for all backends by default; BP_PASS_PER_DISPATCH=1
+    // is a debug/validation override for command-buffer hazard isolation.
+    passPerDispatch = std::getenv("BP_PASS_PER_DISPATCH") != nullptr;
+    fprintf(stderr, "  Backend: %s, %s dispatch\n",
+           gpu->backendType == WGPUBackendType_D3D12 ? "D3D12" : "Vulkan",
+           passPerDispatch ? "pass-per-dispatch" : "single-pass");
 
     // Memory-map GGUF file for tensor data
     MappedFile ggufMap;
@@ -1710,6 +1712,11 @@ void ModelRunner::buildDecodePipeline() {
     useMMA = (gpu->backendType != WGPUBackendType_D3D12) && subgroupMatrixKernelReady;
     decodePoolCapacity = chooseDecodePoolDepth(*gpu);
     decodePoolDepth = decodePoolCapacity;
+    if (const char* depthEnv = std::getenv("BP_DECODE_DEPTH")) {
+        int forcedDepth = std::atoi(depthEnv);
+        if (forcedDepth > 0)
+            decodePoolDepth = std::max(1, std::min(forcedDepth, decodePoolCapacity));
+    }
     decodeCbPoolBatch = chooseDecodeCbPoolBatch(*gpu, cfg);
         fprintf(stderr, "  Initial decode heuristic: qkv=%s oproj=%s gateup=%s lm_head=%s pool=%d batch=%d\n",
         tuning.decodeUseFastQkv ? "fast" : "base",
@@ -1828,6 +1835,8 @@ void ModelRunner::buildDecodePipeline() {
     GPUBuffer embedParams;
     {
         uint32_t p[4] = {cfg.nEmbd, 0, 0, 0};
+        float normalizer = 1.0f;
+        memcpy(&p[1], &normalizer, 4);
         embedParams = gpu->createBuffer("p_embed", 16);
         gpu->writeBuffer(embedParams, p, 16);
     }
@@ -2040,6 +2049,10 @@ void ModelRunner::buildDecodePipeline() {
     ropeDispatchIndices.assign(cfg.nLayer, -1);
     attnP1DispatchIndices.assign(cfg.nLayer, -1);
     attnP2DispatchIndices.assign(cfg.nLayer, -1);
+    q35QRoPEDispatchIndices.assign(cfg.nLayer, -1);
+    q35KvWriteDispatchIndices.assign(cfg.nLayer, -1);
+    argmaxDispatchIndex = -1;
+    argmaxReduceDispatchIndex = -1;
 
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         auto& lw = layerWeights[i];
@@ -2285,6 +2298,7 @@ void ModelRunner::buildDecodePipeline() {
                 auto bg = makeBG(plQ35Rope, {
                     {0, q35QBuf}, {1, qRotBuf}, {2, ropeCosBuf}, {3, ropeSinBuf},
                     {4, q35RopeQParamsBuf}});
+                q35QRoPEDispatchIndices[i] = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plQ35Rope.pipeline, bg,
                     (headDimAct + 255) / 256, cfg.nHead, 1, L+"q35_q_mrope"});
             }
@@ -2294,6 +2308,7 @@ void ModelRunner::buildDecodePipeline() {
                     {0, q35KBuf}, {1, q35VBuf}, {2, kvCache[i].K}, {3, kvCache[i].V},
                     {4, ropeCosBuf}, {5, ropeSinBuf}, {6, q35RopeKParamsBuf},
                     {7, q35KvWriteParamsBuf}});
+                q35KvWriteDispatchIndices[i] = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plKvWrite.pipeline, bg,
                     (headDimAct + 255) / 256, cfg.nKvHeads, 1, L+"q35_kv_write"});
             }
@@ -3173,9 +3188,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         auto& plArgmaxReduce = getKernel("argmax_reduce");
         auto bg = makeBG(plArgmax, {
             {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxParams}, {3, argmaxPartialsBuf}});
+        argmaxDispatchIndex = (int)allDecodeDispatches.size();
         allDecodeDispatches.push_back({plArgmax.pipeline, bg, argmaxNumWg, 1, 1, "argmax"});
         auto bgReduce = makeBG(plArgmaxReduce, {
             {0, argmaxPartialsBuf}, {1, argmaxResultBuf}, {2, argmaxReduceParams}});
+        argmaxReduceDispatchIndex = (int)allDecodeDispatches.size();
         allDecodeDispatches.push_back({plArgmaxReduce.pipeline, bgReduce, 1, 1, 1, "argmax_reduce"});
     }
 
@@ -3234,6 +3251,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         char label[32]; snprintf(label, 32, "staging_%d", s);
         bd.label = {label, (uint32_t)strlen(label)};
         ps.stagingBuf = wgpuDeviceCreateBuffer(gpu->device, &bd);
+        ps.tokenInBuf = gpu->createBuffer("decode_token_in_" + std::to_string(s), 4);
+        ps.tokenOutBuf = gpu->createBuffer("decode_token_out_" + std::to_string(s), 4);
+        int32_t zeroToken = 0;
+        gpu->writeBuffer(ps.tokenInBuf, &zeroToken, 4);
+        gpu->writeBuffer(ps.tokenOutBuf, &zeroToken, 4);
 
         // Per-slot param buffers
         char rl[32]; snprintf(rl, 32, "p_frope_%d", s);
@@ -3242,6 +3264,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         char al[32]; snprintf(al, 32, "p_cattn_%d", s);
         ps.attnParamsBuf = gpu->createBuffer(std::string(al), 32);
         gpu->writeBuffer(ps.attnParamsBuf, chunkedAttnParamData.data(), 32);
+
+        if (q35RopeQParamsBuf.handle) {
+            uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
+            uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
+            uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
+            uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, 0u, 0, 0, 0, 0, 0, 0};
+            char ql[32]; snprintf(ql, 32, "p_q35_rope_q_%d", s);
+            char kl[32]; snprintf(kl, 32, "p_q35_rope_k_%d", s);
+            char vl[32]; snprintf(vl, 32, "p_q35_kv_write_%d", s);
+            ps.q35RopeQParamsBuf = gpu->createBuffer(std::string(ql), 32);
+            ps.q35RopeKParamsBuf = gpu->createBuffer(std::string(kl), 32);
+            ps.q35KvWriteParamsBuf = gpu->createBuffer(std::string(vl), 32);
+            gpu->writeBuffer(ps.q35RopeQParamsBuf, q, 32);
+            gpu->writeBuffer(ps.q35RopeKParamsBuf, k, 32);
+            gpu->writeBuffer(ps.q35KvWriteParamsBuf, kv, 32);
+        }
 
         // SWA per-slot param buffer
         if (hasSWA) {
@@ -3256,22 +3294,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Prefix dispatches before allDecodeDispatches: embed_gather [+ embed_scale]
         autoDecodePrefixCount = (cfg.embeddingScale > 0.0f) ? 2 : 1;
         int prefixCount = autoDecodePrefixCount;
+        auto& plQ35RopeToQRot = getKernel("qwen35_rope_q_to_qrot");
+        auto& plQ35KvWriteRope = getKernel("qwen35_kv_cache_write_rope");
+        ps.dispatches[0].bindGroup = makeBG(plEmbGather, {
+            {0, embeddingGpuBuf}, {1, ps.tokenInBuf},
+            {2, xBuf}, {3, embedParams}});
+        if (argmaxDispatchIndex >= 0) {
+            int idx = argmaxDispatchIndex + prefixCount;
+            ps.dispatches[idx].bindGroup = makeBG(plArgmax, {
+                {0, logitsBuf}, {1, ps.tokenOutBuf}, {2, argmaxParams}, {3, argmaxPartialsBuf}});
+        }
+        if (argmaxReduceDispatchIndex >= 0) {
+            int idx = argmaxReduceDispatchIndex + prefixCount;
+            auto& plArgmaxReduce = getKernel("argmax_reduce");
+            ps.dispatches[idx].bindGroup = makeBG(plArgmaxReduce, {
+                {0, argmaxPartialsBuf}, {1, ps.tokenOutBuf}, {2, argmaxReduceParams}});
+        }
         for (uint32_t layer = 0; layer < cfg.nLayer; layer++) {
-            if (ropeDispatchIndices[layer] < 0 ||
-                attnP1DispatchIndices[layer] < 0 ||
-                attnP2DispatchIndices[layer] < 0) {
+            if (ropeDispatchIndices[layer] >= 0) {
+                int ropeIdx = ropeDispatchIndices[layer] + prefixCount;
+                ps.dispatches[ropeIdx].bindGroup = makeBG(plFusedRope, {
+                    {0, qkvBuf}, {1, qRotBuf},
+                    {2, kvCache[layer].K}, {3, kvCache[layer].V},
+                    {4, ropeCosBuf}, {5, ropeSinBuf},
+                    {6, layerWeights[layer].qNorm}, {7, layerWeights[layer].kNorm},
+                    {8, ps.ropeParamsBuf}});
+            }
+
+            if (q35QRoPEDispatchIndices[layer] >= 0 && ps.q35RopeQParamsBuf.handle) {
+                int qIdx = q35QRoPEDispatchIndices[layer] + prefixCount;
+                ps.dispatches[qIdx].bindGroup = makeBG(plQ35RopeToQRot, {
+                    {0, q35QBuf}, {1, qRotBuf}, {2, ropeCosBuf}, {3, ropeSinBuf},
+                    {4, ps.q35RopeQParamsBuf}});
+            }
+
+            if (q35KvWriteDispatchIndices[layer] >= 0 && ps.q35KvWriteParamsBuf.handle) {
+                int kvIdx = q35KvWriteDispatchIndices[layer] + prefixCount;
+                ps.dispatches[kvIdx].bindGroup = makeBG(plQ35KvWriteRope, {
+                    {0, q35KBuf}, {1, q35VBuf}, {2, kvCache[layer].K}, {3, kvCache[layer].V},
+                    {4, ropeCosBuf}, {5, ropeSinBuf}, {6, ps.q35RopeKParamsBuf},
+                    {7, ps.q35KvWriteParamsBuf}});
+            }
+
+            if (attnP1DispatchIndices[layer] < 0 || attnP2DispatchIndices[layer] < 0) {
                 continue;
             }
-            int ropeIdx = ropeDispatchIndices[layer] + prefixCount;
-            int p1Idx   = attnP1DispatchIndices[layer] + prefixCount;
-            int p2Idx   = attnP2DispatchIndices[layer] + prefixCount;
-
-            ps.dispatches[ropeIdx].bindGroup = makeBG(plFusedRope, {
-                {0, qkvBuf}, {1, qRotBuf},
-                {2, kvCache[layer].K}, {3, kvCache[layer].V},
-                {4, ropeCosBuf}, {5, ropeSinBuf},
-                {6, layerWeights[layer].qNorm}, {7, layerWeights[layer].kNorm},
-                {8, ps.ropeParamsBuf}});
+            int p1Idx = attnP1DispatchIndices[layer] + prefixCount;
+            int p2Idx = attnP2DispatchIndices[layer] + prefixCount;
 
             bool layerIsSWA = hasSWA && layer < cfg.layerAttnTypes.size() &&
                              cfg.layerAttnTypes[layer] == AttnLayerType::SlidingWindow;
@@ -3286,8 +3355,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {2, slotAttnBuf}});
         }
 
-        refillCBPool(s);
     }
+    for (int s = 0; s < decodePoolCapacity; s++)
+        refillCBPool(s);
     fprintf(stderr, "  Pool: %d slots × %d pre-recorded CBs\n",
             decodePoolCapacity, decodeCbPoolBatch);
 
@@ -3630,9 +3700,16 @@ void ModelRunner::refillCBPool(int slot) {
             wgpuComputePassEncoderRelease(pass);
         }
 
-        if (addCopy)
-            wgpuCommandEncoderCopyBufferToBuffer(enc, argmaxResultBuf.handle, 0,
-                                                  ps.stagingBuf, 0, 4);
+        if (addCopy) {
+            int ringDepth = std::max(1, decodePoolDepth);
+            int nextSlot = (slot + 1) % ringDepth;
+            if (nextSlot < (int)pool.size() && pool[nextSlot].tokenInBuf.handle) {
+                wgpuCommandEncoderCopyBufferToBuffer(enc, ps.tokenOutBuf.handle, 0,
+                                                     pool[nextSlot].tokenInBuf.handle, 0, 4);
+            }
+            wgpuCommandEncoderCopyBufferToBuffer(enc, ps.tokenOutBuf.handle, 0,
+                                                ps.stagingBuf, 0, 4);
+        }
 
         WGPUCommandBufferDescriptor cbD{};
         auto cb = wgpuCommandEncoderFinish(enc, &cbD);
@@ -3683,7 +3760,7 @@ double ModelRunner::benchmarkDecodeConfig(int depth, int nTokens, int repeats) {
     double totalMsPerTok = 0.0;
     for (int rep = 0; rep < repeats; rep++) {
         resetKVCache();
-        gpu->writeBuffer(argmaxResultBuf, &seedToken, 4);
+        seedDecodeTokenInputs(seedToken);
         for (int s = 0; s < depth; s++)
             refillCBPool(s);
 
@@ -3959,6 +4036,30 @@ void ModelRunner::destroy() {
             wgpuBufferRelease(slot.attnParamsBuf.handle);
             slot.attnParamsBuf.handle = nullptr;
         }
+        if (slot.attnParamsBufSWA.handle) {
+            wgpuBufferRelease(slot.attnParamsBufSWA.handle);
+            slot.attnParamsBufSWA.handle = nullptr;
+        }
+        if (slot.q35RopeQParamsBuf.handle) {
+            wgpuBufferRelease(slot.q35RopeQParamsBuf.handle);
+            slot.q35RopeQParamsBuf.handle = nullptr;
+        }
+        if (slot.q35RopeKParamsBuf.handle) {
+            wgpuBufferRelease(slot.q35RopeKParamsBuf.handle);
+            slot.q35RopeKParamsBuf.handle = nullptr;
+        }
+        if (slot.q35KvWriteParamsBuf.handle) {
+            wgpuBufferRelease(slot.q35KvWriteParamsBuf.handle);
+            slot.q35KvWriteParamsBuf.handle = nullptr;
+        }
+        if (slot.tokenInBuf.handle) {
+            wgpuBufferRelease(slot.tokenInBuf.handle);
+            slot.tokenInBuf.handle = nullptr;
+        }
+        if (slot.tokenOutBuf.handle) {
+            wgpuBufferRelease(slot.tokenOutBuf.handle);
+            slot.tokenOutBuf.handle = nullptr;
+        }
         slot.dispatches.clear();
     }
     pool.clear();
@@ -4066,6 +4167,18 @@ void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot)
     cp[4] = n_chunks;
     gpu->writeBuffer(ps.attnParamsBuf, localAttn, 32);
 
+    if (ps.q35RopeQParamsBuf.handle) {
+        uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
+        uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
+        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
+        uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim,
+                          cacheLen * cfg.nKvHeads * cfg.headDim,
+                          0, 0, 0, 0, 0, 0};
+        gpu->writeBuffer(ps.q35RopeQParamsBuf, q, 32);
+        gpu->writeBuffer(ps.q35RopeKParamsBuf, k, 32);
+        gpu->writeBuffer(ps.q35KvWriteParamsBuf, kv, 32);
+    }
+
     // SWA per-slot param buffers
     if (ps.attnParamsBufSWA.handle && cfg.slidingWindow > 0) {
         uint32_t T_swa = std::min(T_total, cfg.slidingWindow);
@@ -4165,6 +4278,16 @@ void ModelRunner::submitDecode(uint32_t posOffset, int slot) {
 int32_t ModelRunner::readArgmax(int slot) {
     auto& ps = pool[slot];
     return gpu->completeAsyncMapI32(ps.stagingBuf, ps.pendingFuture);
+}
+
+void ModelRunner::seedDecodeTokenInputs(int32_t tokenId) {
+    if (argmaxResultBuf.handle) {
+        gpu->writeBuffer(argmaxResultBuf, &tokenId, 4);
+    }
+    for (auto& ps : pool) {
+        if (ps.tokenInBuf.handle)
+            gpu->writeBuffer(ps.tokenInBuf, &tokenId, 4);
+    }
 }
 
 void ModelRunner::prefillStep(int32_t tokenId, uint32_t posOffset) {
