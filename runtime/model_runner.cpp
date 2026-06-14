@@ -1662,7 +1662,9 @@ void ModelRunner::buildDecodePipeline() {
     // Load kernels from embedded shaders
     auto& plRmsNorm    = getKernel("rms_norm");
     auto& plAddRmsNorm = getKernel("add_rms_norm");
-    auto& plQ8Matmul   = getKernel("q8_matmul");
+    auto& plQ8Matmul   = (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12)
+        ? getKernel("q8_matmul_vec4")
+        : getKernel("q8_matmul");
     auto& plQ8MatmulNorm = getKernel("q8_matmul_norm");
 
     // K-quant kernel selection
