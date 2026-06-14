@@ -1684,7 +1684,7 @@ void ModelRunner::buildDecodePipeline() {
     const bool subgroupMatrixKernelReady =
         gpu->supportsSubgroupMatrix &&
         canUse512ThreadKernels &&
-        canCompileEmbeddedKernel(*gpu, "test_subgroup_matrix");
+        canCompileEmbeddedKernel(*gpu, "q8_matmul_vulkan");
     fprintf(stderr, "  Subgroup matrix: %s\n",
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
