@@ -60,7 +60,6 @@ struct ModelRunner {
     GPUBuffer q35SsmQBuf;     // [ssm group_count * state_size] normalized Q
     GPUBuffer q35SsmKBuf;     // [ssm group_count * state_size] normalized K
     GPUBuffer q35SsmVBuf;     // [ssm inner_size] V
-    GPUBuffer q35SsmBetaAlphaBuf; // [2 * ssm time_step_rank], beta_proj || alpha_proj
     GPUBuffer q35SsmBetaBuf;  // [ssm time_step_rank]
     GPUBuffer q35SsmAlphaBuf; // [ssm time_step_rank]
     GPUBuffer q35SsmGateBuf;  // [ssm time_step_rank]

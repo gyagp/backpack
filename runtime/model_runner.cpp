@@ -2028,7 +2028,6 @@ void ModelRunner::buildDecodePipeline() {
             q35SsmQBuf     = gpu->createBuffer("q35_ssm_q", qkDim * 4);
             q35SsmKBuf     = gpu->createBuffer("q35_ssm_k", qkDim * 4);
             q35SsmVBuf     = gpu->createBuffer("q35_ssm_v", cfg.ssmInnerSize * 4);
-            q35SsmBetaAlphaBuf = gpu->createBuffer("q35_ssm_beta_alpha", 2u * cfg.ssmTimeStepRank * 4);
             q35SsmBetaBuf  = gpu->createBuffer("q35_ssm_beta", cfg.ssmTimeStepRank * 4);
             q35SsmAlphaBuf = gpu->createBuffer("q35_ssm_alpha", cfg.ssmTimeStepRank * 4);
             q35SsmGateBuf  = gpu->createBuffer("q35_ssm_gate", cfg.ssmTimeStepRank * 4);
@@ -2165,14 +2164,16 @@ void ModelRunner::buildDecodePipeline() {
             }
             bool useFusedBetaAlpha = lw.ssmBetaAlphaW.handle && lw.ssmBetaAlphaS.handle;
             if (useFusedBetaAlpha) {
-                auto p = mkP32("p_ssm_beta_alpha_L"+std::to_string(i),
-                               {cfg.nEmbd, 2u * cfg.ssmTimeStepRank});
-                auto bg = makeBG(plQ8Matmul, {
+                auto& plBetaAlphaGate = getKernel("qwen35_beta_alpha_gate_q8");
+                auto p = mkP32("p_ssm_beta_alpha_gate_L"+std::to_string(i),
+                               {cfg.nEmbd, cfg.ssmTimeStepRank});
+                auto bg = makeBG(plBetaAlphaGate, {
                     {0, normOutBuf}, {1, lw.ssmBetaAlphaW}, {2, lw.ssmBetaAlphaS},
-                    {3, zeroBiasQKV}, {4, q35SsmBetaAlphaBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    {3, lw.ssmDtBias}, {4, lw.ssmA}, {5, q35SsmBetaBuf},
+                    {6, q35SsmGateBuf}, {7, p}});
+                allDecodeDispatches.push_back({plBetaAlphaGate.pipeline, bg,
                     1, (2u * cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1,
-                    L+"ssm_beta_alpha"});
+                    L+"ssm_beta_alpha_gate"});
             } else {
                 auto pBeta = mkP32("p_ssm_beta_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
                 auto bgBeta = makeBG(plQ8Matmul, {
@@ -2188,15 +2189,12 @@ void ModelRunner::buildDecodePipeline() {
                 allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgAlpha,
                     1, (cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_alpha"});
             }
-            {
+            if (!useFusedBetaAlpha) {
                 auto& plGate = getKernel("qwen35_alpha_beta_gate");
                 auto p = mkP32("p_ssm_abg_L"+std::to_string(i),
-                               {cfg.ssmTimeStepRank,
-                                useFusedBetaAlpha ? cfg.ssmTimeStepRank : 0u});
-                const GPUBuffer& betaProj = useFusedBetaAlpha ? q35SsmBetaAlphaBuf : q35SsmBetaBuf;
-                const GPUBuffer& alphaProj = useFusedBetaAlpha ? q35SsmBetaAlphaBuf : q35SsmAlphaBuf;
+                               {cfg.ssmTimeStepRank, 0u});
                 auto bg = makeBG(plGate, {
-                    {0, betaProj}, {1, alphaProj}, {2, lw.ssmDtBias},
+                    {0, q35SsmBetaBuf}, {1, q35SsmAlphaBuf}, {2, lw.ssmDtBias},
                     {3, lw.ssmA}, {4, q35SsmBetaBuf}, {5, q35SsmGateBuf}, {6, p}});
                 allDecodeDispatches.push_back({plGate.pipeline, bg,
                     (cfg.ssmTimeStepRank + 63) / 64, 1, 1, L+"ssm_abg"});
