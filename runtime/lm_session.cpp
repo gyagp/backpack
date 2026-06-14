@@ -1152,9 +1152,8 @@ int32_t LmSession::Decode() {
         return next;
     }
 
-    // Qwen3.5 uses dynamic MRoPE/cache-write params in the correctness path.
-    // Keep it synchronous until the per-slot pipelined parameter buffers are
-    // mirrored for those Qwen3.5-specific dispatches.
+    // Qwen3.5 correctness currently depends on synchronous token-by-token
+    // decode. The generic pipelined path still has a Qwen3.5 state hazard.
     auto* std = impl_->std_.get();
     int32_t next;
     if (std->runner.cfg.arch == "qwen35") {
