@@ -231,6 +231,7 @@ struct ModelRunner {
     bool useMMA = false;   // true on Vulkan with subgroup_matrix support
     bool useDP4A = false;  // true when dot4I8Packed is available (D3D12)
     int autoDecodePrefixCount = 1;  // dispatches before allDecodeDispatches in autoDecodeDispatches
+    bool decodeUsesFusedRopeParams = false;
 
     // Logit softcapping (Gemma): applied between LM head and argmax
     WGPUComputePipeline softcapPipeline = nullptr;

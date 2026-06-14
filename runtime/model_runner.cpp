@@ -1639,6 +1639,7 @@ void ModelRunner::buildDecodePipeline() {
     qDim = cfg.nHead * cfg.headDim;
     kvDim = cfg.nKvHeads * cfg.headDim;
     qkvOut = qDim + 2 * kvDim;
+    decodeUsesFusedRopeParams = false;
     const auto& limits = effectiveLimits(*gpu);
     const bool canUse512ThreadKernels =
         gpu->supportsSubgroups &&
@@ -2280,33 +2281,21 @@ void ModelRunner::buildDecodePipeline() {
                     cfg.nKvHeads, 1, 1, L+"q35_knorm"});
             }
             {
-                auto& plQ35Rope = getKernel("qwen35_rope_multi_partial");
+                auto& plQ35Rope = getKernel("qwen35_rope_q_to_qrot");
                 auto bg = makeBG(plQ35Rope, {
-                    {0, q35QBuf}, {1, ropeCosBuf}, {2, ropeSinBuf}, {3, q35RopeQParamsBuf}});
+                    {0, q35QBuf}, {1, qRotBuf}, {2, ropeCosBuf}, {3, ropeSinBuf},
+                    {4, q35RopeQParamsBuf}});
                 allDecodeDispatches.push_back({plQ35Rope.pipeline, bg,
-                    32, cfg.nHead, 1, L+"q35_q_mrope"});
+                    (headDimAct + 255) / 256, cfg.nHead, 1, L+"q35_q_mrope"});
             }
             {
-                auto& plQ35Rope = getKernel("qwen35_rope_multi_partial");
-                auto bg = makeBG(plQ35Rope, {
-                    {0, q35KBuf}, {1, ropeCosBuf}, {2, ropeSinBuf}, {3, q35RopeKParamsBuf}});
-                allDecodeDispatches.push_back({plQ35Rope.pipeline, bg,
-                    32, cfg.nKvHeads, 1, L+"q35_k_mrope"});
-            }
-            {
-                auto& plCopy = getKernel("copy_buffer");
-                auto p = mkP32("p_q35_copy_qrot_L"+std::to_string(i), {qDimAct, 0u, 0u});
-                auto bg = makeBG(plCopy, {{0, q35QBuf}, {1, qRotBuf}, {2, p}});
-                allDecodeDispatches.push_back({plCopy.pipeline, bg,
-                    (qDimAct + 255) / 256, 1, 1, L+"q35_copy_qrot"});
-            }
-            {
-                auto& plKvWrite = getKernel("qwen35_kv_cache_write");
+                auto& plKvWrite = getKernel("qwen35_kv_cache_write_rope");
                 auto bg = makeBG(plKvWrite, {
                     {0, q35KBuf}, {1, q35VBuf}, {2, kvCache[i].K}, {3, kvCache[i].V},
-                    {4, q35KvWriteParamsBuf}});
+                    {4, ropeCosBuf}, {5, ropeSinBuf}, {6, q35RopeKParamsBuf},
+                    {7, q35KvWriteParamsBuf}});
                 allDecodeDispatches.push_back({plKvWrite.pipeline, bg,
-                    (kvDimAct + 255) / 256, 1, 1, L+"q35_kv_write"});
+                    (headDimAct + 255) / 256, cfg.nKvHeads, 1, L+"q35_kv_write"});
             }
             {
                 auto bg = makeBG(plChunkP1, {
@@ -2426,6 +2415,7 @@ void ModelRunner::buildDecodePipeline() {
                 {6, lw.qNorm}, {7, lw.kNorm},
                 {8, fusedRopeParamsBuf}});
             ropeDispatchIndices[i] = (int)allDecodeDispatches.size();
+            decodeUsesFusedRopeParams = true;
             allDecodeDispatches.push_back({plFusedRope.pipeline, bg,
                 cfg.nHead + cfg.nKvHeads, 1, 1, L+"fused_rope"});
         }
@@ -4024,7 +4014,9 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
     auto* p = reinterpret_cast<int32_t*>(ropeParamData.data());
     p[3] = pos;
     p[5] = cacheLen * cfg.nKvHeads * cfg.headDim;
-    gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
+    if (decodeUsesFusedRopeParams) {
+        gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
+    }
 
     if (q35RopeQParamsBuf.handle) {
         uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;

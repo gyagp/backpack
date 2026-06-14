@@ -1400,6 +1400,97 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )WGSL";
 
+// [attention] qwen35_kv_cache_write_rope
+static const char* WGSL_QWEN35_KV_CACHE_WRITE_ROPE = R"WGSL(
+enable f16;
+
+// Qwen3.5 K RoPE decode path fused with fp16 KV cache write.
+//
+// Bindings:
+//   0: K        [kv_dim] f32, normalized K input
+//   1: V        [kv_dim] f32
+//   2: K_cache  [seq * kv_dim] f16
+//   3: V_cache  [seq * kv_dim] f16
+//   4: cos      [max_seq * rope_half] f32, standard RoPE cos table
+//   5: sin      [max_seq * rope_half] f32, standard RoPE sin table
+//   6: rope_p   [n_kv_head, head_dim, s0, s1, s2, s3, pos, rope_half]
+//   7: kv_p     [kv_dim, cache_offset_words]
+
+@group(0) @binding(0) var<storage, read>       K:       array<f32>;
+@group(0) @binding(1) var<storage, read>       V:       array<f32>;
+@group(0) @binding(2) var<storage, read_write> KCache:  array<f16>;
+@group(0) @binding(3) var<storage, read_write> VCache:  array<f16>;
+@group(0) @binding(4) var<storage, read>       Cos:     array<f32>;
+@group(0) @binding(5) var<storage, read>       Sin:     array<f32>;
+@group(0) @binding(6) var<storage, read>       rope_p:  array<u32>;
+@group(0) @binding(7) var<storage, read>       kv_p:    array<u32>;
+
+fn section_local_idx(pair_idx: u32, s0: u32, s1: u32, s2: u32) -> u32 {
+    var local_idx = pair_idx;
+    var section = 0u;
+    if (local_idx >= s0) {
+        local_idx = local_idx - s0;
+        section = 1u;
+    }
+    if (section == 1u && local_idx >= s1) {
+        local_idx = local_idx - s1;
+        section = 2u;
+    }
+    if (section == 2u && local_idx >= s2) {
+        local_idx = local_idx - s2;
+    }
+    return local_idx;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let kv_dim = kv_p[0];
+    let off = kv_p[1];
+    let n_kv_head = rope_p[0];
+    let head_dim  = rope_p[1];
+    let head_idx = gid.y;
+    let elem_idx = gid.x;
+    if (head_idx >= n_kv_head || elem_idx >= head_dim) { return; }
+
+    let i = head_idx * head_dim + elem_idx;
+    if (i >= kv_dim) { return; }
+
+    let s0        = rope_p[2];
+    let s1        = rope_p[3];
+    let s2        = rope_p[4];
+    let s3        = rope_p[5];
+    let pos       = rope_p[6];
+    let rope_half = rope_p[7];
+
+    let head_base = head_idx * head_dim;
+    let total_pairs = s0 + s1 + s2 + s3;
+
+    var k_val = K[i];
+    if (elem_idx < total_pairs) {
+        let pair_idx = elem_idx;
+        let local_idx = section_local_idx(pair_idx, s0, s1, s2);
+        let table_idx = pos * rope_half + local_idx;
+        let c = Cos[table_idx];
+        let s = Sin[table_idx];
+        let x0 = K[head_base + pair_idx];
+        let x1 = K[head_base + pair_idx + total_pairs];
+        k_val = x0 * c - x1 * s;
+    } else if (elem_idx < total_pairs * 2u) {
+        let pair_idx = elem_idx - total_pairs;
+        let local_idx = section_local_idx(pair_idx, s0, s1, s2);
+        let table_idx = pos * rope_half + local_idx;
+        let c = Cos[table_idx];
+        let s = Sin[table_idx];
+        let x0 = K[head_base + pair_idx];
+        let x1 = K[head_base + pair_idx + total_pairs];
+        k_val = x0 * s + x1 * c;
+    }
+
+    KCache[off + i] = f16(k_val);
+    VCache[off + i] = f16(V[i]);
+}
+)WGSL";
+
 // [attention] rope_batched
 static const char* WGSL_ROPE_BATCHED = R"WGSL(
 enable f16;
@@ -2040,6 +2131,83 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     X[x0_idx] = x0 * c - x1 * s;
     X[x1_idx] = x0 * s + x1 * c;
+}
+)WGSL";
+
+// [attn] qwen35_rope_q_to_qrot
+static const char* WGSL_QWEN35_ROPE_Q_TO_QROT = R"WGSL(
+// Qwen3.5 Q RoPE decode path, writing the attention-ready Q buffer.
+//
+// Bindings:
+//   0: X        [n_head * head_dim] f32, normalized Q input
+//   1: Out      [n_head * head_dim] f32, rotated/copy output for attention
+//   2: cos      [max_seq * rope_half] f32, standard RoPE cos table
+//   3: sin      [max_seq * rope_half] f32, standard RoPE sin table
+//   4: params   [n_head, head_dim, s0, s1, s2, s3, pos, rope_half]
+
+@group(0) @binding(0) var<storage, read>       X:      array<f32>;
+@group(0) @binding(1) var<storage, read_write> Out:    array<f32>;
+@group(0) @binding(2) var<storage, read>       Cos:    array<f32>;
+@group(0) @binding(3) var<storage, read>       Sin:    array<f32>;
+@group(0) @binding(4) var<storage, read>       params: array<u32>;
+
+fn section_local_idx(pair_idx: u32, s0: u32, s1: u32, s2: u32) -> u32 {
+    var local_idx = pair_idx;
+    var section = 0u;
+    if (local_idx >= s0) {
+        local_idx = local_idx - s0;
+        section = 1u;
+    }
+    if (section == 1u && local_idx >= s1) {
+        local_idx = local_idx - s1;
+        section = 2u;
+    }
+    if (section == 2u && local_idx >= s2) {
+        local_idx = local_idx - s2;
+    }
+    return local_idx;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_head    = params[0];
+    let head_dim  = params[1];
+    let s0        = params[2];
+    let s1        = params[3];
+    let s2        = params[4];
+    let s3        = params[5];
+    let pos       = params[6];
+    let rope_half = params[7];
+
+    let head_idx = gid.y;
+    let elem_idx = gid.x;
+    if (head_idx >= n_head || elem_idx >= head_dim) { return; }
+
+    let total_pairs = s0 + s1 + s2 + s3;
+    let head_base = head_idx * head_dim;
+    let out_idx = head_base + elem_idx;
+
+    if (elem_idx < total_pairs) {
+        let pair_idx = elem_idx;
+        let local_idx = section_local_idx(pair_idx, s0, s1, s2);
+        let table_idx = pos * rope_half + local_idx;
+        let c = Cos[table_idx];
+        let s = Sin[table_idx];
+        let x0 = X[head_base + pair_idx];
+        let x1 = X[head_base + pair_idx + total_pairs];
+        Out[out_idx] = x0 * c - x1 * s;
+    } else if (elem_idx < total_pairs * 2u) {
+        let pair_idx = elem_idx - total_pairs;
+        let local_idx = section_local_idx(pair_idx, s0, s1, s2);
+        let table_idx = pos * rope_half + local_idx;
+        let c = Cos[table_idx];
+        let s = Sin[table_idx];
+        let x0 = X[head_base + pair_idx];
+        let x1 = X[head_base + pair_idx + total_pairs];
+        Out[out_idx] = x0 * s + x1 * c;
+    } else {
+        Out[out_idx] = X[out_idx];
+    }
 }
 )WGSL";
 
@@ -17569,8 +17737,10 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"quantize_fp32_rows_d3d12", {WGSL_QUANTIZE_FP32_ROWS_D3D12, 4, false}},
         {"qwen35_alpha_beta_gate", {WGSL_QWEN35_ALPHA_BETA_GATE, 7, false}},
         {"qwen35_kv_cache_write", {WGSL_QWEN35_KV_CACHE_WRITE, 5, false}},
+        {"qwen35_kv_cache_write_rope", {WGSL_QWEN35_KV_CACHE_WRITE_ROPE, 8, false}},
         {"qwen35_norm_gated", {WGSL_QWEN35_NORM_GATED, 5, false}},
         {"qwen35_rope_multi_partial", {WGSL_QWEN35_ROPE_MULTI_PARTIAL, 4, false}},
+        {"qwen35_rope_q_to_qrot", {WGSL_QWEN35_ROPE_Q_TO_QROT, 5, false}},
         {"qwen35_split_qkv_l2", {WGSL_QWEN35_SPLIT_QKV_L2, 5, false}},
         {"resize_nearest", {WGSL_RESIZE_NEAREST, 3, false}},
         {"rms_norm", {WGSL_RMS_NORM, 5, true}},
