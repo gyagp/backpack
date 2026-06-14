@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -845,6 +846,33 @@ struct StandardState {
         return (format == "onnx") ? onnxTokenizer.decode_token(tok) : ggufTokenizer.decode_token(tok);
     }
 
+    void DumpTopLogits(const char* stage, const std::vector<float>& logits) {
+        const char* env = std::getenv("BP_DUMP_TOP_LOGITS");
+        if (!env || !*env || logits.empty()) return;
+
+        int k = std::atoi(env);
+        if (k <= 0) k = 10;
+        k = std::min<int>(k, (int)logits.size());
+
+        std::vector<int32_t> ids(logits.size());
+        for (int32_t i = 0; i < (int32_t)ids.size(); i++) ids[i] = i;
+        std::partial_sort(ids.begin(), ids.begin() + k, ids.end(),
+            [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+
+        fprintf(stderr, "\n[debug] top %d logits after %s:\n", k, stage);
+        for (int i = 0; i < k; i++) {
+            int32_t id = ids[i];
+            std::string text = DetokenizeOne(id);
+            for (char& ch : text) {
+                if (ch == '\n') ch = ' ';
+                if (ch == '\r') ch = ' ';
+                if (ch == '\t') ch = ' ';
+            }
+            fprintf(stderr, "  %2d: id=%d logit=% .6f text=\"%s\"\n",
+                    i + 1, id, logits[id], text.c_str());
+        }
+    }
+
     int32_t Eos() {
         return (format == "onnx") ? onnxTokenizer.eos_token_id : ggufTokenizer.eos_token_id;
     }
@@ -852,6 +880,7 @@ struct StandardState {
     int32_t Prefill(const int32_t* tokens, uint32_t n) {
         std::vector<float> logits;
         for (uint32_t i = 0; i < n; i++) logits = runner.decode(tokens[i], i);
+        DumpTopLogits("prefill", logits);
         int32_t next = ModelRunner::argmax(logits);
         gpu->writeBuffer(runner.argmaxResultBuf, &next, 4);
         pos = n;
@@ -883,6 +912,7 @@ struct StandardState {
 
     std::vector<float> DecodeSynchronous(int32_t token) {
         auto logits = runner.decode(token, pos);
+        DumpTopLogits("decode", logits);
         pos++;
         return logits;
     }
@@ -1122,9 +1152,17 @@ int32_t LmSession::Decode() {
         return next;
     }
 
-    // Standard path: pipelined decode (fast, greedy only)
+    // Qwen3.5 uses dynamic MRoPE/cache-write params in the correctness path.
+    // Keep it synchronous until the per-slot pipelined parameter buffers are
+    // mirrored for those Qwen3.5-specific dispatches.
     auto* std = impl_->std_.get();
-    int32_t next = std->DecodePipelined();
+    int32_t next;
+    if (std->runner.cfg.arch == "qwen35") {
+        auto logits = std->DecodeSynchronous(impl_->lastToken);
+        next = argmax(logits.data(), (int64_t)logits.size());
+    } else {
+        next = std->DecodePipelined();
+    }
     impl_->lastToken = next;
     return next;
 }

@@ -56,6 +56,16 @@ struct ModelRunner {
     GPUBuffer q35VBuf;        // [kvDim_actual] V
     GPUBuffer q35AttnOutBuf;  // [qDim_actual] attention output (pre-gated)
     GPUBuffer q35CosSinBuf;   // [4 sections × max_pairs × 2] MRoPE cos/sin table
+    GPUBuffer q35ConvOutBuf;  // [ssm conv channels] convolved Q/K/V
+    GPUBuffer q35SsmQBuf;     // [ssm group_count * state_size] normalized Q
+    GPUBuffer q35SsmKBuf;     // [ssm group_count * state_size] normalized K
+    GPUBuffer q35SsmVBuf;     // [ssm inner_size] V
+    GPUBuffer q35SsmBetaBuf;  // [ssm time_step_rank]
+    GPUBuffer q35SsmAlphaBuf; // [ssm time_step_rank]
+    GPUBuffer q35SsmGateBuf;  // [ssm time_step_rank]
+    GPUBuffer q35SsmYBuf;     // [ssm inner_size]
+    GPUBuffer q35SsmNormBuf;  // [ssm inner_size]
+    GPUBuffer q35SsmZBuf;     // [ssm inner_size]
 
     // ── SSM persistent state (per layer, allocated when cfg.ssmInnerSize > 0) ──
     // conv state: rolling buffer of last conv_kernel input vectors per channel
@@ -67,6 +77,7 @@ struct ModelRunner {
     // Dynamic params (single set — writeBuffer is queue-sequenced)
     GPUBuffer fusedRopeParamsBuf, chunkedAttnParamsBuf;
     GPUBuffer chunkedAttnParamsBufSWA; // sliding window layers (separate T_total)
+    GPUBuffer q35RopeQParamsBuf, q35RopeKParamsBuf, q35KvWriteParamsBuf;
 
     // Pre-built dispatch lists (single — identical for every token)
     std::vector<Dispatch> allDecodeDispatches;

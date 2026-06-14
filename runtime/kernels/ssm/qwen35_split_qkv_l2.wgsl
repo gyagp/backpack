@@ -21,6 +21,20 @@ enable subgroups;
 @group(0) @binding(4) var<storage, read>       _params_: array<u32>;
 
 const WG: u32 = 128u;
+var<workgroup> sums: array<f32, 4>;
+
+fn reduce_wg(v: f32, tid: u32) -> f32 {
+    let sg = tid / 32u;
+    let lane = tid % 32u;
+    let s = subgroupAdd(v);
+    if (lane == 0u) {
+        sums[sg] = s;
+    }
+    workgroupBarrier();
+    let total = sums[0] + sums[1] + sums[2] + sums[3];
+    workgroupBarrier();
+    return total;
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -44,8 +58,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let v = conv_out[h * dk + d];
             sum_sq = sum_sq + v * v;
         }
-        let total = subgroupAdd(sum_sq);
-        let rms = 1.0 / sqrt(max(total, eps));
+        let total = reduce_wg(sum_sq, tid);
+        let rms = 1.0 / max(sqrt(total), eps);
         for (var d = tid; d < dk; d = d + WG) {
             q_out[h * dk + d] = conv_out[h * dk + d] * rms;
         }
@@ -57,8 +71,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let v = conv_out[k_base + h * dk + d];
             sum_sq = sum_sq + v * v;
         }
-        let total = subgroupAdd(sum_sq);
-        let rms = 1.0 / sqrt(max(total, eps));
+        let total = reduce_wg(sum_sq, tid);
+        let rms = 1.0 / max(sqrt(total), eps);
         for (var d = tid; d < dk; d = d + WG) {
             k_out[h * dk + d] = conv_out[k_base + h * dk + d] * rms;
         }

@@ -180,8 +180,17 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
             cfg.nVocab = (uint32_t)ti.shape[0];
     }
 
-    // Check for QK norm (Qwen3 has it, LLaMA doesn't)
+    // Check for QK norm. Hybrid models such as qwen35 have SSM at blk.0 and
+    // QK norm only on full-attention layers, so probe beyond the first layer.
     cfg.hasQkNorm = gguf.tensor_index.count("blk.0.attn_q_norm.weight") > 0;
+    if (!cfg.hasQkNorm) {
+        for (uint32_t i = 1; i < cfg.nLayer; i++) {
+            if (gguf.tensor_index.count("blk." + std::to_string(i) + ".attn_q_norm.weight") > 0) {
+                cfg.hasQkNorm = true;
+                break;
+            }
+        }
+    }
 
     // Gemma family: GELU activation, embedding scaling, logit softcapping
     bool isGemma = (a == "gemma" || a == "gemma2" || a == "gemma3" || a == "gemma4");
@@ -363,13 +372,27 @@ KQuantPacked pack_q6k(const void* raw_data, uint32_t N, uint32_t K) {
 // ─── K-quant dequantization ─────────────────────────────────────────────────
 
 static float kq_fp16_to_f32(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1;
-    uint32_t exp = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x03FF;
     uint32_t f;
-    if (exp == 0)       f = (sign << 31) | (mant << 13);
-    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
-    else                f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FF;
+            f = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13);
+    } else {
+        f = sign | ((exp + 112) << 23) | (mant << 13);
+    }
     float v;
     memcpy(&v, &f, sizeof(v));
     return v;
@@ -459,31 +482,35 @@ void dequant_kquant(const void* raw_data, float* out, uint32_t N, uint32_t K, GG
         }
     } else if (type == GGUF_TYPE_Q6_K) {
         // Q6_K block layout (210 bytes, QK_K=256):
-        //   ql[128]   (offset 0):   low 4 bits, packed 2 per byte
-        //   qh[64]    (offset 128): high 2 bits, packed 4 per byte
-        //   scales[16](offset 192): int8 scale per 16-element sub-block
-        //   d (fp16)  (offset 208): super-block scale
+        //   ql[128]        (offset 0):   low 4 bits, packed 2 per byte
+        //   qh[64]         (offset 128): high 2 bits, packed 4 per byte
+        //   scales[16]     (offset 192): int8 scale per 16-element sub-block
+        //   d (fp16)       (offset 208): super-block scale
         const uint32_t BLOCK_SIZE = 210;
         for (uint32_t row = 0; row < N; row++) {
             for (uint32_t b = 0; b < nBlocks; b++) {
                 const uint8_t* blk = src + ((uint64_t)row * nBlocks + b) * BLOCK_SIZE;
                 uint16_t d_u16; memcpy(&d_u16, blk + 208, 2);
                 float d = kq_fp16_to_f32(d_u16);
+                const uint8_t* ql0 = blk;
+                const uint8_t* qh0 = blk + 128;
+                const int8_t* sc0 = reinterpret_cast<const int8_t*>(blk + 192);
 
-                for (uint32_t sb = 0; sb < 16; sb++) {
-                    int8_t sc_i8 = (int8_t)blk[192 + sb];
-                    float sc = (float)sc_i8;
-                    for (uint32_t i = 0; i < 16; i++) {
-                        uint32_t kidx = b * QK_K + sb * 16 + i;
-                        if (kidx >= K) continue;
-                        uint32_t eidx = sb * 16 + i;
-                        uint8_t ql_byte = blk[eidx / 2];
-                        uint8_t ql = (eidx & 1) ? ((ql_byte >> 4) & 0x0F) : (ql_byte & 0x0F);
-                        uint8_t qh_byte = blk[128 + eidx / 4];
-                        uint32_t qh_shift = (eidx % 4) * 2;
-                        uint8_t qh = (qh_byte >> qh_shift) & 0x03;
-                        int q6 = (int)(ql | (qh << 4)) - 32;
-                        out[row * K + kidx] = d * sc * (float)q6;
+                for (uint32_t n = 0; n < QK_K; n += 128) {
+                    const uint8_t* ql = ql0 + n / 2;
+                    const uint8_t* qh = qh0 + n / 4;
+                    const int8_t* sc = sc0 + n / 16;
+                    for (uint32_t l = 0; l < 32; l++) {
+                        uint32_t is = l / 16;
+                        int q1 = (int)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        int q3 = (int)((ql[l +  0] >> 4)    | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        int q4 = (int)((ql[l + 32] >> 4)    | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        uint32_t base = row * K + b * QK_K + n + l;
+                        out[base +  0] = d * (float)sc[is + 0] * (float)q1;
+                        out[base + 32] = d * (float)sc[is + 2] * (float)q2;
+                        out[base + 64] = d * (float)sc[is + 4] * (float)q3;
+                        out[base + 96] = d * (float)sc[is + 6] * (float)q4;
                     }
                 }
             }
@@ -759,12 +786,7 @@ static void dq_iq4_nl(const uint8_t* data, float* y, int64_t k) {
 // ─── Universal dequantize ───────────────────────────────────────────────────
 
 static float fp16_val(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
-    uint32_t f;
-    if (exp == 0) f = (sign << 31) | (mant << 13);
-    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
-    else f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-    float r; memcpy(&r, &f, 4); return r;
+    return kq_fp16_to_f32(h);
 }
 
 static float bf16_val(uint16_t h) {

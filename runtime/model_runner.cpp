@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -36,6 +37,58 @@ bool canCompileEmbeddedKernel(GPUContext& gpu, const char* kernelName) {
     if (!sm) return false;
     wgpuShaderModuleRelease(sm);
     return true;
+}
+
+void dumpFloatBufferStats(GPUContext& gpu, const char* name, GPUBuffer buf, uint32_t elems) {
+    if (!buf.handle || elems == 0) return;
+    auto bytes = gpu.readBuffer(buf, (uint64_t)elems * 4ull);
+    if (bytes.size() < (size_t)elems * 4ull) return;
+
+    const float* data = reinterpret_cast<const float*>(bytes.data());
+    float mn = data[0], mx = data[0];
+    double sum = 0.0;
+    uint32_t nonzero = 0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < elems; i++) {
+        float v = data[i];
+        if (!std::isfinite(v)) continue;
+        finite++;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+        sum += v;
+        if (v != 0.0f) nonzero++;
+    }
+    fprintf(stderr,
+            "[debug] %s stats: elems=%u finite=%u nonzero=%u min=% .6e max=% .6e mean=% .6e first4=[% .6e % .6e % .6e % .6e]\n",
+            name, elems, finite, nonzero, mn, mx, sum / std::max<uint32_t>(1, finite),
+            elems > 0 ? data[0] : 0.0f,
+            elems > 1 ? data[1] : 0.0f,
+            elems > 2 ? data[2] : 0.0f,
+            elems > 3 ? data[3] : 0.0f);
+}
+
+void dumpFloatArrayStats(const char* name, const float* data, uint32_t elems) {
+    if (!data || elems == 0) return;
+    float mn = data[0], mx = data[0];
+    double sum = 0.0;
+    uint32_t nonzero = 0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < elems; i++) {
+        float v = data[i];
+        if (!std::isfinite(v)) continue;
+        finite++;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+        sum += v;
+        if (v != 0.0f) nonzero++;
+    }
+    fprintf(stderr,
+            "[debug] %s stats: elems=%u finite=%u nonzero=%u min=% .6e max=% .6e mean=% .6e first4=[% .6e % .6e % .6e % .6e]\n",
+            name, elems, finite, nonzero, mn, mx, sum / std::max<uint32_t>(1, finite),
+            elems > 0 ? data[0] : 0.0f,
+            elems > 1 ? data[1] : 0.0f,
+            elems > 2 ? data[2] : 0.0f,
+            elems > 3 ? data[3] : 0.0f);
 }
 
 int chooseDecodePoolDepth(const GPUContext& gpu) {
@@ -289,13 +342,27 @@ const CompiledPipeline& ModelRunner::getKernelGelu(const std::string& siluName) 
 // ─── fp16 conversion helpers ─────────────────────────────────────────────────
 
 static float fp16_to_f32(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1;
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     uint32_t exp  = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x3FF;
     uint32_t f;
-    if (exp == 0)       f = (sign << 31) | (mant << 13);
-    else if (exp == 31) f = (sign << 31) | 0x7F800000 | (mant << 13);
-    else                f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FF;
+            f = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13);
+    } else {
+        f = sign | ((exp + 112) << 23) | (mant << 13);
+    }
     float result;
     memcpy(&result, &f, 4);
     return result;
@@ -410,14 +477,6 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
                     ? (std::string(" (full-attn every ") + std::to_string(cfg.fullAttentionInterval) + " layers)").c_str()
                     : "");
     }
-    if (cfg.arch == "qwen35") {
-        fprintf(stderr,
-            "\nERROR: qwen35 GGUF detected, but the DeltaNet + partial-RoPE attention\n"
-            "       decode path is not fully implemented yet. Refusing to generate\n"
-            "       known-wrong output; correctness must be established before perf.\n");
-        return false;
-    }
-
     // Single compute pass for all backends — Dawn handles barriers internally
     passPerDispatch = false;
     fprintf(stderr, "  Backend: %s, single-pass dispatch\n",
@@ -885,6 +944,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto& qt = gguf.tensors[qi->second];
             if (qt.shape.size() >= 2) {
                 pl.qDim = (uint32_t)qt.shape[1];
+                if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0 &&
+                    cfg.isAttentionLayer(i)) {
+                    pl.qDim /= 2u; // attn_q.weight is joint Q+gate.
+                }
                 pl.headDim = pl.qDim / cfg.nHead;
             }
         } else {
@@ -995,7 +1058,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 // Pre-fused QKV (qwen35moe / some MoE archs)
                 auto& qkvt = gguf.tensors[qkvi_pre->second];
                 uint32_t qkvN = (uint32_t)qkvt.shape[1];  // out-dim = qDim + 2*kvDim
-                bool tensorIsKQ = (qkvt.type == GGUF_TYPE_Q4_K || qkvt.type == GGUF_TYPE_Q5_K || qkvt.type == GGUF_TYPE_Q6_K);
+                bool tensorIsKQ = cfg.arch != "qwen35" &&
+                    (qkvt.type == GGUF_TYPE_Q4_K || qkvt.type == GGUF_TYPE_Q5_K || qkvt.type == GGUF_TYPE_Q6_K);
                 const uint8_t* src = fileData + gguf.data_offset + qkvt.offset;
                 if (tensorIsKQ) {
                     KQuantPacked kq;
@@ -1055,15 +1119,22 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "attn_output.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
-                if (tensorIsKQ) {
-                    auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim, (GGUFType)ti.type);
-                    if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
-                    uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
-                } else {
+                if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0 &&
+                    cfg.isAttentionLayer(i)) {
                     auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
                                             cfg.nEmbd, layerQDim, (GGUFType)ti.type);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
+                } else {
+                    bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                    if (tensorIsKQ) {
+                        auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim, (GGUFType)ti.type);
+                        if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
+                        uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
+                    } else {
+                        auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                                cfg.nEmbd, layerQDim, (GGUFType)ti.type);
+                        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
+                    }
                 }
             }
         }
@@ -1075,6 +1146,21 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (gi != gguf.tensor_index.end() && ui != gguf.tensor_index.end()) {
                 auto& gt = gguf.tensors[gi->second];
                 auto& ut = gguf.tensors[ui->second];
+                if (cfg.arch == "qwen35") {
+                    auto gr = repackToQ8(fileData + gguf.data_offset + gt.offset,
+                                           layerIM, cfg.nEmbd, (GGUFType)gt.type);
+                    auto ur = repackToQ8(fileData + gguf.data_offset + ut.offset,
+                                           layerIM, cfg.nEmbd, (GGUFType)ut.type);
+                    Q8Repacked fused;
+                    fused.N = 2 * layerIM; fused.K = cfg.nEmbd;
+                    fused.weights.reserve(gr.weights.size() + ur.weights.size());
+                    fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
+                    fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
+                    fused.scales.reserve(gr.scales.size() + ur.scales.size());
+                    fused.scales.insert(fused.scales.end(), gr.scales.begin(), gr.scales.end());
+                    fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
+                } else {
                 bool bothKQ = isKQuant &&
                     (gt.type == GGUF_TYPE_Q4_K || gt.type == GGUF_TYPE_Q5_K || gt.type == GGUF_TYPE_Q6_K) &&
                     (ut.type == GGUF_TYPE_Q4_K || ut.type == GGUF_TYPE_Q5_K || ut.type == GGUF_TYPE_Q6_K);
@@ -1099,6 +1185,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
                 }
+                }
             }
         }
 
@@ -1107,7 +1194,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "ffn_down.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                bool tensorIsKQ = cfg.arch != "qwen35" && isKQuant &&
+                    (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
                 if (tensorIsKQ) {
                     auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM, (GGUFType)ti.type);
                     if (i == 0) { kqDnNBlocks = kq.nBlocks; kqDnRowStride = kq.rowStrideWords; }
@@ -1381,7 +1469,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
             // LM head: use quantized format if embedding is quantized
             if (cfg.tieWordEmbeddings) {
-                if (isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K ||
+                if (cfg.arch == "qwen35") {
+                    auto rep = repackToQ8(data, cfg.nVocab, cfg.nEmbd, (GGUFType)ti.type);
+                    uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
+                    lmHeadIsQ8 = true;
+                    uint64_t wBytes = (uint64_t)rep.weights.size() * 4;
+                    uint64_t sBytes = (uint64_t)rep.scales.size() * 4;
+                    fprintf(stderr, "  LM head: tied embeddings (Q8 for qwen35 correctness, %llu MB)\n",
+                           (unsigned long long)((wBytes + sBytes) / 1048576));
+                } else if (isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K ||
                                  ti.type == GGUF_TYPE_Q6_K)) {
                     // Upload as K-quant on GPU
                     auto kq = packKQ(data, cfg.nVocab, cfg.nEmbd, (GGUFType)ti.type);
@@ -1588,11 +1684,8 @@ void ModelRunner::buildDecodePipeline() {
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
     auto& plFusedRope  = getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope");
-    const bool useLargeHDAttn = (cfg.headDim > 128 && cfg.headDim % 32 == 0);
-    auto& plChunkP1    = useLargeHDAttn ? getKernelHD("gqa_chunked_pass1_large_hd")
-                                         : getKernelHD("gqa_chunked_pass1");
-    auto& plChunkP2    = useLargeHDAttn ? getKernelHD("gqa_chunked_pass2_large_hd")
-                                         : getKernelHD("gqa_chunked_pass2");
+    auto& plChunkP1    = getKernelHD("gqa_chunked_pass1");
+    auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
     auto& plFp16Gemm   = getKernel("fp16_gemm");
     auto& plFp16Wide   = getKernel("fp16_gemm_wide");
     auto& plArgmax     = getKernel("argmax");
@@ -1631,10 +1724,14 @@ void ModelRunner::buildDecodePipeline() {
         gpu->writeBuffer(buf, data, 16);
         return buf;
     };
-    auto q8QkvParams   = makeQ8Params("p_qkv", cfg.nEmbd, qkvOut);
+    uint32_t qkvParamOut = qkvOut;
+    if (cfg.arch == "qwen35" && cfg.ssmInnerSize > 0) {
+        qkvParamOut = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
+    }
+    auto q8QkvParams   = makeQ8Params("p_qkv", cfg.nEmbd, qkvParamOut);
     GPUBuffer q8QkvNormParams;
     {
-        uint32_t data[4] = {cfg.nEmbd, qkvOut, 0, 0};
+        uint32_t data[4] = {cfg.nEmbd, qkvParamOut, 0, 0};
         float eps = cfg.rmsNormEps; memcpy(&data[3], &eps, 4);
         q8QkvNormParams = gpu->createBuffer("p_qkv_norm", 16);
         gpu->writeBuffer(q8QkvNormParams, data, 16);
@@ -1688,7 +1785,7 @@ void ModelRunner::buildDecodePipeline() {
     };
     GPUBuffer kqQkvParams, kqOprojParams, kqGuParams, kqDnParams, kqLmParams;
     if (useKQ) {
-        kqQkvParams   = makeKQParams("p_kq_qkv", cfg.nEmbd, qkvOut, kqQkvNBlocks, kqQkvRowStride);
+        kqQkvParams   = makeKQParams("p_kq_qkv", cfg.nEmbd, qkvParamOut, kqQkvNBlocks, kqQkvRowStride);
         kqOprojParams = makeKQParams("p_kq_oproj", qDim, cfg.nEmbd, kqONBlocks, kqORowStride);
         kqGuParams    = makeKQParams("p_kq_gu", cfg.nEmbd, 2 * cfg.intermediateSize, kqGuNBlocks, kqGuRowStride);
         kqDnParams    = makeKQParams("p_kq_dn", cfg.intermediateSize, cfg.nEmbd, kqDnNBlocks, kqDnRowStride);
@@ -1768,6 +1865,18 @@ void ModelRunner::buildDecodePipeline() {
         memcpy(&p[6], &neg_inf, 4);
         p[7] = maxChunks;
     }
+    if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0) {
+        uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
+        uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
+        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
+        uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, 0u, 0, 0, 0, 0, 0, 0};
+        q35RopeQParamsBuf = gpu->createBuffer("p_q35_rope_q", 32);
+        q35RopeKParamsBuf = gpu->createBuffer("p_q35_rope_k", 32);
+        q35KvWriteParamsBuf = gpu->createBuffer("p_q35_kv_write", 32);
+        gpu->writeBuffer(q35RopeQParamsBuf, q, 32);
+        gpu->writeBuffer(q35RopeKParamsBuf, k, 32);
+        gpu->writeBuffer(q35KvWriteParamsBuf, kv, 32);
+    }
 
     // Ensure layer norms exist (identity for models without QK norm)
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
@@ -1802,6 +1911,12 @@ void ModelRunner::buildDecodePipeline() {
     uint32_t maxQkvOutBuf = qkvOut;
     uint32_t maxQDimBuf = qDim;
     uint32_t maxIMBuf = cfg.intermediateSize;
+    if (cfg.arch == "qwen35" && cfg.ssmInnerSize > 0) {
+        uint32_t ssmConvChannels = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
+        maxQkvOutBuf = std::max(maxQkvOutBuf, ssmConvChannels);
+        maxQkvOutBuf = std::max(maxQkvOutBuf, 2u * cfg.nHead * cfg.headDim);
+        maxQDimBuf = std::max(maxQDimBuf, cfg.nHead * cfg.headDim);
+    }
     for (auto& pl : cfg.perLayer) {
         uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
         if (plQkvOut > maxQkvOutBuf) maxQkvOutBuf = plQkvOut;
@@ -1856,10 +1971,24 @@ void ModelRunner::buildDecodePipeline() {
         fprintf(stderr, "  SSM state buffers: %u SSM layers x (conv=%zuB + h=%zuB) = %zu MB total\n",
                 ssmLayerCount, convBytes, hBytes,
                 (size_t)ssmLayerCount * (convBytes + hBytes) / (1024 * 1024));
+        if (cfg.arch == "qwen35") {
+            uint32_t convChannels = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
+            uint32_t qkDim = cfg.ssmGroupCount * cfg.ssmStateSize;
+            q35ConvOutBuf  = gpu->createBuffer("q35_ssm_conv_out", convChannels * 4);
+            q35SsmQBuf     = gpu->createBuffer("q35_ssm_q", qkDim * 4);
+            q35SsmKBuf     = gpu->createBuffer("q35_ssm_k", qkDim * 4);
+            q35SsmVBuf     = gpu->createBuffer("q35_ssm_v", cfg.ssmInnerSize * 4);
+            q35SsmBetaBuf  = gpu->createBuffer("q35_ssm_beta", cfg.ssmTimeStepRank * 4);
+            q35SsmAlphaBuf = gpu->createBuffer("q35_ssm_alpha", cfg.ssmTimeStepRank * 4);
+            q35SsmGateBuf  = gpu->createBuffer("q35_ssm_gate", cfg.ssmTimeStepRank * 4);
+            q35SsmYBuf     = gpu->createBuffer("q35_ssm_y", cfg.ssmInnerSize * 4);
+            q35SsmNormBuf  = gpu->createBuffer("q35_ssm_normed", cfg.ssmInnerSize * 4);
+            q35SsmZBuf     = gpu->createBuffer("q35_ssm_z", cfg.ssmInnerSize * 4);
+        }
     }
 
     // qwen35moe attention intermediate buffers (sized for actual Q/K/V dims)
-    if (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0) {
+    if ((cfg.arch == "qwen35" || cfg.numExperts > 0) && cfg.fullAttentionInterval > 0) {
         // Discover sizes from first attention layer's qjW buffer.
         // qjW is sized [qOutDim * cfg.nEmbd] in Q8 (1 byte/elem + scale per 32);
         // qOutDim = 2 * qDim_actual. We use a generous bound: 2 * 4 * cfg.nEmbd
@@ -1907,51 +2036,169 @@ void ModelRunner::buildDecodePipeline() {
     allDecodeDispatches.reserve(cfg.nLayer * 11 + 2);
     decodeDispatchIndices.assign(cfg.nLayer, {});
     decodeVariantBGs.assign(cfg.nLayer, {});
-    ropeDispatchIndices.resize(cfg.nLayer);
-    attnP1DispatchIndices.resize(cfg.nLayer);
-    attnP2DispatchIndices.resize(cfg.nLayer);
+    ropeDispatchIndices.assign(cfg.nLayer, -1);
+    attnP1DispatchIndices.assign(cfg.nLayer, -1);
+    attnP2DispatchIndices.assign(cfg.nLayer, -1);
 
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         auto& lw = layerWeights[i];
         auto& di = decodeDispatchIndices[i];
         auto& vbg = decodeVariantBGs[i];
         std::string L = "L" + std::to_string(i) + "/";
+        auto& pl = cfg.perLayer[i];
+        uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
+        uint32_t plQDim = pl.qDim;
+        uint32_t plIM = pl.intermediateSize;
+        auto& layerQkvP = cfg.hasPerLayerDims ? perLayerQkvParams[i] : q8QkvParams;
+        auto& layerQkvNP = cfg.hasPerLayerDims ? perLayerQkvNormParams[i] : q8QkvNormParams;
+        auto& layerOpP = cfg.hasPerLayerDims ? perLayerOprojParams[i] : q8OprojParams;
+        auto& layerGuP = cfg.hasPerLayerDims ? perLayerGuParams[i] : q8GuParams;
+        auto& layerDnP = cfg.hasPerLayerDims ? perLayerDnSiluParams[i] : q8DnSiluParams;
+        bool q35CustomAttn = false;
+        if (std::getenv("BP_TRACE_PIPELINE")) {
+            const char* kind =
+                (cfg.arch == "qwen35" && cfg.ssmInnerSize > 0 && !cfg.isAttentionLayer(i)) ? "qwen35-ssm" :
+                (cfg.arch == "qwen35" && cfg.isAttentionLayer(i)) ? "qwen35-attn" : "standard";
+            fprintf(stderr, "[trace] build layer %u (%s)\n", i, kind);
+            fflush(stderr);
+        }
 
-        // ── DeltaNet layer passthrough (qwen35moe linear-attention layers) ──
-        // CORRECTNESS NOTE: qwen35moe's "SSM" layers are actually DeltaNet
-        // (linear attention with delta rule, NOT standard Mamba). My earlier
-        // implementation using Mamba selective_scan was architecturally wrong.
-        // Reverting to passthrough until proper DeltaNet kernels exist:
-        //
-        // DeltaNet forward (per layer):
-        //   qkvz   = qkvz_proj(x)               -- combined Q/K/V/Z projection
-        //   beta   = sigmoid(beta_proj(x))      -- delta gate
-        //   alpha  = softplus(alpha_proj(x) + ssm_dt)
-        //   gate   = exp(-A_log) * alpha        -- ssm_a is small [dt_rank]
-        //   conv_out = silu(ssm_conv(qkv_mixed, conv1d))
-        //   q, k, v = extract from conv_out
-        //   state' = state * exp(gate) + beta * (k ⊗ v)   -- matrix-state recurrence
-        //   y      = q ⊗ state'                            -- matrix-state @ vec
-        //   y      = ssm_norm * y * silu(z)
-        //   out    = ssm_out @ y                           -- residual add
-        //
-        // Reference: github.com/ggml-org/llama.cpp src/models/qwen35.cpp
-        //   `build_layer_attn_linear` + `build_delta_net_*`
-        //
-        // Needed but NOT in backpack today: matrix-state recurrence kernel,
-        // proper Q/K/V/Z extraction from conv output, delta rule kernel.
-        // (~1-2 weeks of focused work to implement correctly.)
-        //
-        // Also: attention layers use multi-axis RoPE (MRoPE) which backpack
-        // doesn't support either — those layers' attention is also wrong.
-        if (cfg.ssmInnerSize > 0 && !cfg.isAttentionLayer(i)) {
-            if (i == 0) {
-                fprintf(stderr,
-                    "  DeltaNet layers passthrough (%u layers). Output WILL BE WRONG.\n"
-                    "  Proper DeltaNet impl needs matrix-state recurrence kernel.\n",
-                    cfg.nLayer - cfg.nLayer / cfg.fullAttentionInterval);
+        auto mkP32 = [&](const std::string& name, std::initializer_list<uint32_t> data) -> GPUBuffer {
+            uint32_t buf[8] = {0};
+            size_t i2 = 0; for (uint32_t v : data) { buf[i2++] = v; }
+            auto b = gpu->createBuffer(name, 32);
+            gpu->writeBuffer(b, buf, 32);
+            return b;
+        };
+
+        if (cfg.arch == "qwen35" && cfg.ssmInnerSize > 0 && !cfg.isAttentionLayer(i)) {
+            q35CustomAttn = true;
+            uint32_t convChannels = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
+            uint32_t qkDimSsm = cfg.ssmGroupCount * cfg.ssmStateSize;
+            uint32_t headV = cfg.ssmInnerSize / cfg.ssmTimeStepRank;
+            bool useSsmKQ = useKQ && cfg.arch != "qwen35";
+
+            {
+                auto bg = makeBG(plRmsNorm, {
+                    {0, xBuf}, {1, normOutBuf}, {2, lw.inputNorm},
+                    {3, rstdBuf}, {4, rmsParams}});
+                allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1, L+"rms_norm"});
             }
-            continue;
+
+            if (useSsmKQ) {
+                auto bg = makeBG(*plKQ, {
+                    {0, normOutBuf}, {1, lw.qkvKQ}, {2, zeroBiasQKV},
+                    {3, qkvBuf}, {4, kqQkvParams}});
+                allDecodeDispatches.push_back({plKQ->pipeline, bg,
+                    1, (convChannels + kqTileN - 1) / kqTileN, 1, L+"ssm_qkv"});
+            } else {
+                auto p = mkP32("p_ssm_qkv_L"+std::to_string(i), {cfg.nEmbd, convChannels});
+                auto bg = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
+                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (convChannels + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_qkv"});
+            }
+
+            {
+                auto p = mkP32("p_ssm_z_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmInnerSize});
+                auto bg = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.attnGateW}, {2, lw.attnGateS},
+                    {3, zeroBiasQKV}, {4, q35SsmZBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (cfg.ssmInnerSize + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_z"});
+            }
+            {
+                auto p = mkP32("p_ssm_beta_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
+                auto bg = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.ssmBetaW}, {2, lw.ssmBetaS},
+                    {3, zeroBiasQKV}, {4, q35SsmBetaBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_beta"});
+            }
+            {
+                auto p = mkP32("p_ssm_alpha_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmTimeStepRank});
+                auto bg = makeBG(plQ8Matmul, {
+                    {0, normOutBuf}, {1, lw.ssmAlphaW}, {2, lw.ssmAlphaS},
+                    {3, zeroBiasQKV}, {4, q35SsmAlphaBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (cfg.ssmTimeStepRank + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_alpha"});
+            }
+            {
+                auto& plGate = getKernel("qwen35_alpha_beta_gate");
+                auto p = mkP32("p_ssm_abg_L"+std::to_string(i), {cfg.ssmTimeStepRank});
+                auto bg = makeBG(plGate, {
+                    {0, q35SsmBetaBuf}, {1, q35SsmAlphaBuf}, {2, lw.ssmDtBias},
+                    {3, lw.ssmA}, {4, q35SsmBetaBuf}, {5, q35SsmGateBuf}, {6, p}});
+                allDecodeDispatches.push_back({plGate.pipeline, bg,
+                    (cfg.ssmTimeStepRank + 63) / 64, 1, 1, L+"ssm_abg"});
+            }
+            {
+                auto& plConvState = getKernel("conv_state_update");
+                auto p = mkP32("p_ssm_conv_state_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
+                auto bg = makeBG(plConvState, {
+                    {0, ssmConvState[i]}, {1, qkvBuf}, {2, p}});
+                allDecodeDispatches.push_back({plConvState.pipeline, bg,
+                    (convChannels + 255) / 256, 1, 1, L+"ssm_conv_state"});
+            }
+            {
+                auto& plConv = getKernel("conv1d_decode");
+                auto p = mkP32("p_ssm_conv_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
+                auto bg = makeBG(plConv, {
+                    {0, ssmConvState[i]}, {1, lw.ssmConv1dW}, {2, zeroBiasQKV},
+                    {3, q35ConvOutBuf}, {4, p}});
+                allDecodeDispatches.push_back({plConv.pipeline, bg,
+                    (convChannels + 255) / 256, 1, 1, L+"ssm_conv"});
+            }
+            {
+                auto& plSilu = getKernel("silu");
+                auto p = mkP32("p_ssm_silu_L"+std::to_string(i), {convChannels});
+                auto bg = makeBG(plSilu, {
+                    {0, q35ConvOutBuf}, {1, q35ConvOutBuf}, {2, p}});
+                allDecodeDispatches.push_back({plSilu.pipeline, bg,
+                    (convChannels + 255) / 256, 1, 1, L+"ssm_silu"});
+            }
+            {
+                auto& plSplit = getKernel("qwen35_split_qkv_l2");
+                uint32_t epsBits; float eps = cfg.rmsNormEps; memcpy(&epsBits, &eps, 4);
+                auto p = mkP32("p_ssm_split_L"+std::to_string(i),
+                               {cfg.ssmGroupCount, cfg.ssmTimeStepRank, cfg.ssmStateSize, headV, epsBits});
+                auto bg = makeBG(plSplit, {
+                    {0, q35ConvOutBuf}, {1, q35SsmQBuf}, {2, q35SsmKBuf},
+                    {3, q35SsmVBuf}, {4, p}});
+                allDecodeDispatches.push_back({plSplit.pipeline, bg,
+                    3, std::max(cfg.ssmGroupCount, cfg.ssmTimeStepRank), 1, L+"ssm_split"});
+            }
+            {
+                auto& plDelta = getKernel("delta_net_decode");
+                auto p = mkP32("p_ssm_delta_L"+std::to_string(i),
+                               {cfg.ssmTimeStepRank, cfg.ssmGroupCount, cfg.ssmStateSize, headV});
+                auto bg = makeBG(plDelta, {
+                    {0, q35SsmQBuf}, {1, q35SsmKBuf}, {2, q35SsmVBuf},
+                    {3, q35SsmBetaBuf}, {4, q35SsmGateBuf}, {5, ssmHState[i]},
+                    {6, q35SsmYBuf}, {7, p}});
+                allDecodeDispatches.push_back({plDelta.pipeline, bg,
+                    cfg.ssmTimeStepRank, 1, 1, L+"ssm_delta"});
+            }
+            {
+                auto& plNormGate = getKernel("qwen35_norm_gated");
+                uint32_t epsBits; float eps = cfg.rmsNormEps; memcpy(&epsBits, &eps, 4);
+                auto p = mkP32("p_ssm_norm_gate_L"+std::to_string(i),
+                               {cfg.ssmTimeStepRank, headV, epsBits});
+                auto bg = makeBG(plNormGate, {
+                    {0, q35SsmYBuf}, {1, lw.ssmNorm}, {2, q35SsmZBuf},
+                    {3, q35SsmNormBuf}, {4, p}});
+                allDecodeDispatches.push_back({plNormGate.pipeline, bg,
+                    cfg.ssmTimeStepRank, 1, 1, L+"ssm_norm_gate"});
+            }
+            {
+                auto p = mkP32("p_ssm_out_L"+std::to_string(i), {cfg.ssmInnerSize, cfg.nEmbd});
+                auto bg = makeBG(plQ8Matmul, {
+                    {0, q35SsmNormBuf}, {1, lw.ssmOutW}, {2, lw.ssmOutS},
+                    {3, zeroBiasE}, {4, projOutBuf}, {5, p}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_out"});
+            }
         }
 
         // ── qwen35moe attention-layer dispatch (correctness wiring) ────────
@@ -1960,32 +2207,22 @@ void ModelRunner::buildDecodePipeline() {
         // (Note: this dispatches ALONGSIDE the dense path below, so residual
         //  is added twice. Refactoring to skip the dense path requires
         //  wrapping ~400 lines in if/else; for now we live with the duplication.)
-        if (cfg.numExperts > 0 && cfg.fullAttentionInterval > 0 && cfg.isAttentionLayer(i) &&
+        if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0 && cfg.isAttentionLayer(i) &&
             layerWeights[i].qjW.handle && layerWeights[i].kSepW.handle && layerWeights[i].vSepW.handle) {
+            q35CustomAttn = true;
             auto& lwQ35 = layerWeights[i];
             if (i == 3) {
-                fprintf(stderr,
-                    "  qwen35moe attn dispatch wired for layer %u\n"
-                    "  WARN: attention compute uses Q passthrough placeholder. Output INCORRECT.\n", i);
+                fprintf(stderr, "  qwen35 attn dispatch wired for layer %u\n", i);
             }
-            auto mkP35 = [&](const std::string& name, std::initializer_list<uint32_t> data) -> GPUBuffer {
-                uint32_t buf[8] = {0};
-                size_t i2 = 0; for (uint32_t v : data) { buf[i2++] = v; }
-                auto b = gpu->createBuffer(name, 32);
-                gpu->writeBuffer(b, buf, 32);
-                return b;
-            };
 
-            // Discovered actual dims (qwen35moe IQ3_XXS): qOutDim=8192, qDim=4096,
-            // nHead=16, headDim=256, kvDim=512, nKvHeads=2.
-            uint32_t qOutDim = 4u * cfg.nEmbd;   // 8192
-            uint32_t qDimAct = qOutDim / 2u;     // 4096
-            uint32_t headDimAct = qDimAct / cfg.nHead;  // 256
-            uint32_t kvDimAct = cfg.nKvHeads * headDimAct;  // 512
+            uint32_t qDimAct = pl.qDim;
+            uint32_t qOutDim = 2u * qDimAct;
+            uint32_t headDimAct = pl.headDim;
+            uint32_t kvDimAct = pl.kvDim;
 
             // 2. Q matmul: normOutBuf @ qjW → q35QjBuf
             {
-                auto p = mkP35("p_q35_q_L"+std::to_string(i), {cfg.nEmbd, qOutDim});
+                auto p = mkP32("p_q35_q_L"+std::to_string(i), {cfg.nEmbd, qOutDim});
                 auto bg = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lwQ35.qjW}, {2, lwQ35.qjS},
                     {3, zeroBiasV}, {4, q35QjBuf}, {5, p}});
@@ -1994,7 +2231,7 @@ void ModelRunner::buildDecodePipeline() {
             }
             // 3. K matmul
             {
-                auto p = mkP35("p_q35_k_L"+std::to_string(i), {cfg.nEmbd, kvDimAct});
+                auto p = mkP32("p_q35_k_L"+std::to_string(i), {cfg.nEmbd, kvDimAct});
                 auto bg = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lwQ35.kSepW}, {2, lwQ35.kSepS},
                     {3, zeroBiasV}, {4, q35KBuf}, {5, p}});
@@ -2003,7 +2240,7 @@ void ModelRunner::buildDecodePipeline() {
             }
             // 4. V matmul
             {
-                auto p = mkP35("p_q35_v_L"+std::to_string(i), {cfg.nEmbd, kvDimAct});
+                auto p = mkP32("p_q35_v_L"+std::to_string(i), {cfg.nEmbd, kvDimAct});
                 auto bg = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lwQ35.vSepW}, {2, lwQ35.vSepS},
                     {3, zeroBiasV}, {4, q35VBuf}, {5, p}});
@@ -2012,64 +2249,105 @@ void ModelRunner::buildDecodePipeline() {
             }
             // 5. attn_split_qg: q35QjBuf → q35QBuf + q35GateBuf
             {
-                auto& plSplit = getKernel("attn_split_qg");
-                auto p = mkP35("p_q35_split_L"+std::to_string(i), {cfg.nHead, headDimAct});
+                auto& plSplit = getKernel("split_qg");
+                auto p = mkP32("p_q35_split_L"+std::to_string(i), {cfg.nHead, headDimAct});
                 auto bg = makeBG(plSplit, {
                     {0, q35QjBuf}, {1, q35QBuf}, {2, q35GateBuf}, {3, p}});
                 allDecodeDispatches.push_back({plSplit.pipeline, bg,
                     (qDimAct + 255) / 256, 1, 1, L+"q35_split"});
             }
-            // 6. Per-head RMSNorm on Q and K
-            if (lwQ35.qNorm.handle) {
-                auto& plNorm = getKernel("attn_head_rmsnorm");
-                uint32_t epsBits; float eps = cfg.rmsNormEps; memcpy(&epsBits, &eps, 4);
-                auto p = mkP35("p_q35_qnorm_L"+std::to_string(i), {cfg.nHead, headDimAct, epsBits});
-                auto bg = makeBG(plNorm, {{0, q35QBuf}, {1, lwQ35.qNorm}, {2, p}});
-                allDecodeDispatches.push_back({plNorm.pipeline, bg, cfg.nHead, 1, 1, L+"q35_qnorm"});
-            }
-            if (lwQ35.kNorm.handle) {
-                auto& plNorm = getKernel("attn_head_rmsnorm");
-                uint32_t epsBits; float eps = cfg.rmsNormEps; memcpy(&epsBits, &eps, 4);
-                auto p = mkP35("p_q35_knorm_L"+std::to_string(i), {cfg.nKvHeads, headDimAct, epsBits});
-                auto bg = makeBG(plNorm, {{0, q35KBuf}, {1, lwQ35.kNorm}, {2, p}});
-                allDecodeDispatches.push_back({plNorm.pipeline, bg, cfg.nKvHeads, 1, 1, L+"q35_knorm"});
-            }
-            // 7. MRoPE — TODO: need per-decode cos/sin precompute. Skipped for now.
 
-            // 8. Attention compute — PLACEHOLDER: copy Q → attn_out (no real attn).
+            // llama.cpp order for qwen35 full-attention layers:
+            // Q/G split -> Q norm, K norm -> MRoPE(Q/K) -> attention -> sigmoid gate.
             {
-                auto& plCopy = getKernel("shared_copy_buffer");
-                auto p = mkP35("p_q35_attn_ph_L"+std::to_string(i), {qDimAct, 0u, 0u});
-                auto bg = makeBG(plCopy, {{0, q35QBuf}, {1, q35AttnOutBuf}, {2, p}});
+                uint32_t epsBits = 0;
+                memcpy(&epsBits, &cfg.rmsNormEps, 4);
+                auto& plHeadNorm = getKernel("head_rmsnorm");
+                auto p = mkP32("p_q35_qnorm_L"+std::to_string(i),
+                               {cfg.nHead, headDimAct, epsBits});
+                auto bg = makeBG(plHeadNorm, {{0, q35QBuf}, {1, lwQ35.qNorm}, {2, p}});
+                allDecodeDispatches.push_back({plHeadNorm.pipeline, bg,
+                    cfg.nHead, 1, 1, L+"q35_qnorm"});
+            }
+            {
+                uint32_t epsBits = 0;
+                memcpy(&epsBits, &cfg.rmsNormEps, 4);
+                auto& plHeadNorm = getKernel("head_rmsnorm");
+                auto p = mkP32("p_q35_knorm_L"+std::to_string(i),
+                               {cfg.nKvHeads, headDimAct, epsBits});
+                auto bg = makeBG(plHeadNorm, {{0, q35KBuf}, {1, lwQ35.kNorm}, {2, p}});
+                allDecodeDispatches.push_back({plHeadNorm.pipeline, bg,
+                    cfg.nKvHeads, 1, 1, L+"q35_knorm"});
+            }
+            {
+                auto& plQ35Rope = getKernel("qwen35_rope_multi_partial");
+                auto bg = makeBG(plQ35Rope, {
+                    {0, q35QBuf}, {1, ropeCosBuf}, {2, ropeSinBuf}, {3, q35RopeQParamsBuf}});
+                allDecodeDispatches.push_back({plQ35Rope.pipeline, bg,
+                    32, cfg.nHead, 1, L+"q35_q_mrope"});
+            }
+            {
+                auto& plQ35Rope = getKernel("qwen35_rope_multi_partial");
+                auto bg = makeBG(plQ35Rope, {
+                    {0, q35KBuf}, {1, ropeCosBuf}, {2, ropeSinBuf}, {3, q35RopeKParamsBuf}});
+                allDecodeDispatches.push_back({plQ35Rope.pipeline, bg,
+                    32, cfg.nKvHeads, 1, L+"q35_k_mrope"});
+            }
+            {
+                auto& plCopy = getKernel("copy_buffer");
+                auto p = mkP32("p_q35_copy_qrot_L"+std::to_string(i), {qDimAct, 0u, 0u});
+                auto bg = makeBG(plCopy, {{0, q35QBuf}, {1, qRotBuf}, {2, p}});
                 allDecodeDispatches.push_back({plCopy.pipeline, bg,
-                    (qDimAct + 255) / 256, 1, 1, L+"q35_attn_ph"});
+                    (qDimAct + 255) / 256, 1, 1, L+"q35_copy_qrot"});
+            }
+            {
+                auto& plKvWrite = getKernel("qwen35_kv_cache_write");
+                auto bg = makeBG(plKvWrite, {
+                    {0, q35KBuf}, {1, q35VBuf}, {2, kvCache[i].K}, {3, kvCache[i].V},
+                    {4, q35KvWriteParamsBuf}});
+                allDecodeDispatches.push_back({plKvWrite.pipeline, bg,
+                    (kvDimAct + 255) / 256, 1, 1, L+"q35_kv_write"});
+            }
+            {
+                auto bg = makeBG(plChunkP1, {
+                    {0, qRotBuf}, {1, kvCache[i].K}, {2, kvCache[i].V},
+                    {3, attnPartialsBuf}, {4, chunkedAttnParamsBuf}});
+                attnP1DispatchIndices[i] = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plChunkP1.pipeline, bg,
+                    cfg.nHead, maxChunks, 1, L+"q35_attn_p1"});
+            }
+            {
+                auto bg = makeBG(plChunkP2, {
+                    {0, attnPartialsBuf}, {1, attnOutBuf},
+                    {2, chunkedAttnParamsBuf}});
+                attnP2DispatchIndices[i] = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plChunkP2.pipeline, bg,
+                    cfg.nHead, 1, 1, L+"q35_attn_p2"});
             }
             // 9. attn_gated_output
             {
-                auto& plGate = getKernel("attn_gated_output");
-                auto p = mkP35("p_q35_gate_L"+std::to_string(i), {qDimAct});
+                auto& plGate = getKernel("gated_output");
+                auto p = mkP32("p_q35_gate_L"+std::to_string(i), {qDimAct});
                 auto bg = makeBG(plGate, {
-                    {0, q35AttnOutBuf}, {1, q35GateBuf}, {2, q35AttnOutBuf}, {3, p}});
+                    {0, attnOutBuf}, {1, q35GateBuf}, {2, q35AttnOutBuf}, {3, p}});
                 allDecodeDispatches.push_back({plGate.pipeline, bg,
                     (qDimAct + 255) / 256, 1, 1, L+"q35_gated"});
             }
-            // 10. wo matmul + residual (uses existing lw.oW from dense loader)
-            if (lwQ35.oW.handle) {
-                auto p = mkP35("p_q35_oproj_L"+std::to_string(i), {qDimAct, cfg.nEmbd});
+            // 10. wo matmul to projOutBuf. The shared post-attention block below
+            // performs the residual add and post-attention norm.
+            if (useKQ && lwQ35.oKQ.handle && plKQ) {
+                auto bg = makeBG(*plKQ, {
+                    {0, q35AttnOutBuf}, {1, lwQ35.oKQ}, {2, zeroBiasE},
+                    {3, projOutBuf}, {4, kqOprojParams}});
+                allDecodeDispatches.push_back({plKQ->pipeline, bg,
+                    1, (cfg.nEmbd + kqTileN - 1) / kqTileN, 1, L+"q35_kq_oproj"});
+            } else if (lwQ35.oW.handle) {
+                auto p = mkP32("p_q35_oproj_L"+std::to_string(i), {qDimAct, cfg.nEmbd});
                 auto bg = makeBG(plQ8Matmul, {
                     {0, q35AttnOutBuf}, {1, lwQ35.oW}, {2, lwQ35.oS},
                     {3, zeroBiasE}, {4, projOutBuf}, {5, p}});
                 allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
                     1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q35_oproj"});
-
-                auto& plWAcc = getKernel("moe_weighted_accumulate_decode");
-                auto pAdd = mkP35("p_q35_add_L"+std::to_string(i), {cfg.nEmbd, 0u});
-                GPUBuffer one = gpu->createBuffer("q35_one_L"+std::to_string(i), 4);
-                float oneF = 1.0f; gpu->writeBuffer(one, &oneF, 4);
-                auto bgAdd = makeBG(plWAcc,
-                    {{0, xBuf}, {1, projOutBuf}, {2, one}, {3, pAdd}});
-                allDecodeDispatches.push_back({plWAcc.pipeline, bgAdd,
-                    (cfg.nEmbd + 255) / 256, 1, 1, L+"q35_attn_add"});
             }
         }
 
@@ -2108,16 +2386,7 @@ void ModelRunner::buildDecodePipeline() {
         // dispatches run — Dawn flags null qkvW/qkvKQ binds but the run
         // continues with garbage attention output.
 
-        auto& pl = cfg.perLayer[i];
-        uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
-        uint32_t plQDim = pl.qDim;
-        uint32_t plIM = pl.intermediateSize;
-        auto& layerQkvP = cfg.hasPerLayerDims ? perLayerQkvParams[i] : q8QkvParams;
-        auto& layerQkvNP = cfg.hasPerLayerDims ? perLayerQkvNormParams[i] : q8QkvNormParams;
-        auto& layerOpP = cfg.hasPerLayerDims ? perLayerOprojParams[i] : q8OprojParams;
-        auto& layerGuP = cfg.hasPerLayerDims ? perLayerGuParams[i] : q8GuParams;
-        auto& layerDnP = cfg.hasPerLayerDims ? perLayerDnSiluParams[i] : q8DnSiluParams;
-
+        if (!q35CustomAttn) {
         // Shared KV: attention reads from source layer's cache
         uint32_t kvCacheLayer = (pl.kvSourceLayer >= 0) ? (uint32_t)pl.kvSourceLayer : i;
 
@@ -2209,9 +2478,18 @@ void ModelRunner::buildDecodePipeline() {
                     1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_oproj"});
             }
         }
+        }
 
-        // Post-attention: either fused add+norm (standard) or sandwich norms (Gemma 4)
-        if (cfg.hasSandwichNorm && lw.postNorm.handle) {
+        // Post-attention:
+        // - Qwen3.5: residual add first, then attn_post_norm feeds the FFN.
+        // - Gemma sandwich: normalize attention output before residual add.
+        // - Standard: residual add plus ffn_norm in one fused dispatch.
+        if (cfg.arch == "qwen35" && lw.postNorm.handle) {
+            auto bg = makeBG(plAddRmsNorm, {
+                {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
+                {3, lw.postNorm}, {4, rstdBuf}, {5, rmsParams}});
+            allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg, 1, 1, 1, L+"q35_add_attn_post_norm"});
+        } else if (cfg.hasSandwichNorm && lw.postNorm.handle) {
             // Sandwich: RMSNorm(projOutBuf) in-place, then xBuf += projOutBuf, then norm for FFN
             static const char* RMS_NORM_INPLACE_WGSL = R"(
 enable subgroups;
@@ -2495,7 +2773,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         {
-            if (useKQ) {
+            if (useKQ && cfg.arch != "qwen35") {
                 auto bg = makeBG(*plKQ, {
                     {0, normOutBuf}, {1, lw.guKQ}, {2, zeroBiasGU},
                     {3, gateUpBuf}, {4, kqGuParams}});
@@ -2521,7 +2799,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // 9. Down projection + SiLU + residual add
         {
-            if (useKQ) {
+            if (useKQ && cfg.arch != "qwen35") {
                 // K-quant: activation+mul → K-quant matmul → add residual (3 dispatches)
                 auto& plActMul = useGelu ? getKernel("gelu_mul_fused")
                                           : getKernel("silu_mul_fused");
@@ -2989,6 +3267,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         autoDecodePrefixCount = (cfg.embeddingScale > 0.0f) ? 2 : 1;
         int prefixCount = autoDecodePrefixCount;
         for (uint32_t layer = 0; layer < cfg.nLayer; layer++) {
+            if (ropeDispatchIndices[layer] < 0 ||
+                attnP1DispatchIndices[layer] < 0 ||
+                attnP2DispatchIndices[layer] < 0) {
+                continue;
+            }
             int ropeIdx = ropeDispatchIndices[layer] + prefixCount;
             int p1Idx   = attnP1DispatchIndices[layer] + prefixCount;
             int p2Idx   = attnP2DispatchIndices[layer] + prefixCount;
@@ -3702,6 +3985,9 @@ void ModelRunner::destroy() {
 void ModelRunner::uploadEmbedding(int32_t tokenId) {
     if (tokenId < 0 || (uint32_t)tokenId >= cfg.nVocab) tokenId = 0;
     const float* emb = embeddingCPU.data() + tokenId * cfg.nEmbd;
+    if (std::getenv("BP_DUMP_BUFFER_STATS")) {
+        dumpFloatArrayStats("embeddingCPU[token]", emb, cfg.nEmbd);
+    }
     if (cfg.embeddingScale > 0.0f) {
         std::vector<float> scaled(cfg.nEmbd);
         for (uint32_t i = 0; i < cfg.nEmbd; i++)
@@ -3739,6 +4025,16 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
     p[3] = pos;
     p[5] = cacheLen * cfg.nKvHeads * cfg.headDim;
     gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
+
+    if (q35RopeQParamsBuf.handle) {
+        uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
+        uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
+        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
+        uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, cacheLen * cfg.nKvHeads * cfg.headDim, 0, 0, 0, 0, 0, 0};
+        gpu->writeBuffer(q35RopeQParamsBuf, q, 32);
+        gpu->writeBuffer(q35RopeKParamsBuf, k, 32);
+        gpu->writeBuffer(q35KvWriteParamsBuf, kv, 32);
+    }
 
     uint32_t T_total = cacheLen + 1;
     uint32_t n_chunks = (T_total + gqaChunkSize - 1) / gqaChunkSize;
@@ -3808,6 +4104,12 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
 
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len++;
+
+    if (std::getenv("BP_DUMP_BUFFER_STATS")) {
+        dumpFloatBufferStats(*gpu, "xBuf", xBuf, cfg.nEmbd);
+        dumpFloatBufferStats(*gpu, "normOutBuf", normOutBuf, cfg.nEmbd);
+        dumpFloatBufferStats(*gpu, "logitsBuf", logitsBuf, cfg.nVocab);
+    }
 
     std::vector<float> logits(cfg.nVocab);
     memcpy(logits.data(), result.data(), cfg.nVocab * 4);

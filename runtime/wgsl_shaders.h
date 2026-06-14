@@ -1370,6 +1370,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 }
 )WGSL";
 
+// [attention] qwen35_kv_cache_write
+static const char* WGSL_QWEN35_KV_CACHE_WRITE = R"WGSL(
+enable f16;
+
+// Write already-normalized/rotated Qwen3.5 K and raw V into fp16 KV cache.
+//
+// Bindings:
+//   0: K        [kv_dim] f32
+//   1: V        [kv_dim] f32
+//   2: K_cache  [seq * kv_dim] f16
+//   3: V_cache  [seq * kv_dim] f16
+//   4: params   [kv_dim, cache_offset_words]
+
+@group(0) @binding(0) var<storage, read>       K:       array<f32>;
+@group(0) @binding(1) var<storage, read>       V:       array<f32>;
+@group(0) @binding(2) var<storage, read_write> KCache:  array<f16>;
+@group(0) @binding(3) var<storage, read_write> VCache:  array<f16>;
+@group(0) @binding(4) var<storage, read>       params:  array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let kv_dim = params[0];
+    let off = params[1];
+    let i = gid.x;
+    if (i >= kv_dim) { return; }
+    KCache[off + i] = f16(K[i]);
+    VCache[off + i] = f16(V[i]);
+}
+)WGSL";
+
 // [attention] rope_batched
 static const char* WGSL_ROPE_BATCHED = R"WGSL(
 enable f16;
@@ -1945,6 +1975,71 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     for (var j = tid; j < head_dim; j = j + 64u) {
         X[base + j] = X[base + j] * inv_rms * W[j];
     }
+}
+)WGSL";
+
+// [attn] qwen35_rope_multi_partial
+static const char* WGSL_QWEN35_ROPE_MULTI_PARTIAL = R"WGSL(
+// Qwen3.5 partial multi-section RoPE for decode.
+//
+// Text-only Qwen3.5 uses MRoPE sections over the rotated prefix. For the
+// current GGUFs the 64 rotary dimensions are split as 32 pairs: [11, 11, 10, 0].
+// Each section restarts the frequency index, matching ggml_rope_multi.
+//
+// Bindings:
+//   0: X        [n_head * head_dim] f32, in-place
+//   1: cos      [max_seq * rope_half] f32, standard RoPE cos table
+//   2: sin      [max_seq * rope_half] f32, standard RoPE sin table
+//   3: params   [n_head, head_dim, s0, s1, s2, s3, pos, rope_half]
+
+@group(0) @binding(0) var<storage, read_write> X:      array<f32>;
+@group(0) @binding(1) var<storage, read>       Cos:    array<f32>;
+@group(0) @binding(2) var<storage, read>       Sin:    array<f32>;
+@group(0) @binding(3) var<storage, read>       params: array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_head    = params[0];
+    let head_dim  = params[1];
+    let s0        = params[2];
+    let s1        = params[3];
+    let s2        = params[4];
+    let s3        = params[5];
+    let pos       = params[6];
+    let rope_half = params[7];
+
+    let total_pairs = s0 + s1 + s2 + s3;
+    let head_idx = gid.y;
+    let pair_idx = gid.x;
+    if (head_idx >= n_head || pair_idx >= total_pairs) { return; }
+
+    var section: u32 = 0u;
+    var local_idx: u32 = pair_idx;
+    if (local_idx >= s0) {
+        local_idx = local_idx - s0;
+        section = 1u;
+    }
+    if (section == 1u && local_idx >= s1) {
+        local_idx = local_idx - s1;
+        section = 2u;
+    }
+    if (section == 2u && local_idx >= s2) {
+        local_idx = local_idx - s2;
+        section = 3u;
+    }
+
+    let table_idx = pos * rope_half + local_idx;
+    let c = Cos[table_idx];
+    let s = Sin[table_idx];
+
+    let head_base = head_idx * head_dim;
+    let x0_idx = head_base + pair_idx;
+    let x1_idx = head_base + pair_idx + total_pairs;
+    let x0 = X[x0_idx];
+    let x1 = X[x1_idx];
+
+    X[x0_idx] = x0 * c - x1 * s;
+    X[x1_idx] = x0 * s + x1 * c;
 }
 )WGSL";
 
@@ -16875,7 +16970,8 @@ static const char* WGSL_CONV1D_DECODE = R"WGSL(
 // SSM conv1d (depthwise) — Mamba decode primitive
 //
 // For decode mode (single new token), the SSM conv state is a rolling
-// buffer of the last `conv_k` input vectors per channel. This kernel
+// buffer of the last `conv_k` input vectors per channel, ordered oldest to
+// newest like llama.cpp's ggml_ssm_conv input. This kernel
 // performs the FIR filter:
 //   out[c] = sum_{k=0..K-1} weights[c, k] * state[c, k]
 // per channel c in 0..d_inner.
@@ -16903,7 +16999,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (c >= d_inner) { return; }
     var acc: f32 = bias[c];
     // weights laid out as [d_inner, K]: weights[c*K + k]
-    // state    laid out as [d_inner, K]: state[c*K + k]
+    // state laid out as [d_inner, K], oldest to newest: state[c*K + k]
     let base = c * K;
     for (var k: u32 = 0u; k < K; k = k + 1u) {
         acc = acc + weights[base + k] * state[base + k];
@@ -16920,8 +17016,10 @@ static const char* WGSL_CONV_STATE_UPDATE = R"WGSL(
 // vectors per channel. Before each conv1d_decode dispatch, we shift the
 // state by 1 (drop oldest, append new x) per channel.
 //
-// Layout: state[c*K + k] where k=0 is the newest sample, k=K-1 is the oldest.
-// After update: state[c*K + 0] = x[c], state[c*K + k] = old_state[c*K + (k-1)] for k>=1.
+// Layout matches llama.cpp's ggml_ssm_conv input window: state[c*K + k] where
+// k=0 is the oldest sample and k=K-1 is the newest.
+// After update: state[c*K + k] = old_state[c*K + (k+1)] for k<K-1,
+// state[c*K + K-1] = x[c].
 //
 // Bindings:
 //   0: state  [d_inner * K]   (read+write)
@@ -16939,11 +17037,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= d_inner) { return; }
     let base = c * K;
-    // Shift right (k=K-1..1 = state[k-1])
-    for (var k: u32 = K; k > 1u; k = k - 1u) {
-        state[base + k - 1u] = state[base + k - 2u];
+    // Shift left (drop oldest) and append newest at the end.
+    for (var k: u32 = 0u; k + 1u < K; k = k + 1u) {
+        state[base + k] = state[base + k + 1u];
     }
-    state[base + 0u] = x[c];
+    state[base + K - 1u] = x[c];
 }
 )WGSL";
 
@@ -16955,7 +17053,7 @@ static const char* WGSL_DELTA_NET_DECODE = R"WGSL(
 //   kv      = dot(k[h], exp(g[h]) * state[h, :, v_col])
 //   delta   = (v[h, v_col] - kv) * beta[h]
 //   state'  = exp(g[h]) * state + outer(k[h], delta)
-//   y       = q[h] @ state'
+//   y       = (q[h] / sqrt(head_k_dim)) @ state'
 //
 // Heads layout: num_v_heads outputs; K is shared in groups (num_k_heads <= num_v_heads).
 // Q and K are num_k_heads-wide; Q/K head index is derived from the V head.
@@ -16994,7 +17092,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     if (head >= nv) { return; }
     let tid     = lid.x;
 
-    let k_head_idx = (head * nk) / nv;  // mapping v-head → k-head group
+    let k_head_idx = head % nk;  // mapping v-head -> repeated k/q head
 
     let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
@@ -17003,6 +17101,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
     let bh = beta[head];
     let gh = exp(gate[head]);
+    let q_scale = inverseSqrt(f32(dk));
     let ki = tid;
 
     for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
@@ -17025,7 +17124,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let idx = state_base + ki * dv + vi;
             let s_new = gh * state[idx] + k[k_base + ki] * delta;
             state[idx] = s_new;
-            attn_partial = s_new * q[q_base + ki];
+            attn_partial = s_new * q[q_base + ki] * q_scale;
         }
         scratch[ki] = attn_partial;
         workgroupBarrier();
@@ -17132,9 +17231,23 @@ enable subgroups;
 @group(0) @binding(4) var<storage, read>       _params_: array<u32>;
 
 const WG: u32 = 128u;
+var<workgroup> sums: array<f32, 4>;
 
 fn silu(x: f32) -> f32 {
     return x / (1.0 + exp(-x));
+}
+
+fn reduce_wg(v: f32, tid: u32) -> f32 {
+    let sg = tid / 32u;
+    let lane = tid % 32u;
+    let s = subgroupAdd(v);
+    if (lane == 0u) {
+        sums[sg] = s;
+    }
+    workgroupBarrier();
+    let total = sums[0] + sums[1] + sums[2] + sums[3];
+    workgroupBarrier();
+    return total;
 }
 
 @compute @workgroup_size(128)
@@ -17152,7 +17265,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let v = y[h * dv + d];
         sum_sq = sum_sq + v * v;
     }
-    let total = subgroupAdd(sum_sq);
+    let total = reduce_wg(sum_sq, tid);
     let scale = 1.0 / sqrt(total / f32(dv) + eps);
     for (var d = tid; d < dv; d = d + WG) {
         let idx = h * dv + d;
@@ -17186,6 +17299,20 @@ enable subgroups;
 @group(0) @binding(4) var<storage, read>       _params_: array<u32>;
 
 const WG: u32 = 128u;
+var<workgroup> sums: array<f32, 4>;
+
+fn reduce_wg(v: f32, tid: u32) -> f32 {
+    let sg = tid / 32u;
+    let lane = tid % 32u;
+    let s = subgroupAdd(v);
+    if (lane == 0u) {
+        sums[sg] = s;
+    }
+    workgroupBarrier();
+    let total = sums[0] + sums[1] + sums[2] + sums[3];
+    workgroupBarrier();
+    return total;
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -17209,8 +17336,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let v = conv_out[h * dk + d];
             sum_sq = sum_sq + v * v;
         }
-        let total = subgroupAdd(sum_sq);
-        let rms = 1.0 / sqrt(max(total, eps));
+        let total = reduce_wg(sum_sq, tid);
+        let rms = 1.0 / max(sqrt(total), eps);
         for (var d = tid; d < dk; d = d + WG) {
             q_out[h * dk + d] = conv_out[h * dk + d] * rms;
         }
@@ -17222,8 +17349,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let v = conv_out[k_base + h * dk + d];
             sum_sq = sum_sq + v * v;
         }
-        let total = subgroupAdd(sum_sq);
-        let rms = 1.0 / sqrt(max(total, eps));
+        let total = reduce_wg(sum_sq, tid);
+        let rms = 1.0 / max(sqrt(total), eps);
         for (var d = tid; d < dk; d = d + WG) {
             k_out[h * dk + d] = conv_out[k_base + h * dk + d] * rms;
         }
@@ -17441,7 +17568,9 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"qmoe_matmul_q4", {WGSL_QMOE_MATMUL_Q4, 6, false}},
         {"quantize_fp32_rows_d3d12", {WGSL_QUANTIZE_FP32_ROWS_D3D12, 4, false}},
         {"qwen35_alpha_beta_gate", {WGSL_QWEN35_ALPHA_BETA_GATE, 7, false}},
+        {"qwen35_kv_cache_write", {WGSL_QWEN35_KV_CACHE_WRITE, 5, false}},
         {"qwen35_norm_gated", {WGSL_QWEN35_NORM_GATED, 5, false}},
+        {"qwen35_rope_multi_partial", {WGSL_QWEN35_ROPE_MULTI_PARTIAL, 4, false}},
         {"qwen35_split_qkv_l2", {WGSL_QWEN35_SPLIT_QKV_L2, 5, false}},
         {"resize_nearest", {WGSL_RESIZE_NEAREST, 3, false}},
         {"rms_norm", {WGSL_RMS_NORM, 5, true}},

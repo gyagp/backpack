@@ -4,8 +4,10 @@
 // vectors per channel. Before each conv1d_decode dispatch, we shift the
 // state by 1 (drop oldest, append new x) per channel.
 //
-// Layout: state[c*K + k] where k=0 is the newest sample, k=K-1 is the oldest.
-// After update: state[c*K + 0] = x[c], state[c*K + k] = old_state[c*K + (k-1)] for k>=1.
+// Layout matches llama.cpp's ggml_ssm_conv input window: state[c*K + k] where
+// k=0 is the oldest sample and k=K-1 is the newest.
+// After update: state[c*K + k] = old_state[c*K + (k+1)] for k<K-1,
+// state[c*K + K-1] = x[c].
 //
 // Bindings:
 //   0: state  [d_inner * K]   (read+write)
@@ -23,9 +25,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= d_inner) { return; }
     let base = c * K;
-    // Shift right (k=K-1..1 = state[k-1])
-    for (var k: u32 = K; k > 1u; k = k - 1u) {
-        state[base + k - 1u] = state[base + k - 2u];
+    // Shift left (drop oldest) and append newest at the end.
+    for (var k: u32 = 0u; k + 1u < K; k = k + 1u) {
+        state[base + k] = state[base + k + 1u];
     }
-    state[base + 0u] = x[c];
+    state[base + K - 1u] = x[c];
 }

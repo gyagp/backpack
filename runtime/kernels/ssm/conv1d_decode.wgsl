@@ -1,7 +1,8 @@
 // SSM conv1d (depthwise) — Mamba decode primitive
 //
 // For decode mode (single new token), the SSM conv state is a rolling
-// buffer of the last `conv_k` input vectors per channel. This kernel
+// buffer of the last `conv_k` input vectors per channel, ordered oldest to
+// newest like llama.cpp's ggml_ssm_conv input. This kernel
 // performs the FIR filter:
 //   out[c] = sum_{k=0..K-1} weights[c, k] * state[c, k]
 // per channel c in 0..d_inner.
@@ -29,7 +30,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (c >= d_inner) { return; }
     var acc: f32 = bias[c];
     // weights laid out as [d_inner, K]: weights[c*K + k]
-    // state    laid out as [d_inner, K]: state[c*K + k]
+    // state laid out as [d_inner, K], oldest to newest: state[c*K + k]
     let base = c * K;
     for (var k: u32 = 0u; k < K; k = k + 1u) {
         acc = acc + weights[base + k] * state[base + k];

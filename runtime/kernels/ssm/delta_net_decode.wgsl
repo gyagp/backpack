@@ -4,7 +4,7 @@
 //   kv      = dot(k[h], exp(g[h]) * state[h, :, v_col])
 //   delta   = (v[h, v_col] - kv) * beta[h]
 //   state'  = exp(g[h]) * state + outer(k[h], delta)
-//   y       = q[h] @ state'
+//   y       = (q[h] / sqrt(head_k_dim)) @ state'
 //
 // Heads layout: num_v_heads outputs; K is shared in groups (num_k_heads <= num_v_heads).
 // Q and K are num_k_heads-wide; Q/K head index is derived from the V head.
@@ -43,7 +43,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     if (head >= nv) { return; }
     let tid     = lid.x;
 
-    let k_head_idx = (head * nk) / nv;  // mapping v-head → k-head group
+    let k_head_idx = head % nk;  // mapping v-head -> repeated k/q head
 
     let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
@@ -52,6 +52,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
     let bh = beta[head];
     let gh = exp(gate[head]);
+    let q_scale = inverseSqrt(f32(dk));
     let ki = tid;
 
     for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
@@ -74,7 +75,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let idx = state_base + ki * dv + vi;
             let s_new = gh * state[idx] + k[k_base + ki] * delta;
             state[idx] = s_new;
-            attn_partial = s_new * q[q_base + ki];
+            attn_partial = s_new * q[q_base + ki] * q_scale;
         }
         scratch[ki] = attn_partial;
         workgroupBarrier();
