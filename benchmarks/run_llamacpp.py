@@ -2,6 +2,7 @@
 """Run llama.cpp benchmark with Vulkan backend and output results as JSON."""
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -15,7 +16,26 @@ def find_llama_bench():
             p = os.path.join(d, name)
             if os.path.isfile(p):
                 return p
+    for name in ["llama", "llama.exe"]:
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
     return "llama-bench"
+
+
+def build_bench_cmd(model_path, llama_bench_path=None):
+    bench = llama_bench_path or find_llama_bench()
+    exe_name = os.path.basename(bench).lower()
+    cmd = [bench]
+    if exe_name in ("llama", "llama.exe"):
+        cmd.append("bench")
+    cmd.extend([
+        "-m", model_path,
+        "-ngl", "99",
+        "-o", "csv",
+    ])
+    return cmd
 
 
 def parse_model_info(model_path):
@@ -27,13 +47,7 @@ def parse_model_info(model_path):
 
 
 def run_bench(model_path, llama_bench_path=None):
-    bench = llama_bench_path or find_llama_bench()
-    cmd = [
-        bench,
-        "-m", model_path,
-        "-ngl", "99",
-        "-o", "csv",
-    ]
+    cmd = build_bench_cmd(model_path, llama_bench_path)
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
@@ -51,35 +65,55 @@ def parse_csv_output(csv_text):
         print("Raw output:", csv_text, file=sys.stderr)
         sys.exit(1)
 
-    header = lines[0].split(",")
-    col = {name: i for i, name in enumerate(header)}
-
     prefill_toks = None
     decode_toks = None
 
-    for line in lines[1:]:
-        fields = line.split(",")
-        test_type = fields[col.get("test", -1)] if "test" in col else ""
-        if "t/s" in col:
-            toks = float(fields[col["t/s"]])
-        elif "speed" in col:
-            toks = float(fields[col["speed"]])
-        else:
-            for f in reversed(fields):
+    reader = csv.DictReader(lines)
+    for row in reader:
+        test_type = row.get("test", "")
+        toks = None
+        for key in ("t/s", "speed", "avg_ts"):
+            value = row.get(key)
+            if value:
+                toks = float(value)
+                break
+        if toks is None:
+            for value in reversed(list(row.values())):
                 try:
-                    toks = float(f)
+                    toks = float(value)
                     break
-                except ValueError:
+                except (TypeError, ValueError):
                     continue
-            else:
+            if toks is None:
                 continue
 
         if test_type == "pp512" or "pp" in test_type:
             prefill_toks = toks
         elif test_type == "tg128" or "tg" in test_type:
             decode_toks = toks
+        else:
+            n_prompt = int(row.get("n_prompt") or 0)
+            n_gen = int(row.get("n_gen") or 0)
+            if n_prompt > 0 and n_gen == 0:
+                prefill_toks = toks
+            elif n_gen > 0:
+                decode_toks = toks
 
     return prefill_toks, decode_toks
+
+
+def has_vulkan_backend(csv_text):
+    lines = [l.strip() for l in csv_text.strip().splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    reader = csv.DictReader(lines)
+    for row in reader:
+        backend_text = " ".join(
+            str(row.get(key, "")) for key in ("backend", "backends", "gpu_info", "devices")
+        ).lower()
+        if "vulkan" in backend_text:
+            return True
+    return False
 
 
 def main():
@@ -94,6 +128,9 @@ def main():
 
     model_name, quant = parse_model_info(args.model)
     csv_output = run_bench(args.model, args.llama_bench)
+    if not has_vulkan_backend(csv_output):
+        print("llama-bench output did not report a Vulkan backend", file=sys.stderr)
+        sys.exit(1)
     prefill_toks, decode_toks = parse_csv_output(csv_output)
 
     result = {

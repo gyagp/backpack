@@ -7,7 +7,7 @@ import os
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from run_llamacpp import parse_model_info, parse_csv_output
+from run_llamacpp import build_bench_cmd, has_vulkan_backend, parse_model_info, parse_csv_output
 
 
 class TestParseModelInfo:
@@ -49,6 +49,30 @@ class TestParseCsvOutput:
         with pytest.raises(SystemExit):
             parse_csv_output("model,test,t/s\n")
 
+    def test_parses_latest_llama_csv(self):
+        csv = (
+            "model_filename,n_prompt,n_gen,avg_ts,stddev_ts\n"
+            "\"m.gguf\",512,0,372.75,15.8\n"
+            "\"m.gguf\",0,128,29.93,0.5\n"
+        )
+        prefill, decode = parse_csv_output(csv)
+        assert prefill == 372.75
+        assert decode == 29.93
+
+
+class TestBackendDetection:
+    def test_detects_legacy_vulkan_backend_column(self):
+        csv = "model,backend,test,t/s\nm.gguf,Vulkan,pp512,100\n"
+        assert has_vulkan_backend(csv)
+
+    def test_detects_latest_vulkan_backends_column(self):
+        csv = "model_filename,backends,n_prompt,n_gen,avg_ts\nm.gguf,\"CPU,Vulkan\",512,0,100\n"
+        assert has_vulkan_backend(csv)
+
+    def test_rejects_cpu_only_output(self):
+        csv = "model_filename,backends,n_prompt,n_gen,avg_ts\nm.gguf,CPU,512,0,100\n"
+        assert not has_vulkan_backend(csv)
+
 
 class TestCLIInterface:
     def test_requires_model_argument(self):
@@ -66,6 +90,16 @@ class TestCLIInterface:
         )
         assert result.returncode != 0
         assert "not found" in result.stderr.lower() or "error" in result.stderr.lower()
+
+
+class TestCommandBuilder:
+    def test_uses_legacy_llama_bench_directly(self):
+        cmd = build_bench_cmd("model.gguf", "llama-bench.exe")
+        assert cmd[:3] == ["llama-bench.exe", "-m", "model.gguf"]
+
+    def test_uses_launcher_bench_subcommand(self):
+        cmd = build_bench_cmd("model.gguf", "llama.exe")
+        assert cmd[:4] == ["llama.exe", "bench", "-m", "model.gguf"]
 
 
 class TestOutputFormat:
