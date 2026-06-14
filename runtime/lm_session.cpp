@@ -917,6 +917,12 @@ struct StandardState {
         return logits;
     }
 
+    int32_t DecodeArgmaxSynchronous(int32_t token) {
+        int32_t next = runner.decodeArgmax(token, pos);
+        pos++;
+        return next;
+    }
+
     void Reset() { runner.resetKVCache(); pos = 0; pipelineInFlight = 0; pipelineNextSubmitPos = 0; }
 };
 
@@ -1157,8 +1163,7 @@ int32_t LmSession::Decode() {
     auto* std = impl_->std_.get();
     int32_t next;
     if (std->runner.cfg.arch == "qwen35") {
-        auto logits = std->DecodeSynchronous(impl_->lastToken);
-        next = argmax(logits.data(), (int64_t)logits.size());
+        next = std->DecodeArgmaxSynchronous(impl_->lastToken);
     } else {
         next = std->DecodePipelined();
     }
