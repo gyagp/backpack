@@ -111,6 +111,8 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
+    if (profile)
+        session.EnableProfiling();
 
     auto t1 = std::chrono::steady_clock::now();
     auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -164,7 +166,12 @@ int main(int argc, char* argv[]) {
 
         if (profile) {
             fprintf(stderr, "\n=== GPU Hardware Timestamp Profile ===\n");
-            std::string htmlPath = "profile.html";
+            fs::path modelName = fs::path(modelPath).parent_path().filename();
+            if (modelName.empty())
+                modelName = fs::path(modelPath).stem();
+            fs::path profileDir = fs::path("gitignore") / "models" / modelName;
+            fs::create_directories(profileDir);
+            std::string htmlPath = (profileDir / "profile.html").string();
             session.PrintProfileReport(htmlPath);
         }
 

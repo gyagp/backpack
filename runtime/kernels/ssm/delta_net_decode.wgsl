@@ -21,6 +21,8 @@
 //
 // Grid: one workgroup per V head. Workgroup size is 128, matching qwen35 head_k_dim.
 
+enable subgroups;
+
 @group(0) @binding(0) var<storage, read>       q:        array<f32>;
 @group(0) @binding(1) var<storage, read>       k:        array<f32>;
 @group(0) @binding(2) var<storage, read>       v:        array<f32>;
@@ -30,7 +32,20 @@
 @group(0) @binding(6) var<storage, read_write> y:        array<f32>;
 @group(0) @binding(7) var<storage, read>       _params_: array<u32>;
 
-var<workgroup> scratch: array<f32, 128>;
+var<workgroup> warp_sums: array<f32, 4>;
+
+fn reduce_wg_128(x: f32, tid: u32) -> f32 {
+    let warp_id = tid / 32u;
+    let lane = tid % 32u;
+    let sum = subgroupAdd(x);
+    if (lane == 0u) {
+        warp_sums[warp_id] = sum;
+    }
+    workgroupBarrier();
+    let total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+    workgroupBarrier();
+    return total;
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -54,39 +69,31 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let gh = exp(gate[head]);
     let q_scale = inverseSqrt(f32(dk));
     let ki = tid;
+    var qv: f32 = 0.0;
+    var kv: f32 = 0.0;
+    if (ki < dk) {
+        qv = q[q_base + ki] * q_scale;
+        kv = k[k_base + ki];
+    }
 
     for (var vi: u32 = 0u; vi < dv; vi = vi + 1u) {
-        var partial: f32 = 0.0;
+        var kv_partial: f32 = 0.0;
         if (ki < dk) {
-            partial = gh * state[state_base + ki * dv + vi] * k[k_base + ki];
+            kv_partial = gh * state[state_base + ki * dv + vi] * kv;
         }
-        scratch[ki] = partial;
-        workgroupBarrier();
-        for (var stride: u32 = 64u; stride > 0u; stride = stride / 2u) {
-            if (ki < stride) {
-                scratch[ki] = scratch[ki] + scratch[ki + stride];
-            }
-            workgroupBarrier();
-        }
-        let delta = (v[v_base + vi] - scratch[0]) * bh;
+        let kv_dot = reduce_wg_128(kv_partial, ki);
+        let delta = (v[v_base + vi] - kv_dot) * bh;
 
         var attn_partial: f32 = 0.0;
         if (ki < dk) {
             let idx = state_base + ki * dv + vi;
-            let s_new = gh * state[idx] + k[k_base + ki] * delta;
+            let s_new = gh * state[idx] + kv * delta;
             state[idx] = s_new;
-            attn_partial = s_new * q[q_base + ki] * q_scale;
+            attn_partial = s_new * qv;
         }
-        scratch[ki] = attn_partial;
-        workgroupBarrier();
-        for (var stride2: u32 = 64u; stride2 > 0u; stride2 = stride2 / 2u) {
-            if (ki < stride2) {
-                scratch[ki] = scratch[ki] + scratch[ki + stride2];
-            }
-            workgroupBarrier();
-        }
+        let attn = reduce_wg_128(attn_partial, ki);
         if (ki == 0u) {
-            y[v_base + vi] = scratch[0];
+            y[v_base + vi] = attn;
         }
         workgroupBarrier();
     }

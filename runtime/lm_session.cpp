@@ -1340,9 +1340,13 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         int warmupT = st->runner.hasBatchedPrefill() ? std::min(promptLen, 32) : 1;
         std::vector<int32_t> w(warmupT, 0);
         int32_t t = st->runner.prefillBatched(w.data(), (uint32_t)w.size(), 0);
-        st->gpu->writeBuffer(st->runner.argmaxResultBuf, &t, 4);
-        for (int i = 0; i < DEPTH; i++) st->runner.submitDecode((uint32_t)(w.size()+i), i);
-        for (int i = 0; i < DEPTH; i++) st->runner.readArgmax(i);
+        st->runner.seedDecodeTokenInputs(t);
+        for (int i = 0; i < DEPTH; i++) {
+            int slot = ((int)w.size() + i) % DEPTH;
+            st->runner.submitDecode((uint32_t)(w.size() + i), slot);
+        }
+        for (int i = 0; i < DEPTH; i++)
+            st->runner.readArgmax(((int)w.size() + i) % DEPTH);
         st->Reset();
         st->benchWarmupDone = true;
     }
@@ -1355,19 +1359,20 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
     result.prefillMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     result.prefillTokPerSec = promptLen * 1000.0 / result.prefillMs;
 
-    st->gpu->writeBuffer(st->runner.argmaxResultBuf, &first, 4);
+    st->runner.seedDecodeTokenInputs(first);
     st->gpu->timing.wait_ns = 0;
     auto t2 = std::chrono::steady_clock::now();
     int sub = 0, comp = 0;
     for (int i = 0; i < std::min(DEPTH, genTokens); i++) {
-        st->runner.submitDecode((uint32_t)(promptLen + i), i);
+        int slot = (promptLen + i) % DEPTH;
+        st->runner.submitDecode((uint32_t)(promptLen + i), slot);
         sub++;
     }
     while (comp < sub) {
-        st->runner.readArgmax(comp % DEPTH);
+        st->runner.readArgmax((promptLen + comp) % DEPTH);
         comp++;
         if (sub < genTokens) {
-            st->runner.submitDecode((uint32_t)(promptLen + sub), comp % DEPTH);
+            st->runner.submitDecode((uint32_t)(promptLen + sub), (promptLen + sub) % DEPTH);
             sub++;
         }
     }
@@ -1384,6 +1389,8 @@ void LmSession::EnableProfiling() {
     if (!impl_) return;
     if (impl_->backend == Impl::Backend::GenericOnnx)
         impl_->gen_->execCtx.enableGpuProfiling();
+    else
+        impl_->std_->runner.enableProfiling();
 }
 
 void LmSession::PrintProfileReport(const std::string& htmlPath) {
@@ -1407,6 +1414,33 @@ void LmSession::PrintProfileReport(const std::string& htmlPath) {
         auto pt1 = std::chrono::steady_clock::now();
         double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
         gen->execCtx.printGpuProfileReport(1, profMs, htmlPath);
+    } else {
+        auto* st = impl_->std_.get();
+        if (!st->runner.profiler)
+            st->runner.enableProfiling();
+        if (!st->runner.profiler)
+            return;
+
+        st->Reset();
+        std::vector<float> logits;
+        int32_t tok = 0;
+        uint32_t warmupTokens = 5;
+        for (uint32_t i = 0; i < warmupTokens; i++) {
+            logits = st->runner.decode(tok, i);
+            tok = ModelRunner::argmax(logits);
+        }
+        if (st->runner.profiler) {
+            st->runner.profiler->nextIndex = 0;
+            st->runner.profiler->entries.clear();
+        }
+        auto pt0 = std::chrono::steady_clock::now();
+        logits = st->runner.decode(tok, warmupTokens);
+        tok = ModelRunner::argmax(logits);
+        (void)tok;
+        auto pt1 = std::chrono::steady_clock::now();
+        double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
+        st->runner.printProfileReport(1, (int)warmupTokens, 0.0, profMs, htmlPath);
+        st->Reset();
     }
 }
 
