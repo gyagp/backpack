@@ -94,9 +94,58 @@ def invoke_msvc():
         write_error("Could not find vcvars64.bat. Install Visual Studio 2022 Build Tools.")
         sys.exit(1)
 
+    def load_manual_msvc_env():
+        vs_root = vcvars.parents[3]
+        msvc_root = vs_root / "VC" / "Tools" / "MSVC"
+        if not msvc_root.exists():
+            return None
+        versions = sorted([p for p in msvc_root.iterdir() if p.is_dir()], reverse=True)
+        if not versions:
+            return None
+        msvc = versions[0]
+
+        kits_root = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Windows Kits" / "10"
+        include_root = kits_root / "Include"
+        lib_root = kits_root / "Lib"
+        if not include_root.exists() or not lib_root.exists():
+            return None
+        sdk_versions = sorted([p.name for p in include_root.iterdir() if p.is_dir()], reverse=True)
+        sdk = next((v for v in sdk_versions if (lib_root / v).exists()), None)
+        if not sdk:
+            return None
+
+        new_env = os.environ.copy()
+        path_parts = [
+            str(msvc / "bin" / "Hostx64" / "x64"),
+            str(vs_root / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja"),
+            str(kits_root / "bin" / sdk / "x64"),
+            new_env.get("PATH", ""),
+        ]
+        include_parts = [
+            str(msvc / "include"),
+            str(include_root / sdk / "ucrt"),
+            str(include_root / sdk / "um"),
+            str(include_root / sdk / "shared"),
+            str(include_root / sdk / "winrt"),
+            str(include_root / sdk / "cppwinrt"),
+        ]
+        lib_parts = [
+            str(msvc / "lib" / "x64"),
+            str(lib_root / sdk / "ucrt" / "x64"),
+            str(lib_root / sdk / "um" / "x64"),
+        ]
+        new_env["PATH"] = os.pathsep.join(path_parts)
+        new_env["INCLUDE"] = os.pathsep.join(include_parts)
+        new_env["LIB"] = os.pathsep.join(lib_parts)
+        return new_env
+
     print(f"  Loading from: {vcvars}")
     try:
-        output = subprocess.check_output(f'"{vcvars}" >nul 2>&1 && set', shell=True, text=True)
+        output = subprocess.check_output(
+            f'"{vcvars}" >nul 2>&1 && set',
+            shell=True,
+            text=True,
+            timeout=60)
         new_env = os.environ.copy()
         for line in output.splitlines():
             if '=' in line:
@@ -115,8 +164,18 @@ def invoke_msvc():
         write_ok(f"MSVC loaded: {cl_ver}")
         return new_env
     except Exception as e:
-        write_error(f"Failed to load MSVC environment: {e}")
-        sys.exit(1)
+        write_skip(f"vcvars64.bat failed: {e}")
+        new_env = load_manual_msvc_env()
+        if not new_env:
+            write_error("Failed to synthesize MSVC environment")
+            sys.exit(1)
+        os.environ.update(new_env)
+        try:
+            cl_ver = subprocess.check_output("cl 2>&1", env=os.environ, shell=True, stderr=subprocess.STDOUT, text=True).splitlines()[0]
+        except subprocess.CalledProcessError as ce:
+            cl_ver = ce.output.splitlines()[0] if ce.output else "unknown"
+        write_ok(f"MSVC loaded from installed paths: {cl_ver}")
+        return new_env
 
 def invoke_dawn():
     invoke_msvc()
