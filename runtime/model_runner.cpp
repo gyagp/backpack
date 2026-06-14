@@ -1699,11 +1699,11 @@ void ModelRunner::buildDecodePipeline() {
     auto& plDownSilu   = useGelu ? getKernelGelu("q8_down_silu_add")
                                  : getKernel("q8_down_silu_add");
 
-    tuning.decodeUseFastQkv = decodeFastQ8Eligible;
-    tuning.decodeUseFastGateup = decodeFastQ8Eligible;
+    decodeFastVariantsAvailable = decodeFastQ8Eligible && !useKQ;
+    tuning.decodeUseFastQkv = decodeFastVariantsAvailable;
+    tuning.decodeUseFastGateup = decodeFastVariantsAvailable;
     tuning.decodeUseFastOproj = false;
     tuning.decodeUseWideFp16 = decodeWideFp16Eligible;
-    decodeFastVariantsAvailable = decodeFastQ8Eligible && !useKQ;
 
     // Kernel selection per projection:
     auto& plQkv = tuning.decodeUseFastQkv ? plQ8Fast : plQ8Matmul;
@@ -1720,11 +1720,13 @@ void ModelRunner::buildDecodePipeline() {
             decodePoolDepth = std::max(1, std::min(forcedDepth, decodePoolCapacity));
     }
     decodeCbPoolBatch = chooseDecodeCbPoolBatch(*gpu, cfg);
+    const char* lmHeadKind = lmHeadIsKQ ? "k-quant"
+        : (lmHeadIsQ8 ? "q8" : (tuning.decodeUseWideFp16 ? "fp16_wide" : "fp16"));
         fprintf(stderr, "  Initial decode heuristic: qkv=%s oproj=%s gateup=%s lm_head=%s pool=%d batch=%d\n",
         tuning.decodeUseFastQkv ? "fast" : "base",
         tuning.decodeUseFastOproj ? "fast" : "base",
         tuning.decodeUseFastGateup ? "fast" : "base",
-        tuning.decodeUseWideFp16 ? "fp16_wide" : "fp16",
+        lmHeadKind,
         decodePoolDepth, decodeCbPoolBatch);
 
     // Static params (shared between both sets — read-only)
@@ -3966,6 +3968,8 @@ void ModelRunner::saveDecodeAutotuneCache() const {
 }
 
 void ModelRunner::printActiveDecodeTuning(const char* prefix) const {
+    const char* lmHeadKind = lmHeadIsKQ ? "k-quant"
+        : (lmHeadIsQ8 ? "q8" : (tuning.decodeUseWideFp16 ? "fp16_wide" : "fp16"));
     fprintf(stderr, "%s: depth=%d/%d qkv=%s oproj=%s gateup=%s lm_head=%s batch=%d\n",
            prefix,
            decodePoolDepth,
@@ -3973,7 +3977,7 @@ void ModelRunner::printActiveDecodeTuning(const char* prefix) const {
            tuning.decodeUseFastQkv ? "fast" : "base",
            tuning.decodeUseFastOproj ? "fast" : "base",
            tuning.decodeUseFastGateup ? "fast" : "base",
-           tuning.decodeUseWideFp16 ? "fp16_wide" : "fp16",
+           lmHeadKind,
            decodeCbPoolBatch);
 }
 
