@@ -17489,6 +17489,55 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
+// [ssm] qwen35_conv_update_silu
+static const char* WGSL_QWEN35_CONV_UPDATE_SILU = R"WGSL(
+// qwen35 SSM decode fused rolling-state update + depthwise conv + SiLU.
+//
+// Equivalent to:
+//   conv_state_update(state, x)
+//   y = conv1d_decode(state, weights, bias)
+//   out = silu(y)
+//
+// State layout is [channels, K], oldest to newest.
+// Bindings:
+//   0: state   [channels * K] read_write
+//   1: x       [channels] new sample
+//   2: weights [channels * K]
+//   3: bias    [channels]
+//   4: out     [channels]
+//   5: params  [channels, K]
+
+@group(0) @binding(0) var<storage, read_write> state:   array<f32>;
+@group(0) @binding(1) var<storage, read>       x:       array<f32>;
+@group(0) @binding(2) var<storage, read>       weights: array<f32>;
+@group(0) @binding(3) var<storage, read>       bias:    array<f32>;
+@group(0) @binding(4) var<storage, read_write> out:     array<f32>;
+@group(0) @binding(5) var<storage, read>       params:  array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let channels = params[0];
+    let K = params[1];
+    let c = gid.x;
+    if (c >= channels) { return; }
+
+    let base = c * K;
+    var acc = bias[c];
+
+    for (var k = 0u; k + 1u < K; k = k + 1u) {
+        let v = state[base + k + 1u];
+        state[base + k] = v;
+        acc = acc + weights[base + k] * v;
+    }
+
+    let newest = x[c];
+    state[base + K - 1u] = newest;
+    acc = acc + weights[base + K - 1u] * newest;
+
+    out[c] = acc / (1.0 + exp(-acc));
+}
+)WGSL";
+
 // [ssm] qwen35_norm_gated
 static const char* WGSL_QWEN35_NORM_GATED = R"WGSL(
 // Per-head RMSNorm over DeltaNet output, then gate with silu(z).
@@ -17847,6 +17896,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"quantize_fp32_rows_d3d12", {WGSL_QUANTIZE_FP32_ROWS_D3D12, 4, false}},
         {"qwen35_alpha_beta_gate", {WGSL_QWEN35_ALPHA_BETA_GATE, 7, false}},
         {"qwen35_beta_alpha_gate_q8", {WGSL_QWEN35_BETA_ALPHA_GATE_Q8, 8, false}},
+        {"qwen35_conv_update_silu", {WGSL_QWEN35_CONV_UPDATE_SILU, 6, false}},
         {"qwen35_kv_cache_write", {WGSL_QWEN35_KV_CACHE_WRITE, 5, false}},
         {"qwen35_kv_cache_write_rope", {WGSL_QWEN35_KV_CACHE_WRITE_ROPE, 8, false}},
         {"qwen35_norm_gated", {WGSL_QWEN35_NORM_GATED, 5, false}},

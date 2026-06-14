@@ -2200,29 +2200,13 @@ void ModelRunner::buildDecodePipeline() {
                     (cfg.ssmTimeStepRank + 63) / 64, 1, 1, L+"ssm_abg"});
             }
             {
-                auto& plConvState = getKernel("conv_state_update");
-                auto p = mkP32("p_ssm_conv_state_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
-                auto bg = makeBG(plConvState, {
-                    {0, ssmConvState[i]}, {1, qkvBuf}, {2, p}});
-                allDecodeDispatches.push_back({plConvState.pipeline, bg,
-                    (convChannels + 255) / 256, 1, 1, L+"ssm_conv_state"});
-            }
-            {
-                auto& plConv = getKernel("conv1d_decode");
-                auto p = mkP32("p_ssm_conv_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
-                auto bg = makeBG(plConv, {
-                    {0, ssmConvState[i]}, {1, lw.ssmConv1dW}, {2, zeroBiasQKV},
-                    {3, q35ConvOutBuf}, {4, p}});
-                allDecodeDispatches.push_back({plConv.pipeline, bg,
-                    (convChannels + 255) / 256, 1, 1, L+"ssm_conv"});
-            }
-            {
-                auto& plSilu = getKernel("silu");
-                auto p = mkP32("p_ssm_silu_L"+std::to_string(i), {convChannels});
-                auto bg = makeBG(plSilu, {
-                    {0, q35ConvOutBuf}, {1, q35ConvOutBuf}, {2, p}});
-                allDecodeDispatches.push_back({plSilu.pipeline, bg,
-                    (convChannels + 255) / 256, 1, 1, L+"ssm_silu"});
+                auto& plConvSilu = getKernel("qwen35_conv_update_silu");
+                auto p = mkP32("p_ssm_conv_silu_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
+                auto bg = makeBG(plConvSilu, {
+                    {0, ssmConvState[i]}, {1, qkvBuf}, {2, lw.ssmConv1dW},
+                    {3, zeroBiasQKV}, {4, q35ConvOutBuf}, {5, p}});
+                allDecodeDispatches.push_back({plConvSilu.pipeline, bg,
+                    (convChannels + 255) / 256, 1, 1, L+"ssm_conv_silu"});
             }
             {
                 auto& plSplit = getKernel("qwen35_split_qkv_l2");
