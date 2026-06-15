@@ -2224,15 +2224,17 @@ void ModelRunner::buildDecodePipeline() {
                     3, std::max(cfg.ssmGroupCount, cfg.ssmTimeStepRank), 1, L+"ssm_split"});
             }
             {
-                auto& plDelta = getKernel("delta_net_decode");
+                auto& plDelta = qwen35VulkanDecode ? getKernel("delta_net_decode_x2")
+                                                   : getKernel("delta_net_decode");
                 auto p = mkP32("p_ssm_delta_L"+std::to_string(i),
                                {cfg.ssmTimeStepRank, cfg.ssmGroupCount, cfg.ssmStateSize, headV});
                 auto bg = makeBG(plDelta, {
                     {0, q35SsmQBuf}, {1, q35SsmKBuf}, {2, q35SsmVBuf},
                     {3, q35SsmBetaBuf}, {4, q35SsmGateBuf}, {5, ssmHState[i]},
                     {6, q35SsmYBuf}, {7, p}});
+                const uint32_t deltaY = qwen35VulkanDecode ? ((headV + 1u) / 2u) : headV;
                 allDecodeDispatches.push_back({plDelta.pipeline, bg,
-                    cfg.ssmTimeStepRank, headV, 1, L+"ssm_delta"});
+                    cfg.ssmTimeStepRank, deltaY, 1, L+"ssm_delta"});
             }
             {
                 auto& plNormGate = getKernel("qwen35_norm_gated");
