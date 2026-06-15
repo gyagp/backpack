@@ -6364,6 +6364,65 @@ fn main(
 }
 )WGSL";
 
+// [norm] add_rms_norm_qwen_vulkan
+static const char* WGSL_ADD_RMS_NORM_QWEN_VULKAN = R"WGSL(
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> Residual: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<storage, read> W: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Rstd: array<f32>;
+
+struct Params {
+    stride: i32,
+    N: i32,
+    eps: f32,
+};
+@group(0) @binding(5) var<storage, read> params: Params;
+
+var<workgroup> warp_sums: array<f32, 8>;
+var<workgroup> rstd_shared: f32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let tid = lid.x;
+    let lane = tid & 31u;
+    let warp = tid >> 5u;
+    let N = u32(params.N);
+    let base = row * u32(params.stride);
+
+    var sum_sq = 0.0;
+    for (var j = tid; j < N; j = j + 256u) {
+        let idx = base + j;
+        let v = X[idx] + Residual[idx];
+        X[idx] = v;
+        sum_sq += v * v;
+    }
+
+    let warp_sum = subgroupAdd(sum_sq);
+    if (lane == 0u) {
+        warp_sums[warp] = warp_sum;
+    }
+    workgroupBarrier();
+
+    let cross = select(0.0, warp_sums[min(lane, 7u)], warp == 0u && lane < 8u);
+    let total = subgroupAdd(cross);
+    if (tid == 0u) {
+        rstd_shared = 1.0 / sqrt(total / f32(N) + params.eps);
+        Rstd[row] = rstd_shared;
+    }
+    workgroupBarrier();
+
+    let rstd = rstd_shared;
+    for (var j = tid; j < N; j = j + 256u) {
+        Y[base + j] = X[base + j] * rstd * W[j];
+    }
+}
+)WGSL";
+
 // [norm] fused_qknorm_rope
 static const char* WGSL_FUSED_QKNORM_ROPE = R"WGSL(
 enable f16;
@@ -7661,6 +7720,62 @@ fn main(
             let v = buf0[u32(base + idx)];
             buf1[u32(base + idx)] = v * rstd * buf2[u32(idx)];
         }
+    }
+}
+)WGSL";
+
+// [norm] rms_norm_qwen_vulkan
+static const char* WGSL_RMS_NORM_QWEN_VULKAN = R"WGSL(
+enable subgroups;
+
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(2) var<storage, read> W: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Rstd: array<f32>;
+
+struct Params {
+    stride: i32,
+    N: i32,
+    eps: f32,
+};
+@group(0) @binding(4) var<storage, read> params: Params;
+
+var<workgroup> warp_sums: array<f32, 8>;
+var<workgroup> rstd_shared: f32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let tid = lid.x;
+    let lane = tid & 31u;
+    let warp = tid >> 5u;
+    let N = u32(params.N);
+    let base = row * u32(params.stride);
+
+    var sum_sq = 0.0;
+    for (var j = tid; j < N; j = j + 256u) {
+        let v = X[base + j];
+        sum_sq += v * v;
+    }
+
+    let warp_sum = subgroupAdd(sum_sq);
+    if (lane == 0u) {
+        warp_sums[warp] = warp_sum;
+    }
+    workgroupBarrier();
+
+    let cross = select(0.0, warp_sums[min(lane, 7u)], warp == 0u && lane < 8u);
+    let total = subgroupAdd(cross);
+    if (tid == 0u) {
+        rstd_shared = 1.0 / sqrt(total / f32(N) + params.eps);
+        Rstd[row] = rstd_shared;
+    }
+    workgroupBarrier();
+
+    let rstd = rstd_shared;
+    for (var j = tid; j < N; j = j + 256u) {
+        Y[base + j] = X[base + j] * rstd * W[j];
     }
 }
 )WGSL";
@@ -17764,6 +17879,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
     static const std::unordered_map<std::string, ShaderInfo> kernels = {
         {"add_rms_norm", {WGSL_ADD_RMS_NORM, 6, true}},
         {"add_rms_norm_batched", {WGSL_ADD_RMS_NORM_BATCHED, 6, false}},
+        {"add_rms_norm_qwen_vulkan", {WGSL_ADD_RMS_NORM_QWEN_VULKAN, 6, false}},
         {"add_scaled", {WGSL_ADD_SCALED, 3, false}},
         {"argmax", {WGSL_ARGMAX, 4, false}},
         {"argmax_reduce", {WGSL_ARGMAX_REDUCE, 3, false}},
@@ -17906,6 +18022,7 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"resize_nearest", {WGSL_RESIZE_NEAREST, 3, false}},
         {"rms_norm", {WGSL_RMS_NORM, 5, true}},
         {"rms_norm_batched", {WGSL_RMS_NORM_BATCHED, 5, false}},
+        {"rms_norm_qwen_vulkan", {WGSL_RMS_NORM_QWEN_VULKAN, 5, false}},
         {"rmsnorm", {WGSL_RMSNORM, 5, false}},
         {"rope_batched", {WGSL_ROPE_BATCHED, 9, false}},
         {"rope_batched_simple", {WGSL_ROPE_BATCHED_SIMPLE, 9, false}},

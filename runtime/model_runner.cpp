@@ -1691,12 +1691,16 @@ void ModelRunner::buildDecodePipeline() {
         (cfg.nEmbd % 512u == 0u) &&
         (qDim % 512u == 0u);
     const bool decodeWideFp16Eligible = canUse256ThreadSubgroupKernels;
+    const bool qwen35VulkanDecode =
+        (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12);
     uint32_t Q8_TILE = 8;
     uint32_t maxChunks = (maxSeqLen + gqaChunkSize - 1) / gqaChunkSize;
 
     // Load kernels from embedded shaders
-    auto& plRmsNorm    = getKernel("rms_norm");
-    auto& plAddRmsNorm = getKernel("add_rms_norm");
+    auto& plRmsNorm    = qwen35VulkanDecode ? getKernel("rms_norm_qwen_vulkan")
+                                            : getKernel("rms_norm");
+    auto& plAddRmsNorm = qwen35VulkanDecode ? getKernel("add_rms_norm_qwen_vulkan")
+                                            : getKernel("add_rms_norm");
     auto& plQ8Matmul   = (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12)
         ? getKernel("q8_matmul_vec4")
         : getKernel("q8_matmul");
