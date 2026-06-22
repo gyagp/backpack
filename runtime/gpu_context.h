@@ -18,6 +18,7 @@ constexpr uint64_t BUF_STORAGE   = 0x0080;
 constexpr uint64_t BUF_COPY_SRC  = 0x0004;
 constexpr uint64_t BUF_COPY_DST  = 0x0008;
 constexpr uint64_t BUF_MAP_READ  = 0x0001;
+constexpr uint64_t BUF_MAP_WRITE = 0x0002;
 constexpr uint64_t BUF_UNIFORM   = 0x0040;
 constexpr uint64_t BUF_INDIRECT  = 0x0100;
 constexpr uint64_t BUF_DEFAULT   = BUF_STORAGE | BUF_COPY_SRC | BUF_COPY_DST;
