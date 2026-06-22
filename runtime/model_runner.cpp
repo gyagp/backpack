@@ -1646,19 +1646,39 @@ void ModelRunner::computeRopeTables() {
     if (hasPrecomputedRope) return;  // already uploaded in loadOnnx()
 
     uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
-    std::vector<float> cosTable(maxSeqLen * ropeHalf), sinTable(maxSeqLen * ropeHalf);
-    for (uint32_t pos = 0; pos < maxSeqLen; pos++) {
-        for (uint32_t i = 0; i < ropeHalf; i++) {
-            float freq = 1.0f / powf(cfg.ropeTheta, (float)(2 * i) / (rotaryDim > 0 ? rotaryDim : cfg.headDim));
-            float angle = pos * freq;
-            cosTable[pos * ropeHalf + i] = cosf(angle);
-            sinTable[pos * ropeHalf + i] = sinf(angle);
+    auto buildTables = [&](float theta, GPUBuffer& cosBuf, GPUBuffer& sinBuf,
+                           const char* cosName, const char* sinName) {
+        std::vector<float> cosTable(maxSeqLen * ropeHalf), sinTable(maxSeqLen * ropeHalf);
+        for (uint32_t pos = 0; pos < maxSeqLen; pos++) {
+            for (uint32_t i = 0; i < ropeHalf; i++) {
+                float freq = 1.0f / powf(theta, (float)(2 * i) /
+                    (rotaryDim > 0 ? rotaryDim : cfg.headDim));
+                float angle = pos * freq;
+                cosTable[pos * ropeHalf + i] = cosf(angle);
+                sinTable[pos * ropeHalf + i] = sinf(angle);
+            }
         }
+        cosBuf = gpu->createBuffer(cosName, maxSeqLen * ropeHalf * 4);
+        sinBuf = gpu->createBuffer(sinName, maxSeqLen * ropeHalf * 4);
+        gpu->writeBuffer(cosBuf, cosTable.data(), maxSeqLen * ropeHalf * 4);
+        gpu->writeBuffer(sinBuf, sinTable.data(), maxSeqLen * ropeHalf * 4);
+    };
+
+    buildTables(cfg.ropeTheta, ropeCosBuf, ropeSinBuf, "rope_cos", "rope_sin");
+
+    // Gemma 3/4: SWA layers use a separate, smaller theta (default 10000).
+    // The GGUF only stores one rope.freq_base; the SWA base is conventionally
+    // 10000 unless rope.freq_base_swa is present.
+    bool needsSwa = (cfg.arch == "gemma3" || cfg.arch == "gemma4") &&
+                    !cfg.layerAttnTypes.empty();
+    if (needsSwa) {
+        // No GGUF accessor here; just use the convention used by llama.cpp.
+        const float swaTheta = 10000.0f;
+        buildTables(swaTheta, ropeCosBufSWA, ropeSinBufSWA,
+                    "rope_cos_swa", "rope_sin_swa");
+        fprintf(stderr, "  RoPE SWA tables: theta=%.0f (global theta=%.0f)\n",
+                swaTheta, cfg.ropeTheta);
     }
-    ropeCosBuf = gpu->createBuffer("rope_cos", maxSeqLen * ropeHalf * 4);
-    ropeSinBuf = gpu->createBuffer("rope_sin", maxSeqLen * ropeHalf * 4);
-    gpu->writeBuffer(ropeCosBuf, cosTable.data(), maxSeqLen * ropeHalf * 4);
-    gpu->writeBuffer(ropeSinBuf, sinTable.data(), maxSeqLen * ropeHalf * 4);
 }
 
 // ─── Build decode pipeline ───────────────────────────────────────────────────
@@ -2486,10 +2506,16 @@ void ModelRunner::buildDecodePipeline() {
         }
 
         {
+            bool isSwaLayer = hasSWA && i < cfg.layerAttnTypes.size() &&
+                              cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
+            auto& ropeCos = (isSwaLayer && ropeCosBufSWA.handle)
+                            ? ropeCosBufSWA : ropeCosBuf;
+            auto& ropeSin = (isSwaLayer && ropeSinBufSWA.handle)
+                            ? ropeSinBufSWA : ropeSinBuf;
             auto bg = makeBG(plFusedRope, {
                 {0, qkvBuf}, {1, qRotBuf},
                 {2, kvCache[kvCacheLayer].K}, {3, kvCache[kvCacheLayer].V},
-                {4, ropeCosBuf}, {5, ropeSinBuf},
+                {4, ropeCos}, {5, ropeSin},
                 {6, lw.qNorm}, {7, lw.kNorm},
                 {8, fusedRopeParamsBuf}});
             ropeDispatchIndices[i] = (int)allDecodeDispatches.size();

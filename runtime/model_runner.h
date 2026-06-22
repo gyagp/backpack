@@ -221,6 +221,8 @@ struct ModelRunner {
 
     // RoPE tables (read-only, shared)
     GPUBuffer ropeCosBuf, ropeSinBuf;
+    // Optional second pair for Gemma 3/4 SWA layers (base=10000 vs global=1000000).
+    GPUBuffer ropeCosBufSWA, ropeSinBufSWA;
 
     // Derived dimensions
     uint32_t qDim = 0, kvDim = 0, qkvOut = 0;
