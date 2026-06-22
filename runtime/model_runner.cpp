@@ -3663,13 +3663,15 @@ void ModelRunner::initPrefillResources() {
             {3, zeroBiasV}, {4, logitsBuf}, {5, pfCache.pLmP}});
     }
 
-    // Argmax bind group
+    // Argmax bind group. The argmax kernel declares 4 bindings (the 4th is the
+    // Partials scratch buffer used by the multi-WG decode path); the prefill
+    // single-WG dispatch still needs to bind all four or Dawn rejects the BG.
     {
         GPUBuffer argmaxP = gpu->createBuffer("pf_argmax_p", 16);
-        uint32_t p[4] = {cfg.nVocab, 0, 0, 0};
+        uint32_t p[4] = {cfg.nVocab, 1u, 0, 0};
         gpu->writeBuffer(argmaxP, p, 16);
         pfCache.argmaxBG = makeBG(getKernel("argmax"), {
-            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxP}});
+            {0, logitsBuf}, {1, argmaxResultBuf}, {2, argmaxP}, {3, argmaxPartialsBuf}});
     }
 
     // ── Build pre-recorded indirect dispatch table ───────────────────
