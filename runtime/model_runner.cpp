@@ -1089,35 +1089,44 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                             qkvN, cfg.nEmbd, (unsigned)qkvt.type, tensorIsKQ ? "K-quant" : "Q8");
                 }
             } else if (qi != gguf.tensor_index.end()) {
-                auto& qt = gguf.tensors[qi->second];
-                auto& kt = gguf.tensors[ki->second];
-                auto& vt = gguf.tensors[vi->second];
-                bool allKQ = isKQuant &&
-                    (qt.type == GGUF_TYPE_Q4_K || qt.type == GGUF_TYPE_Q5_K || qt.type == GGUF_TYPE_Q6_K) &&
-                    (kt.type == GGUF_TYPE_Q4_K || kt.type == GGUF_TYPE_Q5_K || kt.type == GGUF_TYPE_Q6_K) &&
-                    (vt.type == GGUF_TYPE_Q4_K || vt.type == GGUF_TYPE_Q5_K || vt.type == GGUF_TYPE_Q6_K);
-                if (allKQ) {
-                    auto qp = packKQ(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
-                    auto kp = packKQ(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
-                    auto vp = packKQ(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
-                    auto fused = fuseKQ(fuseKQ(qp, kp), vp);
-                    if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
-                    uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
+                if (ki == gguf.tensor_index.end() || vi == gguf.tensor_index.end()) {
+                    // Shared-KV models (e.g. Gemma 4 layers 15+) ship attn_q but
+                    // not attn_k/attn_v — the layer reuses K/V from a source
+                    // layer. Skip the fuse so qkvW stays null and the standard
+                    // QKV decode dispatch is bypassed for this layer.
+                    if (i == 0)
+                        fprintf(stderr, "  Layer %u: missing attn_k/attn_v (shared KV), skipping QKV fuse\n", i);
                 } else {
-                    auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
-                    auto kr = repackToQ8(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
-                    auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
-                    Q8Repacked fused;
-                    fused.N = layerQkvOut; fused.K = cfg.nEmbd;
-                    fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
-                    fused.weights.insert(fused.weights.end(), qr.weights.begin(), qr.weights.end());
-                    fused.weights.insert(fused.weights.end(), kr.weights.begin(), kr.weights.end());
-                    fused.weights.insert(fused.weights.end(), vr.weights.begin(), vr.weights.end());
-                    fused.scales.reserve(qr.scales.size() + kr.scales.size() + vr.scales.size());
-                    fused.scales.insert(fused.scales.end(), qr.scales.begin(), qr.scales.end());
-                    fused.scales.insert(fused.scales.end(), kr.scales.begin(), kr.scales.end());
-                    fused.scales.insert(fused.scales.end(), vr.scales.begin(), vr.scales.end());
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
+                    auto& qt = gguf.tensors[qi->second];
+                    auto& kt = gguf.tensors[ki->second];
+                    auto& vt = gguf.tensors[vi->second];
+                    bool allKQ = isKQuant &&
+                        (qt.type == GGUF_TYPE_Q4_K || qt.type == GGUF_TYPE_Q5_K || qt.type == GGUF_TYPE_Q6_K) &&
+                        (kt.type == GGUF_TYPE_Q4_K || kt.type == GGUF_TYPE_Q5_K || kt.type == GGUF_TYPE_Q6_K) &&
+                        (vt.type == GGUF_TYPE_Q4_K || vt.type == GGUF_TYPE_Q5_K || vt.type == GGUF_TYPE_Q6_K);
+                    if (allKQ) {
+                        auto qp = packKQ(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
+                        auto kp = packKQ(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
+                        auto vp = packKQ(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
+                        auto fused = fuseKQ(fuseKQ(qp, kp), vp);
+                        if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
+                        uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
+                    } else {
+                        auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
+                        auto kr = repackToQ8(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
+                        auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
+                        Q8Repacked fused;
+                        fused.N = layerQkvOut; fused.K = cfg.nEmbd;
+                        fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
+                        fused.weights.insert(fused.weights.end(), qr.weights.begin(), qr.weights.end());
+                        fused.weights.insert(fused.weights.end(), kr.weights.begin(), kr.weights.end());
+                        fused.weights.insert(fused.weights.end(), vr.weights.begin(), vr.weights.end());
+                        fused.scales.reserve(qr.scales.size() + kr.scales.size() + vr.scales.size());
+                        fused.scales.insert(fused.scales.end(), qr.scales.begin(), qr.scales.end());
+                        fused.scales.insert(fused.scales.end(), kr.scales.begin(), kr.scales.end());
+                        fused.scales.insert(fused.scales.end(), vr.scales.begin(), vr.scales.end());
+                        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
+                    }
                 }
             }
         }
@@ -2594,6 +2603,7 @@ enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
+var<workgroup> wg_warp_sums: array<f32, 8>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0];
@@ -2602,7 +2612,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     var sum_sq: f32 = 0.0;
     for (var i = tid; i < N; i += 256u) { let v = X[i]; sum_sq += v * v; }
     let warp_sum = subgroupAdd(sum_sq);
-    let total = subgroupBroadcastFirst(warp_sum);
+    let warp_id = tid / 32u;
+    let lane = tid % 32u;
+    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
     let rms = 1.0 / sqrt(total / f32(N) + eps);
     for (var i = tid; i < N; i += 256u) { X[i] = X[i] * rms * W[i]; }
 }
@@ -2946,13 +2961,20 @@ enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
+var<workgroup> wg_warp_sums: array<f32, 8>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
-    let total = subgroupAdd(sum_sq);
-    let rms = 1.0 / sqrt(subgroupBroadcastFirst(total) / f32(N) + eps);
+    let warp_sum = subgroupAdd(sum_sq);
+    let warp_id = tid / 32u;
+    let lane = tid % 32u;
+    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
+    let rms = 1.0 / sqrt(total / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
 }
 )"), 3);
@@ -3005,13 +3027,20 @@ enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
+var<workgroup> wg_warp_sums: array<f32, 8>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
-    let total = subgroupAdd(sum_sq);
-    let rms = 1.0 / sqrt(subgroupBroadcastFirst(total) / f32(N) + eps);
+    let warp_sum = subgroupAdd(sum_sq);
+    let warp_id = tid / 32u;
+    let lane = tid % 32u;
+    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
+    let rms = 1.0 / sqrt(total / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
 }
 )"), 3);
