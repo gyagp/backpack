@@ -226,11 +226,18 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
     // Populate per-layer attention types
     if (cfg.slidingWindow > 0 && cfg.nLayer > 0) {
         cfg.layerAttnTypes.resize(cfg.nLayer, AttnLayerType::Global);
-        // Gemma 2/3: alternating pattern (even layers = sliding, odd = global)
-        if (a == "gemma2" || a == "gemma3") {
+        // Gemma 2: 1:1 alternating (even=SWA, odd=Global).
+        if (a == "gemma2") {
             for (uint32_t i = 0; i < cfg.nLayer; i++)
                 cfg.layerAttnTypes[i] = (i % 2 == 0) ? AttnLayerType::SlidingWindow
                                                        : AttnLayerType::Global;
+        }
+        // Gemma 3: groups of 5 sliding + 1 global (every 6th layer is global,
+        // matching llama.cpp's default LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN=6).
+        if (a == "gemma3") {
+            for (uint32_t i = 0; i < cfg.nLayer; i++)
+                cfg.layerAttnTypes[i] = ((i + 1) % 6 == 0) ? AttnLayerType::Global
+                                                              : AttnLayerType::SlidingWindow;
         }
         // Gemma 4: read pattern from metadata if available, else default heuristic
         // llama.cpp stores this as LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN
