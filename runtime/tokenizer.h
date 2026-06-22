@@ -22,9 +22,15 @@ struct Tokenizer {
     // merge_rank[pair_string] -> priority (lower = merge first)
     std::unordered_map<std::string, int32_t> merge_rank;
 
+    // Special tokens (control + user-defined). Encoded in raw UTF-8 — must be
+    // matched on the input text BEFORE BPE so they tokenize as single IDs.
+    // Sorted longest first for greedy matching.
+    std::vector<std::pair<std::string, int32_t>> special_tokens_sorted;
+
     // Special token IDs
     int32_t eos_token_id = -1;
     int32_t bos_token_id = -1;
+    bool add_bos_token = false;
 
     // --- API ---
 
@@ -43,4 +49,7 @@ struct Tokenizer {
 private:
     // GPT-2 byte-level encoding tables
     std::unordered_map<uint32_t, uint8_t> unicode_to_byte_;
+
+    // BPE-encode a non-special segment of text (used internally by encode()).
+    std::vector<int32_t> encode_bpe_segment(const std::string& text) const;
 };

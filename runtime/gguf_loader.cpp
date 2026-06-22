@@ -41,7 +41,9 @@ static GGUFMetaValue read_meta_value(FILE* f, uint32_t type) {
         case META_INT64:   { int64_t v;  fread(&v, 8, 1, f); return v; }
         case META_FLOAT64: return read_f64(f);
         case META_ARRAY: {
-            // For string arrays, store as vector<string>; others: skip
+            // For string arrays, store as vector<string>; for int32 arrays
+            // (e.g. tokenizer.ggml.token_type), store as vector<int32_t>;
+            // skip everything else.
             uint32_t elem_type = read_u32(f);
             uint64_t count = read_u64(f);
             if (elem_type == META_STRING) {
@@ -49,6 +51,14 @@ static GGUFMetaValue read_meta_value(FILE* f, uint32_t type) {
                 arr.reserve(count);
                 for (uint64_t i = 0; i < count; i++)
                     arr.push_back(read_string(f));
+                return arr;
+            }
+            if (elem_type == META_INT32 || elem_type == META_UINT32) {
+                std::vector<int32_t> arr;
+                arr.reserve(count);
+                for (uint64_t i = 0; i < count; i++) {
+                    int32_t v; fread(&v, 4, 1, f); arr.push_back(v);
+                }
                 return arr;
             }
             // Skip non-string arrays

@@ -122,14 +122,42 @@ bool Tokenizer::load(const GGUFFile& gguf) {
 
     // Special tokens
     eos_token_id = (int32_t)gguf.getU32("tokenizer.ggml.eos_token_id", 151645);
-    bos_token_id = (int32_t)gguf.getU32("tokenizer.ggml.bos_token_id", 151643);
+    bos_token_id = (int32_t)gguf.getU32("tokenizer.ggml.bos_token_id", -1);
+    add_bos_token = gguf.getBool("tokenizer.ggml.add_bos_token", false);
 
     // Build byte encoding tables
     uint32_t byte_to_unicode[256];
     build_byte_tables(unicode_to_byte_, byte_to_unicode);
 
-    fprintf(stderr, "  Tokenizer: %zu tokens, %zu merges, EOS=%d\n",
-           vocab.size(), merge_rank.size(), eos_token_id);
+    // Build list of special tokens (control=3 and user_defined=4) for
+    // pre-BPE matching. Without this, multi-byte specials like "<|im_start|>"
+    // tokenize as raw bytes instead of their single dedicated ID.
+    {
+        auto tit = gguf.metadata.find("tokenizer.ggml.token_type");
+        if (tit != gguf.metadata.end()) {
+            auto* types = std::get_if<std::vector<int32_t>>(&tit->second);
+            if (types) {
+                for (int32_t i = 0; i < (int32_t)vocab.size() && i < (int32_t)types->size(); i++) {
+                    int32_t ty = (*types)[i];
+                    if (ty == 3 || ty == 4) {
+                        // Decode the vocab entry (BPE encoding) back to raw bytes
+                        // so we can string-match against the user's input.
+                        std::string raw = bpe_token_to_bytes(vocab[i], unicode_to_byte_);
+                        if (!raw.empty())
+                            special_tokens_sorted.emplace_back(std::move(raw), i);
+                    }
+                }
+                // Longest first so greedy match prefers e.g. "<|im_start|>" over "<".
+                std::sort(special_tokens_sorted.begin(), special_tokens_sorted.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first.size() > b.first.size();
+                          });
+            }
+        }
+    }
+
+    fprintf(stderr, "  Tokenizer: %zu tokens, %zu merges, EOS=%d, special=%zu\n",
+           vocab.size(), merge_rank.size(), eos_token_id, special_tokens_sorted.size());
 
     return true;
 }
@@ -179,6 +207,48 @@ static std::vector<std::string> split_to_chars(const std::string& s) {
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
+    if (text.empty()) return {};
+
+    // 0. Split text on special tokens (control + user_defined). Each special
+    //    token must be matched as an exact string and emitted as its single
+    //    dedicated ID — otherwise multi-byte specials like "<|im_start|>"
+    //    BPE-tokenize as raw bytes and the chat template falls apart.
+    if (!special_tokens_sorted.empty()) {
+        std::vector<int32_t> ids;
+        std::string buf;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            bool matched = false;
+            for (auto& sp : special_tokens_sorted) {
+                if (pos + sp.first.size() <= text.size() &&
+                    text.compare(pos, sp.first.size(), sp.first) == 0) {
+                    if (!buf.empty()) {
+                        auto sub = encode_bpe_segment(buf);
+                        ids.insert(ids.end(), sub.begin(), sub.end());
+                        buf.clear();
+                    }
+                    ids.push_back(sp.second);
+                    pos += sp.first.size();
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                buf.push_back(text[pos]);
+                pos++;
+            }
+        }
+        if (!buf.empty()) {
+            auto sub = encode_bpe_segment(buf);
+            ids.insert(ids.end(), sub.begin(), sub.end());
+        }
+        return ids;
+    }
+
+    return encode_bpe_segment(text);
+}
+
+std::vector<int32_t> Tokenizer::encode_bpe_segment(const std::string& text) const {
     if (text.empty()) return {};
 
     // 1. Convert bytes to BPE string representation
