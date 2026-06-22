@@ -1279,6 +1279,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 } else {
                     scale = 1.0f;
                 }
+                // Gemma stores scales as (real - 1), same convention as its
+                // RMSNorm weights. Loading as-is gives ~0 and zeroes out every
+                // layer's output. Bake in the +1 here.
+                if (gemmaNormBias) scale += 1.0f;
                 lw.outScale = gpu->createBuffer("L" + std::to_string(i) + ".out_scale", 4);
                 gpu->writeBuffer(lw.outScale, &scale, 4);
             }
