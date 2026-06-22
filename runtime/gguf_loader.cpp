@@ -61,6 +61,14 @@ static GGUFMetaValue read_meta_value(FILE* f, uint32_t type) {
                 }
                 return arr;
             }
+            if (elem_type == META_FLOAT32) {
+                std::vector<float> arr;
+                arr.reserve(count);
+                for (uint64_t i = 0; i < count; i++) {
+                    float v; fread(&v, 4, 1, f); arr.push_back(v);
+                }
+                return arr;
+            }
             // Skip non-string arrays
             for (uint64_t i = 0; i < count; i++)
                 read_meta_value(f, elem_type);  // discard

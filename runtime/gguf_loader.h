@@ -41,7 +41,8 @@ using GGUFMetaValue = std::variant<
     bool, std::string,
     uint64_t, int64_t, double,
     std::vector<std::string>,
-    std::vector<int32_t>
+    std::vector<int32_t>,
+    std::vector<float>
 >;
 
 struct GGUFTensorInfo {
