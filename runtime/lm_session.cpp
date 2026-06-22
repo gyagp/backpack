@@ -839,7 +839,18 @@ struct StandardState {
     }
 
     std::vector<int32_t> Tokenize(const std::string& text) {
-        return (format == "onnx") ? onnxTokenizer.encode(text) : ggufTokenizer.encode(text);
+        if (format == "onnx") return onnxTokenizer.encode(text);
+        auto ids = ggufTokenizer.encode(text);
+        // Prepend BOS when the tokenizer flags add_bos_token (e.g. Gemma).
+        // Tokens already starting with BOS (e.g. <bos> literal in the input)
+        // would have hit the special-token matcher above, so we only add when
+        // the first id is not the BOS id.
+        if (ggufTokenizer.add_bos_token &&
+            ggufTokenizer.bos_token_id >= 0 &&
+            (ids.empty() || ids.front() != ggufTokenizer.bos_token_id)) {
+            ids.insert(ids.begin(), ggufTokenizer.bos_token_id);
+        }
+        return ids;
     }
 
     std::string DetokenizeOne(int32_t tok) {

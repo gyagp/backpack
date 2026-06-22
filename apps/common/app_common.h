@@ -76,6 +76,16 @@ inline std::string applyChatTemplate(const std::string& message,
     if (arch.find("lfm2") != std::string::npos)
         return "<|startoftext|><|im_start|>user\n" + message +
                "<|im_end|>\n<|im_start|>assistant\n";
+    // Gemma 4: <|turn>/<turn|> tokens (asymmetric, like <|im_start|>/<|im_end|>
+    // but Gemma 4 specific). BOS is added by the tokenizer when add_bos_token
+    // is set in GGUF metadata.
+    if (arch == "gemma4")
+        return "<|turn>user\n" + message + "<turn|>\n"
+               "<|turn>model\n";
+    // Gemma 2/3 (and original Gemma) use <start_of_turn>/<end_of_turn>.
+    if (arch.find("gemma") != std::string::npos)
+        return "<start_of_turn>user\n" + message + "<end_of_turn>\n"
+               "<start_of_turn>model\n";
     return "<|im_start|>user\n" + message +
            "<|im_end|>\n<|im_start|>assistant\n";
 }
