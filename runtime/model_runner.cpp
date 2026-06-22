@@ -1494,15 +1494,24 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 uint32_t rows = (uint32_t)ti.shape[1];
                 uint32_t cols = (uint32_t)ti.shape[0];
                 dequant_kquant(data, embeddingCPU.data(), rows, cols, (GGUFType)ti.type);
-            } else {
+            } else if (ti.type == GGUF_TYPE_F32) {
                 memcpy(embeddingCPU.data(), data, nel * 4);
+            } else {
+                uint32_t rows = (uint32_t)ti.shape[1];
+                uint32_t cols = (uint32_t)ti.shape[0];
+                dequant_tensor(data, embeddingCPU.data(), rows, cols, (GGUFType)ti.type);
             }
             fprintf(stderr, "  Embedding: %u × %u (%s)\n", cfg.nVocab, cfg.nEmbd,
                    ti.type == GGUF_TYPE_Q8_0 ? "Q8_0→f32" :
                    ti.type == GGUF_TYPE_Q4_K ? "Q4_K→f32" :
                    ti.type == GGUF_TYPE_Q5_K ? "Q5_K→f32" :
                    ti.type == GGUF_TYPE_Q6_K ? "Q6_K→f32" :
-                   ti.type == GGUF_TYPE_F16 ? "f16→f32" : "f32");
+                   ti.type == GGUF_TYPE_Q4_0 ? "Q4_0→f32" :
+                   ti.type == GGUF_TYPE_Q4_1 ? "Q4_1→f32" :
+                   ti.type == GGUF_TYPE_Q5_0 ? "Q5_0→f32" :
+                   ti.type == GGUF_TYPE_Q5_1 ? "Q5_1→f32" :
+                   ti.type == GGUF_TYPE_F16 ? "f16→f32" :
+                   ti.type == GGUF_TYPE_BF16 ? "bf16→f32" : "f32");
 
             // LM head: use quantized format if embedding is quantized
             if (cfg.tieWordEmbeddings) {
