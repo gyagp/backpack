@@ -1746,6 +1746,11 @@ void ModelRunner::buildDecodePipeline() {
     const bool useGelu = (cfg.activation == ActivationType::GELU);
     auto& plDownSilu   = useGelu ? getKernelGelu("q8_down_silu_add")
                                  : getKernel("q8_down_silu_add");
+    const bool decodeDp4aReady = (gpu->backendType == WGPUBackendType_D3D12) &&
+                                 canUse256ThreadSubgroupKernels &&
+                                 canCompileEmbeddedKernel(*gpu, "q8_matmul_decode_dp4a_d3d12");
+    const CompiledPipeline* plQ8DecDp4a = decodeDp4aReady
+        ? &getKernel("q8_matmul_decode_dp4a_d3d12") : nullptr;
 
     decodeFastVariantsAvailable = decodeFastQ8Eligible && !useKQ;
     tuning.decodeUseFastQkv = decodeFastVariantsAvailable;
@@ -3186,12 +3191,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         allDecodeDispatches.push_back({plKQ->pipeline, bg,
             1, (cfg.nVocab + 7) / 8, 1, "lm_head"});
     } else if (lmHeadIsQ8) {
-        auto q8LmParams = makeQ8Params("p_lmhead_q8", cfg.nEmbd, cfg.nVocab);
-        auto bg = makeBG(plQ8Matmul, {
-            {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
-            {3, zeroBiasV}, {4, logitsBuf}, {5, q8LmParams}});
-        allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
-            1, (cfg.nVocab + Q8_TILE - 1) / Q8_TILE, 1, "lm_head"});
+        if (plQ8DecDp4a) {
+            // DP4A decode path: Params{M, N, K, pad}, TILE_N=32
+            uint32_t pData[4] = {1u, cfg.nVocab, cfg.nEmbd, 0};
+            auto lmDpParams = gpu->createBuffer("p_lmhead_q8_dp4a", 16);
+            gpu->writeBuffer(lmDpParams, pData, 16);
+            auto bg = makeBG(*plQ8DecDp4a, {
+                {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
+                {3, zeroBiasV}, {4, logitsBuf}, {5, lmDpParams}});
+            allDecodeDispatches.push_back({plQ8DecDp4a->pipeline, bg,
+                (cfg.nVocab + 31u) / 32u, 1, 1, "lm_head"});
+        } else {
+            auto q8LmParams = makeQ8Params("p_lmhead_q8", cfg.nEmbd, cfg.nVocab);
+            auto bg = makeBG(plQ8Matmul, {
+                {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
+                {3, zeroBiasV}, {4, logitsBuf}, {5, q8LmParams}});
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                1, (cfg.nVocab + Q8_TILE - 1) / Q8_TILE, 1, "lm_head"});
+        }
     } else {
         const auto& plLmHead = tuning.decodeUseWideFp16 ? plFp16Wide : plFp16Gemm;
         uint32_t FP16_TILE = tuning.decodeUseWideFp16 ? 32u : 8u;
