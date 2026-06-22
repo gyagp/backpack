@@ -1563,6 +1563,23 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     uint64_t sBytes = (uint64_t)rep.scales.size() * 4;
                     fprintf(stderr, "  LM head: tied embeddings (Q8, %llu MB)\n",
                            (unsigned long long)((wBytes + sBytes) / 1048576));
+                } else if (ti.type == GGUF_TYPE_Q4_0 || ti.type == GGUF_TYPE_Q4_1 ||
+                           ti.type == GGUF_TYPE_Q5_0 || ti.type == GGUF_TYPE_Q5_1) {
+                    // Legacy quants (e.g. Gemma 4 Q4_0): repack to Q8 so the LM
+                    // head fits the standard Q8 decode dispatch path. The fp16
+                    // fallback below would allocate a ~768 MB f16 buffer for a
+                    // big-vocab model, which on D3D12+Dawn destabilizes the
+                    // queue (small subsequent writeBuffer calls silently no-op).
+                    auto rep = repackToQ8(data, cfg.nVocab, cfg.nEmbd, (GGUFType)ti.type);
+                    uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
+                    lmHeadIsQ8 = true;
+                    uint64_t wBytes = (uint64_t)rep.weights.size() * 4;
+                    uint64_t sBytes = (uint64_t)rep.scales.size() * 4;
+                    fprintf(stderr, "  LM head: tied embeddings (Q8 from %s, %llu MB)\n",
+                           ti.type == GGUF_TYPE_Q4_0 ? "Q4_0" :
+                           ti.type == GGUF_TYPE_Q4_1 ? "Q4_1" :
+                           ti.type == GGUF_TYPE_Q5_0 ? "Q5_0" : "Q5_1",
+                           (unsigned long long)((wBytes + sBytes) / 1048576));
                 } else {
                     // fp16 fallback
                     std::vector<uint16_t> fp16(nel);
