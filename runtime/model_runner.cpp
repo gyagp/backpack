@@ -804,7 +804,11 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     }
     fprintf(stderr, "  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
 
-    // Helper: load fp32/fp16 norm weight from GGUF tensor
+    // Helper: load fp32/fp16 norm weight from GGUF tensor. Gemma stores its
+    // RMSNorm weights as (real_weight - 1) so the kernel needs (1 + w) — bake
+    // the +1 in here so the standard rms_norm kernel produces correct output.
+    const bool gemmaNormBias = (cfg.arch == "gemma" || cfg.arch == "gemma2" ||
+                                cfg.arch == "gemma3" || cfg.arch == "gemma4");
     auto loadNorm = [&](const std::string& ggufName, GPUBuffer& buf) {
         auto it = gguf.tensor_index.find(ggufName);
         if (it == gguf.tensor_index.end()) return;
@@ -819,6 +823,9 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 fp32[j] = fp16_to_f32(fp16[j]);
         } else {
             memcpy(fp32.data(), data, nel * 4);
+        }
+        if (gemmaNormBias) {
+            for (uint32_t j = 0; j < nel; j++) fp32[j] += 1.0f;
         }
         buf = gpu->createBuffer(ggufName, nel * 4);
         gpu->writeBuffer(buf, fp32.data(), nel * 4);
