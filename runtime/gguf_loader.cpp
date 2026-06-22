@@ -141,6 +141,15 @@ uint32_t GGUFFile::getU32(const std::string& key, uint32_t def) const {
     if (auto* v = std::get_if<int16_t> (&it->second)) return (uint32_t)*v;
     if (auto* v = std::get_if<uint8_t> (&it->second)) return *v;
     if (auto* v = std::get_if<int8_t>  (&it->second)) return (uint32_t)*v;
+    // Array-valued metadata (e.g. gemma4's per-layer feed_forward_length
+    // [6144, 6144, ..., 12288, ..., 1228]). Return the max so buffers sized
+    // from cfg.intermediateSize accommodate every layer.
+    if (auto* v = std::get_if<std::vector<int32_t>>(&it->second)) {
+        if (v->empty()) return def;
+        int32_t m = (*v)[0];
+        for (auto x : *v) if (x > m) m = x;
+        return (uint32_t)m;
+    }
     return def;
 }
 
