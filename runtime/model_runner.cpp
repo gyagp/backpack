@@ -813,9 +813,12 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
     // Helper: load fp32/fp16 norm weight from GGUF tensor. Gemma stores its
     // RMSNorm weights as (real_weight - 1) so the kernel needs (1 + w) — bake
-    // the +1 in here so the standard rms_norm kernel produces correct output.
-    const bool gemmaNormBias = (cfg.arch == "gemma" || cfg.arch == "gemma2" ||
-                                cfg.arch == "gemma3" || cfg.arch == "gemma4");
+    // NOTE: Gemma's RMSNorm uses (1 + weight), but llama.cpp's GGUF conversion
+    // already bakes the +1 into the stored norm weights (they sit around ~1-6,
+    // not ~0). So we must NOT add 1 again here — the raw GGUF weight is used
+    // directly, exactly like llama.cpp. (Adding +1 double-counts and blows up
+    // the residual stream.)
+    const bool gemmaNormBias = false;
     auto loadNorm = [&](const std::string& ggufName, GPUBuffer& buf) {
         auto it = gguf.tensor_index.find(ggufName);
         if (it == gguf.tensor_index.end()) return;
