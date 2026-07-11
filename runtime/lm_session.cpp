@@ -1177,9 +1177,9 @@ int32_t LmSession::Decode() {
     int32_t next;
     bool q35Sync = std->runner.cfg.arch == "qwen35" &&
                    std::getenv("BP_Q35_SYNC") != nullptr;
-    // Gemma 4 has per-layer head dims and shared-KV layers; the pipelined
-    // pool path can't carry per-layer params, so use synchronous decode.
-    bool gemma4Sync = std->runner.cfg.arch == "gemma4";
+    // Gemma models (sandwich norms, per-layer head dims, shared-KV) don't fit
+    // the pre-recorded pooled decode path; use synchronous decode.
+    bool gemma4Sync = std->runner.cfg.arch.rfind("gemma", 0) == 0;
     if (q35Sync || gemma4Sync) {
         next = std->DecodeArgmaxSynchronous(impl_->lastToken);
     } else {

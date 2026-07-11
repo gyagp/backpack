@@ -262,9 +262,11 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
     cfg.sharedKvLayers = gguf.getU32(a + ".attention.shared_kv_layers", 0);
     cfg.pleSize = gguf.getU32(a + ".embedding_length_per_layer_input", 0);
 
-    // Sandwich norm detection (Gemma 4 has post_norm / post_ffw_norm tensors)
+    // Sandwich norm detection. Gemma 4 ships post_norm.weight; Gemma 2/3 ship
+    // post_attention_norm.weight. Either (plus a post-FFN norm) means sandwich.
     cfg.hasSandwichNorm = gguf.tensor_index.count("blk.0.post_norm.weight") > 0 ||
-                          gguf.tensor_index.count("blk.0.attn_post_norm.weight") > 0;
+                          gguf.tensor_index.count("blk.0.attn_post_norm.weight") > 0 ||
+                          gguf.tensor_index.count("blk.0.post_attention_norm.weight") > 0;
 
     // MTP head detection
     cfg.hasMtp = gguf.tensor_index.count("mtp.0.blk.0.attn_q.weight") > 0 ||

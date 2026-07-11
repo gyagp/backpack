@@ -1254,11 +1254,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         // Norm weights
         loadNorm(pfx + "attn_norm.weight", lw.inputNorm);
         if (cfg.hasSandwichNorm) {
-            // Gemma 4: 4-norm sandwich pattern
+            // Gemma sandwich (4 norms): pre-attn, post-attn, pre-FFN, post-FFN.
+            // Tensor names differ across Gemma versions: Gemma 4 uses
+            // post_norm.weight, Gemma 2/3 use post_attention_norm.weight.
             loadNorm(pfx + "ffn_norm.weight", lw.ffnNorm);  // pre-FFN norm
             loadNorm(pfx + "post_norm.weight", lw.postNorm); // post-attention sandwich
             if (!lw.postNorm.handle)
                 loadNorm(pfx + "attn_post_norm.weight", lw.postNorm);
+            if (!lw.postNorm.handle)
+                loadNorm(pfx + "post_attention_norm.weight", lw.postNorm);
             loadNorm(pfx + "post_ffw_norm.weight", lw.postFfwNorm); // post-FFN sandwich
             if (!lw.postFfwNorm.handle)
                 loadNorm(pfx + "ffn_post_norm.weight", lw.postFfwNorm);
@@ -3690,10 +3694,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                  weightQuantType == GGUF_TYPE_Q5_K ||
                  weightQuantType == GGUF_TYPE_Q6_K);
     bool hasSharedKv = cfg.sharedKvLayers > 0;
-    if (!isKQ && !hasSharedKv) {
+    // Batched prefill assumes standard 2-norm layers with a full QKV per layer.
+    // Gemma sandwich-norm models (and shared-KV) don't fit it; use serial
+    // decode. qwen35 keeps its own path and batched prefill.
+    bool isGemma = cfg.arch.rfind("gemma", 0) == 0;
+    bool gemmaSerial = isGemma && (cfg.hasSandwichNorm || hasSharedKv);
+    if (!isKQ && !gemmaSerial) {
         initPrefillResources();
-    } else if (hasSharedKv) {
-        fprintf(stderr, "  Prefill: skipped (shared-KV layers, using serial decode)\n");
+    } else if (gemmaSerial) {
+        fprintf(stderr, "  Prefill: skipped (Gemma sandwich/shared-KV, using serial decode)\n");
     } else {
         fprintf(stderr, "  Prefill: skipped (K-quant weights, using serial decode)\n");
     }
