@@ -101,6 +101,11 @@ bool Tokenizer::load(const GGUFFile& gguf) {
     std::string model_str = gguf.getString("tokenizer.ggml.model", "gpt2");
     if (model_str == "gpt2")        model_kind = Model::Gpt2Bpe;
     else if (model_str == "llama")  model_kind = Model::LlamaSpm;
+    // Gemma's SentencePiece vocab is declared under model-specific strings in
+    // newer GGUFs ("gemma", "gemma2", "gemma3", "gemma4", ...). They are all
+    // llama-style SPM (scores + greedy merge, ▁ word-start), so treat any
+    // "gemma*" as SPM rather than falling back to the wrong GPT-2 BPE path.
+    else if (model_str.rfind("gemma", 0) == 0) model_kind = Model::LlamaSpm;
     else                            model_kind = Model::Unknown;
 
     // Extract vocabulary
