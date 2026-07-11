@@ -224,6 +224,12 @@ struct ModelRunner {
     bool embeddingGpuIsF16 = false;
     bool embeddingGatherFromQ8 = false;  // gather embeddings from tied Q8 LM head
     GPUBuffer qOnlyScratchK, qOnlyScratchV;  // discard KV targets for shared-KV layers
+    // Per-layer rope/attention param buffers for variable head-dim models
+    // (Gemma 4: 256-wide sliding-window layers, 512-wide global layers).
+    // Populated only when cfg.hasVariableHeadDim; updated per token.
+    std::vector<GPUBuffer> perLayerRopeParamBufs;
+    std::vector<GPUBuffer> perLayerAttnParamBufs;
+    bool hasVariableHeadDim = false;
     std::vector<float> embeddingCPU;
 
     // RoPE tables (read-only, shared)
@@ -397,8 +403,10 @@ private:
 
     const CompiledPipeline& getKernel(const std::string& name);
     const CompiledPipeline& getKernelHD(const std::string& name);
+    const CompiledPipeline& getKernelHD(const std::string& name, uint32_t headDim);
     const CompiledPipeline& getKernelGelu(const std::string& siluName);
     std::string patchShaderHD(const char* source) const;
+    std::string patchShaderHD(const char* source, uint32_t headDim) const;
     WGPUBindGroup makeBG(const CompiledPipeline& pl,
                          const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
     void applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,

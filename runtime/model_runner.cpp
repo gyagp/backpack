@@ -160,8 +160,11 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
 // ─── HD-patched kernel loading ───────────────────────────────────────────────
 
 std::string ModelRunner::patchShaderHD(const char* source) const {
+    return patchShaderHD(source, cfg.headDim);
+}
+
+std::string ModelRunner::patchShaderHD(const char* source, uint32_t hd) const {
     std::string s(source);
-    uint32_t hd = cfg.headDim;
     if (hd == 128) return s;  // no patching needed
 
     // Replace "const HD: u32 = 128u;" with actual value
@@ -253,10 +256,14 @@ std::string ModelRunner::patchShaderHD(const char* source) const {
 }
 
 const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
-    if (cfg.headDim == 128) return getKernel(name);
+    return getKernelHD(name, cfg.headDim);
+}
+
+const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32_t headDim) {
+    if (headDim == 128) return getKernel(name);
 
     // Patched pipeline: keyed by name + "_HD" + headDim
-    std::string patchedName = name + "_HD" + std::to_string(cfg.headDim);
+    std::string patchedName = name + "_HD" + std::to_string(headDim);
 
     auto& kernels = getEmbeddedKernels();
     auto it = kernels.find(name);
@@ -265,7 +272,7 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
         exit(1);
     }
 
-    std::string patchedSource = patchShaderHD(it->second.source);
+    std::string patchedSource = patchShaderHD(it->second.source, headDim);
     return gpu->getOrCreatePipeline(patchedName, patchedSource,
                                      it->second.numBindings);
 }
@@ -986,6 +993,19 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                       pl.kvDim != cfg.perLayer[0].kvDim ||
                       pl.intermediateSize != cfg.perLayer[0].intermediateSize))
             cfg.hasPerLayerDims = true;
+    }
+
+    // Gemma 4: derive sliding-window vs global attention from the per-layer
+    // head dim (sliding layers are key_length_swa=256 wide, global layers
+    // key_length=512). This is more reliable than a hardcoded period and
+    // matches the actual tensor shapes; the GGUF pattern heuristic was wrong.
+    if (cfg.arch == "gemma4" && cfg.hasPerLayerDims && !cfg.layerAttnTypes.empty()) {
+        uint32_t maxHd = 0;
+        for (uint32_t i = 0; i < cfg.nLayer; i++)
+            maxHd = std::max(maxHd, cfg.perLayer[i].headDim);
+        for (uint32_t i = 0; i < cfg.nLayer && i < cfg.layerAttnTypes.size(); i++)
+            cfg.layerAttnTypes[i] = (cfg.perLayer[i].headDim == maxHd)
+                ? AttnLayerType::Global : AttnLayerType::SlidingWindow;
     }
 
     // Shared KV mapping
@@ -2234,6 +2254,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         gpu->writeBuffer(chunkedAttnParamsBufSWA, chunkedAttnParamData.data(), 32);
     }
 
+    // Detect variable per-layer head dims (Gemma 4). When present, each layer
+    // gets its own rope + attention param buffer with the layer's head dim
+    // baked in; these are refreshed per token in updateDecodeParams.
+    hasVariableHeadDim = false;
+    if (cfg.hasPerLayerDims) {
+        for (uint32_t li = 1; li < cfg.nLayer; li++)
+            if (cfg.perLayer[li].headDim != cfg.perLayer[0].headDim)
+                hasVariableHeadDim = true;
+    }
+    if (hasVariableHeadDim) {
+        perLayerRopeParamBufs.resize(cfg.nLayer);
+        perLayerAttnParamBufs.resize(cfg.nLayer);
+        for (uint32_t li = 0; li < cfg.nLayer; li++) {
+            perLayerRopeParamBufs[li] = gpu->createBuffer("p_frope_" + std::to_string(li), 32);
+            perLayerAttnParamBufs[li] = gpu->createBuffer("p_cattn_" + std::to_string(li), 32);
+        }
+        fprintf(stderr, "  Variable head dims: per-layer rope/attn params (%u layers)\n", cfg.nLayer);
+    }
+
     // ─── Build dispatch list (single — identical for every token) ─────────
     allDecodeDispatches.reserve(cfg.nLayer * 11 + 2);
     decodeDispatchIndices.assign(cfg.nLayer, {});
@@ -2636,39 +2675,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // preserved (attention below reads the real K/V from it).
             auto& ropeK = lw.qOnly && qOnlyScratchK.handle ? qOnlyScratchK : kvCache[kvCacheLayer].K;
             auto& ropeV = lw.qOnly && qOnlyScratchV.handle ? qOnlyScratchV : kvCache[kvCacheLayer].V;
-            auto bg = makeBG(plFusedRope, {
+            // Per-layer head-dim kernel + params for variable-head-dim models.
+            uint32_t hdL = cfg.perLayer[i].headDim;
+            auto& plRope = hasVariableHeadDim
+                ? getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope", hdL)
+                : plFusedRope;
+            auto& ropeParamBuf = hasVariableHeadDim ? perLayerRopeParamBufs[i] : fusedRopeParamsBuf;
+            auto bg = makeBG(plRope, {
                 {0, qkvBuf}, {1, qRotBuf},
                 {2, ropeK}, {3, ropeV},
                 {4, ropeCos}, {5, ropeSin},
                 {6, lw.qNorm}, {7, lw.kNorm},
-                {8, fusedRopeParamsBuf}});
+                {8, ropeParamBuf}});
             ropeDispatchIndices[i] = (int)allDecodeDispatches.size();
             decodeUsesFusedRopeParams = true;
-            allDecodeDispatches.push_back({plFusedRope.pipeline, bg,
+            allDecodeDispatches.push_back({plRope.pipeline, bg,
                 cfg.nHead + cfg.nKvHeads, 1, 1, L+"fused_rope"});
         }
 
         {
             bool isSWA = hasSWA && i < cfg.layerAttnTypes.size() &&
                          cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
-            auto& attnParams = isSWA ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf;
-            auto bg = makeBG(plChunkP1, {
+            uint32_t hdL = cfg.perLayer[i].headDim;
+            auto& attnParams = hasVariableHeadDim ? perLayerAttnParamBufs[i]
+                             : (isSWA ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf);
+            auto& plP1 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass1", hdL) : plChunkP1;
+            auto bg = makeBG(plP1, {
                 {0, qRotBuf}, {1, kvCache[kvCacheLayer].K}, {2, kvCache[kvCacheLayer].V},
                 {3, attnPartialsBuf}, {4, attnParams}});
             attnP1DispatchIndices[i] = (int)allDecodeDispatches.size();
-            allDecodeDispatches.push_back({plChunkP1.pipeline, bg,
+            allDecodeDispatches.push_back({plP1.pipeline, bg,
                 cfg.nHead, maxChunks, 1, L+"attn_p1"});
         }
 
         {
             bool isSWA2 = hasSWA && i < cfg.layerAttnTypes.size() &&
                           cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
-            auto& attnParams2 = isSWA2 ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf;
-            auto bg = makeBG(plChunkP2, {
+            uint32_t hdL = cfg.perLayer[i].headDim;
+            auto& attnParams2 = hasVariableHeadDim ? perLayerAttnParamBufs[i]
+                              : (isSWA2 ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf);
+            auto& plP2 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass2", hdL) : plChunkP2;
+            auto bg = makeBG(plP2, {
                 {0, attnPartialsBuf}, {1, attnOutBuf},
                 {2, attnParams2}});
             attnP2DispatchIndices[i] = (int)allDecodeDispatches.size();
-            allDecodeDispatches.push_back({plChunkP2.pipeline, bg,
+            allDecodeDispatches.push_back({plP2.pipeline, bg,
                 cfg.nHead, 1, 1, L+"attn_p2"});
         }
 
@@ -4425,6 +4476,43 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
         sp[2] = T_swa;
         sp[4] = n_chunks_swa;
         gpu->writeBuffer(chunkedAttnParamsBufSWA, swaData, 32);
+    }
+
+    // Variable head dims (Gemma 4): refresh each layer's own rope + attention
+    // params with the layer's head dim, rope half-dim, KV stride and scale.
+    if (hasVariableHeadDim) {
+        for (uint32_t li = 0; li < cfg.nLayer; li++) {
+            uint32_t hdL = cfg.perLayer[li].headDim;
+            uint32_t qDimL = cfg.nHead * hdL;
+            uint32_t kvDimL = cfg.nKvHeads * hdL;
+            uint32_t ropeHalfL = hdL / 2;
+            // rope params: [nHead, qDim, kvDim, pos, ropeHalf, kvWriteOff, eps, 0]
+            uint8_t rd[32];
+            memcpy(rd, ropeParamData.data(), 32);
+            auto* rp = reinterpret_cast<int32_t*>(rd);
+            rp[0] = (int)cfg.nHead; rp[1] = (int)qDimL; rp[2] = (int)kvDimL;
+            rp[3] = (int)pos; rp[4] = (int)ropeHalfL;
+            rp[5] = (int)(cacheLen * kvDimL);
+            gpu->writeBuffer(perLayerRopeParamBufs[li], rd, 32);
+
+            // attn params: [kvStride, n_rep, T, chunk, n_chunks, scale, -inf, maxChunks]
+            bool isSWA = !cfg.layerAttnTypes.empty() && li < cfg.layerAttnTypes.size() &&
+                         cfg.layerAttnTypes[li] == AttnLayerType::SlidingWindow;
+            uint32_t Tl = (isSWA && cfg.slidingWindow > 0)
+                        ? std::min(T_total, cfg.slidingWindow) : T_total;
+            uint32_t nchL = (Tl + gqaChunkSize - 1) / gqaChunkSize;
+            uint8_t ad[32];
+            auto* ap = reinterpret_cast<uint32_t*>(ad);
+            ap[0] = kvDimL;
+            ap[1] = cfg.nHead / cfg.nKvHeads;
+            ap[2] = Tl; ap[3] = gqaChunkSize; ap[4] = nchL;
+            float scaleL = 1.0f / sqrtf((float)hdL);
+            float neg_inf = -1e9f;
+            memcpy(&ap[5], &scaleL, 4);
+            memcpy(&ap[6], &neg_inf, 4);
+            ap[7] = reinterpret_cast<const uint32_t*>(chunkedAttnParamData.data())[7];
+            gpu->writeBuffer(perLayerAttnParamBufs[li], ad, 32);
+        }
     }
 }
 
