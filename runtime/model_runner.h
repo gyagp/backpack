@@ -147,6 +147,7 @@ struct ModelRunner {
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
         // Sandwich norms (Gemma 4)
         GPUBuffer postNorm;        // post-attention norm (sandwich, before residual)
+        GPUBuffer postLayerNorm;   // Gemma 4 per-layer output norm (post_norm.weight)
         GPUBuffer ffnNorm;         // pre-FFN norm (separate from postAttnNorm)
         GPUBuffer postFfwNorm;     // post-FFN norm (sandwich, before residual)
         // PLE (Per-Layer Embedding)

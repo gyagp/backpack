@@ -1258,17 +1258,21 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         loadNorm(pfx + "attn_norm.weight", lw.inputNorm);
         if (cfg.hasSandwichNorm) {
             // Gemma sandwich (4 norms): pre-attn, post-attn, pre-FFN, post-FFN.
-            // Tensor names differ across Gemma versions: Gemma 4 uses
-            // post_norm.weight, Gemma 2/3 use post_attention_norm.weight.
+            // The post-attention norm is post_attention_norm.weight on all Gemma
+            // versions. Gemma 4 additionally ships a separate post_norm.weight
+            // (a per-layer output norm) — load it into postLayerNorm, not the
+            // post-attention slot.
             loadNorm(pfx + "ffn_norm.weight", lw.ffnNorm);  // pre-FFN norm
-            loadNorm(pfx + "post_norm.weight", lw.postNorm); // post-attention sandwich
+            loadNorm(pfx + "post_attention_norm.weight", lw.postNorm);
             if (!lw.postNorm.handle)
                 loadNorm(pfx + "attn_post_norm.weight", lw.postNorm);
             if (!lw.postNorm.handle)
-                loadNorm(pfx + "post_attention_norm.weight", lw.postNorm);
+                loadNorm(pfx + "post_norm.weight", lw.postNorm);
             loadNorm(pfx + "post_ffw_norm.weight", lw.postFfwNorm); // post-FFN sandwich
             if (!lw.postFfwNorm.handle)
                 loadNorm(pfx + "ffn_post_norm.weight", lw.postFfwNorm);
+            // Gemma 4 extra per-layer output norm.
+            loadNorm(pfx + "post_norm.weight", lw.postLayerNorm);
         } else {
             // Standard: 2-norm (pre-attn + pre-FFN fused with residual add)
             loadNorm(pfx + "ffn_norm.weight", lw.postAttnNorm);
