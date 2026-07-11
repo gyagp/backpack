@@ -74,5 +74,5 @@ private:
 
     // Llama-SPM encode a non-special segment of text. Applies ▁ normalization
     // then greedy merge by score.
-    std::vector<int32_t> encode_spm_segment(const std::string& text) const;
+    std::vector<int32_t> encode_spm_segment(const std::string& text, bool addPrefix) const;
 };

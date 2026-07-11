@@ -288,10 +288,15 @@ static std::vector<std::string> split_to_chars(const std::string& s) {
 std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
     if (text.empty()) return {};
 
+    // SPM adds the ▁ word-start prefix only at the very beginning of the input,
+    // not after every special token. Track whether we are still at the start.
+    bool atStart = true;
     auto encode_segment = [&](const std::string& s) {
-        return (model_kind == Model::LlamaSpm)
-            ? encode_spm_segment(s)
+        auto r = (model_kind == Model::LlamaSpm)
+            ? encode_spm_segment(s, atStart)
             : encode_bpe_segment(s);
+        atStart = false;
+        return r;
     };
 
     // 0. Split text on special tokens (control + user_defined). Each special
@@ -313,6 +318,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
                         buf.clear();
                     }
                     ids.push_back(sp.second);
+                    atStart = false;  // a special token consumed the start
                     pos += sp.first.size();
                     matched = true;
                     break;
@@ -397,19 +403,19 @@ std::vector<int32_t> Tokenizer::encode_bpe_segment(const std::string& text) cons
 //      that exists in the vocab, merge it. Stop when no mergeable pair remains.
 //   4. Emit ids in order.
 
-std::vector<int32_t> Tokenizer::encode_spm_segment(const std::string& text) const {
+std::vector<int32_t> Tokenizer::encode_spm_segment(const std::string& text, bool addPrefix) const {
     if (text.empty()) return {};
 
-    // 1. Normalize: turn ASCII spaces into ▁ (U+2581). Llama/Gemma always do
-    // this — without it, "Hello world" splits into "▁Hello" + "world" (no leading
-    // ▁ on the second word).
+    // 1. Normalize: turn ASCII spaces into ▁ (U+2581). The leading word-start ▁
+    // is only added when addPrefix (i.e. this is the very start of the input),
+    // not for segments that follow a special token.
     std::string norm;
     norm.reserve(text.size() + 6);
     auto append_under = [&]() { norm.push_back((char)0xE2); norm.push_back((char)0x96); norm.push_back((char)0x81); };
     bool start = true;
     for (size_t i = 0; i < text.size(); i++) {
         char c = text[i];
-        if (start && add_space_prefix && c != ' ') {
+        if (start && add_space_prefix && addPrefix && c != ' ') {
             append_under();
             start = false;
         } else if (c == ' ') {
