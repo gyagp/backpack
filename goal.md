@@ -10,31 +10,32 @@ on Windows (RTX 5080, D3D12 + Vulkan backends).
 |-------|-------------|--------------------------------------------------|
 | Qwen3.5-2B | ✅ Fixed — "2 + 2 = 4" | 234 tok/s vs 350 = **0.67x** |
 | Qwen3.5-4B | ✅ Fixed — "2+2 equals 4." | 120 tok/s vs 194 = **0.62x** |
-| Gemma 3 (1B) | ✅ Coherent in prompt mode ("Paris is the capital of the world, and to the people,"); chat mode still off | — |
-| Gemma 4 (E2B) | ⚠️ Runs end-to-end, stable/bounded numerics, output not coherent | — |
+| Gemma 3 (1B) | ✅ **Fixed** — "The capital of France is Paris." (Paris top logit) | — |
+| Gemma 4 (E2B) | ⚠️ Runs, coherent-ish but factual retrieval still off ("...is the a to in") | — |
 
-### The two Gemma breakthroughs
-1. Device-removal fix: a uniform buffer was bound to a storage descriptor slot
-   in the sandwich-norm down projection → Dawn removed the D3D12 device. Fixed.
-2. Double +1 on norm weights: Gemma's RMSNorm is x*(1+w), but llama.cpp's GGUF
-   conversion already bakes the +1 into the stored weights (they sit ~1-6, not
-   ~0). We were adding +1 again, over-scaling every norm and exploding the
-   residual (xBuf hit ~38000). Removing the extra +1 made Gemma 3 coherent.
+### The Gemma breakthroughs
+1. Device-removal fix: a uniform buffer bound to a storage descriptor slot in
+   the sandwich-norm down projection removed the D3D12 device. Fixed.
+2. Double +1 on norm weights: GGUF already bakes Gemma's (1+w); we were adding
+   it again and exploding the residual. Removed the extra +1.
+3. Tokenizer: Gemma 4 declares tokenizer.ggml.model="gemma4" (Gemma 3 uses
+   "llama"); map any "gemma*" to SentencePiece. Fixed Gemma 4 token salad.
+4. PLE: implemented project_per_layer_inputs + the post_norm injection RMSNorm.
+5. **Q8 matmul K-tail (the Gemma 3 fix):** every Q8 matmul kernel truncated its
+   K-loop to `K/256`, dropping the last 128 of E=1152 dims on Gemma 3's QKV /
+   gate-up / LM-head. Model stayed fluent but lost facts. Rounding up to
+   `(K+255)/256` + tail guards made Gemma 3 say "Paris". Qwen (aligned dims +
+   separate qwen35 path) was never affected. See memory q8-matmul-k-tail-bug.
 
-### Gemma 4 remaining work (why it's still not coherent)
-Gemma 3 works and shares the base path, so the remaining issues are the
-Gemma-4-specific features:
-- PLE (per-layer embeddings, Gemma 3n MatFormer): novel architecture, our
-  injection (inp_gate / proj / per_layer_token_embd) is unverified against the
-  reference and is likely the dominant remaining issue (Gemma 4 E2B needs it).
-- Shared-KV Q-only attention (layers 15-34): implemented approximately (Q-proj
-  + fused-rope with scratch KV write + attention against source cache); needs
-  validation.
-- Gemma 3 chat mode: SPM tokenization of the <start_of_turn>/<end_of_turn>
-  template still yields wrong tokens (prompt mode is fine).
+### Gemma 4 remaining work (E=1536 is 256-aligned, so NOT the K-tail bug)
+Factual retrieval still broken (generic function-word logits). Suspects are the
+Gemma-4-only features, all only approximately implemented:
+- Shared-KV Q-only attention (layers 15-34, 20 of 35 layers)
+- PLE injection exact scales / gating
+- Variable per-layer head dims (256 SWA / 512 global) attention
+- Double-wide MLP
+Localize by dumping per-layer xBuf and bisecting the first divergent layer.
 
-Continue by dumping per-layer xBuf for Gemma 4 vs llama.cpp and bisecting the
-first divergent layer; check PLE math against the Gemma 3n reference.
 
 ## Environment
 
