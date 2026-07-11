@@ -1090,12 +1090,17 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 }
             } else if (qi != gguf.tensor_index.end()) {
                 if (ki == gguf.tensor_index.end() || vi == gguf.tensor_index.end()) {
-                    // Shared-KV models (e.g. Gemma 4 layers 15+) ship attn_q but
-                    // not attn_k/attn_v — the layer reuses K/V from a source
-                    // layer. Skip the fuse so qkvW stays null and the standard
-                    // QKV decode dispatch is bypassed for this layer.
-                    if (i == 0)
-                        fprintf(stderr, "  Layer %u: missing attn_k/attn_v (shared KV), skipping QKV fuse\n", i);
+                    // Shared-KV layers (Gemma 4 layers 15+) ship attn_q but not
+                    // attn_k/attn_v — the layer reuses K/V from a source layer.
+                    // Load Q-only so a dedicated Q-projection + shared-KV
+                    // attention path can run at decode time.
+                    auto& qt = gguf.tensors[qi->second];
+                    uint32_t qN = (uint32_t)qt.shape[1];
+                    auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset,
+                                         qN, cfg.nEmbd, (GGUFType)qt.type);
+                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qonly",
+                                   qr, lw.qOnlyW, lw.qOnlyS);
+                    lw.qOnly = true;
                 } else {
                     auto& qt = gguf.tensors[qi->second];
                     auto& kt = gguf.tensors[ki->second];
@@ -2119,6 +2124,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     attnOutBuf    = gpu->createBuffer("attn_out", maxQDimBuf * 4);
     projOutBuf    = gpu->createBuffer("proj_out", cfg.nEmbd * 4);
     gateUpBuf     = gpu->createBuffer("gate_up", 2 * maxIMBuf * 4);
+    // Scratch K/V write targets for shared-KV (Q-only) layers: the fused-rope
+    // kernel always writes K/V somewhere; for those layers we discard its K/V
+    // and read the real K/V from the source layer's cache instead.
+    if (cfg.sharedKvLayers > 0) {
+        uint32_t kvScratchDim = maxSeqLen * cfg.nKvHeads * cfg.headDim * 2; // fp16
+        qOnlyScratchK = gpu->createBuffer("qonly_scratch_k", kvScratchDim);
+        qOnlyScratchV = gpu->createBuffer("qonly_scratch_v", kvScratchDim);
+    }
 
     // MoE intermediate buffers (allocate when MoE arch detected)
     if (cfg.numExperts > 0) {
@@ -2581,7 +2594,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // 2. QKV matmul
         {
-            if (useKQ) {
+            if (lw.qOnly) {
+                // Shared-KV layer: only a Q projection exists. Produce Q into
+                // qkvBuf's Q region; K/V are reused from the source layer's
+                // cache (kvCacheLayer). rope writes its K/V output to a scratch
+                // buffer so the shared cache is not corrupted.
+                vbg.qkvBase = makeBG(plQ8MatmulNorm, {
+                    {0, xBuf}, {1, lw.qOnlyW}, {2, lw.qOnlyS},
+                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, layerQkvNP},
+                    {6, lw.inputNorm}});
+                di.qkv = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plQ8MatmulNorm.pipeline, vbg.qkvBase,
+                    1, (plQDim + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_q_only"});
+            } else if (useKQ) {
                 auto bg = makeBG(*plKQ, {
                     {0, normOutBuf}, {1, lw.qkvKQ}, {2, zeroBiasQKV},
                     {3, qkvBuf}, {4, kqQkvParams}});
@@ -2606,9 +2631,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             ? ropeCosBufSWA : ropeCosBuf;
             auto& ropeSin = (isSwaLayer && ropeSinBufSWA.handle)
                             ? ropeSinBufSWA : ropeSinBuf;
+            // Shared-KV (Q-only) layers: rope Q into qRotBuf but send the
+            // kernel's K/V writes to scratch so the shared source cache is
+            // preserved (attention below reads the real K/V from it).
+            auto& ropeK = lw.qOnly && qOnlyScratchK.handle ? qOnlyScratchK : kvCache[kvCacheLayer].K;
+            auto& ropeV = lw.qOnly && qOnlyScratchV.handle ? qOnlyScratchV : kvCache[kvCacheLayer].V;
             auto bg = makeBG(plFusedRope, {
                 {0, qkvBuf}, {1, qRotBuf},
-                {2, kvCache[kvCacheLayer].K}, {3, kvCache[kvCacheLayer].V},
+                {2, ropeK}, {3, ropeV},
                 {4, ropeCos}, {5, ropeSin},
                 {6, lw.qNorm}, {7, lw.kNorm},
                 {8, fusedRopeParamsBuf}});
@@ -3601,12 +3631,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             decodePoolCapacity, decodeCbPoolBatch);
 
     // Pre-allocate prefill resources (buffers + bind groups at maxSeqLen)
-    // Skip for K-quant models — prefill kernels only support Q8/fp32 weights
+    // Skip for K-quant models — prefill kernels only support Q8/fp32 weights.
+    // Also skip for shared-KV models (Gemma 4): the batched prefill path
+    // assumes every layer has a full QKV projection, which shared-KV (Q-only)
+    // layers lack. Fall back to serial decode for prefill there.
     bool isKQ = (weightQuantType == GGUF_TYPE_Q4_K ||
                  weightQuantType == GGUF_TYPE_Q5_K ||
                  weightQuantType == GGUF_TYPE_Q6_K);
-    if (!isKQ) {
+    bool hasSharedKv = cfg.sharedKvLayers > 0;
+    if (!isKQ && !hasSharedKv) {
         initPrefillResources();
+    } else if (hasSharedKv) {
+        fprintf(stderr, "  Prefill: skipped (shared-KV layers, using serial decode)\n");
     } else {
         fprintf(stderr, "  Prefill: skipped (K-quant weights, using serial decode)\n");
     }

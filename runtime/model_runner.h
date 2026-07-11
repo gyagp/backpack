@@ -139,6 +139,10 @@ struct ModelRunner {
         GPUBuffer dnW, dnS;
         GPUBuffer inputNorm, postAttnNorm;
         GPUBuffer qNorm, kNorm;
+        // Shared-KV layers (Gemma 4 layers 15+): only a Q projection; K/V are
+        // reused from an earlier layer's cache. qOnly = true marks these.
+        bool qOnly = false;
+        GPUBuffer qOnlyW, qOnlyS;   // Q-only projection (Q8)
         // K-quant: single buffer per weight (raw block data as u32)
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
         // Sandwich norms (Gemma 4)
@@ -219,6 +223,7 @@ struct ModelRunner {
     GPUBuffer embeddingGpuBuf;
     bool embeddingGpuIsF16 = false;
     bool embeddingGatherFromQ8 = false;  // gather embeddings from tied Q8 LM head
+    GPUBuffer qOnlyScratchK, qOnlyScratchV;  // discard KV targets for shared-KV layers
     std::vector<float> embeddingCPU;
 
     // RoPE tables (read-only, shared)
