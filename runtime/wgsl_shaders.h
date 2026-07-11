@@ -13364,7 +13364,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     // K_PER_ITER=8: each lane processes 8 elements per 256-element stride
     // (32 lanes × 8 elem/lane = 256 elements = 8 Q8_0 blocks per stride)
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
     let stride_w = K / 4u;  // u32 per weight row
 
     var acc: f32 = 0.0;
@@ -13464,7 +13464,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     // K_PER_ITER=8: each lane processes 8 elements per 256-element stride
     // (32 lanes × 8 elem/lane = 256 elements = 8 Q8_0 blocks per stride)
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
     let stride_w = K / 4u;  // u32 per weight row
 
     var acc: f32 = 0.0;
@@ -13709,7 +13709,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_blocks = K / 32u;
     let w_base = select(0u, col * stride_w, valid);
     let s_base = select(0u, col * n_blocks, valid);
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
 
     var acc: f32 = 0.0;
 
@@ -13803,7 +13803,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
     let stride_w = K / 4u;
 
     // ── Pass 1: Residual add + compute sum of squares ──────────────────
@@ -13848,20 +13848,21 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         for (var g = 0u; g < n_strides; g = g + 1u) {
             let k_base = g * 256u + lane * 8u;
+            let inb = k_base < K;
 
-            // Re-read X from L1 cache + apply norm
-            let raw0 = vec4<f32>(X[x_base + k_base],
+            // Re-read X from L1 cache + apply norm (bounds-guarded tail)
+            let raw0 = select(vec4<f32>(0.0), vec4<f32>(X[x_base + k_base],
                                  X[x_base + k_base + 1u],
                                  X[x_base + k_base + 2u],
-                                 X[x_base + k_base + 3u]);
-            let raw1 = vec4<f32>(X[x_base + k_base + 4u],
+                                 X[x_base + k_base + 3u]), inb);
+            let raw1 = select(vec4<f32>(0.0), vec4<f32>(X[x_base + k_base + 4u],
                                  X[x_base + k_base + 5u],
                                  X[x_base + k_base + 6u],
-                                 X[x_base + k_base + 7u]);
-            let nw0 = vec4<f32>(NormW[k_base],     NormW[k_base + 1u],
-                                NormW[k_base + 2u], NormW[k_base + 3u]);
-            let nw1 = vec4<f32>(NormW[k_base + 4u], NormW[k_base + 5u],
-                                NormW[k_base + 6u], NormW[k_base + 7u]);
+                                 X[x_base + k_base + 7u]), inb);
+            let nw0 = select(vec4<f32>(0.0), vec4<f32>(NormW[k_base],     NormW[k_base + 1u],
+                                NormW[k_base + 2u], NormW[k_base + 3u]), inb);
+            let nw1 = select(vec4<f32>(0.0), vec4<f32>(NormW[k_base + 4u], NormW[k_base + 5u],
+                                NormW[k_base + 6u], NormW[k_base + 7u]), inb);
             let xv0 = raw0 * rstd * nw0;
             let xv1 = raw1 * rstd * nw1;
 
@@ -14905,7 +14906,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_blocks = K / 32u;
     let w_base = select(0u, col * stride_w, valid);
     let s_base = select(0u, col * n_blocks, valid);
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
 
     var acc: f32 = 0.0;
 
@@ -15003,23 +15004,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
     let stride_w = K / 4u;
 
     // ── Pass 1: Compute sum of squares for RMSNorm ──────────────────────
     // Each warp independently reads the full X and computes sum_sq.
     // X is 8KB (K=2048 × 4 bytes) — fits in L1 cache for pass 2.
+    // K need not be a multiple of 256: the final stride is bounds-guarded
+    // (inb) so out-of-range lanes contribute 0. Gemma's E=1152 is 256*4+128.
     var sum_sq: f32 = 0.0;
     for (var g = 0u; g < n_strides; g = g + 1u) {
         let k_base = g * 256u + lane * 8u;
-        let xv0 = vec4<f32>(X[x_base + k_base],
+        let inb = k_base < K;
+        let xv0 = select(vec4<f32>(0.0), vec4<f32>(X[x_base + k_base],
                             X[x_base + k_base + 1u],
                             X[x_base + k_base + 2u],
-                            X[x_base + k_base + 3u]);
-        let xv1 = vec4<f32>(X[x_base + k_base + 4u],
+                            X[x_base + k_base + 3u]), inb);
+        let xv1 = select(vec4<f32>(0.0), vec4<f32>(X[x_base + k_base + 4u],
                             X[x_base + k_base + 5u],
                             X[x_base + k_base + 6u],
-                            X[x_base + k_base + 7u]);
+                            X[x_base + k_base + 7u]), inb);
         sum_sq += dot(xv0, xv0) + dot(xv1, xv1);
     }
     let total_sq = subgroupAdd(sum_sq);
@@ -15036,20 +15040,21 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         for (var g = 0u; g < n_strides; g = g + 1u) {
             let k_base = g * 256u + lane * 8u;
+            let inb = k_base < K;
 
-            // Re-read X from L1 cache + apply norm
-            let raw0 = vec4<f32>(X[x_base + k_base],
+            // Re-read X from L1 cache + apply norm (bounds-guarded tail)
+            let raw0 = select(vec4<f32>(0.0), vec4<f32>(X[x_base + k_base],
                                  X[x_base + k_base + 1u],
                                  X[x_base + k_base + 2u],
-                                 X[x_base + k_base + 3u]);
-            let raw1 = vec4<f32>(X[x_base + k_base + 4u],
+                                 X[x_base + k_base + 3u]), inb);
+            let raw1 = select(vec4<f32>(0.0), vec4<f32>(X[x_base + k_base + 4u],
                                  X[x_base + k_base + 5u],
                                  X[x_base + k_base + 6u],
-                                 X[x_base + k_base + 7u]);
-            let nw0 = vec4<f32>(NormW[k_base],     NormW[k_base + 1u],
-                                NormW[k_base + 2u], NormW[k_base + 3u]);
-            let nw1 = vec4<f32>(NormW[k_base + 4u], NormW[k_base + 5u],
-                                NormW[k_base + 6u], NormW[k_base + 7u]);
+                                 X[x_base + k_base + 7u]), inb);
+            let nw0 = select(vec4<f32>(0.0), vec4<f32>(NormW[k_base],     NormW[k_base + 1u],
+                                NormW[k_base + 2u], NormW[k_base + 3u]), inb);
+            let nw1 = select(vec4<f32>(0.0), vec4<f32>(NormW[k_base + 4u], NormW[k_base + 5u],
+                                NormW[k_base + 6u], NormW[k_base + 7u]), inb);
             let xv0 = raw0 * rstd * nw0;
             let xv1 = raw1 * rstd * nw1;
 
@@ -15900,7 +15905,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
     let stride_w = K / 4u;
 
     var acc: f32 = 0.0;
@@ -17639,7 +17644,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let lane = tid % 32u;
     let col = tile_col * TILE_N + warp_id;
 
-    let n_strides = K / 256u;
+    let n_strides = (K + 255u) / 256u;
     let stride_w = K / 4u;
     var acc: f32 = 0.0;
 

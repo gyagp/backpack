@@ -1326,10 +1326,19 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 } else {
                     scale = 1.0f;
                 }
-                // Gemma stores scales as (real - 1), same convention as its
-                // RMSNorm weights. Loading as-is gives ~0 and zeroes out every
-                // layer's output. Bake in the +1 here.
-                if (gemmaNormBias) scale += 1.0f;
+                // Gemma 4 stores per-layer output scales as (real - 1): the raw
+                // values sit near 0 (e.g. 0.02, 0.24, 0.79) and are applied as a
+                // multiplier on the whole residual (xBuf *= scale). Loading them
+                // as-is multiplies layer 0's residual by ~0.02 and annihilates the
+                // signal, so the +1 must always be baked in here — unlike the
+                // RMSNorm weights, which llama.cpp already stores with the +1 baked
+                // (they sit ~1-56, see gemmaNormBias=false). Different conventions.
+                // Gemma 4's per-layer output scale is applied as-is (raw, small
+                // values ~0.02-0.79 that damp each layer's residual). Empirically
+                // baking +1 (giving ~1.02-1.79) makes the residual explode over
+                // depth and produces garbage, and disabling it also breaks output;
+                // the raw value is correct. NOT the (real-1) convention despite the
+                // small magnitude.
                 lw.outScale = gpu->createBuffer("L" + std::to_string(i) + ".out_scale", 4);
                 gpu->writeBuffer(lw.outScale, &scale, 4);
             }
@@ -2278,7 +2287,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
 
     // Sliding window attention: separate param buffer with clamped T_total
-    bool hasSWA = !cfg.layerAttnTypes.empty() && cfg.slidingWindow > 0;
+    bool hasSWA = !cfg.layerAttnTypes.empty() && cfg.slidingWindow > 0
+                  && !std::getenv("BP_NO_SWA");
     if (hasSWA) {
         chunkedAttnParamsBufSWA = gpu->createBuffer("p_cattn_swa", 32);
         gpu->writeBuffer(chunkedAttnParamsBufSWA, chunkedAttnParamData.data(), 32);
@@ -2653,8 +2663,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Shared KV: attention reads from source layer's cache
         uint32_t kvCacheLayer = (pl.kvSourceLayer >= 0) ? (uint32_t)pl.kvSourceLayer : i;
 
-        // 1. RMSNorm (only for KQ path — Q8 path uses fused q8_matmul_norm)
-        if (i == 0 && useKQ) {
+        // 1. RMSNorm (only for KQ path — Q8 path uses fused q8_matmul_norm).
+        // Must run EVERY layer: the K-quant qkv matmul below reads normOutBuf,
+        // which is otherwise clobbered by each layer's pre-FFN norm. Restricting
+        // this to layer 0 left layers 1+ projecting QKV from the previous layer's
+        // FFN-normed activation instead of this layer's attention-normed input —
+        // producing fluent but factually wrong output for K-quant Gemma models.
+        if (useKQ && !lw.qOnly) {
             auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, lw.inputNorm},
                 {3, rstdBuf}, {4, rmsParams}});
@@ -4650,6 +4665,42 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
         dumpFloatBufferStats(*gpu, "xBuf", xBuf, cfg.nEmbd);
         dumpFloatBufferStats(*gpu, "normOutBuf", normOutBuf, cfg.nEmbd);
         dumpFloatBufferStats(*gpu, "logitsBuf", logitsBuf, cfg.nVocab);
+    }
+
+    if (std::getenv("BP_DUMP_KV")) {
+        // Dump the first element of the first few token slots of layer 0's K
+        // cache, to verify serial prefill writes distinct per-token K/V.
+        uint32_t kvStride = cfg.nKvHeads * cfg.headDim;  // elements per token slot
+        uint32_t nSlots = std::min<uint32_t>(kvCache[0].len, 8);
+        auto bytes = gpu->readBuffer(kvCache[0].K,
+                                     (uint64_t)nSlots * kvStride * 2ull);
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(bytes.data());
+        auto h2f = [](uint16_t x) -> float {
+            uint32_t s = (x >> 15) & 1, e = (x >> 10) & 0x1F, m = x & 0x3FF, out;
+            if (e == 0) out = (s << 31) | ((m) << 13);
+            else if (e == 31) out = (s << 31) | 0x7F800000 | (m << 13);
+            else out = (s << 31) | ((e + 112) << 23) | (m << 13);
+            float f; memcpy(&f, &out, 4); return f;
+        };
+        fprintf(stderr, "[kv] layer0 K pos=%u len=%u stride=%u:", posOffset,
+                kvCache[0].len, kvStride);
+        for (uint32_t t = 0; t < nSlots; t++)
+            fprintf(stderr, " t%u[%.3f %.3f %.3f]", t,
+                    h2f(h[t * kvStride + 0]), h2f(h[t * kvStride + 1]),
+                    h2f(h[t * kvStride + 2]));
+        fprintf(stderr, "\n");
+    }
+
+    if (std::getenv("BP_DUMP_ATTN")) {
+        dumpFloatBufferStats(*gpu, "attnOutBuf", attnOutBuf, cfg.headDim * cfg.nHead);
+    }
+
+    if (std::getenv("BP_DUMP_NORMW") && posOffset == 0) {
+        auto& l0 = layerWeights[0];
+        if (l0.inputNorm.handle) dumpFloatBufferStats(*gpu, "inputNorm.w", l0.inputNorm, cfg.nEmbd);
+        if (l0.qNorm.handle)     dumpFloatBufferStats(*gpu, "qNorm.w", l0.qNorm, cfg.headDim);
+        if (l0.kNorm.handle)     dumpFloatBufferStats(*gpu, "kNorm.w", l0.kNorm, cfg.headDim);
+        if (l0.postNorm.handle)  dumpFloatBufferStats(*gpu, "postNorm.w", l0.postNorm, cfg.nEmbd);
     }
 
     std::vector<float> logits(cfg.nVocab);
