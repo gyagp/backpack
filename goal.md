@@ -10,42 +10,31 @@ on Windows (RTX 5080, D3D12 + Vulkan backends).
 |-------|-------------|--------------------------------------------------|
 | Qwen3.5-2B | ✅ Fixed — "2 + 2 = 4" | 234 tok/s vs 350 = **0.67x** |
 | Qwen3.5-4B | ✅ Fixed — "2+2 equals 4." | 120 tok/s vs 194 = **0.62x** |
-| Gemma 3/4 | ⚠️ Runs end-to-end, generates tokens, NOT yet coherent | — |
+| Gemma 3 (1B) | ✅ Coherent in prompt mode ("Paris is the capital of the world, and to the people,"); chat mode still off | — |
+| Gemma 4 (E2B) | ⚠️ Runs end-to-end, stable/bounded numerics, output not coherent | — |
 
-### Gemma breakthrough + remaining work
-The fatal blocker is FIXED: a uniform buffer was bound to a storage descriptor
-slot in the sandwich-norm down projection, which made Dawn's D3D12 backend
-remove the device (DXGI_ERROR_DEVICE_REMOVED). Since then Gemma 3 and 4 load,
-build all layers, and generate tokens.
+### The two Gemma breakthroughs
+1. Device-removal fix: a uniform buffer was bound to a storage descriptor slot
+   in the sandwich-norm down projection → Dawn removed the D3D12 device. Fixed.
+2. Double +1 on norm weights: Gemma's RMSNorm is x*(1+w), but llama.cpp's GGUF
+   conversion already bakes the +1 into the stored weights (they sit ~1-6, not
+   ~0). We were adding +1 again, over-scaling every norm and exploding the
+   residual (xBuf hit ~38000). Removing the extra +1 made Gemma 3 coherent.
 
-Fixes landed for Gemma:
-- Device-removal (uniform→storage params) — the critical fix.
-- Sandwich-norm detection for Gemma 2/3 (post_attention_norm.weight) — was
-  completely missing, so those norms were never applied.
-- Per-layer head dims (256 sliding / 512 global) for rope + attention kernels
-  and params.
-- SWA-vs-global classification from per-layer head dim.
-- Q-only attention path for Gemma 4 shared-KV layers 15-34.
-- Serial decode + serial prefill routing for Gemma (pooled/batched paths don't
-  carry sandwich dispatches or per-layer params).
-- VRAM: fp16 / tied-Q8 embedding gather, exact-size large-buffer allocation.
+### Gemma 4 remaining work (why it's still not coherent)
+Gemma 3 works and shares the base path, so the remaining issues are the
+Gemma-4-specific features:
+- PLE (per-layer embeddings, Gemma 3n MatFormer): novel architecture, our
+  injection (inp_gate / proj / per_layer_token_embd) is unverified against the
+  reference and is likely the dominant remaining issue (Gemma 4 E2B needs it).
+- Shared-KV Q-only attention (layers 15-34): implemented approximately (Q-proj
+  + fused-rope with scratch KV write + attention against source cache); needs
+  validation.
+- Gemma 3 chat mode: SPM tokenization of the <start_of_turn>/<end_of_turn>
+  template still yields wrong tokens (prompt mode is fine).
 
-Still NOT coherent. Symptom: top logits after prefill are nearly flat (~19 with
-sub-1.0 spread) — the hidden state loses discriminative signal through the
-layers. Remaining suspects to investigate (need layer-by-layer activation
-diff vs llama.cpp):
-- QK-norm application detail in fused_qknorm_rope (dimension / ordering).
-- Query pre-attention scaling (Gemma may use a fixed query_pre_attn_scalar
-  rather than 1/sqrt(headDim) per layer).
-- PLE (per-layer embedding) injection correctness for Gemma 4.
-- Approximate Q-only shared-KV attention quality.
-- Sandwich-norm numeric exactness (eps, +1 bias, buffer targets).
-- rope convention / dimension_count vs head_dim.
-
-Debugging approach that would close it: dump per-layer hidden state (xBuf) for
-the same prompt from both backpack and llama.cpp and bisect the first layer
-where they diverge. backpack has BP_DUMP_BUFFER_STATS / BP_DUMP_TOP_LOGITS;
-llama.cpp would need --verbose or an eval-callback build.
+Continue by dumping per-layer xBuf for Gemma 4 vs llama.cpp and bisecting the
+first divergent layer; check PLE math against the Gemma 3n reference.
 
 ## Environment
 
