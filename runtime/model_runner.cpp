@@ -1271,8 +1271,6 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             loadNorm(pfx + "post_ffw_norm.weight", lw.postFfwNorm); // post-FFN sandwich
             if (!lw.postFfwNorm.handle)
                 loadNorm(pfx + "ffn_post_norm.weight", lw.postFfwNorm);
-            // Gemma 4 extra per-layer output norm.
-            loadNorm(pfx + "post_norm.weight", lw.postLayerNorm);
         } else {
             // Standard: 2-norm (pre-attn + pre-FFN fused with residual add)
             loadNorm(pfx + "ffn_norm.weight", lw.postAttnNorm);
@@ -1303,6 +1301,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             loadNorm(pfx + "per_layer_post_norm.weight", lw.plePostNorm);
             if (!lw.plePostNorm.handle)
                 loadNorm(pfx + "post_norm_ple.weight", lw.plePostNorm);
+            // Gemma 4: the per-layer PLE-injection norm (post_per_layer_input_norm)
+            // is stored as blk.N.post_norm.weight.
+            if (!lw.plePostNorm.handle)
+                loadNorm(pfx + "post_norm.weight", lw.plePostNorm);
         }
 
         // Per-layer output scale
@@ -1653,7 +1655,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     rows, cols, (size_t)rows * cols * 4 / 1048576);
         }
 
-        // per_layer_model_proj.weight — Q8 repack for GPU
+        // per_layer_model_proj.weight — Q8 repack for GPU + fp32 CPU copy for
+        // the per-token project_per_layer_inputs computation.
         {
             auto it2 = gguf.tensor_index.find("per_layer_model_proj.weight");
             if (it2 != gguf.tensor_index.end()) {
@@ -1664,12 +1667,28 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
                                            N, K, (GGUFType)ti.type);
                     uploadQ8Weight(*gpu, "ple_model_proj", rep, pleModelProjW, pleModelProjS);
+                    // CPU fp32 copy: [N=nLayer*pleSize rows, K=E cols]
+                    pleModelProjCPU.resize((size_t)N * K);
+                    dequant_tensor(fileData + gguf.data_offset + ti.offset,
+                                   pleModelProjCPU.data(), N, K, (GGUFType)ti.type);
                 }
             }
         }
 
-        // per_layer_proj_norm.weight
+        // per_layer_proj_norm.weight — GPU + fp32 CPU copy
         loadNorm("per_layer_proj_norm.weight", pleProjNormW);
+        {
+            auto it3 = gguf.tensor_index.find("per_layer_proj_norm.weight");
+            if (it3 != gguf.tensor_index.end()) {
+                auto& ti = gguf.tensors[it3->second];
+                uint32_t nel = 1;
+                for (auto d : ti.shape) nel *= (uint32_t)d;
+                pleProjNormCPU.resize(nel);
+                const uint8_t* data = fileData + gguf.data_offset + ti.offset;
+                if (ti.type == GGUF_TYPE_F32) memcpy(pleProjNormCPU.data(), data, nel * 4);
+                else dequant_tensor(data, pleProjNormCPU.data(), 1, nel, (GGUFType)ti.type);
+            }
+        }
     }
 
     // ─── MTP weight loading ──────────────────────────────────────────────
@@ -4434,25 +4453,59 @@ void ModelRunner::uploadEmbedding(int32_t tokenId) {
         gpu->writeBuffer(xBuf, emb, cfg.nEmbd * 4);
     }
 
-    // PLE: compute per-layer embedding slices for this token
+    // PLE: compute per-layer input for this token, matching Gemma 4's
+    // project_per_layer_inputs:
+    //   proj = per_layer_model_proj(embedding)           # [nLayer*pleDim]
+    //   proj = RMSNorm_per_slice(proj, per_layer_proj_norm)
+    //   tok  = per_layer_token_embd[token] * sqrt(pleDim)
+    //   per_layer_input = (proj + tok) / sqrt(2)
     if (cfg.pleSize > 0 && !pleEmbCPU.empty() && !pleSliceBufs.empty()) {
         uint32_t pleDim = cfg.pleSize;
         uint32_t totalPleDim = pleDim * cfg.nLayer;
         float pleScale = sqrtf((float)pleDim);
-        float embInvScale = 1.0f / sqrtf((float)cfg.nEmbd);
 
-        // 1. Look up per-layer token embeddings: pleEmbCPU[tokenId * totalPleDim .. +totalPleDim]
-        //    Shape: [totalPleDim] = [nLayer * pleDim]
-        std::vector<float> pleEmbs(totalPleDim);
+        std::vector<float> perLayerInput(totalPleDim, 0.0f);
+
+        // token-side signal: per_layer_token_embd[token] * sqrt(pleDim)
         if ((size_t)tokenId * totalPleDim + totalPleDim <= pleEmbCPU.size()) {
             for (uint32_t j = 0; j < totalPleDim; j++)
-                pleEmbs[j] = pleEmbCPU[(size_t)tokenId * totalPleDim + j] * pleScale;
+                perLayerInput[j] = pleEmbCPU[(size_t)tokenId * totalPleDim + j] * pleScale;
         }
 
-        // 2. Upload per-layer slices to GPU
+        // model-projection side: proj = per_layer_model_proj @ embedding, then
+        // RMSNorm each pleDim slice with per_layer_proj_norm, then combine /sqrt(2).
+        if (pleModelProjCPU.size() == (size_t)totalPleDim * cfg.nEmbd) {
+            const float* embSrc = embeddingCPU.data() + (size_t)tokenId * cfg.nEmbd;
+            const float invSqrt2 = 0.70710678f;
+            float eps = cfg.rmsNormEps;
+            for (uint32_t li = 0; li < cfg.nLayer; li++) {
+                // project this layer's pleDim rows
+                std::vector<float> proj(pleDim);
+                for (uint32_t r = 0; r < pleDim; r++) {
+                    const float* w = pleModelProjCPU.data() +
+                        (size_t)(li * pleDim + r) * cfg.nEmbd;
+                    float acc = 0.0f;
+                    for (uint32_t k = 0; k < cfg.nEmbd; k++) acc += w[k] * embSrc[k];
+                    proj[r] = acc;
+                }
+                // RMSNorm over the pleDim slice with per_layer_proj_norm
+                float ss = 0.0f;
+                for (uint32_t r = 0; r < pleDim; r++) ss += proj[r] * proj[r];
+                float rms = 1.0f / sqrtf(ss / (float)pleDim + eps);
+                for (uint32_t r = 0; r < pleDim; r++) {
+                    float w = (r < pleProjNormCPU.size()) ? pleProjNormCPU[r] : 1.0f;
+                    float projNormed = proj[r] * rms * w;
+                    // combine with token signal, scale by 1/sqrt(2)
+                    perLayerInput[li * pleDim + r] =
+                        (projNormed + perLayerInput[li * pleDim + r]) * invSqrt2;
+                }
+            }
+        }
+
+        // Upload per-layer slices to GPU
         for (uint32_t li = 0; li < cfg.nLayer && li < (uint32_t)pleSliceBufs.size(); li++) {
             gpu->writeBuffer(pleSliceBufs[li],
-                             pleEmbs.data() + li * pleDim, pleDim * 4);
+                             perLayerInput.data() + li * pleDim, pleDim * 4);
         }
     }
 }

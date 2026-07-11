@@ -206,6 +206,8 @@ struct ModelRunner {
 
     // PLE (Per-Layer Embedding) global buffers
     std::vector<float> pleEmbCPU;     // per-layer token embeddings (CPU)
+    std::vector<float> pleModelProjCPU;  // per_layer_model_proj weights (fp32, [nLayer*pleSize, E])
+    std::vector<float> pleProjNormCPU;   // per_layer_proj_norm weights (fp32, [pleSize])
     GPUBuffer pleModelProjW, pleModelProjS;  // [E, pleSize*nLayer] projection
     GPUBuffer pleProjNormW;           // RMSNorm weights [pleSize]
     GPUBuffer pleBuf;                 // intermediate [pleSize] for PLE computation
