@@ -1800,6 +1800,55 @@ void ModelRunner::buildDecodePipeline() {
     auto& plFp16Wide   = getKernel("fp16_gemm_wide");
     auto& plArgmax     = getKernel("argmax");
     auto& plEmbGather  = getKernel("embed_gather");
+    // f16 embedding gather (embeddingGpuBuf is stored fp16 to halve VRAM).
+    static const char* EMBED_GATHER_F16_WGSL = R"(
+enable f16;
+@group(0) @binding(0) var<storage, read> EmbeddingTable: array<f16>;
+@group(0) @binding(1) var<storage, read> TokenId: array<i32>;
+@group(0) @binding(2) var<storage, read_write> X: array<f32>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let E = _params_[0];
+    let normalizer = bitcast<f32>(_params_[1]);
+    let token = u32(TokenId[0]);
+    let base_offset = token * E;
+    let i = gid.x;
+    if (i >= E) { return; }
+    X[i] = f32(EmbeddingTable[base_offset + i]) * normalizer;
+}
+)";
+    auto& plEmbGatherF16 = gpu->getOrCreatePipeline("embed_gather_f16",
+        std::string(EMBED_GATHER_F16_WGSL), 4);
+    // Q8 embedding gather straight from the tied Q8 LM head (weights+scales),
+    // avoiding a separate 0.75–1.5 GB embedding buffer. Layout matches
+    // repack_q8_0: weights[row*(E/4) + i/4] packs 4 int8; scales are fp16
+    // packed 2-per-u32, one per 32-element block at row*(E/32)+i/32.
+    static const char* EMBED_GATHER_Q8_WGSL = R"(
+@group(0) @binding(0) var<storage, read> W: array<u32>;
+@group(0) @binding(1) var<storage, read> S: array<u32>;
+@group(0) @binding(2) var<storage, read> TokenId: array<i32>;
+@group(0) @binding(3) var<storage, read_write> X: array<f32>;
+@group(0) @binding(4) var<storage, read> _params_: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let E = _params_[0];
+    let normalizer = bitcast<f32>(_params_[1]);
+    let token = u32(TokenId[0]);
+    let i = gid.x;
+    if (i >= E) { return; }
+    let wIdx = token * (E / 4u) + i / 4u;
+    let packed = W[wIdx];
+    let byte = (packed >> ((i % 4u) * 8u)) & 0xFFu;
+    let q = (i32(byte) << 24u) >> 24u;   // sign-extend int8
+    let gblock = token * (E / 32u) + i / 32u;
+    let sp = unpack2x16float(S[gblock / 2u]);
+    let scale = select(sp.x, sp.y, (gblock & 1u) != 0u);
+    X[i] = f32(q) * scale * normalizer;
+}
+)";
+    auto& plEmbGatherQ8 = gpu->getOrCreatePipeline("embed_gather_q8",
+        std::string(EMBED_GATHER_Q8_WGSL), 5);
     const bool useGelu = (cfg.activation == ActivationType::GELU);
     auto& plDownSilu   = useGelu ? getKernelGelu("q8_down_silu_add")
                                  : getKernel("q8_down_silu_add");
@@ -1956,15 +2005,30 @@ void ModelRunner::buildDecodePipeline() {
         gpu->writeBuffer(embedParams, p, 16);
     }
 
-    // Upload embedding table to GPU (shared)
-    {
-        uint64_t embBytes = (uint64_t)embeddingCPU.size() * 4;
+    // Upload embedding table to GPU (shared). Two strategies to keep the
+    // resident set small enough to stay under the D3D12 per-process memory
+    // budget (much smaller than total VRAM on a shared desktop — exceeding it
+    // surfaces as DXGI_ERROR_DEVICE_REMOVED from CreatePlacedResource and
+    // silently kills the device):
+    //   1. Tied Q8 LM head resident → gather straight from it (no extra buffer).
+    //   2. Otherwise store a dedicated fp16 copy (half the fp32 size).
+    if (lmHeadIsQ8 && cfg.tieWordEmbeddings && lmHeadQ8W.handle) {
+        embeddingGpuIsF16 = false;         // signal: use Q8 gather from lm head
+        embeddingGatherFromQ8 = true;
+        embeddingGpuBuf = GPUBuffer{};     // no separate embedding buffer
+        fprintf(stderr, "  Embedding gather: from tied Q8 LM head (no extra buffer)\n");
+    } else {
+        uint64_t nEl = embeddingCPU.size();
+        embeddingGpuIsF16 = true;
+        std::vector<uint16_t> f16(nEl);
+        for (uint64_t j = 0; j < nEl; j++) f16[j] = f32_to_fp16(embeddingCPU[j]);
+        uint64_t embBytes = nEl * 2;
         embeddingGpuBuf = gpu->createBuffer("embedding_gpu", embBytes);
         const uint64_t CHUNK = 128 * 1024 * 1024;
         for (uint64_t off = 0; off < embBytes; off += CHUNK) {
             uint64_t sz = std::min(CHUNK, embBytes - off);
             wgpuQueueWriteBuffer(gpu->queue, embeddingGpuBuf.handle, off,
-                                 (const uint8_t*)embeddingCPU.data() + off, sz);
+                                 (const uint8_t*)f16.data() + off, sz);
         }
     }
 
@@ -2615,12 +2679,15 @@ void ModelRunner::buildDecodePipeline() {
             allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg, 1, 1, 1, L+"q35_add_attn_post_norm"});
         } else if (cfg.hasSandwichNorm && lw.postNorm.handle) {
             // Sandwich: RMSNorm(projOutBuf) in-place, then xBuf += projOutBuf, then norm for FFN
+            // Pure workgroup shared-memory tree reduction — no subgroup ops.
+            // The subgroup+workgroup-shared variant crashed the D3D12 driver
+            // (DXGI_ERROR_DEVICE_REMOVED at the first pipeline that uses it)
+            // when compiled for Gemma 4's sandwich norms.
             static const char* RMS_NORM_INPLACE_WGSL = R"(
-enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
-var<workgroup> wg_warp_sums: array<f32, 8>;
+var<workgroup> wg_sums: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0];
@@ -2628,13 +2695,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var i = tid; i < N; i += 256u) { let v = X[i]; sum_sq += v * v; }
-    let warp_sum = subgroupAdd(sum_sq);
-    let warp_id = tid / 32u;
-    let lane = tid % 32u;
-    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    wg_sums[tid] = sum_sq;
     workgroupBarrier();
-    var total: f32 = 0.0;
-    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) { wg_sums[tid] = wg_sums[tid] + wg_sums[tid + stride]; }
+        workgroupBarrier();
+    }
+    let total = wg_sums[0];
     let rms = 1.0 / sqrt(total / f32(N) + eps);
     for (var i = tid; i < N; i += 256u) { X[i] = X[i] * rms * W[i]; }
 }
@@ -3030,10 +3097,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 allDecodeDispatches.push_back({plActMulSW.pipeline, bgAct,
                     (plIM + 127) / 128, 1, 1, L+"act_mul_sw"});
 
-                // 2. Down matmul: siluMulOutBuf → projOutBuf (no residual add)
+                // 2. Down matmul: siluMulOutBuf → projOutBuf (no residual add).
+                // Use a dedicated STORAGE params buffer: plQ8Matmul declares its
+                // params binding as var<storage>, but layerDnP / perLayerDnSiluParams
+                // is a UNIFORM buffer (for q8_down_silu_add). Binding a uniform
+                // buffer to a storage slot builds an invalid D3D12 descriptor and
+                // removes the device (DXGI_ERROR_DEVICE_REMOVED).
+                auto dnMatmulP = makeQ8Params("p_dn_sw_" + std::to_string(i), plIM, cfg.nEmbd);
                 auto bgDn = makeBG(plQ8Matmul, {
                     {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
-                    {3, zeroBiasE}, {4, projOutBuf}, {5, layerDnP}});
+                    {3, zeroBiasE}, {4, projOutBuf}, {5, dnMatmulP}});
                 allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgDn,
                     1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_sw"});
 
@@ -3349,11 +3422,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Auto-decode: embed_gather + full pipeline
     {
-        auto bg = makeBG(plEmbGather, {
-            {0, embeddingGpuBuf}, {1, argmaxResultBuf},
-            {2, xBuf}, {3, embedParams}});
+        // Gather the token embedding into xBuf (f32). Prefer gathering from the
+        // tied Q8 LM head (no extra buffer); otherwise from the fp16 copy.
+        std::vector<std::pair<uint32_t, GPUBuffer>> gatherBg =
+            embeddingGatherFromQ8
+            ? std::vector<std::pair<uint32_t, GPUBuffer>>{
+                  {0, lmHeadQ8W}, {1, lmHeadQ8S}, {2, argmaxResultBuf},
+                  {3, xBuf}, {4, embedParams}}
+            : std::vector<std::pair<uint32_t, GPUBuffer>>{
+                  {0, embeddingGpuBuf}, {1, argmaxResultBuf},
+                  {2, xBuf}, {3, embedParams}};
+        auto& plGather = embeddingGatherFromQ8 ? plEmbGatherQ8 : plEmbGatherF16;
+        auto bg = makeBG(plGather, gatherBg);
         autoDecodeDispatches.clear();
-        autoDecodeDispatches.push_back({plEmbGather.pipeline, bg,
+        autoDecodeDispatches.push_back({plGather.pipeline, bg,
             (cfg.nEmbd + 255) / 256, 1, 1, "embed_gather"});
 
         // Embedding scaling (Gemma: multiply by sqrt(n_embd))
@@ -3447,9 +3529,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         int prefixCount = autoDecodePrefixCount;
         auto& plQ35RopeToQRot = getKernel("qwen35_rope_q_to_qrot");
         auto& plQ35KvWriteRope = getKernel("qwen35_kv_cache_write_rope");
-        ps.dispatches[0].bindGroup = makeBG(plEmbGather, {
-            {0, embeddingGpuBuf}, {1, ps.tokenInBuf},
-            {2, xBuf}, {3, embedParams}});
+        if (embeddingGatherFromQ8) {
+            ps.dispatches[0].bindGroup = makeBG(plEmbGatherQ8, {
+                {0, lmHeadQ8W}, {1, lmHeadQ8S}, {2, ps.tokenInBuf},
+                {3, xBuf}, {4, embedParams}});
+        } else {
+            ps.dispatches[0].bindGroup = makeBG(plEmbGatherF16, {
+                {0, embeddingGpuBuf}, {1, ps.tokenInBuf},
+                {2, xBuf}, {3, embedParams}});
+        }
         if (argmaxDispatchIndex >= 0) {
             int idx = argmaxDispatchIndex + prefixCount;
             ps.dispatches[idx].bindGroup = makeBG(plArgmax, {

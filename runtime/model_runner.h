@@ -217,6 +217,8 @@ struct ModelRunner {
 
     // Embedding (CPU-side for prefill, GPU-side for decode)
     GPUBuffer embeddingGpuBuf;
+    bool embeddingGpuIsF16 = false;
+    bool embeddingGatherFromQ8 = false;  // gather embeddings from tied Q8 LM head
     std::vector<float> embeddingCPU;
 
     // RoPE tables (read-only, shared)

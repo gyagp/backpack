@@ -222,7 +222,19 @@ bool GPUContext::init(WGPUBackendType backend) {
         };
     ddesc.uncapturedErrorCallbackInfo.userdata1 = this;
 
-    // deviceLostCallbackInfo left empty (zero-initialized)
+    // Device-lost callback: surface OOM / TDR / driver resets. Without this a
+    // lost device silently turns every subsequent write/read into a no-op that
+    // returns zeroes (observed with Gemma 4's large resource footprint).
+    ddesc.deviceLostCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+    ddesc.deviceLostCallbackInfo.callback =
+        [](WGPUDevice const*, WGPUDeviceLostReason r, WGPUStringView m, void* ud, void*) {
+            const char* n[] = {"Unknown","Destroyed","CallbackCancelled","FailedCreation"};
+            int ri = (int)r; if (ri < 0 || ri > 3) ri = 0;
+            fprintf(stderr, "[DAWN DeviceLost:%s] %.*s\n", n[ri], (int)m.length, m.data);
+            fflush(stderr);
+            if (ud) static_cast<GPUContext*>(ud)->deviceLost = true;
+        };
+    ddesc.deviceLostCallbackInfo.userdata1 = this;
 
     fprintf(stderr, "  Creating device with %zu features, limits=%p...\n", feats.size(), (void*)ddesc.requiredLimits);
     fflush(stderr);
@@ -310,8 +322,15 @@ int GPUContext::poolBucket(uint64_t size) const {
 
 GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
                                    uint64_t usage, bool mappedAtCreation) {
-    // Try pool first (only for default usage, non-mapped)
-    if (bufferPoolEnabled && usage == BUF_DEFAULT && !mappedAtCreation && size > 0) {
+    // Only pool small transient buffers. Large buffers (weights, embedding,
+    // KV cache) live for the whole model lifetime and are never reused, so
+    // rounding them up to the next power-of-two pool bucket wastes enormous
+    // VRAM (a 40 MB weight rounds to 64 MB → ~60% waste). Allocate those at
+    // exact size. Threshold: 2 MB.
+    constexpr uint64_t POOL_MAX_POOLED = 2ull * 1024 * 1024;
+    // Try pool first (only for default usage, non-mapped, small)
+    if (bufferPoolEnabled && usage == BUF_DEFAULT && !mappedAtCreation &&
+        size > 0 && size <= POOL_MAX_POOLED) {
         int bucket = poolBucket(size);
         if (!pool_[bucket].empty()) {
             GPUBuffer buf = pool_[bucket].back();
@@ -379,8 +398,11 @@ void GPUContext::releaseBuffer(GPUBuffer buf) {
     if (buf.offset != 0) return;
     if (totalAllocatedBytes >= buf.size)
         totalAllocatedBytes -= buf.size;
+    // Only pool small buffers (matches createBuffer's pooling threshold).
+    // Large buffers are destroyed immediately to free VRAM.
+    constexpr uint64_t POOL_MAX_POOLED = 2ull * 1024 * 1024;
     int bucket = poolBucket(buf.size);
-    if (pool_[bucket].size() < 256) {
+    if (buf.size <= POOL_MAX_POOLED && pool_[bucket].size() < 256) {
         pool_[bucket].push_back(buf);
     } else {
         wgpuBufferDestroy(buf.handle);
