@@ -1514,14 +1514,22 @@ void GraphExecutor::Execute(
     totalCopies += (int)ctx.pendingCopies_.size();
 
 
-    fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback), bufs=%d (pool=%d)\n",
-            executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, ctx.flushCount_,
-            ctx.intReadbackSyncs_, gpu->createBufferCount, gpu->poolHitCount);
+    // Per-execution statistics are useful when diagnosing graph scheduling, but
+    // a token-generation loop executes this path once per token.  Formatting
+    // and flushing a line for every token materially distorts wall-clock TPS,
+    // especially when stderr is transported over WinRM.  Keep the counters
+    // available behind an explicit diagnostic switch.
+    const bool printExecStats = std::getenv("BP_EXEC_STATS") != nullptr;
+    if (printExecStats) {
+        fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback), bufs=%d (pool=%d)\n",
+                executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, ctx.flushCount_,
+                ctx.intReadbackSyncs_, gpu->createBufferCount, gpu->poolHitCount);
+    }
     gpu->createBufferCount = 0;
     gpu->poolHitCount = 0;
     // Print sync sources on first call
     static int printSyncCount = 0;
-    if (printSyncCount < 2 && !ctx.flushSources_.empty()) {
+    if (printExecStats && printSyncCount < 2 && !ctx.flushSources_.empty()) {
         std::vector<std::pair<std::string, int>> sorted(ctx.flushSources_.begin(), ctx.flushSources_.end());
         std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
         fprintf(stderr, "  [sync sources] %d total:\n", ctx.flushCount_);
