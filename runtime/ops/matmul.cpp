@@ -379,12 +379,20 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             outDtype = TensorDtype::Float32;
             *out[0] = ex.AllocTensor(outShape, outDtype);
         }
-        auto& pipeline = ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
+        const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
+            ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
+            ex.getGpu()->supportsSubgroups;
+        auto& pipeline = useSubgroupDecode
+            ? ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
+                []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); })
+            : ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
         auto group = ex.MakeBindGroup(pipeline, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
-        ex.QueueDispatch(pipeline.pipeline, group, (N + 3) / 4,
-                         static_cast<uint32_t>(M), 1, "matmul_q8_block32");
+        ex.QueueDispatch(pipeline.pipeline, group,
+                         useSubgroupDecode ? (N + 7) / 8 : (N + 3) / 4,
+                         static_cast<uint32_t>(M), 1,
+                         useSubgroupDecode ? "matmul_q8_block32_subgroup" : "matmul_q8_block32");
         return;
     }
 
