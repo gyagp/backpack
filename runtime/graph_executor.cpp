@@ -91,11 +91,8 @@ static size_t warmupGraphPipelines(GraphExecutor& ex) {
     }
     if (has("MatMulNBits")) {
         addRaw("matmul_q4", WGSL_MATMUL_Q4, 5);
-        const bool hasValidatedLogicalWarp =
-            ex.gpu->adapterName.find("AMD") == std::string::npos &&
-            ex.gpu->adapterName.find("Radeon") == std::string::npos;
         if (ex.gpu->backendType == WGPUBackendType_D3D12 &&
-            ex.gpu->supportsSubgroups && hasValidatedLogicalWarp)
+            ex.gpu->supportsSubgroups)
             addRaw("matmul_q4_decode", WGSL_MATMUL_Q4_DECODE, 5);
     }
     if (has("Gemm")) {

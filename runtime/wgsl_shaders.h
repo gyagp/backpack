@@ -8897,7 +8897,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     // Write output
     for (var c = 0u; c < COLS_PER_WARP; c++) {
-        let warp_sum = subgroupAdd(acc[c]);
+        // Reduce a logical 32-lane warp explicitly. subgroupAdd combines all
+        // 64 lanes on RDNA, mixing the two independent column groups. XOR
+        // shuffles with masks <= 16 stay within each 32-lane half on both
+        // wave32 and wave64 hardware.
+        var warp_sum = acc[c];
+        warp_sum += subgroupShuffleXor(warp_sum, 16u);
+        warp_sum += subgroupShuffleXor(warp_sum, 8u);
+        warp_sum += subgroupShuffleXor(warp_sum, 4u);
+        warp_sum += subgroupShuffleXor(warp_sum, 2u);
+        warp_sum += subgroupShuffleXor(warp_sum, 1u);
         if (lane == 0u && col_valid[c]) {
             Y[cols[c]] = warp_sum;
         }
