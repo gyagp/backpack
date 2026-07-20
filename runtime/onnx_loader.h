@@ -28,6 +28,7 @@ struct OnnxLoadResult {
     /// Per-layer weights — either Q8 repacked or fp16.
     struct LayerData {
         Q8Repacked qkv;         // fused Q/K/V projection (Q8 format)
+        Q8Repacked qOnly;       // Q-only projection for shared-KV layers
         Q8Repacked o;           // output projection
         Q8Repacked gateup;      // fused gate + up projection
         Q8Repacked down;        // down projection

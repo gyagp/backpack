@@ -633,6 +633,32 @@ std::vector<float> dequantEmbedding(const uint8_t* rawData, const uint8_t* scale
     return fp32;
 }
 
+std::vector<float> dequantQ4Embedding(const uint8_t* rawData,
+                                      const uint8_t* scaleData,
+                                      const uint8_t* zeroPointData,
+                                      uint32_t nVocab, uint32_t nGroups,
+                                      uint32_t blockSize) {
+    const uint32_t K = nGroups * blockSize;
+    const uint32_t packedBlockSize = blockSize / 2;
+    std::vector<float> fp32((size_t)nVocab * K);
+    const uint16_t* scales = reinterpret_cast<const uint16_t*>(scaleData);
+    for (uint32_t row = 0; row < nVocab; row++) {
+        for (uint32_t g = 0; g < nGroups; g++) {
+            const size_t block = (size_t)row * nGroups + g;
+            const uint8_t zpByte = zeroPointData ? zeroPointData[block / 2] : 0x88;
+            const int zeroPoint = (block & 1) ? zpByte >> 4 : zpByte & 0x0f;
+            const float scale = fp16_to_f32(scales[block]);
+            const uint8_t* src = rawData + block * packedBlockSize;
+            float* dst = fp32.data() + (size_t)row * K + (size_t)g * blockSize;
+            for (uint32_t j = 0; j < packedBlockSize; j++) {
+                dst[j * 2] = ((int)(src[j] & 0x0f) - zeroPoint) * scale;
+                dst[j * 2 + 1] = ((int)(src[j] >> 4) - zeroPoint) * scale;
+            }
+        }
+    }
+    return fp32;
+}
+
 /// Extract Constant node tensor values from a GraphProto subgraph.
 /// Used to find cos_cache/sin_cache embedded in If node then_branch.
 /// Returns a map of output_name → OnnxTensor for Constant nodes with tensor data.
@@ -1141,6 +1167,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             if (node.inputs.size() < 3) continue;
             auto& embInput = node.inputs[0];
             auto& scaleName = node.inputs[2];
+            const std::string zeroPointName = node.inputs.size() >= 4
+                ? node.inputs[3] : std::string();
 
             // Trace through Reshape if needed
             std::string actualEmbName = embInput;
@@ -1162,6 +1190,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             // clear conformance failure until the packed per-layer embedding
             // path is wired into ModelRunner.
             if (actualEmbName.find("embed_tokens_per_layer_split") != std::string::npos) {
+                if (std::getenv("BP_ONNX_INSPECT_SKIP_PLE"))
+                    continue;
                 fprintf(stderr,
                     "Unsupported ONNX feature: packed Gemma 4 per-layer embedding '%s'\n",
                     actualEmbName.c_str());
@@ -1189,8 +1219,16 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             fflush(stderr);
 
             uint32_t nVocab = (uint32_t)embT.dims[0];
-            uint32_t nGroups = (embT.dims.size() >= 2) ? (uint32_t)embT.dims[1] : 1;
-            uint32_t bs = (embT.dims.size() >= 3) ? (uint32_t)embT.dims[2] : 32;
+            const uint32_t bits = (uint32_t)node.getAttrInt("bits");
+            uint32_t bs = (uint32_t)node.getAttrInt("block_size");
+            if (bs == 0) bs = 32;
+            uint32_t nGroups = 1;
+            if (scaleIt != initializers.end() && scaleIt->second.dims.size() >= 2)
+                nGroups = (uint32_t)scaleIt->second.dims[1];
+            else if (embT.dims.size() >= 2)
+                nGroups = bits == 4
+                    ? (uint32_t)embT.dims[1] * 2 / bs
+                    : (uint32_t)embT.dims[1] / bs;
             uint32_t embK = nGroups * bs;
 
             fprintf(stderr, "  [onnx] V=%u nGroups=%u bs=%u embK=%u\n",
@@ -1201,9 +1239,18 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             fflush(stderr);
 
             if (scaleIt != initializers.end() && scaleIt->second.rawData) {
-                result.embeddingCPU = dequantEmbedding(
-                    embT.rawData, scaleIt->second.rawData,
-                    nVocab, nGroups, bs, embK);
+                auto zpIt = initializers.find(zeroPointName);
+                const uint8_t* zp = zpIt != initializers.end()
+                    ? zpIt->second.rawData : nullptr;
+                if (bits == 4) {
+                    result.embeddingCPU = dequantQ4Embedding(
+                        embT.rawData, scaleIt->second.rawData, zp,
+                        nVocab, nGroups, bs);
+                } else {
+                    result.embeddingCPU = dequantEmbedding(
+                        embT.rawData, scaleIt->second.rawData,
+                        nVocab, nGroups, bs, embK);
+                }
             } else {
                 // No scales, treat as fp16
                 uint32_t nel = 1;
@@ -1318,6 +1365,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         };
 
         moveQ8(pfx + "self_attn.qkv_proj.weight", ld.qkv);
+        if (ld.qkv.N == 0)
+            moveQ8(pfx + "self_attn.q_proj.weight", ld.qOnly);
         moveQ8(pfx + "self_attn.o_proj.weight", ld.o);
         moveQ8(pfx + "mlp.gate_up_proj.weight", ld.gateup);
         moveQ8(pfx + "mlp.down_proj.weight", ld.down);
@@ -1468,6 +1517,23 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
 
     fprintf(stderr, "  Model: E=%u, IM=%u, HD=%u, V=%u\n",
            cfg.nEmbd, cfg.intermediateSize, cfg.headDim, cfg.nVocab);
+
+    // GenAI packages may place token embedding in a separate graph.  Load it
+    // through the same quantized-Gather path; decoder/model.onnx consumes the
+    // resulting inputs_embeds rather than owning a token table itself.
+    if (result.embeddingCPU.empty() && useGenaiFormat) {
+        fs::path embeddingDir = fs::path(modelDir).parent_path() / "embedding";
+        if (fs::exists(embeddingDir / "model.onnx")) {
+            OnnxLoadResult embedding;
+            if (!loadOnnxModel(embeddingDir.string(), embedding) ||
+                embedding.embeddingCPU.empty()) {
+                fprintf(stderr, "Failed to load GenAI embedding submodel: %s\n",
+                        embeddingDir.string().c_str());
+                return false;
+            }
+            result.embeddingCPU = std::move(embedding.embeddingCPU);
+        }
+    }
 
     return true;
 }
