@@ -1,5 +1,5 @@
 param(
-    [string]$BackupRoot = 'D:\workspace\project\agents\backup\llamacpp'
+    [string]$BackupRoot = 'D:\backup\x64\llamacpp'
 )
 $ErrorActionPreference = 'Stop'
 $release = Invoke-RestMethod 'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest' -Headers @{'User-Agent'='Backpack'}
@@ -23,7 +23,7 @@ $targets = @('10.172.21.15','10.95.136.157')
 foreach ($target in $targets) {
     $session = New-PSSession -ComputerName $target -Authentication Negotiate
     try {
-        $remote = "D:\workspace\project\agents\backup\llamacpp\$($release.tag_name)\vulkan"
+        $remote = "D:\backup\x64\llamacpp\$($release.tag_name)\vulkan"
         Invoke-Command -Session $session -ScriptBlock { param($path) New-Item -ItemType Directory -Force $path | Out-Null } -ArgumentList $remote
         Copy-Item (Join-Path $destination '*') $remote -ToSession $session -Recurse -Force
     } finally {

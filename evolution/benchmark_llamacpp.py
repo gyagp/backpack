@@ -14,7 +14,7 @@ def main() -> int:
     parser.add_argument("--generation-tokens", type=int, default=128)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--root", type=Path,
-                        default=Path(r"D:\workspace\project\agents\backup\llamacpp"))
+                        default=Path(r"D:\backup\x64\llamacpp"))
     args = parser.parse_args()
 
     versions = sorted(
