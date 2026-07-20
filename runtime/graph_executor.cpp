@@ -1171,16 +1171,19 @@ void GraphExecutor::Execute(
     }
 
     // Build tensor reference counts for buffer recycling
-    std::unordered_map<std::string, int> tensorRefCount;
-    for (size_t ni : execOrder) {
-        auto& node = graph_.nodes[ni];
-        for (auto& inName : node.inputs)
-            if (!inName.empty()) tensorRefCount[inName]++;
+    if (cachedTensorRefCounts_.empty()) {
+        cachedTensorRefCounts_.reserve(graph_.nodes.size() * 2);
+        for (size_t ni : execOrder) {
+            auto& node = graph_.nodes[ni];
+            for (auto& inName : node.inputs)
+                if (!inName.empty()) cachedTensorRefCounts_[inName]++;
+        }
+        for (auto& [name, _] : graph_.initializers)
+            cachedTensorRefCounts_[name] += 1000;
     }
+    auto tensorRefCount = cachedTensorRefCounts_;
     // Output tensors should not be released
     for (auto& [name, _] : outputs) tensorRefCount[name] += 1000;
-    // Initializers should not be released
-    for (auto& [name, _] : graph_.initializers) tensorRefCount[name] += 1000;
     // Model inputs should not be released (they may be read multiple times)
     for (auto& [name, _] : inputs) tensorRefCount[name] += 1000;
 

@@ -349,6 +349,10 @@ private:
     // Cached topo sort order (reused across Execute calls for the same graph)
     std::vector<size_t> cachedExecOrder_;
 
+    // Immutable input-use counts for the cached execution order.  Model
+    // outputs and invocation inputs are added per Execute call.
+    std::unordered_map<std::string, int> cachedTensorRefCounts_;
+
     // Cached lifetime intervals (recomputed when execOrder changes)
     std::vector<LifetimeInterval> cachedLifetimeIntervals_;
     size_t lifetimeExecOrderSize_ = 0;
