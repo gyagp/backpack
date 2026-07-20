@@ -442,7 +442,19 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
     if (captureWritesCb_ && size > 0) {
         captureWritesCb_(buf.handle, offset, data, size, captureWritesCtx_);
     }
+    // Avoid a single enormous Dawn staging allocation. Qwen 3.5's quantized
+    // LM head is about 509 MB; one QueueWriteBuffer call for it can spend
+    // minutes copying/committing memory on Windows. Moderate chunks keep the
+    // upload streaming and are also accepted by all D3D12 adapters.
+    constexpr uint64_t kUploadChunk = 16ull * 1024 * 1024;
+    if (size > kUploadChunk && (size & 3) == 0) {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        for (uint64_t done = 0; done < size; done += kUploadChunk) {
+            uint64_t chunk = std::min(kUploadChunk, size - done);
+            wgpuQueueWriteBuffer(queue, buf.handle, offset + done, bytes + done, chunk);
+        }
     // WebGPU requires writeBuffer size to be a multiple of 4
+    } else
     if (size > 0 && (size & 3)) {
         uint64_t aligned = size & ~(uint64_t)3;
         if (aligned > 0)

@@ -57,9 +57,10 @@ set(BACKPACK_CORE_SOURCES
     ops/shape.cpp
     ops/matmul.cpp
     ops/norm.cpp
-    ops/attention.cpp
-    ops/conv.cpp
-    ops/moe.cpp
+      ops/attention.cpp
+      ops/conv.cpp
+      ops/recurrent.cpp
+      ops/moe.cpp
     clock_calibration.cpp
     profile_html.cpp
 )

@@ -206,6 +206,74 @@ static const WGPULimits& effectiveLimits(const GPUContext& gpu) {
 
 // ─── MatMulNBits ─────────────────────────────────────────────────────────────
 
+static const char* kMatMulQ8Block32 = R"WGSL(
+struct Params { M: u32, N: u32, K: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+var<workgroup> sums: array<f32, 1024>;
+fn byte_at(word: u32, index: u32) -> u32 {
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+fn scale_at(index: u32) -> f32 {
+    let pair = unpack2x16float(scales[index >> 1u]);
+    return select(pair.x, pair.y, (index & 1u) != 0u);
+}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let lane = lid3.x;
+    let m = wid.y;
+    let n0 = wid.x * 4u;
+    let groups = p.K / 32u;
+    var acc0 = 0.0; var acc1 = 0.0; var acc2 = 0.0; var acc3 = 0.0;
+    for (var k = lane; k < p.K; k += 256u) {
+        let x = X[m * p.K + k];
+        let byte_in_word = k & 3u;
+        let word_k = k >> 2u;
+        if (n0 < p.N) {
+            let q = f32(i32(byte_at(W[n0 * (p.K / 4u) + word_k], byte_in_word)) - 128);
+            acc0 += x * q * scale_at(n0 * groups + k / 32u);
+        }
+        if (n0 + 1u < p.N) {
+            let n = n0 + 1u;
+            let q = f32(i32(byte_at(W[n * (p.K / 4u) + word_k], byte_in_word)) - 128);
+            acc1 += x * q * scale_at(n * groups + k / 32u);
+        }
+        if (n0 + 2u < p.N) {
+            let n = n0 + 2u;
+            let q = f32(i32(byte_at(W[n * (p.K / 4u) + word_k], byte_in_word)) - 128);
+            acc2 += x * q * scale_at(n * groups + k / 32u);
+        }
+        if (n0 + 3u < p.N) {
+            let n = n0 + 3u;
+            let q = f32(i32(byte_at(W[n * (p.K / 4u) + word_k], byte_in_word)) - 128);
+            acc3 += x * q * scale_at(n * groups + k / 32u);
+        }
+    }
+    sums[lane] = acc0; sums[256u + lane] = acc1;
+    sums[512u + lane] = acc2; sums[768u + lane] = acc3;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+            sums[256u + lane] += sums[256u + lane + stride];
+            sums[512u + lane] += sums[512u + lane + stride];
+            sums[768u + lane] += sums[768u + lane + stride];
+        }
+        workgroupBarrier();
+    }
+    if (lane == 0u) {
+        if (n0 < p.N) { Y[m * p.N + n0] = sums[0]; }
+        if (n0 + 1u < p.N) { Y[m * p.N + n0 + 1u] = sums[256]; }
+        if (n0 + 2u < p.N) { Y[m * p.N + n0 + 2u] = sums[512]; }
+        if (n0 + 3u < p.N) { Y[m * p.N + n0 + 3u] = sums[768]; }
+    }
+}
+)WGSL";
+
 static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
                            const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1]; auto* S = in[2];
@@ -270,6 +338,7 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
     }
     ex.EnsureGpu(*S);
 
+
     // Check for zero_point input (4th input)
     auto* ZP = (in.size() > 3 && in[3] && in[3]->IsValid()) ? in[3] : nullptr;
     if (ZP) ex.EnsureGpu(*ZP);
@@ -290,6 +359,34 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
     uint32_t params[4] = {(uint32_t)M, N, K, 0};
     auto paramBuf = ex.getParamBuffer(16);
     ex.getGpu()->writeBuffer(paramBuf, params, 16);
+
+    const int64_t bits = n.GetInt("bits", 4);
+    if (bits == 8) {
+        // ORT blockwise Q8 stores unsigned bytes with an implicit zero point
+        // of 128 and one fp16 scale per 32 values.
+        if (X->dtype == TensorDtype::Float16) {
+            GpuTensor f32 = ex.AllocTensor(X->shape, TensorDtype::Float32);
+            uint32_t castParams[4] = {(uint32_t)X->ElementCount(), 0, 0, 0};
+            auto castParam = ex.getParamBuffer(16);
+            ex.getGpu()->writeBuffer(castParam, castParams, 16);
+            auto& cast = ex.GetPipelineT("cast_f16_to_f32", 3,
+                []() { return std::string(WGSL_CAST_F16_TO_F32); });
+            auto castGroup = ex.MakeBindGroup(cast,
+                {{0, X->buffer}, {1, f32.buffer}, {2, castParam}});
+            ex.QueueDispatch(cast.pipeline, castGroup,
+                (castParams[0] + 255) / 256, 1, 1, "q8_input_cast");
+            *X = std::move(f32);
+            outDtype = TensorDtype::Float32;
+            *out[0] = ex.AllocTensor(outShape, outDtype);
+        }
+        auto& pipeline = ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
+        auto group = ex.MakeBindGroup(pipeline, {
+            {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+            {3, out[0]->buffer}, {4, paramBuf}});
+        ex.QueueDispatch(pipeline.pipeline, group, (N + 3) / 4,
+                         static_cast<uint32_t>(M), 1, "matmul_q8_block32");
+        return;
+    }
 
     if (ZP) {
         // Decode: K-parallel subgroup kernel (8 warps × 32 lanes, TILE_N=8).
@@ -316,6 +413,15 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
                 (N + 127) / 128, ((uint32_t)M + 7) / 8, 1, "matmul_q4_zp_wide");
         }
     } else {
+        // The portable no-zero-point Q4 shader is an f32 kernel. Some Qwen
+        // projections feed it fp16 tensors; interpreting those bytes as f32
+        // also made the shader write past an fp16-sized output allocation.
+        if (X->dtype == TensorDtype::Float16) {
+            if (!ensureTensorFloat32(ex, *X,
+                    n.inputs.empty() ? std::string() : n.inputs[0])) return;
+            outDtype = TensorDtype::Float32;
+            *out[0] = ex.AllocTensor(outShape, outDtype);
+        }
         auto& pl = ex.GetPipelineT("matmul_q4", 5, []() { return std::string(WGSL_MATMUL_Q4); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},

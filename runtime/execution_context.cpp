@@ -507,10 +507,15 @@ GpuTensor* OpContext::GetTensor(const std::string& name) {
 }
 
 void OpContext::Submit(const std::vector<Dispatch>& dispatches) {
+    // Direct submissions must not overtake work accumulated by QueueDispatch.
+    // WebGPU preserves queue submission order, but pending work has not reached
+    // the queue yet until SubmitPending is called.
+    exec.SubmitPending();
     graph.Submit(dispatches);
 }
 
 void OpContext::SubmitAsync(const std::vector<Dispatch>& dispatches) {
+    exec.SubmitPending();
     graph.SubmitAsync(dispatches);
 }
 

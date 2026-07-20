@@ -91,6 +91,69 @@ static bool readTensorInt64Values(OpContext& ex, GpuTensor* t,
     return false;
 }
 
+static void opTile(OpContext& ex, const OnnxGraphNode& n,
+                   const std::vector<GpuTensor*>& in,
+                   std::vector<GpuTensor*>& out) {
+    if (in.size() < 2 || !in[0] || !in[1] || out.empty()) return;
+    auto* data = in[0];
+    std::vector<int64_t> repeats;
+    if (!readTensorInt64Values(ex, in[1], n.inputs.size() > 1 ? n.inputs[1] : "", repeats) ||
+        repeats.size() != data->shape.size()) return;
+    std::vector<uint8_t> source;
+    const size_t sourceBytes = data->ByteSize();
+    if (!loadTensorBytes(ex, data, n.inputs.empty() ? "" : n.inputs[0], sourceBytes, source)) return;
+    std::vector<int64_t> shape(data->shape.size());
+    int64_t outputElements = 1;
+    for (size_t i = 0; i < shape.size(); i++) {
+        shape[i] = data->shape[i] * repeats[i];
+        outputElements *= shape[i];
+    }
+    const size_t elementBytes = data->DtypeSize();
+    std::vector<uint8_t> result((size_t)outputElements * elementBytes);
+    std::vector<int64_t> inputStrides(shape.size(), 1), outputStrides(shape.size(), 1);
+    for (int i = (int)shape.size() - 2; i >= 0; i--) {
+        inputStrides[i] = inputStrides[i + 1] * data->shape[i + 1];
+        outputStrides[i] = outputStrides[i + 1] * shape[i + 1];
+    }
+    for (int64_t flat = 0; flat < outputElements; flat++) {
+        int64_t remaining = flat, inputFlat = 0;
+        for (size_t d = 0; d < shape.size(); d++) {
+            int64_t coord = remaining / outputStrides[d];
+            remaining %= outputStrides[d];
+            inputFlat += (coord % data->shape[d]) * inputStrides[d];
+        }
+        memcpy(result.data() + flat * elementBytes,
+               source.data() + inputFlat * elementBytes, elementBytes);
+    }
+    *out[0] = ex.AllocCpuTensor(shape, data->dtype, result.data(), result.size());
+}
+
+static void opReduceMax(OpContext& ex, const OnnxGraphNode& n,
+                        const std::vector<GpuTensor*>& in,
+                        std::vector<GpuTensor*>& out) {
+    if (in.empty() || !in[0] || out.empty()) return;
+    auto* data = in[0];
+    const int64_t count = data->ElementCount();
+    std::vector<uint8_t> source;
+    if (count <= 0 || !loadTensorBytes(ex, data,
+        n.inputs.empty() ? "" : n.inputs[0], data->ByteSize(), source)) return;
+    if (data->dtype == TensorDtype::Int32) {
+        const int32_t* values = reinterpret_cast<const int32_t*>(source.data());
+        int32_t maximum = values[0];
+        for (int64_t i = 1; i < count; i++) maximum = std::max(maximum, values[i]);
+        *out[0] = ex.AllocCpuTensor(n.GetInt("keepdims", 1) ? std::vector<int64_t>{1}
+                                                               : std::vector<int64_t>{},
+                                    TensorDtype::Int32, &maximum, sizeof(maximum));
+    } else if (data->dtype == TensorDtype::Int64) {
+        const int64_t* values = reinterpret_cast<const int64_t*>(source.data());
+        int64_t maximum = values[0];
+        for (int64_t i = 1; i < count; i++) maximum = std::max(maximum, values[i]);
+        *out[0] = ex.AllocCpuTensor(n.GetInt("keepdims", 1) ? std::vector<int64_t>{1}
+                                                               : std::vector<int64_t>{},
+                                    TensorDtype::Int64, &maximum, sizeof(maximum));
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Zero-copy ops (no GPU work, just change shape metadata)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -254,6 +317,24 @@ static void opGather(OpContext& ex, const OnnxGraphNode& n,
     bool haveIndexVals = readTensorInt64Values(ex, indices,
                                                n.inputs.size() > 1 ? n.inputs[1] : "",
                                                indexVals);
+    // Scalar Constant indices can be materialized as a GPU-only tensor by the
+    // generic executor. Recover them here before selecting the axis-0-only
+    // gather kernel; otherwise a Gather(axis=1, index=-1), used to prune LLM
+    // logits to the last prompt token, silently keeps the whole sequence.
+    if (!haveIndexVals && axis != 0 && indices->buffer.handle && nIdx <= 64) {
+        ex.FlushPendingWork();
+        auto raw = ex.getGpu()->readBuffer(indices->buffer, nIdx * indices->DtypeSize());
+        if (indices->dtype == TensorDtype::Int64 && raw.size() >= (size_t)nIdx * 8) {
+            indexVals.resize((size_t)nIdx);
+            memcpy(indexVals.data(), raw.data(), (size_t)nIdx * 8);
+            haveIndexVals = true;
+        } else if (indices->dtype == TensorDtype::Int32 && raw.size() >= (size_t)nIdx * 4) {
+            indexVals.resize((size_t)nIdx);
+            auto* values = reinterpret_cast<const int32_t*>(raw.data());
+            for (int64_t i = 0; i < nIdx; i++) indexVals[(size_t)i] = values[i];
+            haveIndexVals = true;
+        }
+    }
 
     if (haveDataRaw && haveIndexVals && axis == 0 && !data->shape.empty()) {
         int64_t inner = 1;
@@ -1793,3 +1874,5 @@ static void opSplitCopy(OpContext& ex, const OnnxGraphNode& n,
 }
 
 REGISTER_OP(SplitCopy, opSplitCopy)
+REGISTER_OP(Tile, opTile)
+REGISTER_OP(ReduceMax, opReduceMax)

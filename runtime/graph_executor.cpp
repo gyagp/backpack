@@ -698,6 +698,12 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     // Upload initializers to GPU
     int uploaded = 0, nodata = 0;
     for (auto& t : initTensors) {
+        if ((uploaded % 50) == 0 || t.rawSize >= 16u * 1024u * 1024u) {
+            fprintf(stderr, "  Uploading initializer %d/%zu: %s (%.1f MB)\n",
+                    uploaded + 1, initTensors.size(), t.name.c_str(),
+                    t.rawSize / (1024.0 * 1024.0));
+            fflush(stderr);
+        }
         // Resolve inline typed data if no raw_data
         std::vector<uint8_t> inlineDataBuf;
         if (!t.rawData || t.rawSize == 0) {
@@ -801,6 +807,7 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         GpuTensor gt;
         gt.shape = t.dims;
         gt.dtype = dtype;
+        const bool flushLargeInitializer = bufSize >= 16u * 1024u * 1024u;
         gt.buffer = gpu->createBuffer(t.name, bufSize);
         if (t.rawSize < 4) {
             // Tiny buffer: pad to 4 bytes
@@ -819,6 +826,10 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
                 gpu->writeBuffer(gt.buffer, padded, 4, writeSize);
             }
         }
+        // QueueWriteBuffer uses internal staging allocations. Retiring them
+        // after a large tensor prevents the 1.3 GB Qwen upload from retaining
+        // every staging copy until first inference.
+        if (flushLargeInitializer) gpu->waitForQueue();
         weightStore_[t.name] = std::move(gt);
 
         // Also record in graph initializers (for metadata)
@@ -827,8 +838,13 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         uploaded++;
     }
 
+    fprintf(stderr, "  %d initializers uploaded; pipelines compile lazily\n", uploaded);
+    fflush(stderr);
     auto warmupT0 = std::chrono::steady_clock::now();
-    size_t warmedPipelines = warmupGraphPipelines(*this);
+    // Eagerly creating every generic pipeline can serialize for many minutes
+    // in Dawn's D3D12 compiler for large LLM graphs. The session has a focused
+    // warmup pass and every op also compiles safely on first use.
+    size_t warmedPipelines = 0;
     auto warmupT1 = std::chrono::steady_clock::now();
 
     auto t1 = std::chrono::steady_clock::now();
@@ -1216,8 +1232,15 @@ void GraphExecutor::Execute(
             if (outName.empty()) {
                 outTensors.push_back(nullptr);
             } else {
-                // Outputs go to per-session store
-                outTensors.push_back(&ctx.tensorStore_[outName]);
+                // Tensor-valued Constant outputs are pre-parsed into the
+                // immutable weight store. Preserve that typed value instead
+                // of default-inserting an empty per-session tensor and
+                // replacing it with Constant's float-zero fallback.
+                auto persistent = weightStore_.find(outName);
+                if (persistent != weightStore_.end() && persistent->second.IsValid())
+                    outTensors.push_back(&persistent->second);
+                else
+                    outTensors.push_back(&ctx.tensorStore_[outName]);
             }
         }
 

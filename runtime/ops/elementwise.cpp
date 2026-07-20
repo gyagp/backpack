@@ -922,7 +922,7 @@ DEF_UNARY(Abs, 13)
 DEF_UNARY(Floor, 14)
 DEF_UNARY(Ceil, 15)
 DEF_UNARY(Round, 16)
-DEF_UNARY(Softplus, 17)
+DEF_UNARY(Softplus, 18)
 
 REGISTER_OP(Add, opAdd)
 REGISTER_OP(Sub, opSub)

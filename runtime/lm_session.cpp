@@ -202,6 +202,8 @@ struct GenericOnnxState {
     int64_t convLCache = 3;
     int64_t maxSeqLen = 0;
     int64_t intermediateSize = 0;
+    int64_t convChannels = 0;
+    int64_t recurrentHeads = 0, recurrentKeyDim = 0, recurrentValueDim = 0;
     int64_t moeIntermediateSize = 0;
     int64_t numExperts = 0, numExpertsPerTok = 0;
     float normEps = 1e-5f;
@@ -211,6 +213,7 @@ struct GenericOnnxState {
 
     uint32_t pos = 0;
     std::unordered_map<std::string, GpuTensor> convState;
+    std::unordered_map<std::string, GpuTensor> recurrentState;
     std::unordered_map<std::string, GpuTensor> kvState;
     std::vector<int> convLayerIndices, attnLayerIndices;
 
@@ -246,7 +249,9 @@ struct GenericOnnxState {
         std::string cfgStr{std::istreambuf_iterator<char>(cfgFile),
                            std::istreambuf_iterator<char>()};
         cfgFile.close();
-        auto cfg = json_parse(cfgStr);
+        auto cfgRoot = json_parse(cfgStr);
+        const JsonValue& cfg = cfgRoot.has("text_config")
+            ? cfgRoot["text_config"] : cfgRoot;
 
         hiddenSize = cfg.has("hidden_size") ? cfg["hidden_size"].as_int() : 2048;
         numLayers = cfg.has("num_hidden_layers") ? cfg["num_hidden_layers"].as_int() : 24;
@@ -256,6 +261,16 @@ struct GenericOnnxState {
         headDim = hiddenSize / numHeads;
         convLCache = cfg.has("conv_L_cache") ? cfg["conv_L_cache"].as_int() : 3;
         intermediateSize = cfg.has("intermediate_size") ? cfg["intermediate_size"].as_int() : 7168;
+        convChannels = cfg.has("linear_conv_kernel_dim")
+            ? 3 * hiddenSize : hiddenSize;
+        recurrentHeads = cfg.has("linear_num_value_heads")
+            ? cfg["linear_num_value_heads"].as_int() : 0;
+        recurrentKeyDim = cfg.has("linear_key_head_dim")
+            ? cfg["linear_key_head_dim"].as_int() : 0;
+        recurrentValueDim = cfg.has("linear_value_head_dim")
+            ? cfg["linear_value_head_dim"].as_int() : 0;
+        if (cfg.has("linear_conv_kernel_dim"))
+            convLCache = cfg["linear_conv_kernel_dim"].as_int() - 1;
         moeIntermediateSize = cfg.has("moe_intermediate_size") ? cfg["moe_intermediate_size"].as_int() : 1792;
         numExperts = cfg.has("num_experts") ? cfg["num_experts"].as_int() : 32;
         numExpertsPerTok = cfg.has("num_experts_per_tok") ? cfg["num_experts_per_tok"].as_int() : 4;
@@ -273,7 +288,8 @@ struct GenericOnnxState {
             for (int64_t i = 0; i < cfg["layer_types"].size(); i++) {
                 std::string lt = cfg["layer_types"][i].as_string();
                 layerTypes.push_back(lt);
-                if (lt == "conv") convLayerIndices.push_back((int)i);
+                if (lt == "conv" || lt == "linear_attention")
+                    convLayerIndices.push_back((int)i);
                 else if (lt == "full_attention" || lt == "sliding_attention")
                     attnLayerIndices.push_back((int)i);
             }
@@ -305,6 +321,7 @@ struct GenericOnnxState {
         prefillDone = false;
         nlkWritten = false;
         convState.clear();
+        recurrentState.clear();
         kvState.clear();
         if (fastDecodeCaptured) {
             execCtx.ReleaseCaptured();
@@ -314,21 +331,35 @@ struct GenericOnnxState {
 
         for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
             int idx = convLayerIndices[ci];
-            std::string name = "past_conv." + std::to_string(idx);
+            std::string name = "past_key_values." + std::to_string(idx) + ".conv_state";
             GpuTensor t;
-            t.shape = {1, hiddenSize, convLCache};
+            t.shape = {1, convChannels, convLCache};
             t.dtype = TensorDtype::Float16;
-            size_t bytes = (size_t)(hiddenSize * convLCache * 2);
+            size_t bytes = (size_t)(convChannels * convLCache * 2);
             if (fastDecodeEnabled && ci < convCastF16Bufs.size()) {
                 t.buffer = convCastF16Bufs[ci];
-                std::vector<uint16_t> zeros((size_t)(hiddenSize * convLCache), 0);
+                std::vector<uint16_t> zeros((size_t)(convChannels * convLCache), 0);
                 gpu->writeBuffer(t.buffer, zeros.data(), bytes);
             } else {
                 t.buffer = gpu->createBuffer(name, bytes);
-                std::vector<uint16_t> zeros((size_t)(hiddenSize * convLCache), 0);
+                std::vector<uint16_t> zeros((size_t)(convChannels * convLCache), 0);
                 gpu->writeBuffer(t.buffer, zeros.data(), bytes);
             }
             convState[name] = t;
+
+            if (recurrentHeads > 0 && recurrentKeyDim > 0 && recurrentValueDim > 0) {
+                std::string recurrentName = "past_key_values." + std::to_string(idx) +
+                                            ".recurrent_state";
+                GpuTensor recurrent;
+                recurrent.shape = {1, recurrentHeads, recurrentKeyDim, recurrentValueDim};
+                recurrent.dtype = TensorDtype::Float16;
+                size_t recurrentBytes = (size_t)recurrentHeads * recurrentKeyDim *
+                                        recurrentValueDim * 2;
+                recurrent.buffer = gpu->createBuffer(recurrentName, recurrentBytes);
+                std::vector<uint16_t> recurrentZeros(recurrentBytes / 2, 0);
+                gpu->writeBuffer(recurrent.buffer, recurrentZeros.data(), recurrentBytes);
+                recurrentState[recurrentName] = recurrent;
+            }
         }
 
         size_t kvBytes = (size_t)(numKvHeads * maxSeqLen * headDim * 4);
@@ -351,7 +382,7 @@ struct GenericOnnxState {
         convOutBufs.resize(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string name = "conv_out_" + std::to_string(convLayerIndices[i]);
-            convOutBufs[i] = gpu->createBuffer(name, hiddenSize * convLCache * 4);
+            convOutBufs[i] = gpu->createBuffer(name, convChannels * convLCache * 4);
         }
     }
 
@@ -405,6 +436,7 @@ struct GenericOnnxState {
         inputs["num_logits_to_keep"] = &nlkT;
 
         for (auto& [name, t] : convState) inputs[name] = &t;
+        for (auto& [name, t] : recurrentState) inputs[name] = &t;
         for (auto& [name, t] : kvState) {
             t.shape = {1, numKvHeads, (int64_t)(pos - T), headDim};
             inputs[name] = &t;
@@ -419,11 +451,20 @@ struct GenericOnnxState {
 
         std::vector<GpuTensor> convOuts(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
-            std::string name = "present_conv." + std::to_string(convLayerIndices[i]);
-            convOuts[i].shape = {1, hiddenSize, convLCache};
+            std::string name = "present." + std::to_string(convLayerIndices[i]) + ".conv_state";
+            convOuts[i].shape = {1, convChannels, convLCache};
             convOuts[i].dtype = TensorDtype::Float32;
             convOuts[i].buffer = convOutBufs[i];
             outputs[name] = &convOuts[i];
+        }
+
+        std::vector<GpuTensor> recurrentOuts(convLayerIndices.size());
+        for (size_t i = 0; i < convLayerIndices.size() && recurrentHeads > 0; i++) {
+            std::string name = "present." + std::to_string(convLayerIndices[i]) +
+                               ".recurrent_state";
+            recurrentOuts[i].shape = {1, recurrentHeads, recurrentKeyDim, recurrentValueDim};
+            recurrentOuts[i].dtype = TensorDtype::Float32;
+            outputs[name] = &recurrentOuts[i];
         }
 
         std::vector<GpuTensor> kvOuts(attnLayerIndices.size() * 2);
@@ -442,13 +483,15 @@ struct GenericOnnxState {
             outputs[vName] = &kvOuts[i*2+1];
         }
 
+        const uint64_t logitBytes = (uint64_t)vocabSize * sizeof(float);
+        auto readbackHandle = gpu->getOrCreateReadbackBuf(logitBytes);
+        execCtx.RequestReadback(logitsBuf, {readbackHandle, logitBytes}, logitBytes);
         executor.Execute(execCtx, inputs, outputs);
 
         int64_t logitNel = logitsOut.ElementCount();
         std::vector<float> logits(logitNel);
         auto rb = gpu->mapReadbackBuffer(logitNel * 4);
         memcpy(logits.data(), rb.data(), logitNel * 4);
-
         auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name, size_t idx) {
             if (src.dtype != TensorDtype::Float32) return;
             int64_t nel = src.ElementCount();
@@ -477,10 +520,18 @@ struct GenericOnnxState {
         };
 
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
-            std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
+            std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
+                                 ".conv_state";
             if (!convOuts[i].IsValid()) continue;
             gpuCastF32ToF16(convOuts[i], inName, i);
             convState[inName] = convOuts[i];
+            if (i < recurrentOuts.size() && recurrentOuts[i].IsValid()) {
+                std::string recurrentName = "past_key_values." +
+                    std::to_string(convLayerIndices[i]) + ".recurrent_state";
+                gpuCastF32ToF16(recurrentOuts[i], recurrentName,
+                                convLayerIndices.size() + i);
+                recurrentState[recurrentName] = recurrentOuts[i];
+            }
         }
 
         for (int idx : attnLayerIndices) {
@@ -515,7 +566,8 @@ struct GenericOnnxState {
             memcpy(logits.data(), rb.data(), vocabSize * 4);
 
             for (size_t i = 0; i < convLayerIndices.size(); i++) {
-                std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
+                std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
+                                     ".conv_state";
                 wgpuBindGroupAddRef(convCastBindGroups[i]);
                 execCtx.QueueDispatch(convCastPipeline->pipeline, convCastBindGroups[i],
                     convCastWorkgroups, 1, 1, "cache_cast_f16");
@@ -557,7 +609,7 @@ struct GenericOnnxState {
             }
 
             if (!convLayerIndices.empty()) {
-                int64_t nel = hiddenSize * convLCache;
+                int64_t nel = convChannels * convLCache;
                 convCastWorkgroups = (uint32_t)((nel + 255) / 256);
                 uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
                 auto paramBuf = gpu->createBuffer("conv_cast_params", 16);
@@ -586,6 +638,8 @@ struct GenericOnnxState {
             if (node.opType == "If" || node.opType == "Loop" || node.opType == "Scan")
                 return "model contains dynamic control flow (" + node.opType + " op: " + node.name + ")";
         }
+        if (arch == "qwen3_5_text")
+            return "Qwen 3.5 recurrent graph capture is pending state-buffer alias validation";
         if (convLayerIndices.empty() && attnLayerIndices.empty())
             return "model has no conv or attention layers";
         return "";
@@ -595,13 +649,18 @@ struct GenericOnnxState {
         fastDecodeEnabled = true;
         convCastF16Bufs.resize(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
-            size_t nel = (size_t)(hiddenSize * convLCache);
+            size_t nel = (size_t)(convChannels * convLCache);
             convCastF16Bufs[i] = gpu->createBuffer(
                 "conv_cast_f16_" + std::to_string(i), nel * 2);
         }
     }
 
     void WarmupPipelines() {
+        // Qwen 3.5 uses generic ONNX specializations (including recurrent
+        // kernels) that are compiled with runtime shapes. The legacy blanket
+        // warmup includes unrelated fixed-shape shaders and is both invalid
+        // for this graph and slower than lazy compilation.
+        if (arch == "qwen3_5_text") return;
         auto t0 = std::chrono::steady_clock::now();
         auto& kernels = getEmbeddedKernels();
 
@@ -710,6 +769,7 @@ private:
         inputs["num_logits_to_keep"] = &nlkT;
 
         for (auto& [name, t] : convState) inputs[name] = &t;
+        for (auto& [name, t] : recurrentState) inputs[name] = &t;
         for (auto& [name, t] : kvState) {
             t.shape = {1, numKvHeads, (int64_t)(pos - 1), headDim};
             inputs[name] = &t;
@@ -725,11 +785,20 @@ private:
 
         std::vector<GpuTensor> convOuts(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
-            std::string name = "present_conv." + std::to_string(convLayerIndices[i]);
-            convOuts[i].shape = {1, hiddenSize, convLCache};
+            std::string name = "present." + std::to_string(convLayerIndices[i]) + ".conv_state";
+            convOuts[i].shape = {1, convChannels, convLCache};
             convOuts[i].dtype = TensorDtype::Float32;
             convOuts[i].buffer = convOutBufs[i];
             outputs[name] = &convOuts[i];
+        }
+
+        std::vector<GpuTensor> recurrentOuts(convLayerIndices.size());
+        for (size_t i = 0; i < convLayerIndices.size() && recurrentHeads > 0; i++) {
+            std::string name = "present." + std::to_string(convLayerIndices[i]) +
+                               ".recurrent_state";
+            recurrentOuts[i].shape = {1, recurrentHeads, recurrentKeyDim, recurrentValueDim};
+            recurrentOuts[i].dtype = TensorDtype::Float32;
+            outputs[name] = &recurrentOuts[i];
         }
 
         std::vector<GpuTensor> kvOuts(attnLayerIndices.size() * 2);
@@ -787,10 +856,18 @@ private:
         };
 
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
-            std::string inName = "past_conv." + std::to_string(convLayerIndices[i]);
+            std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
+                                 ".conv_state";
             if (!convOuts[i].IsValid()) continue;
             gpuCastF32ToF16(convOuts[i], inName, i);
             convState[inName] = convOuts[i];
+            if (i < recurrentOuts.size() && recurrentOuts[i].IsValid()) {
+                std::string recurrentName = "past_key_values." +
+                    std::to_string(convLayerIndices[i]) + ".recurrent_state";
+                gpuCastF32ToF16(recurrentOuts[i], recurrentName,
+                                convLayerIndices.size() + i);
+                recurrentState[recurrentName] = recurrentOuts[i];
+            }
         }
 
         for (int idx : attnLayerIndices) {
