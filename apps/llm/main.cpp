@@ -80,6 +80,8 @@ int main(int argc, char* argv[]) {
             "  --top-k <n>       Top-k sampling (0 = disabled)\n"
             "  --seed <n>        Random seed for sampling\n"
             "  --benchmark        Prefill+decode sweep\n"
+            "  --bench-prompt-len <n>  Benchmark one prompt length instead of the full sweep\n"
+            "  --bench-gen-tokens <n>  Generated tokens per benchmark row (default: 128)\n"
             "  --profile          GPU timestamp profiling + HTML timeline\n"
             "  --save-baseline [path]  Save benchmark results to JSON\n"
             "  --max-seq-len <n>  Max context length (default: auto from GPU memory)\n", argv[0]);
