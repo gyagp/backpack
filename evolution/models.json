@@ -23,6 +23,10 @@
       "gguf": {
         "path": "D:/workspace/project/agents/ai-models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf",
         "relative_dir": "Qwen3.5-4B-GGUF"
+      },
+      "ort": {
+        "path": "D:/workspace/project/agents/ai-models/Qwen3.5-4B/onnx-webgpu",
+        "relative_dir": "Qwen3.5-4B/onnx-webgpu"
       }
     },
     "conformance_spec": {"prompt": "What is 2 + 2?", "required_fact": "4", "temperature": 0}
@@ -35,6 +39,10 @@
       "gguf": {
         "path": "D:/workspace/project/agents/ai-models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf",
         "relative_dir": "Qwen3.5-2B-GGUF"
+      },
+      "ort": {
+        "path": "D:/workspace/project/agents/ai-models/Qwen3.5-2B/onnx-webgpu",
+        "relative_dir": "Qwen3.5-2B/onnx-webgpu"
       }
     },
     "conformance_spec": {"prompt": "What is 2 + 2?", "required_fact": "4", "temperature": 0}
