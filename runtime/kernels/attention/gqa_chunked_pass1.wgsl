@@ -9,6 +9,7 @@ enable f16;
 const HD: u32 = 128u;
 const HD_PER_THREAD: u32 = 4u;
 var<workgroup> dot_scratch: array<f32, 32>;
+var<workgroup> active_chunk_count: u32;
 
 @compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -26,7 +27,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let neg_inf = bitcast<f32>(_params_[6]);
     let max_chunks = _params_[7];
 
-    let chunk_active = chunk_id < n_chunks;
+    if (lane == 0u) { active_chunk_count = n_chunks; }
+    workgroupBarrier();
+    let chunk_active = chunk_id < workgroupUniformLoad(&active_chunk_count);
+    if (!chunk_active) { return; }
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
