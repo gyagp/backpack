@@ -201,12 +201,6 @@ def codex_repair(task: dict[str, Any], run: dict[str, Any], repo: Path, name: st
     codex = _command_output(["where.exe", "codex"]).splitlines()
     if not codex:
         return {"status": "cli_missing", "error": f"Codex CLI is not installed on {name}"}
-    login = subprocess.run([codex[0], "login", "status"], text=True, encoding="utf-8",
-                           errors="replace", capture_output=True, timeout=30, shell=False)
-    login_output = (login.stdout + "\n" + login.stderr).strip()
-    if login.returncode != 0 or "not logged in" in login_output.lower():
-        return {"status": "authentication_required", "device": name,
-                "error": login_output[-4000:] or "Codex CLI is not authenticated"}
     task_id = str(task.get("id") or run.get("task_id") or "task")
     safe_name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
     branch = f"experiment/{task_id}/{safe_name}"
