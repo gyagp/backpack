@@ -67,8 +67,11 @@ inline std::string applyChatTemplate(const std::string& message,
     // Empty <think></think> block disables thinking mode.
     if (arch.find("qwen3") != std::string::npos ||
         arch.find("qwen2") != std::string::npos)
-        return "<|im_start|>user\n" + message + "<|im_end|>\n"
-               "<|im_start|>assistant\n<think>\n</think>\n";
+        // Match ORT GenAI's Qwen 3.5 processor prefix. Disable thinking for
+        // deterministic conformance and benchmark prompts.
+        return "You are a helpful AI assistant."
+               "<|im_start|>user\n" + message + "<|im_end|>\n"
+               "<|im_start|>assistant\n<think>\n\n</think>\n\n";
     // Phi-3/Phi-4-mini: uses <|user|>/<|end|>/<|assistant|> tokens
     if (arch.find("phi3") != std::string::npos ||
         arch.find("phi4") != std::string::npos)

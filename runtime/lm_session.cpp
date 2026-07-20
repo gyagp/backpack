@@ -393,6 +393,16 @@ struct GenericOnnxState {
 
     int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
         if (T == 0) return -1;
+        // Qwen 3.5 recurrent/conv state updates are not yet equivalent in the
+        // batched graph on all D3D12 vendors. Preserve correctness by default;
+        // BP_GENERIC_BATCHED_PREFILL remains available for focused parity work.
+        if ((arch == "qwen3_5_text" && !std::getenv("BP_GENERIC_BATCHED_PREFILL")) ||
+            std::getenv("BP_GENERIC_SERIAL_PREFILL")) {
+            std::vector<float> logits;
+            for (uint32_t i = 0; i < T; ++i)
+                logits = RunPrefillStep(tokenIds[i]);
+            return argmax(logits.data(), (int64_t)logits.size());
+        }
         if (T == 1) {
             auto logits = RunPrefillStep(tokenIds[0]);
             return argmax(logits.data(), (int64_t)logits.size());

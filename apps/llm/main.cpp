@@ -208,6 +208,11 @@ int main(int argc, char* argv[]) {
 
     auto promptTokens = session.Tokenize(finalPrompt);
     fprintf(stderr, "Prompt: %zu tokens\n", promptTokens.size());
+    if (std::getenv("BP_DUMP_TOKENS")) {
+        fprintf(stderr, "[debug] prompt tokens:");
+        for (int32_t token : promptTokens) fprintf(stderr, " %d", token);
+        fprintf(stderr, "\n");
+    }
     if (temperature > 0)
         fprintf(stderr, "Sampling: temperature=%.2f, top_k=%d, seed=%llu\n",
                temperature, topK, (unsigned long long)samplerSeed);
