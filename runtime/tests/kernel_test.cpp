@@ -42,6 +42,7 @@ struct TestResult {
 
 static std::vector<TestResult> g_results;
 static std::string g_filter;
+static WGPUBackendType g_backend = WGPUBackendType_Vulkan;
 
 static int ceilDiv(int a, int b) { return (a + b - 1) / b; }
 
@@ -1666,6 +1667,94 @@ TEST(q8_matmul_batched_dp4a_real_smoke) {
     return assertClose((const float*)r.data(),bias.data(),N,1e-6f,0);
 }
 
+static CheckResult testQ8DecodeProjection(GPUContext& gpu, bool fusedNorm) {
+    auto wgsl = loadWgsl("quant_q8", fusedNorm ? "q8_matmul_norm" : "q8_matmul");
+    if (wgsl.empty()) return {false, "cannot load kernel"};
+    const int K = 1536, N = 13, B = K / 32;
+    Rng rng(fusedNorm ? 0x4141u : 0x3131u);
+    auto x = rng.randnVec(K), bias = rng.uniformVec(N, -0.1f, 0.1f);
+    auto norm = rng.uniformVec(K, 0.25f, 2.0f);
+    std::vector<uint32_t> w((size_t)N * K / 4);
+    for (size_t i = 0; i < w.size(); ++i) w[i] = rng.next();
+    std::vector<uint16_t> sh((size_t)N * B);
+    std::vector<uint32_t> scales((sh.size() + 1) / 2, 0);
+    for (size_t i = 0; i < sh.size(); ++i) {
+        sh[i] = f32ToF16(0.001f + 0.0001f * float(i % 19));
+        scales[i / 2] |= uint32_t(sh[i]) << (16 * (i & 1));
+    }
+    float rstd = 1.0f;
+    if (fusedNorm) {
+        double ss = 0.0; for (float v : x) ss += double(v) * v;
+        rstd = 1.0f / std::sqrt(float(ss / K) + 1.0e-6f);
+    }
+    std::vector<float> expected(N);
+    for (int n = 0; n < N; ++n) {
+        float sum = bias[n];
+        for (int k = 0; k < K; ++k) {
+            int q = int8_t((w[(size_t)n * K / 4 + k / 4] >> (8 * (k & 3))) & 255);
+            float xv = x[k] * (fusedNorm ? rstd * norm[k] : 1.0f);
+            sum += xv * q * f16ToF32(sh[(size_t)n * B + k / 32]);
+        }
+        expected[n] = sum;
+    }
+    auto bx=makeBuffer(gpu,"X",x.data(),K), bw=makeBufferU32(gpu,"W",w.data(),w.size());
+    auto bs=makeBufferU32(gpu,"S",scales.data(),scales.size()), bb=makeBuffer(gpu,"B",bias.data(),N);
+    auto by=makeBuffer(gpu,"Y",nullptr,N), bn=makeBuffer(gpu,"Norm",norm.data(),K);
+    uint32_t epsBits=f32AsU32(1.0e-6f);
+    auto p=makeParams(gpu,"P",{K,N,0u,epsBits});
+    std::vector<std::pair<uint32_t,GPUBuffer>> bindings={{0,bx},{1,bw},{2,bs},{3,bb},{4,by},{5,p}};
+    if (fusedNorm) bindings.push_back({6,bn});
+    auto result=dispatchAndReadback(gpu,wgsl,bindings,1,ceilDiv(N,8),1,by,N*4,bindings.size());
+    return assertClose((const float*)result.data(),expected.data(),N,3e-4f,3e-4f);
+}
+
+TEST(q8_matmul_decode_gemma_shape) { return testQ8DecodeProjection(gpu, false); }
+TEST(q8_matmul_norm_gemma_shape) { return testQ8DecodeProjection(gpu, true); }
+
+TEST(fused_qknorm_rope_gemma_hd256) {
+    auto wgsl=loadWgsl("norm","fused_qknorm_rope");
+    if(wgsl.empty())return{false,"cannot load kernel"};
+    const std::string from="const HD: u32 = 128u;",to="const HD: u32 = 256u;";
+    auto at=wgsl.find(from);if(at==std::string::npos)return{false,"HD marker missing"};
+    wgsl.replace(at,from.size(),to);
+    const int HD=256,NH=2,NKV=1,Q=NH*HD,KV=NKV*HD;
+    Rng rng(0x5252u);auto qkv=rng.randnVec(Q+2*KV),qw=rng.uniformVec(HD,.5f,1.5f),kw=rng.uniformVec(HD,.5f,1.5f);
+    std::vector<float>cs(HD/2,1.0f),sn(HD/2,0.0f),expectedQ(Q),expectedK(HD),expectedV(HD);
+    for(int h=0;h<NH;h++){double ss=0;for(int d=0;d<HD;d++)ss+=double(qkv[h*HD+d])*qkv[h*HD+d];float r=1/std::sqrt(float(ss/HD)+1e-6f);for(int d=0;d<HD;d++)expectedQ[h*HD+d]=qkv[h*HD+d]*r*qw[d];}
+    double ks=0,vs=0;for(int d=0;d<HD;d++){ks+=double(qkv[Q+d])*qkv[Q+d];vs+=double(qkv[Q+KV+d])*qkv[Q+KV+d];}
+    float kr=1/std::sqrt(float(ks/HD)+1e-6f),vr=1/std::sqrt(float(vs/HD)+1e-6f);
+    for(int d=0;d<HD;d++){expectedK[d]=qkv[Q+d]*kr*kw[d];expectedV[d]=qkv[Q+KV+d]*vr;}
+    auto bi=makeBuffer(gpu,"qkv",qkv.data(),qkv.size()),bq=makeBuffer(gpu,"q",nullptr,Q);
+    auto bk=makeBufferU32(gpu,"k",nullptr,HD/2),bv=makeBufferU32(gpu,"v",nullptr,HD/2);
+    auto bc=makeBuffer(gpu,"c",cs.data(),cs.size()),bs=makeBuffer(gpu,"s",sn.data(),sn.size());
+    auto bqw=makeBuffer(gpu,"qw",qw.data(),HD),bkw=makeBuffer(gpu,"kw",kw.data(),HD);
+    auto p=makeParams(gpu,"p",{NH,Q,KV,0u,HD/2,0u,f32AsU32(1e-6f),1u});
+    auto qr=dispatchAndReadback(gpu,wgsl,{{0,bi},{1,bq},{2,bk},{3,bv},{4,bc},{5,bs},{6,bqw},{7,bkw},{8,p}},NH+NKV,1,1,bq,Q*4,9);
+    auto qc=assertClose((const float*)qr.data(),expectedQ.data(),Q,2e-5f,2e-5f);if(!qc.ok)return qc;
+    auto kh=gpu.readBuffer(bk,HD*2),vh=gpu.readBuffer(bv,HD*2);std::vector<float>ka(HD),va(HD);
+    for(int d=0;d<HD;d++){ka[d]=f16ToF32(reinterpret_cast<const uint16_t*>(kh.data())[d]);va[d]=f16ToF32(reinterpret_cast<const uint16_t*>(vh.data())[d]);}
+    auto kc=assertClose(ka.data(),expectedK.data(),HD,1e-3f,1e-3f);if(!kc.ok)return kc;
+    return assertClose(va.data(),expectedV.data(),HD,1e-3f,1e-3f);
+}
+
+TEST(gqa_chunked_gemma_hd256) {
+    auto p1=loadWgsl("attention","gqa_chunked_pass1"),p2=loadWgsl("attention","gqa_chunked_pass2");
+    if(p1.empty()||p2.empty())return{false,"cannot load kernels"};
+    const std::string hd128="const HD: u32 = 128u;",hd256="const HD: u32 = 256u;";
+    const std::string ept4="const HD_PER_THREAD: u32 = 4u;",ept8="const HD_PER_THREAD: u32 = 8u;";
+    for(auto* s:{&p1,&p2}){auto a=s->find(hd128);if(a==std::string::npos)return{false,"HD marker missing"};s->replace(a,hd128.size(),hd256);a=s->find(ept4);if(a==std::string::npos)return{false,"EPT marker missing"};s->replace(a,ept4.size(),ept8);}
+    const int HD=256,NH=2,T=5,MC=4,PS=HD+2;Rng rng(0x6262u);
+    auto q=rng.uniformVec(NH*HD,-.2f,.2f),kf=rng.uniformVec(T*HD,-.2f,.2f),vf=rng.uniformVec(T*HD,-.2f,.2f);
+    auto kp=packF16(kf),vp=packF16(vf);std::vector<float>expected(NH*HD);
+    for(int h=0;h<NH;h++){float mx=-1e30f;std::vector<float>score(T);for(int t=0;t<T;t++){float z=0;for(int d=0;d<HD;d++)z+=q[h*HD+d]*f16ToF32(uint16_t(kp[(t*HD+d)/2]>>(16*((t*HD+d)&1))));score[t]=z;mx=std::max(mx,z);}float den=0;for(float&z:score){z=std::exp(z-mx);den+=z;}for(int d=0;d<HD;d++)for(int t=0;t<T;t++)expected[h*HD+d]+=score[t]/den*f16ToF32(uint16_t(vp[(t*HD+d)/2]>>(16*((t*HD+d)&1))));}
+    auto bq=makeBuffer(gpu,"q",q.data(),q.size()),bk=makeBufferU32(gpu,"k",kp.data(),kp.size()),bv=makeBufferU32(gpu,"v",vp.data(),vp.size());
+    auto bp=makeBuffer(gpu,"partial",nullptr,NH*MC*PS),bo=makeBuffer(gpu,"out",nullptr,NH*HD);
+    auto prm=makeParams(gpu,"p",{HD,2u,T,0u,1u,f32AsU32(1.0f),f32AsU32(-1e9f),MC});
+    dispatchAndReadback(gpu,p1,{{0,bq},{1,bk},{2,bv},{3,bp},{4,prm}},NH,MC,1,bp,NH*MC*PS*4,5);
+    auto out=dispatchAndReadback(gpu,p2,{{0,bp},{1,bo},{2,prm}},NH,1,1,bo,NH*HD*4,3);
+    return assertClose((const float*)out.data(),expected.data(),NH*HD,1e-4f,1e-4f);
+}
+
 TEST(q5k_matmul_reference) {
     auto wgsl=loadWgsl("quant_kq","q5k_matmul");if(wgsl.empty())return{false,"cannot load kernel"};
     const int N=8,K=256;Rng rng(4242);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*176);
@@ -1917,6 +2006,16 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--filter" && i + 1 < argc)
             g_filter = argv[++i];
+        else if (std::string(argv[i]) == "--backend" && i + 1 < argc) {
+            std::string backend = argv[++i];
+            if (backend == "d3d12") g_backend = WGPUBackendType_D3D12;
+            else if (backend == "vulkan") g_backend = WGPUBackendType_Vulkan;
+            else {
+                fprintf(stderr, "Unknown backend: %s (expected d3d12 or vulkan)\n",
+                        backend.c_str());
+                return 2;
+            }
+        }
     }
 
     // Determine kernel directory (relative to executable)
@@ -1941,11 +2040,9 @@ int main(int argc, char* argv[]) {
 
     // Init GPU
     GPUContext gpu;
-    if (!gpu.init(WGPUBackendType_Vulkan)) {
-        if (!gpu.init(WGPUBackendType_D3D12)) {
-            fprintf(stderr, "Failed to init GPU\n");
-            return 1;
-        }
+    if (!gpu.init(g_backend)) {
+        fprintf(stderr, "Failed to init requested GPU backend\n");
+        return 1;
     }
     fprintf(stderr, "GPU: %s (%s)\n", gpu.adapterName.c_str(),
             gpu.adapterDescription.c_str());
