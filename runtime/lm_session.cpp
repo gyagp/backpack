@@ -217,7 +217,7 @@ struct GenericOnnxState {
     std::unordered_map<std::string, GpuTensor> kvState;
     std::vector<int> convLayerIndices, attnLayerIndices;
 
-    GPUBuffer idsBuf, maskBuf, nlkBuf, logitsBuf;
+    GPUBuffer idsBuf, positionBuf, maskBuf, nlkBuf, logitsBuf;
     std::vector<GPUBuffer> convOutBufs;
     uint32_t maskBufCapacity = 0;
 
@@ -383,6 +383,7 @@ struct GenericOnnxState {
         }
 
         idsBuf = gpu->createBuffer("ids", 8);
+        positionBuf = gpu->createBuffer("position_ids", maxSeqLen * 8);
         nlkBuf = gpu->createBuffer("nlk", 8);
         logitsBuf = gpu->createBuffer("logits_out", vocabSize * 4);
         maskBuf = gpu->createBuffer("mask", maxSeqLen * 8);
@@ -438,6 +439,18 @@ struct GenericOnnxState {
         idT.cpuData.resize(T * 8);
         memcpy(idT.cpuData.data(), ids64.data(), T * 8);
         inputs["input_ids"] = &idT;
+
+        GpuTensor positionT;
+        std::vector<int64_t> positions(T);
+        for (uint32_t i = 0; i < T; i++)
+            positions[i] = (int64_t)(pos - T + i);
+        positionT.shape = {1, (int64_t)T};
+        positionT.dtype = TensorDtype::Int64;
+        positionT.buffer = positionBuf;
+        gpu->writeBuffer(positionBuf, positions.data(), T * 8);
+        positionT.cpuData.resize(T * 8);
+        memcpy(positionT.cpuData.data(), positions.data(), T * 8);
+        inputs["position_ids"] = &positionT;
 
         std::vector<int64_t> mask(pos, 1);
         GpuTensor maskT;
@@ -771,6 +784,16 @@ private:
         idT.cpuData.resize(8);
         memcpy(idT.cpuData.data(), &tokenId, 8);
         inputs["input_ids"] = &idT;
+
+        int64_t position = (int64_t)(pos - 1);
+        GpuTensor positionT;
+        positionT.shape = {1, 1};
+        positionT.dtype = TensorDtype::Int64;
+        positionT.buffer = positionBuf;
+        gpu->writeBuffer(positionBuf, &position, sizeof(position));
+        positionT.cpuData.resize(sizeof(position));
+        memcpy(positionT.cpuData.data(), &position, sizeof(position));
+        inputs["position_ids"] = &positionT;
 
         std::vector<int64_t> mask(pos, 1);
         GpuTensor maskT;
