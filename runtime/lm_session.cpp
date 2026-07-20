@@ -344,15 +344,15 @@ struct GenericOnnxState {
             std::string name = "past_key_values." + std::to_string(idx) + ".conv_state";
             GpuTensor t;
             t.shape = {1, convChannels, convLCache};
-            t.dtype = TensorDtype::Float16;
-            size_t bytes = (size_t)(convChannels * convLCache * 2);
+            t.dtype = TensorDtype::Float32;
+            size_t bytes = (size_t)(convChannels * convLCache * 4);
             if (fastDecodeEnabled && ci < convCastF16Bufs.size()) {
                 t.buffer = convCastF16Bufs[ci];
-                std::vector<uint16_t> zeros((size_t)(convChannels * convLCache), 0);
+                std::vector<float> zeros((size_t)(convChannels * convLCache), 0.0f);
                 gpu->writeBuffer(t.buffer, zeros.data(), bytes);
             } else {
                 t.buffer = gpu->createBuffer(name, bytes);
-                std::vector<uint16_t> zeros((size_t)(convChannels * convLCache), 0);
+                std::vector<float> zeros((size_t)(convChannels * convLCache), 0.0f);
                 gpu->writeBuffer(t.buffer, zeros.data(), bytes);
             }
             convState[name] = t;
@@ -362,11 +362,11 @@ struct GenericOnnxState {
                                             ".recurrent_state";
                 GpuTensor recurrent;
                 recurrent.shape = {1, recurrentHeads, recurrentKeyDim, recurrentValueDim};
-                recurrent.dtype = TensorDtype::Float16;
+                recurrent.dtype = TensorDtype::Float32;
                 size_t recurrentBytes = (size_t)recurrentHeads * recurrentKeyDim *
-                                        recurrentValueDim * 2;
+                                        recurrentValueDim * 4;
                 recurrent.buffer = gpu->createBuffer(recurrentName, recurrentBytes);
-                std::vector<uint16_t> recurrentZeros(recurrentBytes / 2, 0);
+                std::vector<float> recurrentZeros(recurrentBytes / 4, 0.0f);
                 gpu->writeBuffer(recurrent.buffer, recurrentZeros.data(), recurrentBytes);
                 recurrentState[recurrentName] = recurrent;
             }
@@ -534,44 +534,14 @@ struct GenericOnnxState {
         std::vector<float> logits(logitNel);
         auto rb = gpu->mapReadbackBuffer(logitNel * 4);
         memcpy(logits.data(), rb.data(), logitNel * 4);
-        auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name, size_t idx) {
-            if (src.dtype != TensorDtype::Float32) return;
-            int64_t nel = src.ElementCount();
-            GpuTensor dst;
-            dst.shape = src.shape;
-            dst.dtype = TensorDtype::Float16;
-            if (fastDecodeEnabled && idx < convCastF16Bufs.size()) {
-                dst.buffer = convCastF16Bufs[idx];
-            } else {
-                dst.buffer = gpu->createBuffer(name, nel * 2);
-                if (fastDecodeEnabled && convCastF16Bufs.size() <= idx) {
-                    convCastF16Bufs.resize(idx + 1);
-                    convCastF16Bufs[idx] = dst.buffer;
-                }
-            }
-            uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
-            auto paramBuf = execCtx.getParamBuffer(16);
-            gpu->writeBuffer(paramBuf, params, 16);
-            auto& cPl = executor.GetPipelineT("cast_f32_to_f16", 3,
-                []() { return std::string(WGSL_CAST_F32_TO_F16); });
-            auto bg = executor.MakeBindGroup(cPl, {
-                {0, src.buffer}, {1, dst.buffer}, {2, paramBuf}});
-            execCtx.QueueDispatch(cPl.pipeline, bg,
-                (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16");
-            src = dst;
-        };
-
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
                                  ".conv_state";
             if (!convOuts[i].IsValid()) continue;
-            gpuCastF32ToF16(convOuts[i], inName, i);
             convState[inName] = convOuts[i];
             if (i < recurrentOuts.size() && recurrentOuts[i].IsValid()) {
                 std::string recurrentName = "past_key_values." +
                     std::to_string(convLayerIndices[i]) + ".recurrent_state";
-                gpuCastF32ToF16(recurrentOuts[i], recurrentName,
-                                convLayerIndices.size() + i);
                 recurrentState[recurrentName] = recurrentOuts[i];
             }
         }
@@ -888,44 +858,14 @@ private:
         auto rb = gpu->mapReadbackBuffer(logitNel * 4);
         memcpy(logits.data(), rb.data(), logitNel * 4);
 
-        auto gpuCastF32ToF16 = [&](GpuTensor& src, const std::string& name, size_t idx) {
-            if (src.dtype != TensorDtype::Float32) return;
-            int64_t nel = src.ElementCount();
-            GpuTensor dst;
-            dst.shape = src.shape;
-            dst.dtype = TensorDtype::Float16;
-            if (fastDecodeEnabled && idx < convCastF16Bufs.size()) {
-                dst.buffer = convCastF16Bufs[idx];
-            } else {
-                dst.buffer = gpu->createBuffer(name, nel * 2);
-                if (fastDecodeEnabled && convCastF16Bufs.size() <= idx) {
-                    convCastF16Bufs.resize(idx + 1);
-                    convCastF16Bufs[idx] = dst.buffer;
-                }
-            }
-            uint32_t params[4] = {(uint32_t)nel, 0, 0, 0};
-            auto paramBuf = execCtx.getParamBuffer(16);
-            gpu->writeBuffer(paramBuf, params, 16);
-            auto& cPl = executor.GetPipelineT("cast_f32_to_f16", 3,
-                []() { return std::string(WGSL_CAST_F32_TO_F16); });
-            auto bg = executor.MakeBindGroup(cPl, {
-                {0, src.buffer}, {1, dst.buffer}, {2, paramBuf}});
-            execCtx.QueueDispatch(cPl.pipeline, bg,
-                (uint32_t)((nel + 255) / 256), 1, 1, "cache_cast_f16");
-            src = dst;
-        };
-
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
                                  ".conv_state";
             if (!convOuts[i].IsValid()) continue;
-            gpuCastF32ToF16(convOuts[i], inName, i);
             convState[inName] = convOuts[i];
             if (i < recurrentOuts.size() && recurrentOuts[i].IsValid()) {
                 std::string recurrentName = "past_key_values." +
                     std::to_string(convLayerIndices[i]) + ".recurrent_state";
-                gpuCastF32ToF16(recurrentOuts[i], recurrentName,
-                                convLayerIndices.size() + i);
                 recurrentState[recurrentName] = recurrentOuts[i];
             }
         }

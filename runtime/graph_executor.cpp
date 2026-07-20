@@ -886,7 +886,13 @@ GpuTensor GraphExecutor::AllocTensor(std::vector<int64_t> shape,
     }
     // Align to 4 bytes for WebGPU
     size_t bufBytes = (bytes + 3) & ~(size_t)3;
-    t.buffer = gpu->createBuffer("tmp", bufBytes);
+    std::string diagnosticLabel = "tmp";
+    if (std::getenv("BP_EXEC_STATS") && g_currentOp) {
+        std::string op = g_currentOp;
+        if (auto colon = op.find(':'); colon != std::string::npos) op.resize(colon);
+        diagnosticLabel += ":" + op;
+    }
+    t.buffer = gpu->createBuffer(diagnosticLabel, bufBytes);
     return t;
 }
 
@@ -1514,9 +1520,19 @@ void GraphExecutor::Execute(
         fprintf(stderr, "  [exec] %d/%zu ops executed, %d unimplemented, %d dispatches, %d copies, %d syncs (%d from int-readback), bufs=%d (pool=%d)\n",
                 executed, graph_.nodes.size(), skipped, totalDispatches, totalCopies, ctx.flushCount_,
                 ctx.intReadbackSyncs_, gpu->createBufferCount, gpu->poolHitCount);
+        std::vector<std::pair<std::string, int>> labels(
+            gpu->createBufferLabels.begin(), gpu->createBufferLabels.end());
+        std::sort(labels.begin(), labels.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        fprintf(stderr, "  [buffer labels]");
+        for (size_t i = 0; i < std::min<size_t>(labels.size(), 12); ++i)
+            fprintf(stderr, " %s=%d", labels[i].first.c_str(), labels[i].second);
+        fprintf(stderr, "\n");
     }
     gpu->createBufferCount = 0;
     gpu->poolHitCount = 0;
+    gpu->createBufferLabels.clear();
     // Print sync sources on first call
     static int printSyncCount = 0;
     if (printExecStats && printSyncCount < 2 && !ctx.flushSources_.empty()) {

@@ -112,6 +112,7 @@ struct GPUContext {
     // --- Buffers ---
     int createBufferCount = 0;  // allocation counter for profiling
     int poolHitCount = 0;  // pool reuse counter
+    std::unordered_map<std::string, int> createBufferLabels;
 
     // Memory tracking
     uint64_t totalAllocatedBytes = 0;

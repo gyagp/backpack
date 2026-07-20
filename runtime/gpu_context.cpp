@@ -322,6 +322,7 @@ int GPUContext::poolBucket(uint64_t size) const {
 
 GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
                                    uint64_t usage, bool mappedAtCreation) {
+    if (std::getenv("BP_EXEC_STATS")) createBufferLabels[name]++;
     // Only pool small transient buffers. Large buffers (weights, embedding,
     // KV cache) live for the whole model lifetime and are never reused, so
     // rounding them up to the next power-of-two pool bucket wastes enormous
