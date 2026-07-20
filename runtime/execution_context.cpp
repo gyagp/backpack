@@ -514,6 +514,35 @@ GpuTensor OpContext::AllocTensor(std::vector<int64_t> shape, TensorDtype dtype) 
 
 GpuTensor OpContext::AllocCpuTensor(const std::vector<int64_t>& shape, TensorDtype dtype,
                                      const void* data, size_t bytes) {
+    // CPU shape/control-flow operators also have stable output slots after
+    // graph warmup.  Keep their host representation for downstream CPU
+    // consumers, but upload into the planned WebGPU buffer rather than
+    // allocating a new buffer every token when a GPU consumer is reached.
+    for (size_t i = exec.plannedOutputHintCursor_;
+         i < exec.plannedOutputHints_.size(); ++i) {
+        auto& hint = exec.plannedOutputHints_[i];
+        if (!hint.buffer.handle || hint.dtype != dtype || hint.shape != shape ||
+            hint.buffer.size < std::max<size_t>(bytes, 4)) continue;
+        GpuTensor result = hint;
+        result.cpuData.resize(bytes);
+        if (data && bytes) memcpy(result.cpuData.data(), data, bytes);
+        result.isCpuOnly = false;
+        if (bytes < 4) {
+            uint8_t padded[4] = {};
+            if (bytes) memcpy(padded, result.cpuData.data(), bytes);
+            graph.gpu->writeBuffer(result.buffer, padded, 4);
+        } else {
+            const size_t aligned = bytes & ~(size_t)3;
+            if (aligned) graph.gpu->writeBuffer(result.buffer, result.cpuData.data(), aligned);
+            if (aligned != bytes) {
+                uint8_t padded[4] = {};
+                memcpy(padded, result.cpuData.data() + aligned, bytes - aligned);
+                graph.gpu->writeBuffer(result.buffer, padded, 4, aligned);
+            }
+        }
+        exec.plannedOutputHintCursor_ = i + 1;
+        return result;
+    }
     return graph.AllocCpuTensor(shape, dtype, data, bytes);
 }
 

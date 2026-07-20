@@ -921,7 +921,9 @@ void GraphExecutor::EnsureGpu(GpuTensor& t) {
     if (bytes == 0) bytes = 4;
     // Align to 4 bytes for WebGPU
     size_t bufSize = (bytes + 3) & ~(size_t)3;
-    t.buffer = gpu->createBuffer("cpu2gpu", bufSize);
+    std::string label = "cpu2gpu";
+    if (std::getenv("BP_EXEC_STATS") && g_currentOp) label += ":" + std::string(g_currentOp);
+    t.buffer = gpu->createBuffer(label, bufSize);
     if (bytes < 4) {
         uint8_t padded[4] = {0};
         memcpy(padded, t.cpuData.data(), bytes);
