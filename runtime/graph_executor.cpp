@@ -1170,23 +1170,6 @@ void GraphExecutor::Execute(
         DetectFusions();
     }
 
-    // Build tensor reference counts for buffer recycling
-    if (cachedTensorRefCounts_.empty()) {
-        cachedTensorRefCounts_.reserve(graph_.nodes.size() * 2);
-        for (size_t ni : execOrder) {
-            auto& node = graph_.nodes[ni];
-            for (auto& inName : node.inputs)
-                if (!inName.empty()) cachedTensorRefCounts_[inName]++;
-        }
-        for (auto& [name, _] : graph_.initializers)
-            cachedTensorRefCounts_[name] += 1000;
-    }
-    auto tensorRefCount = cachedTensorRefCounts_;
-    // Output tensors should not be released
-    for (auto& [name, _] : outputs) tensorRefCount[name] += 1000;
-    // Model inputs should not be released (they may be read multiple times)
-    for (auto& [name, _] : inputs) tensorRefCount[name] += 1000;
-
     // Track tensor name aliases: if op X aliases output to input (same buffer handle),
     // record the relationship so we know not to recycle the input while output is live.
     std::unordered_map<std::string, std::string> aliasOf;
@@ -1452,16 +1435,6 @@ void GraphExecutor::Execute(
                     if (outTensors[oi]->buffer.handle == inTensors[ti]->buffer.handle) {
                         aliasOf[node.outputs[oi]] = node.inputs[ti];
                     }
-                }
-            }
-
-            // Buffer lifetime tracking: decrement refcounts for later cleanup.
-            // Actual release happens at end of Execute() to avoid GPU read-after-free.
-            if (graph_.nodes.size() > 100) {
-                for (size_t ti = 0; ti < node.inputs.size(); ti++) {
-                    auto& inName = node.inputs[ti];
-                    if (inName.empty()) continue;
-                    tensorRefCount[inName]--;
                 }
             }
 

@@ -351,7 +351,6 @@ private:
 
     // Immutable input-use counts for the cached execution order.  Model
     // outputs and invocation inputs are added per Execute call.
-    std::unordered_map<std::string, int> cachedTensorRefCounts_;
 
     // Cached lifetime intervals (recomputed when execOrder changes)
     std::vector<LifetimeInterval> cachedLifetimeIntervals_;
