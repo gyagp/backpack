@@ -32,6 +32,8 @@ struct OnnxLoadResult {
         Q8Repacked o;           // output projection
         Q8Repacked gateup;      // fused gate + up projection
         Q8Repacked down;        // down projection
+        Q8Repacked pleInputGate;
+        Q8Repacked pleProjection;
         // fp16 alternative (used when Q4 source — avoids double-quantization)
         std::vector<uint16_t> qkvFp16;
         std::vector<uint16_t> oFp16;
@@ -46,11 +48,24 @@ struct OnnxLoadResult {
         std::vector<float> postAttnNorm;    // post-attention layer norm weights
         std::vector<float> qNorm;           // Q-norm weights (empty if not present)
         std::vector<float> kNorm;           // K-norm weights (empty if not present)
+        std::vector<float> preFfnNorm;
+        std::vector<float> postFfnNorm;
+        std::vector<float> plePostNorm;
+        std::vector<float> outputScale;
     };
     std::vector<LayerData> layers;
 
     /// Embedding table (fp32 for CPU lookup).
     std::vector<float> embeddingCPU;
+
+    struct PackedPleEmbedding {
+        std::vector<uint8_t> weights, scales, zeroPoints;
+        uint32_t vocab = 0, layers = 0, dim = 0, blockSize = 0;
+        uint32_t weightBytesPerRow = 0, scaleBytesPerRow = 0;
+        uint32_t zeroPointBytesPerRow = 0;
+    } pleEmbedding;
+    Q8Repacked pleModelProjection;
+    std::vector<float> pleProjectionNorm;
 
     /// LM head weights.
     Q8Repacked lmHeadQ8;

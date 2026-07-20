@@ -1,5 +1,4 @@
 // @meta bindings=7
-enable subgroups;
 
 // Fused: RMSNorm + Q8_0 matmul.
 // Reads raw X, computes RMSNorm inline (two-pass over X — second from L1 cache),
@@ -27,6 +26,7 @@ enable subgroups;
 @group(0) @binding(6) var<storage, read_write> NormW: array<f32>;
 
 const TILE_N: u32 = 8u;
+var<workgroup> reduce_scratch: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -63,8 +63,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                             X[x_base + k_base + 7u]);
         sum_sq += dot(xv0, xv0) + dot(xv1, xv1);
     }
-    let total_sq = subgroupAdd(sum_sq);
+    reduce_scratch[tid] = sum_sq;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reduce_scratch[tid] += reduce_scratch[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let total_sq = reduce_scratch[warp_id * 32u];
     let rstd = 1.0 / sqrt(total_sq / f32(K) + eps);
+    // Every logical warp must consume its RMS result before the same scratch
+    // array is reused for the matmul reduction below. Wider/non-lockstep
+    // hardware subgroups otherwise expose a write-after-read race.
+    workgroupBarrier();
 
     // ── Pass 2: Normalized matmul ───────────────────────────────────────
     // Re-read X (L1 cached), apply RMSNorm weight, dot with Q8 weights.
@@ -119,7 +131,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
     }
 
-    let warp_sum = subgroupAdd(acc);
+    reduce_scratch[tid] = acc;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reduce_scratch[tid] += reduce_scratch[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let warp_sum = reduce_scratch[warp_id * 32u];
 
     if (lane == 0u && col < N) {
         Y[row * N + col] = warp_sum + Bias[col];

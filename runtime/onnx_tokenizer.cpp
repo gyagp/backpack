@@ -219,6 +219,8 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
     std::string tokStr((std::istreambuf_iterator<char>(tokFile)),
                         std::istreambuf_iterator<char>());
     tokFile.close();
+    sentencepiece_bpe = tokStr.find("\"content\": \"▁\"") != std::string::npos &&
+                        tokStr.find("\"type\": \"ByteFallback\"") != std::string::npos;
 
     const char* p = tokStr.data();
     const char* end = p + tokStr.size();
@@ -418,6 +420,21 @@ std::string OnnxTokenizer::decode_token(int32_t token_id) const {
     if (token_id < 0 || token_id >= (int32_t)vocab.size())
         return "";
     const std::string& tok = vocab[token_id];
+    if (sentencepiece_bpe) {
+        if (tok.size() == 6 && tok.rfind("<0x", 0) == 0 && tok[5] == '>') {
+            char* tail = nullptr;
+            long value = strtol(tok.substr(3, 2).c_str(), &tail, 16);
+            return std::string(1, (char)(uint8_t)value);
+        }
+        std::string out = tok;
+        const std::string marker = "▁";
+        size_t pos = 0;
+        while ((pos = out.find(marker, pos)) != std::string::npos) {
+            out.replace(pos, marker.size(), " ");
+            pos += 1;
+        }
+        return out;
+    }
     if (tok.size() >= 2 && tok[0] == '<' && tok.back() == '>')
         return tok;
     return bpe_token_to_bytes(tok, unicode_to_byte_);
@@ -483,6 +500,40 @@ std::vector<int32_t> OnnxTokenizer::encode(const std::string& text) const {
 
 std::vector<int32_t> OnnxTokenizer::encodeBpe(const std::string& text) const {
     if (text.empty()) return {};
+
+    if (sentencepiece_bpe) {
+        std::string normalized;
+        normalized.reserve(text.size() + 8);
+        for (char c : text) {
+            if (c == ' ') normalized += "▁";
+            else normalized.push_back(c);
+        }
+        auto pieces = split_to_chars(normalized);
+        while (pieces.size() > 1) {
+            int best = -1;
+            int32_t rank = std::numeric_limits<int32_t>::max();
+            for (int i = 0; i + 1 < (int)pieces.size(); i++) {
+                auto it = merge_rank.find(pieces[i] + " " + pieces[i + 1]);
+                if (it != merge_rank.end() && it->second < rank) {
+                    rank = it->second; best = i;
+                }
+            }
+            if (best < 0) break;
+            pieces[best] += pieces[best + 1];
+            pieces.erase(pieces.begin() + best + 1);
+        }
+        std::vector<int32_t> ids;
+        for (const auto& piece : pieces) {
+            auto it = token_to_id.find(piece);
+            if (it != token_to_id.end()) { ids.push_back(it->second); continue; }
+            for (uint8_t b : piece) {
+                char fallback[7]; snprintf(fallback, sizeof(fallback), "<0x%02X>", b);
+                auto bi = token_to_id.find(fallback);
+                if (bi != token_to_id.end()) ids.push_back(bi->second);
+            }
+        }
+        return ids;
+    }
 
     // 1. Convert bytes to BPE string representation
     std::string bpe_text = bytes_to_bpe_string(text, byte_to_unicode_);

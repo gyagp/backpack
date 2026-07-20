@@ -31,6 +31,7 @@ struct OnnxTokenizer {
     // Special token IDs
     int32_t eos_token_id = -1;
     int32_t bos_token_id = -1;
+    bool sentencepiece_bpe = false;
 
     // --- API ---
 

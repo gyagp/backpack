@@ -1,6 +1,3 @@
-enable subgroups;
-diagnostic(off, subgroup_uniformity);
-
 @group(0) @binding(0) var<storage, read_write> Partials: array<f32>;
 @group(0) @binding(1) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(2) var<storage, read_write> _params_: array<u32>;

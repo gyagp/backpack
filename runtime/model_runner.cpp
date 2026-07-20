@@ -685,6 +685,88 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     rotaryDim = onnx.rotaryDim;
     hasPrecomputedRope = onnx.hasPrecomputedRope;
 
+    // The GGUF path infers this table while loading tensor metadata.  ONNX
+    // previously left it empty and loadOnnx indexed it unconditionally.
+    cfg.perLayer.resize(cfg.nLayer);
+    cfg.layerAttnTypes.resize(cfg.nLayer, AttnLayerType::Global);
+    for (uint32_t i = 0; i < cfg.nLayer; i++) {
+        auto& pl = cfg.perLayer[i];
+        pl.headDim = cfg.headDim;
+        pl.qDim = cfg.nHead * cfg.headDim;
+        pl.kvDim = cfg.nKvHeads * cfg.headDim;
+        pl.intermediateSize = cfg.intermediateSize;
+        pl.kvSourceLayer = -1;
+
+        // Fused QKV has N = heads*HD + 2*kv_heads*HD.  This also recovers
+        // Gemma 4's alternating 256/512 head dimensions from the exported
+        // projection shapes instead of assuming the decoder-level head_size.
+        const uint32_t attentionN = i < onnx.layers.size()
+            ? (onnx.layers[i].qkv.N > 0
+                ? onnx.layers[i].qkv.N : onnx.layers[i].qOnly.N)
+            : 0;
+        if (i < onnx.layers.size() && onnx.layers[i].qkv.N > 0) {
+            const uint32_t denom = cfg.nHead + 2 * cfg.nKvHeads;
+            if (denom && onnx.layers[i].qkv.N % denom == 0) {
+                pl.headDim = onnx.layers[i].qkv.N / denom;
+                pl.qDim = cfg.nHead * pl.headDim;
+                pl.kvDim = cfg.nKvHeads * pl.headDim;
+            }
+        } else if (attentionN > 0 && attentionN % cfg.nHead == 0) {
+            pl.headDim = attentionN / cfg.nHead;
+            pl.qDim = attentionN;
+            pl.kvDim = cfg.nKvHeads * pl.headDim;
+        }
+        if (i < onnx.layers.size() && onnx.layers[i].gateup.N > 0)
+            pl.intermediateSize = onnx.layers[i].gateup.N / 2;
+        if (i > 0 && (pl.headDim != cfg.perLayer[0].headDim ||
+                      pl.intermediateSize != cfg.perLayer[0].intermediateSize))
+            cfg.hasPerLayerDims = true;
+    }
+    if (cfg.arch == "gemma4") {
+        uint32_t maxHd = 0;
+        for (const auto& pl : cfg.perLayer) maxHd = std::max(maxHd, pl.headDim);
+        for (uint32_t i = 0; i < cfg.nLayer; i++)
+            cfg.layerAttnTypes[i] = cfg.perLayer[i].headDim == maxHd
+                ? AttnLayerType::Global : AttnLayerType::SlidingWindow;
+
+        // Gemma 4 exports K/V projections only for the first cache-owning
+        // layers.  Later Q-only layers reuse the final local/global cache.
+        int lastSliding = -1, lastGlobal = -1;
+        for (uint32_t i = 0; i < cfg.nLayer; i++) {
+            const bool qOnly = i < onnx.layers.size() &&
+                onnx.layers[i].qkv.N == 0 && onnx.layers[i].qOnly.N > 0;
+            const bool sliding = cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
+            if (!qOnly) {
+                if (sliding) lastSliding = (int)i; else lastGlobal = (int)i;
+            } else {
+                cfg.perLayer[i].kvSourceLayer = sliding ? lastSliding : lastGlobal;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < cfg.nLayer; i++) {
+        if (i >= onnx.layers.size() ||
+            (onnx.layers[i].qkv.N == 0 && onnx.layers[i].qOnly.N == 0) ||
+            onnx.layers[i].o.N == 0 || onnx.layers[i].gateup.N == 0 ||
+            onnx.layers[i].down.N == 0) {
+            fprintf(stderr,
+                "Unsupported/incomplete ONNX transformer layer %u: "
+                "qkv=%u qOnly=%u o=%u gateup=%u down=%u\n", i,
+                i < onnx.layers.size() ? onnx.layers[i].qkv.N : 0,
+                i < onnx.layers.size() ? onnx.layers[i].qOnly.N : 0,
+                i < onnx.layers.size() ? onnx.layers[i].o.N : 0,
+                i < onnx.layers.size() ? onnx.layers[i].gateup.N : 0,
+                i < onnx.layers.size() ? onnx.layers[i].down.N : 0);
+            return false;
+        }
+    }
+    if (onnx.embeddingCPU.size() < (size_t)cfg.nVocab * cfg.nEmbd) {
+        fprintf(stderr,
+            "Unsupported/incomplete ONNX embedding: got %zu values, need %zu\n",
+            onnx.embeddingCPU.size(), (size_t)cfg.nVocab * cfg.nEmbd);
+        return false;
+    }
+
     fprintf(stderr, "Model: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u) [ONNX]\n",
            cfg.arch.c_str(), cfg.nLayer, cfg.nEmbd, cfg.headDim,
            cfg.nVocab, cfg.nKvHeads);
@@ -773,10 +855,23 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         auto& lw = layerWeights[i];
         auto& ld = onnx.layers[i];
 
-        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", ld.qkv, lw.qkvW, lw.qkvS);
+        if (ld.qkv.N > 0) {
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv",
+                           ld.qkv, lw.qkvW, lw.qkvS);
+        } else if (ld.qOnly.N > 0) {
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".q_only",
+                           ld.qOnly, lw.qOnlyW, lw.qOnlyS);
+            lw.qOnly = true;
+        }
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", ld.down, lw.dnW, lw.dnS);
+        if (ld.pleInputGate.N > 0)
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_gate",
+                           ld.pleInputGate, lw.pleInpGateW, lw.pleInpGateS);
+        if (ld.pleProjection.N > 0)
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_proj",
+                           ld.pleProjection, lw.pleProjW, lw.pleProjS);
 
         // Norm weights
         if (!ld.inputNorm.empty()) {
@@ -785,9 +880,10 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             gpu->writeBuffer(lw.inputNorm, ld.inputNorm.data(), ld.inputNorm.size() * 4);
         }
         if (!ld.postAttnNorm.empty()) {
-            lw.postAttnNorm = gpu->createBuffer("L" + std::to_string(i) + ".panorm",
+            GPUBuffer& dst = cfg.arch == "gemma4" ? lw.postNorm : lw.postAttnNorm;
+            dst = gpu->createBuffer("L" + std::to_string(i) + ".panorm",
                                                  ld.postAttnNorm.size() * 4);
-            gpu->writeBuffer(lw.postAttnNorm, ld.postAttnNorm.data(), ld.postAttnNorm.size() * 4);
+            gpu->writeBuffer(dst, ld.postAttnNorm.data(), ld.postAttnNorm.size() * 4);
         }
         // QK norm (optional)
         if (!ld.qNorm.empty()) {
@@ -800,6 +896,16 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
                                           ld.kNorm.size() * 4);
             gpu->writeBuffer(lw.kNorm, ld.kNorm.data(), ld.kNorm.size() * 4);
         }
+        auto uploadNorm = [&](const std::string& name, const std::vector<float>& src,
+                              GPUBuffer& dst) {
+            if (src.empty()) return;
+            dst = gpu->createBuffer(name, src.size() * 4);
+            gpu->writeBuffer(dst, src.data(), src.size() * 4);
+        };
+        uploadNorm("L" + std::to_string(i) + ".ffn_norm", ld.preFfnNorm, lw.ffnNorm);
+        uploadNorm("L" + std::to_string(i) + ".post_ffn_norm", ld.postFfnNorm, lw.postFfwNorm);
+        uploadNorm("L" + std::to_string(i) + ".ple_post_norm", ld.plePostNorm, lw.plePostNorm);
+        uploadNorm("L" + std::to_string(i) + ".output_scale", ld.outputScale, lw.outScale);
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
             fprintf(stderr, "  uploaded layer %u/%u\n", i + 1, cfg.nLayer);
@@ -814,6 +920,36 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     // Embedding
     embeddingCPU = std::move(onnx.embeddingCPU);
     fprintf(stderr, "  Embedding: %u × %u (fp32)\n", cfg.nVocab, cfg.nEmbd);
+
+    if (cfg.pleSize > 0 && onnx.pleEmbedding.layers == cfg.nLayer) {
+        auto uploadRaw = [&](const std::string& name, const std::vector<uint8_t>& src) {
+            GPUBuffer b = gpu->createBuffer(name, src.size());
+            constexpr uint64_t CHUNK = 64ull * 1024 * 1024;
+            for (uint64_t off = 0; off < src.size(); off += CHUNK)
+                gpu->writeBuffer(b, src.data() + off,
+                    std::min<uint64_t>(CHUNK, src.size() - off), off);
+            return b;
+        };
+        pleTokenEmbW = uploadRaw("ple_token_q4", onnx.pleEmbedding.weights);
+        pleTokenEmbS = uploadRaw("ple_token_scales", onnx.pleEmbedding.scales);
+        pleTokenEmbZ = uploadRaw("ple_token_zero_points", onnx.pleEmbedding.zeroPoints);
+        pleTokenEmbAsymmetric = true;
+        if (onnx.pleModelProjection.N > 0)
+            uploadQ8Weight(*gpu, "ple_model_projection", onnx.pleModelProjection,
+                           pleModelProjW, pleModelProjS);
+        if (!onnx.pleProjectionNorm.empty()) {
+            pleProjNormW = gpu->createBuffer("ple_projection_norm",
+                                             onnx.pleProjectionNorm.size() * 4);
+            gpu->writeBuffer(pleProjNormW, onnx.pleProjectionNorm.data(),
+                             onnx.pleProjectionNorm.size() * 4);
+        }
+        pleGpuPreprocess = pleTokenEmbW.handle && pleTokenEmbS.handle &&
+                           pleTokenEmbZ.handle && pleModelProjW.handle &&
+                           pleProjNormW.handle;
+        fprintf(stderr, "  PLE: packed asymmetric Q4, %u × %u × %u\n",
+                onnx.pleEmbedding.layers, onnx.pleEmbedding.vocab,
+                onnx.pleEmbedding.dim);
+    }
 
     // LM head
     if (onnx.hasLmHeadQ8) {
@@ -2050,12 +2186,16 @@ void ModelRunner::buildDecodePipeline() {
     qkvOut = qDim + 2 * kvDim;
     decodeUsesFusedRopeParams = false;
     const auto& limits = effectiveLimits(*gpu);
+    std::string decodeAdapter = gpu->adapterName;
+    std::transform(decodeAdapter.begin(), decodeAdapter.end(), decodeAdapter.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    const bool isNvidiaAdapter = decodeAdapter.find("nvidia") != std::string::npos;
     const bool canUse512ThreadKernels =
         gpu->supportsSubgroups &&
         limits.maxComputeInvocationsPerWorkgroup >= 512u &&
         limits.maxComputeWorkgroupStorageSize >= 32u * 1024u;
     const bool canUse256ThreadSubgroupKernels =
-        gpu->supportsSubgroups &&
+        gpu->supportsSubgroups && isNvidiaAdapter &&
         limits.maxComputeInvocationsPerWorkgroup >= 256u &&
         limits.maxComputeWorkgroupStorageSize >= 16u * 1024u;
     const bool decodeFastQ8Eligible =
@@ -2233,15 +2373,35 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec
 @group(0) @binding(4) var<storage, read> P: array<u32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+ let i=gid.x;let K=P[0];if(i>=K){return;}let row=u32(max(Token[0],0));
+ let word=B[row*(K/8u)+i/8u];let q=i32((word>>((i&7u)*4u))&15u)-8;
+ let block=row*(K/32u)+i/32u;let sp=unpack2x16float(S[block/2u]);
+ let scale=select(sp.x,sp.y,(block&1u)!=0u);Y[i]=f32(q)*scale*bitcast<f32>(P[1]);
+}
+)";
+    static const char* PLE_TOKEN_Q4_ASYM_GATHER_WGSL = R"(
+@group(0) @binding(0) var<storage, read> B: array<u32>;
+@group(0) @binding(1) var<storage, read> S: array<u32>;
+@group(0) @binding(2) var<storage, read> Z: array<u32>;
+@group(0) @binding(3) var<storage, read> Token: array<i32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read> P: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; let K = P[0];
     if (i >= K) { return; }
-    let row = u32(max(Token[0], 0));
-    let word = B[row * (K / 8u) + i / 8u];
-    let q = i32((word >> ((i & 7u) * 4u)) & 15u) - 8;
-    let block = row * (K / 32u) + i / 32u;
+    let row = u32(max(Token[0], 0)); let V=P[2]; let D=P[3];
+    let layer=i/D; let col=i%D; let packedRow=layer*V+row;
+    let byteIndex=packedRow*(D/2u)+col/2u;
+    let word=B[byteIndex/4u];
+    let qv=i32((word>>(((byteIndex&3u)*8u+(col&1u)*4u)))&15u);
+    let block = packedRow * (D / 32u) + col / 32u;
+    let zpByteIndex=block/2u; let zpWord=Z[zpByteIndex/4u];
+    let zpByte=(zpWord>>((zpByteIndex&3u)*8u))&255u;
+    let zp=i32(select(zpByte&15u,zpByte>>4u,(block&1u)==1u));
     let sp = unpack2x16float(S[block / 2u]);
     let scale = select(sp.x, sp.y, (block & 1u) != 0u);
-    Y[i] = f32(q) * scale * bitcast<f32>(P[1]);
+    Y[i] = f32(qv-zp) * scale * bitcast<f32>(P[1]);
 }
 )";
     static const char* PLE_PROJECT_COMBINE_WGSL = R"(
@@ -2266,7 +2426,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 )";
     const CompiledPipeline* plPleTokenGather = pleGpuPreprocess
-        ? &gpu->getOrCreatePipeline("ple_token_q4_gather", std::string(PLE_TOKEN_Q4_GATHER_WGSL), 5)
+        ? &gpu->getOrCreatePipeline(
+            pleTokenEmbAsymmetric ? "ple_token_q4_asym_gather" : "ple_token_q4_gather",
+            pleTokenEmbAsymmetric ? std::string(PLE_TOKEN_Q4_ASYM_GATHER_WGSL)
+                                  : std::string(PLE_TOKEN_Q4_GATHER_WGSL),
+            pleTokenEmbAsymmetric ? 6 : 5)
         : nullptr;
     const CompiledPipeline* plPleProjectCombine = pleGpuPreprocess
         ? &gpu->getOrCreatePipeline("ple_project_combine", std::string(PLE_PROJECT_COMBINE_WGSL), 4)
@@ -2431,7 +2595,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         perLayerDnSiluParams.resize(cfg.nLayer);
         for (uint32_t li = 0; li < cfg.nLayer; li++) {
             auto& pl = cfg.perLayer[li];
-            uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
+            uint32_t plQkvOut = layerWeights[li].qOnly
+                ? pl.qDim : pl.qDim + 2 * pl.kvDim;
             perLayerQkvParams[li] = makeQ8Params("p_qkv_" + std::to_string(li), cfg.nEmbd, plQkvOut);
             {
                 uint32_t data[4] = {cfg.nEmbd, plQkvOut, 0, 0};
@@ -2801,9 +2966,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     argmaxReduceDispatchIndex = -1;
     pleTokenGatherDispatchIndex = -1;
 
-    if (pleGpuPreprocess && plPleTokenGather && plQ4A32 && plPleProjectCombine) {
+    if (pleGpuPreprocess && plPleTokenGather &&
+        (pleTokenEmbAsymmetric || plQ4A32) && plPleProjectCombine) {
         uint32_t totalPleDim = cfg.pleSize * cfg.nLayer;
-        uint32_t gatherData[4] = {totalPleDim, 0, 0, 0};
+        uint32_t gatherData[4] = {totalPleDim, 0, cfg.nVocab, cfg.pleSize};
         float tokenScale = sqrtf((float)cfg.pleSize);
         memcpy(&gatherData[1], &tokenScale, 4);
         pleTokenGatherParams = gpu->createBuffer("p_ple_token_gather", 16);
@@ -2814,18 +2980,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pleCombineParams = gpu->createBuffer("p_ple_combine", 16);
         gpu->writeBuffer(pleCombineParams, combineData, 16);
 
-        auto bgGather = makeBG(*plPleTokenGather, {
-            {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, argmaxResultBuf},
-            {3, pleInputBuf}, {4, pleTokenGatherParams}});
+        auto bgGather = pleTokenEmbAsymmetric
+            ? makeBG(*plPleTokenGather, {
+                {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, pleTokenEmbZ},
+                {3, argmaxResultBuf}, {4, pleInputBuf}, {5, pleTokenGatherParams}})
+            : makeBG(*plPleTokenGather, {
+                {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, argmaxResultBuf},
+                {3, pleInputBuf}, {4, pleTokenGatherParams}});
         pleTokenGatherDispatchIndex = (int)allDecodeDispatches.size();
         allDecodeDispatches.push_back({plPleTokenGather->pipeline, bgGather,
             (totalPleDim + 255) / 256, 1, 1, "ple_token_gather"});
 
-        auto bgProj = makeBG(*plQ4A32, {
-            {0, xBuf}, {1, pleModelProjW}, {2, pleModelProjS},
-            {3, pleProjRawBuf}, {4, pleModelProjParams}});
-        allDecodeDispatches.push_back({plQ4A32->pipeline, bgProj,
-            (totalPleDim + 3) / 4, 1, 1, "ple_model_proj"});
+        if (pleTokenEmbAsymmetric) {
+            auto q8p = makeQ8Params("p_ple_model_proj_q8", cfg.nEmbd, totalPleDim);
+            auto bgProj = makeBG(plQ8Matmul, {
+                {0, xBuf}, {1, pleModelProjW}, {2, pleModelProjS},
+                {3, zeroBiasV}, {4, pleProjRawBuf}, {5, q8p}});
+            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgProj,
+                1, (totalPleDim + Q8_TILE - 1) / Q8_TILE, 1, "ple_model_proj"});
+        } else {
+            auto bgProj = makeBG(*plQ4A32, {
+                {0, xBuf}, {1, pleModelProjW}, {2, pleModelProjS},
+                {3, pleProjRawBuf}, {4, pleModelProjParams}});
+            allDecodeDispatches.push_back({plQ4A32->pipeline, bgProj,
+                (totalPleDim + 3) / 4, 1, 1, "ple_model_proj"});
+        }
 
         auto bgCombine = makeBG(*plPleProjectCombine, {
             {0, pleProjRawBuf}, {1, pleProjNormW},
@@ -4171,10 +4350,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Final RMSNorm
     {
-        auto bg = makeBG(plRmsNorm, {
+        static const char* FINAL_RMS_PORTABLE_WGSL = R"(
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(2) var<storage, read> W: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Rstd: array<f32>;
+@group(0) @binding(4) var<storage, read> P: array<u32>;
+var<workgroup> sums: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid=lid.x; let N=P[0]; let eps=bitcast<f32>(P[1]); var ss=0.0;
+    for(var i=tid;i<N;i+=256u){let v=X[i];ss+=v*v;}
+    sums[tid]=ss;workgroupBarrier();
+    for(var stride=128u;stride>0u;stride>>=1u){
+        if(tid<stride){sums[tid]+=sums[tid+stride];}workgroupBarrier();
+    }
+    let r=inverseSqrt(sums[0]/f32(N)+eps);
+    if(tid==0u){Rstd[0]=r;}
+    for(var i=tid;i<N;i+=256u){Y[i]=X[i]*r*W[i];}
+}
+)";
+        auto& plFinalRms = gpu->getOrCreatePipeline(
+            "final_rms_portable", std::string(FINAL_RMS_PORTABLE_WGSL), 5);
+        auto bg = makeBG(plFinalRms, {
             {0, xBuf}, {1, normOutBuf}, {2, finalNormW},
             {3, rstdBuf}, {4, rmsParams}});
-        allDecodeDispatches.push_back({plRmsNorm.pipeline, bg, 1, 1, 1, "final_rms"});
+        allDecodeDispatches.push_back({plFinalRms.pipeline, bg, 1, 1, 1, "final_rms"});
     }
 
     // LM head
@@ -4414,9 +4615,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (pleTokenGatherDispatchIndex >= 0 && plPleTokenGather) {
             int idx = pleTokenGatherDispatchIndex + prefixCount;
-            ps.dispatches[idx].bindGroup = makeBG(*plPleTokenGather, {
-                {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, ps.tokenInBuf},
-                {3, pleInputBuf}, {4, pleTokenGatherParams}});
+            ps.dispatches[idx].bindGroup = pleTokenEmbAsymmetric
+                ? makeBG(*plPleTokenGather, {
+                    {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, pleTokenEmbZ},
+                    {3, ps.tokenInBuf}, {4, pleInputBuf}, {5, pleTokenGatherParams}})
+                : makeBG(*plPleTokenGather, {
+                    {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, ps.tokenInBuf},
+                    {3, pleInputBuf}, {4, pleTokenGatherParams}});
         }
         if (argmaxDispatchIndex >= 0) {
             int idx = argmaxDispatchIndex + prefixCount;
@@ -5615,6 +5820,43 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
+    if (const char* stopDispatch = std::getenv("BP_STOP_AFTER_DISPATCH")) {
+        size_t end = allDecodeDispatches.size();
+        for (size_t j = 0; j < allDecodeDispatches.size(); ++j) {
+            if (allDecodeDispatches[j].name == stopDispatch) { end = j + 1; break; }
+        }
+        if (end < allDecodeDispatches.size()) {
+            const char* which = std::getenv("BP_STOP_BUFFER");
+            std::string bufferName = which ? which : "x";
+            GPUBuffer buffer = xBuf;
+            uint32_t count = cfg.nEmbd;
+            if (bufferName == "qkv") { buffer = qkvBuf; count = qkvOut; }
+            else if (bufferName == "qrot") { buffer = qRotBuf; count = qDim; }
+            else if (bufferName == "attn") { buffer = attnOutBuf; count = qDim; }
+            else if (bufferName == "proj") { buffer = projOutBuf; count = cfg.nEmbd; }
+            else if (bufferName == "norm") { buffer = normOutBuf; count = cfg.nEmbd; }
+            else if (bufferName == "gateup") { buffer = gateUpBuf; count = 2 * cfg.intermediateSize; }
+            else if (bufferName == "ple") { buffer = pleBuf; count = cfg.pleSize; }
+            else if (bufferName == "pleinput") { buffer = pleInputBuf; count = cfg.pleSize * cfg.nLayer; }
+            else if (bufferName == "pleout") { buffer = pleOutBuf; count = cfg.nEmbd; }
+            else if (bufferName == "logits") { buffer = logitsBuf; count = cfg.nVocab; }
+            std::vector<Dispatch> partial(allDecodeDispatches.begin(), allDecodeDispatches.begin() + end);
+            auto bytes = gpu->submitAndReadback(partial, buffer, count * 4, passPerDispatch);
+            const float* values = reinterpret_cast<const float*>(bytes.data());
+            double ss = 0.0; uint32_t nonfinite = 0;
+            for (uint32_t j = 0; j < count; ++j) {
+                if (!std::isfinite(values[j])) ++nonfinite;
+                else ss += (double)values[j] * values[j];
+            }
+            fprintf(stderr, "[dispatch-dump] after=%s buffer=%s count=%u nonfinite=%u norm=%.9g first8=",
+                    stopDispatch, bufferName.c_str(), count, nonfinite, sqrt(ss));
+            for (uint32_t j = 0; j < std::min(8u, count); ++j)
+                fprintf(stderr, "%s%.9g", j ? "," : "", values[j]);
+            fprintf(stderr, "\n"); fflush(stderr);
+            std::exit(0);
+        }
+    }
+
     const char* stopEnv = std::getenv("BP_STOP_AFTER_LAYER");
     uint32_t stopPos = std::getenv("BP_STOP_POS")
         ? (uint32_t)std::max(0, std::atoi(std::getenv("BP_STOP_POS"))) : 0u;
@@ -6197,7 +6439,8 @@ int32_t ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
     if (qwen35Pf.ready && !std::getenv("BP_QWEN35_SERIAL_PREFILL"))
         return prefillQwen35Batched(tokenIds,T,posOffset);
-    if (gemmaPf.ready && !std::getenv("BP_GEMMA_SERIAL_PREFILL"))
+    if (gemmaPf.ready && !pleTokenEmbAsymmetric &&
+        !std::getenv("BP_GEMMA_SERIAL_PREFILL"))
         return prefillGemmaBatched(tokenIds, T, posOffset);
     if ((pleGpuPreprocess || cfg.arch == "qwen35") &&
         !std::getenv("BP_SYNC_PREFILL"))

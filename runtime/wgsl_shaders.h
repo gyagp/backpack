@@ -594,8 +594,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 // [attention] gqa_chunked_pass1
 static const char* WGSL_GQA_CHUNKED_PASS1 = R"WGSL(
 enable f16;
-enable subgroups;
-diagnostic(off, subgroup_uniformity);
 
 @group(0) @binding(0) var<storage, read_write> Q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> K_cache: array<f16>;
@@ -605,6 +603,7 @@ diagnostic(off, subgroup_uniformity);
 
 const HD: u32 = 128u;
 const HD_PER_THREAD: u32 = 4u;
+var<workgroup> dot_scratch: array<f32, 32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -622,9 +621,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let neg_inf = bitcast<f32>(_params_[6]);
     let max_chunks = _params_[7];
 
-    if (chunk_id >= n_chunks) {
-        return;
-    }
+    let chunk_active = chunk_id < n_chunks;
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
@@ -650,7 +647,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     for (var i = 0u; i < CHUNK; i = i + 1u) {
         let logical_t = t_start + i;
-        let valid = logical_t < T_total;
+        let valid = chunk_active && logical_t < T_total;
         let t = kv_start + logical_t;
 
         let k_base = select(0u, t * kv_stride + kv_off, valid);
@@ -663,7 +660,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             }
             dot_partial += q[e] * k;
         }
-        let dot = subgroupAdd(dot_partial);
+        dot_scratch[lane] = dot_partial;
+        workgroupBarrier();
+        for (var stride = 16u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                dot_scratch[lane] += dot_scratch[lane + stride];
+            }
+            workgroupBarrier();
+        }
+        let dot = dot_scratch[0];
         let raw_score = dot * scale;
         let score = select(neg_inf, raw_score, valid);
 
@@ -686,6 +691,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         m_prev = m_new;
         l_prev = l_new;
+        workgroupBarrier();
     }
 
     // Use max_chunks for the stride to prevent overlapping writes across heads.
@@ -708,9 +714,6 @@ const CHUNK: u32 = 64u;
 
 // [attention] gqa_chunked_pass2
 static const char* WGSL_GQA_CHUNKED_PASS2 = R"WGSL(
-enable subgroups;
-diagnostic(off, subgroup_uniformity);
-
 @group(0) @binding(0) var<storage, read_write> Partials: array<f32>;
 @group(0) @binding(1) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(2) var<storage, read_write> _params_: array<u32>;
@@ -4109,10 +4112,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let offset = _params_[1];
     let i = gid.x;
     if (i >= N) { return; }
-    let g = Gate[i];
+    // The tanh approximation's cubic term and the subsequent product can
+    // overflow on some native WebGPU drivers even when the normalized result
+    // is representable. GELU is already saturated outside this interval.
+    let g = clamp(Gate[i], -20.0, 20.0);
     let inner = 0.7978845608 * (g + 0.044715 * g * g * g);
-    let gelu = 0.5 * g * (1.0 + tanh(inner));
-    Gate[i] = gelu * PleInput[offset + i];
+    let gelu = select(select(0.0, g, g > 10.0),
+                      0.5 * g * (1.0 + tanh(inner)), abs(g) <= 10.0);
+    let ple = clamp(PleInput[offset + i], -65504.0, 65504.0);
+    Gate[i] = gelu * ple;
 }
 )WGSL";
 
@@ -13187,8 +13195,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [quant_q8] q8_down_silu_add
 static const char* WGSL_Q8_DOWN_SILU_ADD = R"WGSL(
-enable subgroups;
-
 // Fused: SiLU·mul + Q8_0 matmul + residual add.
 // Reads gateUpBuf (2*IM elements), applies silu(gate)*up on-the-fly,
 // then multiplies by W_down and adds to residual Y.
@@ -13292,7 +13298,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let warp_sum = subgroupAdd(acc);
+    smem_x[tid] = acc;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            smem_x[tid] += smem_x[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let warp_sum = smem_x[warp_id * 32u];
     if (lane == 0u && valid) {
         Y[row * N + col] += warp_sum + Bias[col];
     }
@@ -15715,8 +15729,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [quant_q8] q8_matmul_norm
 static const char* WGSL_Q8_MATMUL_NORM = R"WGSL(
-enable subgroups;
-
 // Fused: RMSNorm + Q8_0 matmul.
 // Reads raw X, computes RMSNorm inline (two-pass over X — second from L1 cache),
 // then multiplies normalized X by Q8 weight matrix.
@@ -15743,6 +15755,7 @@ enable subgroups;
 @group(0) @binding(6) var<storage, read_write> NormW: array<f32>;
 
 const TILE_N: u32 = 8u;
+var<workgroup> reduce_scratch: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -15779,8 +15792,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                             X[x_base + k_base + 7u]);
         sum_sq += dot(xv0, xv0) + dot(xv1, xv1);
     }
-    let total_sq = subgroupAdd(sum_sq);
+    reduce_scratch[tid] = sum_sq;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reduce_scratch[tid] += reduce_scratch[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let total_sq = reduce_scratch[warp_id * 32u];
     let rstd = 1.0 / sqrt(total_sq / f32(K) + eps);
+    // Every logical warp must consume its RMS result before the same scratch
+    // array is reused for the matmul reduction below. Wider/non-lockstep
+    // hardware subgroups otherwise expose a write-after-read race.
+    workgroupBarrier();
 
     // ── Pass 2: Normalized matmul ───────────────────────────────────────
     // Re-read X (L1 cached), apply RMSNorm weight, dot with Q8 weights.
@@ -15835,7 +15860,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
     }
 
-    let warp_sum = subgroupAdd(acc);
+    reduce_scratch[tid] = acc;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reduce_scratch[tid] += reduce_scratch[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let warp_sum = reduce_scratch[warp_id * 32u];
 
     if (lane == 0u && col < N) {
         Y[row * N + col] = warp_sum + Bias[col];

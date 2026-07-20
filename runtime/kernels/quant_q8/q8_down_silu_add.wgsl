@@ -1,5 +1,4 @@
 // @meta bindings=6
-enable subgroups;
 
 // Fused: SiLU·mul + Q8_0 matmul + residual add.
 // Reads gateUpBuf (2*IM elements), applies silu(gate)*up on-the-fly,
@@ -104,7 +103,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let warp_sum = subgroupAdd(acc);
+    smem_x[tid] = acc;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            smem_x[tid] += smem_x[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let warp_sum = smem_x[warp_id * 32u];
     if (lane == 0u && valid) {
         Y[row * N + col] += warp_sum + Bias[col];
     }

@@ -236,7 +236,8 @@ struct ModelRunner {
     std::vector<float> pleModelProjCPU;  // per_layer_model_proj weights (fp32, [nLayer*pleSize, E])
     std::vector<float> pleProjNormCPU;   // per_layer_proj_norm weights (fp32, [pleSize])
     GPUBuffer pleModelProjW, pleModelProjS;  // [E, pleSize*nLayer] projection
-    GPUBuffer pleTokenEmbW, pleTokenEmbS;    // native Q4 token PLE table
+    GPUBuffer pleTokenEmbW, pleTokenEmbS, pleTokenEmbZ; // packed Q4 PLE table
+    bool pleTokenEmbAsymmetric = false;
     GPUBuffer pleProjNormW;           // RMSNorm weights [pleSize]
     bool pleWeightsUseFp16 = false;
     bool pleGpuPreprocess = false;

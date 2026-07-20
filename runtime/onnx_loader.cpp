@@ -375,6 +375,9 @@ WeightMapping mapOnnxName(const std::string& onnxName) {
     // Map names
     struct NameEntry { std::string onnxSuffix; std::string backpackSuffix; };
     static const NameEntry nameMap[] = {
+        {"per_layer_model_projection", "ple_model_projection.weight"},
+        {"per_layer_input_gate", "ple_input_gate.weight"},
+        {"per_layer_projection", "ple_projection.weight"},
         {"attn.qkv_proj", "self_attn.qkv_proj.weight"},
         {"attn.q_proj",   "self_attn.q_proj.weight"},
         {"attn.k_proj",   "self_attn.k_proj.weight"},
@@ -406,6 +409,8 @@ WeightMapping mapOnnxName(const std::string& onnxName) {
                 return {"layers." + std::to_string(layerIdx) + "." + entry.backpackSuffix, layerIdx};
             if (entry.onnxSuffix == "lm_head")
                 return {entry.backpackSuffix, -1};
+            if (entry.onnxSuffix == "per_layer_model_projection")
+                return {entry.backpackSuffix, -1};
         }
     }
 
@@ -417,8 +422,26 @@ std::string mapOnnxNormName(const std::string& onnxName) {
     std::string name = onnxName;
     if (name.substr(0, 6) == "model.") name = name.substr(6);
 
+    if (name.find("per_layer_projection_norm") != std::string::npos)
+        return "ple_projection_norm.weight";
     if (name.find("final_norm") != std::string::npos)
         return "norm.weight";
+
+    auto layerNormName = [&](const char* suffix) -> std::string {
+        auto p = name.find("layers.");
+        if (p == std::string::npos) return {};
+        p += 7;
+        size_t end = p;
+        while (end < name.size() && isdigit((unsigned char)name[end])) end++;
+        if (end == p) return {};
+        return "layers." + name.substr(p, end - p) + "." + suffix;
+    };
+    if (name.find("pre_feedforward_layernorm") != std::string::npos)
+        return layerNormName("pre_ffn_norm.weight");
+    if (name.find("post_feedforward_layernorm") != std::string::npos)
+        return layerNormName("post_ffn_norm.weight");
+    if (name.find("post_per_layer_input_norm") != std::string::npos)
+        return layerNormName("ple_post_norm.weight");
 
     if (name.find("input_layernorm") != std::string::npos) {
         // Extract layer number
@@ -773,6 +796,15 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     cfg.tieWordEmbeddings = true;
     cfg.hasQkNorm = false;
     cfg.intermediateSize = 0;  // inferred from weights
+    if (cfg.arch == "gemma4") {
+        cfg.rmsNormEps = 1e-6f;
+        cfg.ropeTheta = 1000000.0f;
+        cfg.embeddingScale = std::sqrt((float)cfg.nEmbd);
+        cfg.logitSoftcap = 30.0f;
+        cfg.slidingWindow = 512;
+        cfg.activation = ActivationType::GELU;
+        cfg.hasSandwichNorm = true;
+    }
 
     fprintf(stderr, "ONNX Config: %s (%u layers, E=%u, HD=%u, V=%u, KV=%u)\n",
            cfg.arch.c_str(), cfg.nLayer, cfg.nEmbd, cfg.headDim,
@@ -988,6 +1020,21 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                     cfg.intermediateSize = N;
             }
         }
+        else if (initName.find(".layer_scalar") != std::string::npos) {
+            auto p = initName.find("layers.");
+            if (p != std::string::npos) {
+                p += 7; size_t end = p;
+                while (end < initName.size() && isdigit((unsigned char)initName[end])) end++;
+                if (end > p) {
+                    std::vector<float> value(1);
+                    if (tensor.dataType == ONNX_FLOAT16)
+                        value[0] = fp16_to_f32(*reinterpret_cast<const uint16_t*>(tensor.rawData));
+                    else if (tensor.dataType == ONNX_FLOAT)
+                        memcpy(value.data(), tensor.rawData, sizeof(float));
+                    normWeights["layers." + initName.substr(p, end-p) + ".output_scale"] = std::move(value);
+                }
+            }
+        }
         // Norm weights: name ends with "layernorm.weight" or "norm.weight"
         else if (initName.find("layernorm.weight") != std::string::npos ||
                  (initName.find("norm.weight") != std::string::npos &&
@@ -1190,12 +1237,53 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             // clear conformance failure until the packed per-layer embedding
             // path is wired into ModelRunner.
             if (actualEmbName.find("embed_tokens_per_layer_split") != std::string::npos) {
-                if (std::getenv("BP_ONNX_INSPECT_SKIP_PLE"))
-                    continue;
-                fprintf(stderr,
-                    "Unsupported ONNX feature: packed Gemma 4 per-layer embedding '%s'\n",
-                    actualEmbName.c_str());
-                return false;
+                auto embIt = initializers.find(actualEmbName);
+                auto scaleIt = initializers.find(scaleName);
+                auto zpIt = initializers.find(zeroPointName);
+                if (embIt == initializers.end() || scaleIt == initializers.end() ||
+                    zpIt == initializers.end() || !embIt->second.rawData ||
+                    !scaleIt->second.rawData || !zpIt->second.rawData) {
+                    fprintf(stderr, "Incomplete packed Gemma PLE tensor '%s'\n",
+                            actualEmbName.c_str());
+                    return false;
+                }
+                const std::string marker = "embed_tokens_per_layer_split.";
+                const size_t p = actualEmbName.find(marker) + marker.size();
+                const uint32_t layer = (uint32_t)std::stoul(actualEmbName.substr(p));
+                auto& packed = result.pleEmbedding;
+                const uint32_t vocab = (uint32_t)embIt->second.dims[0];
+                const uint32_t groups = scaleIt->second.dims.size() >= 2
+                    ? (uint32_t)scaleIt->second.dims[1] : 8u;
+                const uint32_t blockSize = (uint32_t)std::max<int64_t>(
+                    1, node.getAttrInt("block_size"));
+                const uint32_t weightRow = (uint32_t)(embIt->second.rawSize / vocab);
+                const uint32_t scaleRow = (uint32_t)(scaleIt->second.rawSize / vocab);
+                const uint32_t zpRow = (uint32_t)(zpIt->second.rawSize / vocab);
+                if (packed.layers == 0) {
+                    packed.vocab = vocab;
+                    packed.layers = cfg.nLayer;
+                    packed.dim = groups * blockSize;
+                    packed.blockSize = blockSize;
+                    packed.weightBytesPerRow = weightRow;
+                    packed.scaleBytesPerRow = scaleRow;
+                    packed.zeroPointBytesPerRow = zpRow;
+                    packed.weights.resize((size_t)packed.layers * vocab * weightRow);
+                    packed.scales.resize((size_t)packed.layers * vocab * scaleRow);
+                    packed.zeroPoints.resize((size_t)packed.layers * vocab * zpRow);
+                }
+                if (layer >= packed.layers || packed.vocab != vocab ||
+                    packed.weightBytesPerRow != weightRow) {
+                    fprintf(stderr, "Inconsistent packed Gemma PLE layer %u\n", layer);
+                    return false;
+                }
+                memcpy(packed.weights.data() + (size_t)layer * vocab * weightRow,
+                       embIt->second.rawData, embIt->second.rawSize);
+                memcpy(packed.scales.data() + (size_t)layer * vocab * scaleRow,
+                       scaleIt->second.rawData, scaleIt->second.rawSize);
+                memcpy(packed.zeroPoints.data() + (size_t)layer * vocab * zpRow,
+                       zpIt->second.rawData, zpIt->second.rawSize);
+                cfg.pleSize = packed.dim;
+                continue;
             }
 
             auto embIt = initializers.find(actualEmbName);
@@ -1370,10 +1458,16 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         moveQ8(pfx + "self_attn.o_proj.weight", ld.o);
         moveQ8(pfx + "mlp.gate_up_proj.weight", ld.gateup);
         moveQ8(pfx + "mlp.down_proj.weight", ld.down);
+        moveQ8(pfx + "ple_input_gate.weight", ld.pleInputGate);
+        moveQ8(pfx + "ple_projection.weight", ld.pleProjection);
         moveNorm(pfx + "input_layernorm.weight", ld.inputNorm);
         moveNorm(pfx + "post_attention_layernorm.weight", ld.postAttnNorm);
         moveNorm(pfx + "q_norm.weight", ld.qNorm);
         moveNorm(pfx + "k_norm.weight", ld.kNorm);
+        moveNorm(pfx + "pre_ffn_norm.weight", ld.preFfnNorm);
+        moveNorm(pfx + "post_ffn_norm.weight", ld.postFfnNorm);
+        moveNorm(pfx + "ple_post_norm.weight", ld.plePostNorm);
+        moveNorm(pfx + "output_scale", ld.outputScale);
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
             fprintf(stderr, "  processed layer %u/%u\n", i + 1, cfg.nLayer);
@@ -1385,6 +1479,19 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         if (it != normWeights.end()) {
             result.finalNorm = std::move(it->second);
             normWeights.erase(it);
+        }
+    }
+
+    {
+        auto it = q8Weights.find("ple_model_projection.weight");
+        if (it != q8Weights.end()) {
+            result.pleModelProjection = std::move(it->second);
+            q8Weights.erase(it);
+        }
+        auto ni = normWeights.find("ple_projection_norm.weight");
+        if (ni != normWeights.end()) {
+            result.pleProjectionNorm = std::move(ni->second);
+            normWeights.erase(ni);
         }
     }
 

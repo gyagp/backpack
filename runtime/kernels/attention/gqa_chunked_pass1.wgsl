@@ -1,6 +1,4 @@
 enable f16;
-enable subgroups;
-diagnostic(off, subgroup_uniformity);
 
 @group(0) @binding(0) var<storage, read_write> Q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> K_cache: array<f16>;
@@ -10,6 +8,7 @@ diagnostic(off, subgroup_uniformity);
 
 const HD: u32 = 128u;
 const HD_PER_THREAD: u32 = 4u;
+var<workgroup> dot_scratch: array<f32, 32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -27,9 +26,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let neg_inf = bitcast<f32>(_params_[6]);
     let max_chunks = _params_[7];
 
-    if (chunk_id >= n_chunks) {
-        return;
-    }
+    let chunk_active = chunk_id < n_chunks;
 
     let kv_head = head / n_rep;
     let kv_off = kv_head * HD;
@@ -55,7 +52,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     for (var i = 0u; i < CHUNK; i = i + 1u) {
         let logical_t = t_start + i;
-        let valid = logical_t < T_total;
+        let valid = chunk_active && logical_t < T_total;
         let t = kv_start + logical_t;
 
         let k_base = select(0u, t * kv_stride + kv_off, valid);
@@ -68,7 +65,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             }
             dot_partial += q[e] * k;
         }
-        let dot = subgroupAdd(dot_partial);
+        dot_scratch[lane] = dot_partial;
+        workgroupBarrier();
+        for (var stride = 16u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                dot_scratch[lane] += dot_scratch[lane + stride];
+            }
+            workgroupBarrier();
+        }
+        let dot = dot_scratch[0];
         let raw_score = dot * scale;
         let score = select(neg_inf, raw_score, valid);
 
@@ -91,6 +96,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         m_prev = m_new;
         l_prev = l_new;
+        workgroupBarrier();
     }
 
     // Use max_chunks for the stride to prevent overlapping writes across heads.
