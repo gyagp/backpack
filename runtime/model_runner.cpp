@@ -732,6 +732,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         // Gemma 4 exports K/V projections only for the first cache-owning
         // layers.  Later Q-only layers reuse the final local/global cache.
         int lastSliding = -1, lastGlobal = -1;
+        cfg.sharedKvLayers = 0;
         for (uint32_t i = 0; i < cfg.nLayer; i++) {
             const bool qOnly = i < onnx.layers.size() &&
                 onnx.layers[i].qkv.N == 0 && onnx.layers[i].qOnly.N > 0;
@@ -740,6 +741,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
                 if (sliding) lastSliding = (int)i; else lastGlobal = (int)i;
             } else {
                 cfg.perLayer[i].kvSourceLayer = sliding ? lastSliding : lastGlobal;
+                cfg.sharedKvLayers++;
             }
         }
     }
@@ -5838,10 +5840,33 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
             else if (bufferName == "gateup") { buffer = gateUpBuf; count = 2 * cfg.intermediateSize; }
             else if (bufferName == "ple") { buffer = pleBuf; count = cfg.pleSize; }
             else if (bufferName == "pleinput") { buffer = pleInputBuf; count = cfg.pleSize * cfg.nLayer; }
+            else if (bufferName.rfind("kvv", 0) == 0) {
+                uint32_t li = (uint32_t)std::max(0, std::atoi(bufferName.c_str() + 3));
+                if (li < kvCache.size()) {
+                    buffer = kvCache[li].V;
+                    count = cfg.perLayer[li].kvDim;
+                }
+            }
             else if (bufferName == "pleout") { buffer = pleOutBuf; count = cfg.nEmbd; }
             else if (bufferName == "logits") { buffer = logitsBuf; count = cfg.nVocab; }
             std::vector<Dispatch> partial(allDecodeDispatches.begin(), allDecodeDispatches.begin() + end);
             auto bytes = gpu->submitAndReadback(partial, buffer, count * 4, passPerDispatch);
+            if (bufferName.rfind("kvv", 0) == 0) {
+                auto raw = gpu->readBuffer(buffer, count * 2);
+                const uint16_t* h = reinterpret_cast<const uint16_t*>(raw.data());
+                auto h2f = [](uint16_t x) {
+                    uint32_t s=(x>>15)&1,e=(x>>10)&31,m=x&1023,out;
+                    if(e==0) out=(s<<31)|(m<<13);
+                    else if(e==31) out=(s<<31)|0x7f800000|(m<<13);
+                    else out=(s<<31)|((e+112)<<23)|(m<<13);
+                    float f; memcpy(&f,&out,4); return f;
+                };
+                fprintf(stderr, "[dispatch-dump] after=%s buffer=%s count=%u first8=",
+                        stopDispatch, bufferName.c_str(), count);
+                for (uint32_t j=0;j<std::min(8u,count);j++)
+                    fprintf(stderr,"%s%.9g",j?",":"",h2f(h[j]));
+                fprintf(stderr,"\n"); std::exit(0);
+            }
             const float* values = reinterpret_cast<const float*>(bytes.data());
             double ss = 0.0; uint32_t nonfinite = 0;
             for (uint32_t j = 0; j < count; ++j) {

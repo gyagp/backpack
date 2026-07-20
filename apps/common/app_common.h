@@ -80,7 +80,8 @@ inline std::string applyChatTemplate(const std::string& message,
     // but Gemma 4 specific). BOS is added by the tokenizer when add_bos_token
     // is set in GGUF metadata.
     if (arch == "gemma4")
-        return "<|turn>user\n" + message + "<turn|>\n"
+        return "<bos><|turn>system\nYou are a helpful AI assistant.<turn|>\n\n\n"
+               "<bos><|turn>user\n" + message + "<turn|>\n"
                "<|turn>model\n";
     // Gemma 2/3 (and original Gemma) use <start_of_turn>/<end_of_turn>.
     if (arch.find("gemma") != std::string::npos)

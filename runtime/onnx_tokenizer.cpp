@@ -389,6 +389,8 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
 
     // 2. Parse config for special tokens
     std::string cfgPath = (fs::path(modelDir) / "config.json").string();
+    if (!fs::exists(cfgPath))
+        cfgPath = (fs::path(modelDir) / "genai_config.json").string();
     std::ifstream cfgFile(cfgPath);
     if (cfgFile.is_open()) {
         std::string cfgStr((std::istreambuf_iterator<char>(cfgFile)),
