@@ -5456,8 +5456,7 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
             ap[0] = kvDimL;
             ap[1] = cfg.nHead / cfg.nKvHeads;
             ap[2] = Tl; ap[3] = isSWA ? T_total - Tl : 0u; ap[4] = nchL;
-            float scaleL = cfg.arch == "gemma4" ? 1.0f
-                                                  : 1.0f / sqrtf((float)hdL);
+            float scaleL = 1.0f / sqrtf((float)hdL);
             float neg_inf = -1e9f;
             memcpy(&ap[5], &scaleL, 4);
             memcpy(&ap[6], &neg_inf, 4);
@@ -5536,7 +5535,7 @@ void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot)
             uint32_t ad[8] = {kvDimL, cfg.nHead / cfg.nKvHeads, Tl,
                               isSWA ? T_total - Tl : 0u, (Tl + gqaChunkSize - 1) / gqaChunkSize,
                               0, 0, reinterpret_cast<const uint32_t*>(chunkedAttnParamData.data())[7]};
-            float scaleL = cfg.arch == "gemma4" ? 1.0f : 1.0f / sqrtf((float)hdL);
+            float scaleL = 1.0f / sqrtf((float)hdL);
             float negInf = -1e9f;
             memcpy(&ad[5], &scaleL, 4);
             memcpy(&ad[6], &negInf, 4);
@@ -6035,7 +6034,7 @@ int32_t ModelRunner::prefillGemmaBatched(
             uint32_t total=cacheLen+M;
             uint32_t kvStart=(swa&&cfg.slidingWindow>0&&total>cfg.slidingWindow)
                 ? total-cfg.slidingWindow:0u;
-            float ascale=1.0f,ni=-1e9f;uint32_t asb,nib;
+            float ascale=1.0f/sqrtf((float)hd),ni=-1e9f;uint32_t asb,nib;
             memcpy(&asb,&ascale,4);memcpy(&nib,&ni,4);
             auto ap=mkP("gpf_attn_"+std::to_string(li),
                 {kvdim,cfg.nHead/cfg.nKvHeads,total,cacheLen,M,asb,nib,kvStart},true);
