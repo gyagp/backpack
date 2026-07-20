@@ -150,6 +150,25 @@ static bool ensureCpuBackedFloat32(OpContext& ex, GpuTensor& tensor, const std::
         return tensor.buffer.handle != nullptr;
     }
 
+    // Dynamic fp16 tensors must stay on the GPU.  The previous fallback read
+    // the whole tensor to the CPU, converted it, and uploaded it again.  Mixed
+    // fp16/fp32 attention gates hit that path once per attention layer and
+    // introduced a blocking fence for every Mul.  Match ORT WebGPU's approach
+    // by encoding an ordered GPU cast into the current command stream.
+    if (tensor.buffer.handle && tensor.cpuData.empty() && !ex.GetInitData(name)) {
+        const uint32_t count = static_cast<uint32_t>(tensor.ElementCount());
+        GpuTensor converted = ex.AllocTensor(tensor.shape, TensorDtype::Float32);
+        auto params = makeParamBuf(ex, count);
+        auto& pipeline = ex.GetPipeline("elementwise_cast_f16_to_f32",
+                                        WGSL_CAST_F16_TO_F32, 3);
+        auto group = ex.MakeBindGroup(pipeline, {
+            {0, tensor.buffer}, {1, converted.buffer}, {2, params}});
+        ex.QueueDispatch(pipeline.pipeline, group, (count + 255) / 256, 1, 1,
+                         "CastF16ToF32");
+        tensor = std::move(converted);
+        return true;
+    }
+
     const uint8_t* src = nullptr;
     size_t bytes = 0;
     std::vector<uint8_t> gpuReadback;
