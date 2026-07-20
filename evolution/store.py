@@ -574,6 +574,7 @@ class Store:
 
     def claim_run(self, machine_name: str, capabilities: list[str], actor: str) -> dict[str, Any] | None:
         """Atomically claim the oldest pending run this worker knows how to execute."""
+        self.expire_stale_runs()
         machine = self._row(self._db.execute(
             "SELECT * FROM machines WHERE lower(name)=lower(?)", (machine_name,)).fetchone())
         if not machine:
@@ -617,10 +618,11 @@ class Store:
         if status not in {"pending", "running", "completed", "failed", "blocked", "cancelled"}:
             raise DomainError("invalid run status")
         requested_failure = status == "failed"
+        timed_out = str(data.get("error", "")).lower().startswith("timeout:")
         prior_failures = self._db.execute(
             "SELECT COUNT(*) FROM audit_events WHERE entity_type='run' AND entity_id=? AND event_type='automatic_retry'",
             (run_id,)).fetchone()[0]
-        if requested_failure and prior_failures < 2:
+        if requested_failure and not timed_out and prior_failures < 2:
             status = "pending"
             data = {**data, "phase": f"automatic repair/retry {prior_failures + 1}/2", "progress": 0}
         now = utc_now()
@@ -643,6 +645,35 @@ class Store:
                 self._db.execute("UPDATE machines SET current_run_id=NULL WHERE current_run_id=?", (run_id,))
         return self.get_run(run_id)  # type: ignore[return-value]
 
+    def expire_stale_runs(self, benchmark_timeout_seconds: int = 1800) -> int:
+        """Fail abandoned benchmark runs so a device can claim its next task."""
+        now = datetime.now(timezone.utc)
+        expired = []
+        for run in (item for item in self.list_runs() if item["status"] == "running"):
+            task = self.get_task(run["task_id"])
+            if not task or task["kind"] != "benchmark" or not run.get("started_at"):
+                continue
+            timeout = int(task.get("manifest", {}).get("timeout_seconds") or benchmark_timeout_seconds)
+            try:
+                elapsed = (now - datetime.fromisoformat(run["started_at"])).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if elapsed > timeout:
+                expired.append((run, timeout, int(elapsed)))
+        if not expired:
+            return 0
+        stamp = utc_now()
+        with self._lock, self._db:
+            for run, timeout, elapsed in expired:
+                error = f"timeout: exceeded {timeout} seconds (observed after {elapsed} seconds)"
+                self._db.execute("""UPDATE task_runs SET status='failed',phase='timed out',progress=100,
+                  error=?,completed_at=?,updated_at=? WHERE id=? AND status='running'""",
+                                 (error, stamp, stamp, run["id"]))
+                self._db.execute("UPDATE machines SET current_run_id=NULL WHERE current_run_id=?", (run["id"],))
+                self.audit("run", run["id"], "timed_out", "scheduler",
+                           {"timeout_seconds": timeout, "elapsed_seconds": elapsed})
+        return len(expired)
+
     def status(self) -> dict[str, Any]:
         counts = {row["state"]: row["n"] for row in self._db.execute("SELECT state,COUNT(*) n FROM tasks GROUP BY state")}
         return {
@@ -653,6 +684,7 @@ class Store:
         }
 
     def activity(self, limit: int = 40) -> dict[str, Any]:
+        self.expire_stale_runs()
         now = datetime.now(timezone.utc)
         fleet = []
         for machine in self.list_machines():

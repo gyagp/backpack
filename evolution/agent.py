@@ -120,10 +120,49 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                  {"status": "running", "phase": "validating Codex repair" if execution_repo != repo else "executing",
                   "progress": 10}, name)
     started = time.monotonic()
-    completed = subprocess.run(
-        argv, cwd=execution_repo, text=True, encoding="utf-8", errors="replace",
-        capture_output=True, timeout=7200, shell=False,
-    )
+    timeout_seconds = int(manifest.get("timeout_seconds") or (1800 if task.get("kind") == "benchmark" else 7200))
+    live_dir = repo / "gitignore" / "evolution" / "live"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path, stderr_path = live_dir / f"{run_id}.stdout.log", live_dir / f"{run_id}.stderr.log"
+    timed_out = False
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_file, \
+            stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_file:
+        process = subprocess.Popen(argv, cwd=execution_repo, text=True, encoding="utf-8", errors="replace",
+                                   stdout=stdout_file, stderr=stderr_file, shell=False)
+        last_upload = 0.0
+        while process.poll() is None:
+            elapsed = time.monotonic() - started
+            if elapsed >= timeout_seconds:
+                timed_out = True
+                if platform.system() == "Windows":
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   capture_output=True, timeout=30, shell=False)
+                else:
+                    process.kill()
+                process.wait(timeout=30)
+                break
+            if elapsed - last_upload >= 10:
+                stdout_file.flush(); stderr_file.flush()
+                stdout_tail = stdout_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+                stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+                request_json(server + f"/api/runs/{run_id}", "POST", {
+                    "status": "running", "phase": "executing", "progress": 10,
+                    "result": {"live": True, "elapsed_seconds": round(elapsed, 1),
+                               "stdout_tail": stdout_tail, "stderr_tail": stderr_tail},
+                }, name)
+                last_upload = elapsed
+            time.sleep(1)
+    stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+    stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    if timed_out:
+        request_json(server + f"/api/runs/{run_id}", "POST", {
+            "status": "failed", "phase": "timed out", "progress": 100,
+            "error": f"timeout: exceeded {timeout_seconds} seconds",
+            "result": {"argv": argv, "timeout_seconds": timeout_seconds,
+                       "stdout_tail": stdout[-12000:], "stderr_tail": stderr[-12000:]},
+        }, name)
+        return
+    completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
     result = {"argv": argv, "exit_code": completed.returncode,
               "duration_seconds": round(time.monotonic() - started, 3),
               "stdout_tail": completed.stdout[-12000:], "stderr_tail": completed.stderr[-12000:]}

@@ -152,6 +152,24 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(42, completed["result"]["decode_tok_s"])
         self.assertIsNotNone(completed["completed_at"])
 
+    def test_stale_benchmark_run_times_out_without_retry(self) -> None:
+        task = self.store.create_task({"title": "Timed benchmark", "kind": "benchmark",
+                                       "hypothesis": "Measure throughput",
+                                       "manifest": {"adapter": "argv", "argv": ["benchmark"],
+                                                    "timeout_seconds": 1},
+                                       "device_policy": {"machine_ids": [self.machine["id"]]}})
+        self.store.ensure_task_runs()
+        run = next(item for item in self.store.list_runs(task["id"]) if item["machine_id"] == self.machine["id"])
+        self.store.update_run(run["id"], {"status": "running"}, "agent")
+        with self.store._db:
+            self.store._db.execute("UPDATE task_runs SET started_at=? WHERE id=?",
+                                   ("2020-01-01T00:00:00+00:00", run["id"]))
+        self.assertEqual(1, self.store.expire_stale_runs())
+        expired = self.store.get_run(run["id"])
+        self.assertEqual("failed", expired["status"])
+        self.assertEqual("timed out", expired["phase"])
+        self.assertIn("timeout:", expired["error"])
+
     def test_worker_claim_is_capability_filtered_and_atomic(self) -> None:
         executable = self.store.create_task({
             "title": "Typed diagnostic", "kind": "correctness", "hypothesis": "Run a diagnostic",
