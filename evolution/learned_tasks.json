@@ -23,7 +23,7 @@
     "kind": "correctness",
     "hypothesis": "Native ORT WebGPU logits and generated outputs provide a format-independent reference for Backpack ORT and GGUF localization.",
     "source": {"type": "upstream", "project": "onnxruntime-genai", "url": "https://github.com/microsoft/onnxruntime-genai"},
-    "manifest": {"models": ["gemma-4-e2b-it-qat"], "format": "ort", "runtime": "ort", "backend": "webgpu-native"},
+    "manifest": {"models": ["gemma-4-e2b-it-qat"], "format": "ort", "runtime": "ort", "backend": "webgpu"},
     "device_policy": {"required": [{"selector": {"role": "required"}, "count": 3}]}
   },
   {

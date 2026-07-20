@@ -22,7 +22,7 @@ Use `--host` and `--port` to change the listener.
 On each benchmark machine:
 
 ```powershell
-$env:BP_EVOLUTION_BACKEND = "d3d12"
+$env:BP_EVOLUTION_BACKEND = "webgpu"
 python -m evolution.agent --server http://control-host:8787 register
 ```
 

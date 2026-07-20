@@ -127,6 +127,9 @@ class Store:
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
+        with self._db:
+            self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
+            self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
 
     def close(self) -> None:
         self._db.close()
@@ -510,8 +513,7 @@ class Store:
                         "--model", model_entry["path"], "--prompt-tokens", "128",
                         "--generation-tokens", "128", "--repetitions", "5"]
             else:
-                argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"],
-                        "--backend", "d3d12"]
+                argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"]]
             if task["kind"] == "benchmark":
                 if runtime.get("framework") != "llamacpp":
                     argv.append("--benchmark")
@@ -787,10 +789,13 @@ class Store:
         if conformance not in {"pass", "fail", "unknown", "not_applicable"}:
             raise DomainError("invalid conformance status")
         observation_id = data.get("id") or f"obs-{uuid.uuid4().hex[:12]}"
+        backend = data.get("backend", "webgpu")
+        if framework in {"backpack", "ort"} and backend in {"d3d12", "webgpu-native", "webgpu"}:
+            backend = "webgpu"
         with self._lock, self._db:
             self._db.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
                 observation_id, model_id, machine_id, framework, data.get("format", "gguf"),
-                data.get("backend", "d3d12"), conformance,
+                backend, conformance,
                 json_text(data.get("conformance_details") or {}), json_text(data.get("metrics") or {}),
                 data.get("revision"), json_text(data.get("artifacts") or []), utc_now(),
             ))
@@ -853,11 +858,15 @@ class Store:
             cells = []
             for machine in machines:
                 items = by_cell.get((model["id"], machine["id"]), [])
-                backpack = next((x for x in items if x["framework"] == "backpack"), None)
+                backpack = next((x for x in items if x["framework"] == "backpack"
+                                 and x["format"] == "gguf" and x["backend"] == "webgpu"), None)
+                if not backpack:
+                    backpack = next((x for x in items if x["framework"] == "backpack"
+                                     and x["backend"] == "webgpu"), None)
                 conformant = bool(backpack and backpack["conformance"] == "pass")
                 cells.append({"machine": machine, "conformant": conformant,
                               "conformance": backpack["conformance"] if backpack else "unknown",
-                              "results": items if conformant else [x for x in items if x["framework"] == "backpack"]})
+                              "results": items})
             rows.append({"model": model, "cells": cells})
         return {"models": rows, "machines": machines}
 
@@ -885,12 +894,16 @@ class Store:
                 created.append(task)
                 open_tasks.append(task)
 
-            for cell in (c for c in row["cells"] if c["conformant"]):
+            for cell in row["cells"]:
                 expected = []
                 if "gguf" in model.get("files", {}):
-                    expected += [("backpack", "gguf", "d3d12"), ("llamacpp", "gguf", "vulkan")]
+                    if cell["conformant"]:
+                        expected.append(("backpack", "gguf", "webgpu"))
+                    expected.append(("llamacpp", "gguf", "vulkan"))
                 if "ort" in model.get("files", {}):
-                    expected += [("backpack", "ort", "d3d12"), ("ort", "ort", "webgpu-native")]
+                    if cell["conformant"]:
+                        expected.append(("backpack", "ort", "webgpu"))
+                    expected.append(("ort", "ort", "webgpu"))
                 missing = []
                 for framework, fmt, backend in expected:
                     result = next((item for item in cell["results"] if item["framework"] == framework
