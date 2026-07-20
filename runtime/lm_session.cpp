@@ -261,14 +261,22 @@ struct GenericOnnxState {
         headDim = hiddenSize / numHeads;
         convLCache = cfg.has("conv_L_cache") ? cfg["conv_L_cache"].as_int() : 3;
         intermediateSize = cfg.has("intermediate_size") ? cfg["intermediate_size"].as_int() : 7168;
-        convChannels = cfg.has("linear_conv_kernel_dim")
-            ? 3 * hiddenSize : hiddenSize;
         recurrentHeads = cfg.has("linear_num_value_heads")
             ? cfg["linear_num_value_heads"].as_int() : 0;
         recurrentKeyDim = cfg.has("linear_key_head_dim")
             ? cfg["linear_key_head_dim"].as_int() : 0;
         recurrentValueDim = cfg.has("linear_value_head_dim")
             ? cfg["linear_value_head_dim"].as_int() : 0;
+        if (cfg.has("linear_conv_kernel_dim")) {
+            const int64_t keyHeads = cfg.has("linear_num_key_heads")
+                ? cfg["linear_num_key_heads"].as_int() : recurrentHeads;
+            // The convolution packs Q, K, and V. Q/K use key-head geometry,
+            // while V uses value-head geometry; this is not generally 3H.
+            convChannels = 2 * keyHeads * recurrentKeyDim +
+                           recurrentHeads * recurrentValueDim;
+        } else {
+            convChannels = hiddenSize;
+        }
         if (cfg.has("linear_conv_kernel_dim"))
             convLCache = cfg["linear_conv_kernel_dim"].as_int() - 1;
         moeIntermediateSize = cfg.has("moe_intermediate_size") ? cfg["moe_intermediate_size"].as_int() : 1792;
