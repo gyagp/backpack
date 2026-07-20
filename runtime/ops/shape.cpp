@@ -354,8 +354,17 @@ static void opGather(OpContext& ex, const OnnxGraphNode& n,
         return;
     }
 
-    // GPU Gather only handles axis=0. For axis!=0, force CPU readback.
-    if (axis != 0 && !haveDataRaw && haveIndexVals && data->buffer.handle) {
+    // Keep a CPU fallback for byte layouts that cannot be addressed safely by
+    // the u32 GPU kernel. Aligned floating-point gathers stay GPU-resident for
+    // every axis (notably Qwen's last-token logits pruning on axis 1).
+    int ndim = (int)data->shape.size();
+    int64_t normAxis = axis;
+    if (normAxis < 0) normAxis += ndim;
+    int64_t innerElements = 1;
+    for (int i = (int)normAxis + 1; i < ndim; i++) innerElements *= data->shape[i];
+    const bool gpuLayoutAligned = normAxis >= 0 && normAxis < ndim &&
+        ((size_t)innerElements * data->DtypeSize()) % sizeof(uint32_t) == 0;
+    if (axis != 0 && !gpuLayoutAligned && !haveDataRaw && haveIndexVals && data->buffer.handle) {
         size_t readBytes = std::min(data->ByteSize(), data->buffer.size);
         if (readBytes >= data->DtypeSize() && readBytes <= 8000000) {
             ex.FlushPendingWork();
@@ -366,9 +375,6 @@ static void opGather(OpContext& ex, const OnnxGraphNode& n,
 
     // CPU path for non-zero axis gather
     if (haveDataRaw && haveIndexVals && axis != 0 && !data->shape.empty()) {
-        int ndim = (int)data->shape.size();
-        int64_t normAxis = axis;
-        if (normAxis < 0) normAxis += ndim;
         size_t elemSize = data->DtypeSize();
 
         std::vector<int64_t> os;
@@ -409,20 +415,21 @@ static void opGather(OpContext& ex, const OnnxGraphNode& n,
         return;
     }
 
-    // GPU path: dispatch gather kernel (axis=0 only)
+    // GPU path: dispatch the general-axis gather kernel.
     ex.EnsureGpu(*data);
     ex.EnsureGpu(*indices);
 
-    int64_t inner = 1;
-    for (size_t i=1; i<data->shape.size(); i++) inner *= data->shape[i];
+    int64_t outer = 1, inner = 1;
+    for (int i = 0; i < (int)normAxis; i++) outer *= data->shape[i];
+    for (int i = (int)normAxis + 1; i < ndim; i++) inner *= data->shape[i];
     size_t elemSize = data->DtypeSize();
-    uint32_t sliceSizeU32 = (uint32_t)((inner * elemSize + 3) / 4);
-    uint32_t dataStrideU32 = sliceSizeU32;
+    uint32_t innerU32 = (uint32_t)(inner * elemSize / 4);
 
     std::vector<int64_t> os;
+    for (int i = 0; i < (int)normAxis; i++) os.push_back(data->shape[i]);
     for (auto d : indices->shape) if (d > 0) os.push_back(d);
-    for (size_t i=1; i<data->shape.size(); i++) os.push_back(data->shape[i]);
-    if (os.empty()) for (size_t i=1; i<data->shape.size(); i++) os.push_back(data->shape[i]);
+    for (int i = (int)normAxis + 1; i < ndim; i++) os.push_back(data->shape[i]);
+    if (os.empty()) os.push_back(1);
 
     *out[0] = ex.AllocTensor(os, data->dtype);
 
@@ -440,8 +447,9 @@ static void opGather(OpContext& ex, const OnnxGraphNode& n,
         }
     }
 
-    uint32_t total = (uint32_t)(nIdx * sliceSizeU32);
-    uint32_t params[4] = {(uint32_t)nIdx, sliceSizeU32, dataStrideU32, 0};
+    uint32_t total = (uint32_t)(outer * nIdx * innerU32);
+    uint32_t params[4] = {(uint32_t)outer, (uint32_t)data->shape[normAxis],
+                          innerU32, (uint32_t)nIdx};
     auto paramBuf = ex.getParamBuffer(16);
     ex.getGpu()->writeBuffer(paramBuf, params, 16);
 

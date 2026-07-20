@@ -596,13 +596,14 @@ TEST(gather) {
     std::vector<uint32_t> data(nRows * sliceSize);
     for (int i = 0; i < nRows * sliceSize; i++) data[i] = (uint32_t)i;
     int32_t indices[] = {2, 0, 5};
-    uint32_t paramsData[] = {(uint32_t)nIdx, (uint32_t)sliceSize, (uint32_t)sliceSize};
+    uint32_t paramsData[] = {1, (uint32_t)nRows, (uint32_t)sliceSize,
+                             (uint32_t)nIdx};
 
     int total = nIdx * sliceSize;
     auto bufData = makeBufferU32(gpu, "Data", data.data(), nRows * sliceSize);
     auto bufIdx = makeBufferI32(gpu, "Indices", indices, nIdx);
     auto bufOut = makeBufferU32(gpu, "Out", nullptr, total);
-    auto bufP = makeBufferU32(gpu, "params", paramsData, 3);
+    auto bufP = makeBufferU32(gpu, "params", paramsData, 4);
 
     auto result = dispatchAndReadback(gpu, wgsl,
         {{0, bufData}, {1, bufIdx}, {2, bufOut}, {3, bufP}},

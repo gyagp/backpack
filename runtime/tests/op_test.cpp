@@ -506,7 +506,8 @@ static std::map<std::string, TestOutput> runOnnxModel(
     const std::vector<std::string>& outputNames)
 {
     // Write to temp file
-    auto tmpDir = fs::temp_directory_path() / ("bptest_" + std::to_string(g_tempCounter++));
+    auto tmpDir = fs::current_path() / "gitignore" / "runtime" / "op-tests" /
+                  ("bptest_" + std::to_string(g_tempCounter++));
     fs::create_directories(tmpDir);
     auto modelPath = (tmpDir / "model.onnx").string();
     {
@@ -514,7 +515,10 @@ static std::map<std::string, TestOutput> runOnnxModel(
         f.write(reinterpret_cast<const char*>(onnxBytes.data()), onnxBytes.size());
     }
 
-    // Load model
+    std::map<std::string, TestOutput> results;
+    {
+    // Keep the mapped model inside a scope so its Windows file handle closes
+    // before removing the temporary model directory.
     GraphExecutor executor;
     if (!executor.Load(gpu, modelPath)) {
         fs::remove_all(tmpDir);
@@ -560,7 +564,6 @@ static std::map<std::string, TestOutput> runOnnxModel(
     gpu.waitForQueue();
 
     // Read back
-    std::map<std::string, TestOutput> results;
     for (auto& name : outputNames) {
         auto* t = outputPtrs.count(name) ? outputPtrs[name] : nullptr;
         if (!t || !t->IsValid()) continue;
@@ -587,6 +590,7 @@ static std::map<std::string, TestOutput> runOnnxModel(
     // Clear handles to prevent dangling pointer issues.
     for (auto& [n, t] : inputTensors) t.buffer = {nullptr, 0};
     for (auto& [n, t] : outputTensors) t.buffer = {nullptr, 0};
+    }
     fs::remove_all(tmpDir);
 
     return results;
@@ -951,6 +955,21 @@ TEST(gather) {
          {"indices", makeInputI64("indices", {2}, indices)}},
         {"Y"});
     assertCloseVec(outputs["Y"].asFloat32(), expected);
+
+    // Last-token pruning must remain GPU-resident: [outer, sequence, vocab]
+    // gathered at axis 1 with ONNX's negative index convention.
+    std::vector<float> logits = {
+        1, 2, 3, 4,  5, 6, 7, 8,
+        9,10,11,12, 13,14,15,16};
+    auto axis1Model = buildOnnxModel(
+        {{"Gather", {"data", "indices"}, {"Y"}, {{"axis", AttrDef::INT, 1}}}},
+        {{"data", ONNX_FLOAT, {2, 2, 4}}, {"indices", ONNX_INT64, {1}}},
+        {{"Y", ONNX_FLOAT, {2, 1, 4}}});
+    auto axis1Outputs = runOnnxModel(gpu, axis1Model,
+        {{"data", makeInputF32("data", {2, 2, 4}, logits)},
+         {"indices", makeInputI64("indices", {1}, {-1})}}, {"Y"});
+    assertCloseVec(axis1Outputs["Y"].asFloat32(),
+                   {5, 6, 7, 8, 13, 14, 15, 16});
 }
 
 TEST(split) {
