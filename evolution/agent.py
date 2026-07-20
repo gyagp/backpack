@@ -142,11 +142,26 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                 if repair.get("candidate_sha"):
                     status = "pending"
     if status == "completed" and task.get("kind") == "benchmark":
+        canonical = re.search(r"(?m)^EVOLUTION_METRICS (\{.*\})$", completed.stdout)
+        runtime = (manifest.get("runtimes") or [{}])[0]
+        if canonical:
+            metrics = json.loads(canonical.group(1))
+            revision_match = re.search(r"(?m)^LLAMACPP_REVISION (\S+)$", completed.stdout)
+            origin = task.get("origin", {})
+            request_json(server + "/api/observations", "POST", {
+                "model_id": origin.get("model_id") or next(iter(manifest.get("models") or []), ""),
+                "machine_id": run["machine_id"], "framework": runtime.get("framework", "llamacpp"),
+                "format": runtime.get("format", "gguf"), "backend": runtime.get("backend", "vulkan"),
+                "conformance": "not_applicable",
+                "revision": revision_match.group(1) if revision_match else "unknown",
+                "conformance_details": {"source": f"benchmark task {task.get('id', run['task_id'])}"},
+                "metrics": metrics, "artifacts": [],
+            }, name)
         rows = re.findall(
             r"(?m)^\s*(\d+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)(?:\s+([0-9.]+)\s+([0-9.]+)%)?\s*$",
             completed.stdout + "\n" + completed.stderr,
         )
-        if rows:
+        if rows and not canonical:
             prompt_tokens, prefill_ms, prefill_rate, decode_ms, decode_rate, fence_ms, fence_pct = rows[-1]
             origin, manifest = task.get("origin", {}), task.get("manifest", {})
             model_path = next((argv[i + 1] for i, value in enumerate(argv[:-1]) if value == "--model"), "")

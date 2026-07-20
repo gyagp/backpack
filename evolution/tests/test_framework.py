@@ -132,10 +132,11 @@ class FrameworkTest(unittest.TestCase):
                                     "framework": "backpack", "format": "gguf", "backend": "d3d12",
                                     "conformance": "pass", "metrics": {}, "revision": "test"}, "test")
         tasks = self.store.ensure_automatic_tasks()
-        perf = next(task for task in tasks if task["kind"] == "benchmark")
-        runtimes = perf["manifest"]["runtimes"]
+        perf = [task for task in tasks if task["kind"] == "benchmark"]
+        runtimes = [runtime for task in perf for runtime in task["manifest"]["runtimes"]]
         self.assertTrue(any(item["framework"] == "backpack" for item in runtimes))
         self.assertTrue(any(item["framework"] == "llamacpp" for item in runtimes))
+        self.assertTrue(all(len(task["manifest"]["runtimes"]) == 1 for task in perf))
 
     def test_device_runs_track_real_execution_state_and_result(self) -> None:
         self.store.ensure_task_runs()

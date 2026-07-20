@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
 import uuid
 import re
@@ -503,10 +504,17 @@ class Store:
             model_entry = files.get("gguf") or files.get("ort")
             if not model_entry or not model_entry.get("path"):
                 continue
-            argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"],
-                    "--backend", "d3d12"]
+            runtime = next(iter(manifest.get("runtimes") or []), {})
+            if task["kind"] == "benchmark" and runtime.get("framework") == "llamacpp":
+                argv = [sys.executable, r"D:\workspace\project\backpack\evolution\benchmark_llamacpp.py",
+                        "--model", model_entry["path"], "--prompt-tokens", "128",
+                        "--generation-tokens", "128", "--repetitions", "5"]
+            else:
+                argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"],
+                        "--backend", "d3d12"]
             if task["kind"] == "benchmark":
-                argv.append("--benchmark")
+                if runtime.get("framework") != "llamacpp":
+                    argv.append("--benchmark")
             else:
                 spec = (model or {}).get("conformance_spec", {})
                 argv += ["--prompt", spec.get("prompt", "What is 2 + 2?"), "--max-tokens", "32"]
@@ -692,7 +700,8 @@ class Store:
                                    and item["framework"] == requirement["framework"]
                                    and item["format"] == requirement["format"]
                                    and item["backend"] == requirement["backend"]), None)
-                    complete = bool(result and result.get("metrics", {}).get("decode_tok_s") is not None)
+                    complete = bool(result and result.get("metrics", {}).get("prefill_tok_s") is not None
+                                    and result.get("metrics", {}).get("decode_tok_s") is not None)
                     runtime_status.append({"name": f"{requirement['framework']}/{requirement['backend']}",
                                            "status": "complete" if complete else "pending"})
                 completed = sum(item["status"] == "complete" for item in runtime_status)
@@ -886,28 +895,32 @@ class Store:
                 for framework, fmt, backend in expected:
                     result = next((item for item in cell["results"] if item["framework"] == framework
                                    and item["format"] == fmt and item["backend"] == backend), None)
-                    if not result or result.get("metrics", {}).get("decode_tok_s") is None:
+                    if (not result or result.get("metrics", {}).get("prefill_tok_s") is None
+                            or result.get("metrics", {}).get("decode_tok_s") is None):
                         missing.append({"framework": framework, "format": fmt, "backend": backend})
                 if not missing:
                     continue
                 machine = cell["machine"]
-                key = f"performance:{model['id']}:{machine['id']}"
-                duplicate_perf = any(t.get("origin", {}).get("automation_key") == key
-                                     and t["state"] not in {"integrated", "rejected", "failed", "reverted"}
-                                     for t in open_tasks)
-                if duplicate_perf:
-                    continue
-                task = self.create_task({
-                    "title": f"Collect {model['name']} performance on {machine['name']}", "kind": "benchmark",
-                    "hypothesis": "A conformant model/device cell requires Backpack and reference performance baselines.",
-                    "origin": {"type": "automatic", "automation_key": key, "model_id": model["id"],
-                               "machine_id": machine["id"]},
-                    "manifest": {"models": [model["id"]], "metrics": ["prefill_tok_s", "decode_tok_s"],
-                                 "runtimes": missing, "conformance_first": True},
-                    "device_policy": {"machine_ids": [machine["id"]]},
-                }, "automation")
-                created.append(task)
-                open_tasks.append(task)
+                for runtime in missing:
+                    key = (f"performance:{model['id']}:{machine['id']}:"
+                           f"{runtime['framework']}:{runtime['backend']}")
+                    duplicate_perf = any(t.get("origin", {}).get("automation_key") == key
+                                         and t["state"] not in {"integrated", "rejected", "failed", "reverted"}
+                                         for t in open_tasks)
+                    if duplicate_perf:
+                        continue
+                    task = self.create_task({
+                        "title": (f"Collect {model['name']} {runtime['framework']}/{runtime['backend']} "
+                                  f"performance on {machine['name']}"), "kind": "benchmark",
+                        "hypothesis": "Prefill and decode throughput must be measured independently.",
+                        "origin": {"type": "automatic", "automation_key": key, "model_id": model["id"],
+                                   "machine_id": machine["id"]},
+                        "manifest": {"models": [model["id"]], "metrics": ["prefill_tok_s", "decode_tok_s"],
+                                     "runtimes": [runtime], "conformance_first": True},
+                        "device_policy": {"machine_ids": [machine["id"]]},
+                    }, "automation")
+                    created.append(task)
+                    open_tasks.append(task)
         return created
 
     def add_history(self, data: dict[str, Any], actor: str) -> dict[str, Any]:
