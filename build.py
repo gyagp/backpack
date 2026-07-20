@@ -60,7 +60,10 @@ def invoke_clone():
 
 def invoke_msvc():
     write_step("Loading MSVC environment")
-    if shutil.which("cl"):
+    # Avoid searching an arbitrarily long inherited PATH unless a developer
+    # environment is known to be active. On unhealthy Windows installations,
+    # probing stale PATH entries can itself take minutes.
+    if os.environ.get("VSCMD_VER") and shutil.which("cl"):
         write_skip("MSVC already loaded (cl.exe found)")
         return os.environ.copy()
 
@@ -119,10 +122,12 @@ def invoke_msvc():
             str(msvc / "bin" / "Hostx64" / "x64"),
             str(vs_root / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja"),
             str(kits_root / "bin" / sdk / "x64"),
+            str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "CMake" / "bin"),
             new_env.get("PATH", ""),
         ]
         include_parts = [
             str(msvc / "include"),
+            str(msvc / "atlmfc" / "include"),
             str(include_root / sdk / "ucrt"),
             str(include_root / sdk / "um"),
             str(include_root / sdk / "shared"),
@@ -131,13 +136,37 @@ def invoke_msvc():
         ]
         lib_parts = [
             str(msvc / "lib" / "x64"),
+            str(msvc / "atlmfc" / "lib" / "x64"),
             str(lib_root / sdk / "ucrt" / "x64"),
             str(lib_root / sdk / "um" / "x64"),
         ]
         new_env["PATH"] = os.pathsep.join(path_parts)
         new_env["INCLUDE"] = os.pathsep.join(include_parts)
         new_env["LIB"] = os.pathsep.join(lib_parts)
+        new_env["LIBPATH"] = os.pathsep.join([
+            str(msvc / "lib" / "x64"),
+            str(kits_root / "UnionMetadata" / sdk),
+            str(kits_root / "References" / sdk),
+        ])
         return new_env
+
+    # VsDevCmd runs every installed extension, including vcpkg-init.cmd. A
+    # damaged or partially updated VS vcpkg installation can block there
+    # indefinitely before cl.exe is ever reached. This project only needs the
+    # compiler and Windows SDK paths, so synthesize that small environment by
+    # default. Set BACKPACK_USE_VCVARS=1 only when a custom VS extension is
+    # intentionally required.
+    if os.environ.get("BACKPACK_USE_VCVARS") != "1":
+        new_env = load_manual_msvc_env()
+        if new_env:
+            os.environ.update(new_env)
+            cl_path = shutil.which("cl", path=new_env["PATH"])
+            if cl_path:
+                # Do not launch a probe compiler process here. A damaged VS
+                # installation can make process teardown itself block; the
+                # actual CMake/Ninja invocation will report compiler errors.
+                write_ok(f"MSVC loaded from installed paths: {cl_path}")
+                return new_env
 
     print(f"  Loading from: {vcvars}")
     try:
@@ -156,12 +185,10 @@ def invoke_msvc():
         for k, v in new_env.items():
             os.environ[k] = v
 
-        try:
-            cl_ver = subprocess.check_output("cl 2>&1", env=os.environ, shell=True, stderr=subprocess.STDOUT, text=True).splitlines()[0]
-        except subprocess.CalledProcessError as e:
-            cl_ver = e.output.splitlines()[0] if e.output else "unknown"
-
-        write_ok(f"MSVC loaded: {cl_ver}")
+        cl_path = shutil.which("cl", path=new_env.get("PATH"))
+        if not cl_path:
+            raise RuntimeError("vcvars64.bat completed but cl.exe was not found")
+        write_ok(f"MSVC loaded: {cl_path}")
         return new_env
     except Exception as e:
         write_skip(f"vcvars64.bat failed: {e}")
@@ -170,11 +197,11 @@ def invoke_msvc():
             write_error("Failed to synthesize MSVC environment")
             sys.exit(1)
         os.environ.update(new_env)
-        try:
-            cl_ver = subprocess.check_output("cl 2>&1", env=os.environ, shell=True, stderr=subprocess.STDOUT, text=True).splitlines()[0]
-        except subprocess.CalledProcessError as ce:
-            cl_ver = ce.output.splitlines()[0] if ce.output else "unknown"
-        write_ok(f"MSVC loaded from installed paths: {cl_ver}")
+        cl_path = shutil.which("cl", path=new_env.get("PATH"))
+        if not cl_path:
+            write_error("Synthesized MSVC environment does not contain cl.exe")
+            sys.exit(1)
+        write_ok(f"MSVC loaded from installed paths: {cl_path}")
         return new_env
 
 def invoke_dawn():
@@ -290,20 +317,30 @@ def invoke_runtime():
 
     write_step("Configuring runtime")
     RUNTIME_BUILD.mkdir(parents=True, exist_ok=True)
-    configure_cmd = (
-        f"cmake -S {RUNTIME_DIR} -B {RUNTIME_BUILD} -G Ninja "
-        f"-DCMAKE_BUILD_TYPE=Release "
-        f"-DDAWN_SRC={DAWN_DIR} "
-        f"-DDAWN_BUILD={DAWN_BUILD} "
-        f"-DDAWN_LIB={DAWN_DLL_DIR}"
-    )
-    if not run_cmd(configure_cmd, check=False):
-        write_error("Runtime CMake configure failed")
-        sys.exit(1)
-    write_ok(f"Runtime configured at {RUNTIME_BUILD}")
+    have_ninja_tree = (RUNTIME_BUILD / "build.ninja").exists() and \
+                      (RUNTIME_BUILD / "CMakeCache.txt").exists()
+    force_configure = os.environ.get("BACKPACK_RECONFIGURE") == "1"
+    if have_ninja_tree and not force_configure:
+        # Ninja tracks CMake inputs and regenerates only when required. Avoid
+        # launching a redundant CMake configure on every incremental build:
+        # stale/orphaned CMake state on Windows can otherwise wedge a healthy
+        # compiler toolchain before Ninja is reached.
+        write_skip(f"Using existing Ninja tree at {RUNTIME_BUILD}")
+    else:
+        configure_cmd = (
+            f"cmake -S {RUNTIME_DIR} -B {RUNTIME_BUILD} -G Ninja "
+            f"-DCMAKE_BUILD_TYPE=Release "
+            f"-DDAWN_SRC={DAWN_DIR} "
+            f"-DDAWN_BUILD={DAWN_BUILD} "
+            f"-DDAWN_LIB={DAWN_DLL_DIR}"
+        )
+        if not run_cmd(configure_cmd, check=False):
+            write_error("Runtime CMake configure failed")
+            sys.exit(1)
+        write_ok(f"Runtime configured at {RUNTIME_BUILD}")
 
     write_step("Building runtime")
-    build_cmd = f"cmake --build {RUNTIME_BUILD} --target backpack_runtime --target backpack_llm"
+    build_cmd = f"ninja -C {RUNTIME_BUILD} backpack_runtime backpack_llm"
     if not run_cmd(build_cmd, check=False):
         write_error("Runtime build failed")
         sys.exit(1)

@@ -1,5 +1,3 @@
-enable subgroups;
-
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W_Q6K: array<u32>;
 @group(0) @binding(2) var<storage, read> Bias: array<f32>;
@@ -12,14 +10,15 @@ const QK_K: u32 = 256u;
 // Shared memory: cache X for the current super-block (256 elements)
 var<workgroup> smem_x: array<f32, 256>;
 
-fn get_u8(base_word: u32, byte_off: u32) -> u32 {
-    let wi = base_word + byte_off / 4u;
-    let sh = (byte_off % 4u) * 8u;
+fn get_u8(base_byte: u32, byte_off: u32) -> u32 {
+    let addr = base_byte + byte_off;
+    let wi = addr / 4u;
+    let sh = (addr % 4u) * 8u;
     return (W_Q6K[wi] >> sh) & 0xFFu;
 }
 
-fn get_i8(base_word: u32, byte_off: u32) -> i32 {
-    let u = get_u8(base_word, byte_off);
+fn get_i8(base_byte: u32, byte_off: u32) -> i32 {
+    let u = get_u8(base_byte, byte_off);
     return select(i32(u), i32(u) - 256, u >= 128u);
 }
 
@@ -54,7 +53,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
 
         if (col < N) {
-            let block_base = col * row_stride_words + b * row_stride_words / n_blocks;
+            // Q6_K blocks are 210 bytes and therefore alternate between word-
+            // aligned and half-word-aligned starts. Address them in bytes.
+            let block_base = col * row_stride_words * 4u + b * 210u;
 
             let d_u16 = get_u8(block_base, 208u) | (get_u8(block_base, 209u) << 8u);
             let d = unpack2x16float(d_u16).x;
@@ -98,7 +99,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let sum = subgroupAdd(acc);
+    // Keep the eight logical 32-lane columns independent on GPUs whose
+    // hardware subgroup width is not 32.
+    smem_x[tid] = acc;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset = offset / 2u) {
+        if (lane < offset) { smem_x[tid] += smem_x[tid + offset]; }
+        workgroupBarrier();
+    }
+    let sum = smem_x[warp_id * 32u];
     if (lane == 0u && col < N) {
         Y[row * N + col + y_offset] = sum + Bias[col];
     }

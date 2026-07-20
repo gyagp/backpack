@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <execution>
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
@@ -136,6 +137,7 @@ WGPUBindGroup ModelRunner::makeBG(
         memset(&entries[i], 0, sizeof(WGPUBindGroupEntry));
         entries[i].binding = bindings[i].first;
         entries[i].buffer  = bindings[i].second.handle;
+        entries[i].offset  = bindings[i].second.offset;
         entries[i].size    = bindings[i].second.size;
     }
     WGPUBindGroupDescriptor d;
@@ -153,8 +155,45 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
         fprintf(stderr, "Kernel not found: %s\n", name.c_str());
         exit(1);
     }
-    return gpu->getOrCreatePipeline(name, it->second.source,
-                                     it->second.numBindings);
+    // The K-quant kernels partition a workgroup into logical 32-lane columns.
+    // AMD can expose wider hardware subgroups, so its shaders use explicit
+    // workgroup-memory reductions. Preserve the lower-overhead subgroup path
+    // on NVIDIA/Intel, where the validated subgroup width is 32.
+    std::string adapter = gpu->adapterName;
+    std::transform(adapter.begin(), adapter.end(), adapter.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (adapter.find("amd") == std::string::npos) {
+        std::string source = it->second.source;
+        bool patched = false;
+        auto replaceRange = [&](const std::string& begin, const std::string& end,
+                                const std::string& replacement) {
+            size_t first = source.find(begin);
+            if (first == std::string::npos) return;
+            size_t last = source.find(end, first);
+            if (last == std::string::npos) return;
+            last += end.size();
+            source.replace(first, last - first, replacement);
+            patched = true;
+        };
+        if (name == "q4k_matmul" || name == "q5k_matmul" || name == "q6k_matmul") {
+            replaceRange("smem_x[tid] = acc;", "let sum = smem_x[warp_id * 32u];",
+                         "let sum = subgroupAdd(acc);");
+        } else if (name == "q4k_matmul_128") {
+            replaceRange("sx[tid]=acc;", "let s=sx[warp*32u];",
+                         "let s=subgroupAdd(acc);");
+        } else if (name == "q8_matmul" || name == "qwen35_beta_alpha_gate_q8") {
+            const std::string result = name == "q8_matmul" ? "warp_sum" : "sum";
+            replaceRange("reduce_scratch[tid] = acc;",
+                         "let " + result + " = reduce_scratch[warp_id * 32u];",
+                         "let " + result + " = subgroupAdd(acc);");
+        }
+        if (patched) {
+            source.insert(0, "enable subgroups;\n");
+            return gpu->getOrCreatePipeline(name + "_subgroup32", source,
+                                             it->second.numBindings);
+        }
+    }
+    return gpu->getOrCreatePipeline(name, it->second.source, it->second.numBindings);
 }
 
 // ─── HD-patched kernel loading ───────────────────────────────────────────────
@@ -260,10 +299,13 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
 }
 
 const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32_t headDim) {
-    if (headDim == 128) return getKernel(name);
+    if (headDim == 128 && (name != "gqa_chunked_pass1" || gqaChunkSize == 64))
+        return getKernel(name);
 
     // Patched pipeline: keyed by name + "_HD" + headDim
     std::string patchedName = name + "_HD" + std::to_string(headDim);
+    if (name == "gqa_chunked_pass1")
+        patchedName += "_C" + std::to_string(gqaChunkSize);
 
     auto& kernels = getEmbeddedKernels();
     auto it = kernels.find(name);
@@ -273,6 +315,13 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32
     }
 
     std::string patchedSource = patchShaderHD(it->second.source, headDim);
+    if (name == "gqa_chunked_pass1" && gqaChunkSize != 64) {
+        const std::string from = "const CHUNK: u32 = 64u;";
+        const std::string to = "const CHUNK: u32 = " + std::to_string(gqaChunkSize) + "u;";
+        size_t pos = patchedSource.find(from);
+        if (pos != std::string::npos)
+            patchedSource.replace(pos, from.size(), to);
+    }
     return gpu->getOrCreatePipeline(patchedName, patchedSource,
                                      it->second.numBindings);
 }
@@ -395,8 +444,53 @@ static void uploadQ8Weight(GPUContext& gpu, const std::string& name,
     uint64_t sSize = rep.scales.size() * 4;
     wBuf = gpu.createBuffer(name + ".w", wSize);
     sBuf = gpu.createBuffer(name + ".s", sSize);
-    gpu.writeBuffer(wBuf, rep.weights.data(), wSize);
-    gpu.writeBuffer(sBuf, rep.scales.data(), sSize);
+    constexpr uint64_t CHUNK = 64ull * 1024 * 1024;
+    for (uint64_t off = 0; off < wSize; off += CHUNK)
+        gpu.writeBuffer(wBuf, reinterpret_cast<const uint8_t*>(rep.weights.data()) + off,
+                        std::min(CHUNK, wSize - off), off);
+    for (uint64_t off = 0; off < sSize; off += CHUNK)
+        gpu.writeBuffer(sBuf, reinterpret_cast<const uint8_t*>(rep.scales.data()) + off,
+                        std::min(CHUNK, sSize - off), off);
+}
+
+static Q8Repacked repackQ4_0Native(const void* rawData, uint32_t N, uint32_t K) {
+    Q8Repacked out;
+    out.N = N; out.K = K;
+    const uint8_t* src = static_cast<const uint8_t*>(rawData);
+    const uint32_t blocksPerRow = K / 32;
+    const size_t totalBlocks = (size_t)N * blocksPerRow;
+    out.weights.resize((size_t)N * (K / 8));
+    out.scales.assign((totalBlocks + 1) / 2, 0);
+    for (size_t b = 0; b < totalBlocks; b++) {
+        const uint8_t* block = src + b * 18;
+        uint16_t scale; memcpy(&scale, block, 2);
+        out.scales[b / 2] |= (uint32_t)scale << ((b & 1) * 16);
+        const uint8_t* qs = block + 2;
+        for (uint32_t group = 0; group < 4; group++) {
+            uint32_t packed = 0;
+            for (uint32_t j = 0; j < 8; j++) {
+                uint32_t e = group * 8 + j;
+                uint32_t q = e < 16 ? (qs[e] & 0xFu) : (qs[e - 16] >> 4);
+                packed |= q << (j * 4);
+            }
+            out.weights[b * 4 + group] = packed;
+        }
+    }
+    return out;
+}
+
+static Q8Repacked concatRepacked(const Q8Repacked& a, const Q8Repacked& b) {
+    Q8Repacked out;
+    out.N = a.N + b.N; out.K = a.K;
+    out.weights.reserve(a.weights.size() + b.weights.size());
+    out.weights.insert(out.weights.end(), a.weights.begin(), a.weights.end());
+    out.weights.insert(out.weights.end(), b.weights.begin(), b.weights.end());
+    // All supported decoder dimensions contain an even number of Q4 blocks
+    // per tensor, so packed fp16 scale pairs concatenate without re-alignment.
+    out.scales.reserve(a.scales.size() + b.scales.size());
+    out.scales.insert(out.scales.end(), a.scales.begin(), a.scales.end());
+    out.scales.insert(out.scales.end(), b.scales.begin(), b.scales.end());
+    return out;
 }
 
 // ─── Load model ──────────────────────────────────────────────────────────────
@@ -770,6 +864,25 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     auto t0 = std::chrono::steady_clock::now();
     fprintf(stderr, "  Loading %llu tensors...\n", (unsigned long long)gguf.n_tensors);
 
+    if (std::getenv("BP_DUMP_GGUF_WEIGHT_TYPES")) {
+        auto typeName = [](uint32_t type) {
+            switch ((GGUFType)type) {
+                case GGUF_TYPE_Q4_K: return "Q4_K";
+                case GGUF_TYPE_Q5_K: return "Q5_K";
+                case GGUF_TYPE_Q6_K: return "Q6_K";
+                case GGUF_TYPE_Q8_0: return "Q8_0";
+                case GGUF_TYPE_F16: return "F16";
+                case GGUF_TYPE_F32: return "F32";
+                default: return "other";
+            }
+        };
+        for (const auto& tensor : gguf.tensors) {
+            if (tensor.name.find(".weight") != std::string::npos)
+                fprintf(stderr, "  [weight-type] %-48s %s (%u)\n",
+                        tensor.name.c_str(), typeName(tensor.type), tensor.type);
+        }
+    }
+
     uint32_t qDim  = cfg.nHead * cfg.headDim;
     uint32_t kvDim = cfg.nKvHeads * cfg.headDim;
     uint32_t qkvOut = qDim + 2 * kvDim;
@@ -921,7 +1034,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(name);
             if (it != gguf.tensor_index.end()) {
                 auto t = (GGUFType)gguf.tensors[it->second].type;
-                if (t != GGUF_TYPE_Q4_K && t != GGUF_TYPE_Q5_K && t != GGUF_TYPE_Q6_K) {
+                if ((t != GGUF_TYPE_Q4_K && t != GGUF_TYPE_Q5_K && t != GGUF_TYPE_Q6_K) ||
+                    t != weightQuantType) {
                     allSameKQ = false;
                     break;
                 }
@@ -932,6 +1046,11 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     (weightQuantType == GGUF_TYPE_Q4_K ||
                      weightQuantType == GGUF_TYPE_Q5_K ||
                      weightQuantType == GGUF_TYPE_Q6_K);
+    weightsUseNativeKQ = isKQuant;
+    weightsAreNativeQ4 = cfg.arch == "gemma4" &&
+                         weightQuantType == GGUF_TYPE_Q4_0 &&
+                         gpu->backendType != WGPUBackendType_D3D12 &&
+                         !std::getenv("BP_DISABLE_NATIVE_Q4");
     auto packKQ = [&](const void* data, uint32_t N, uint32_t K, GGUFType type) -> KQuantPacked {
         switch (type) {
             case GGUF_TYPE_Q4_K: return pack_q4k(data, N, K);
@@ -940,10 +1059,19 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             default: return {};
         }
     };
-    const char* kqName = (weightQuantType == GGUF_TYPE_Q4_K) ? "Q4_K" :
+    const char* kqName = !isKQuant && cfg.arch == "qwen35" ? "mixed K-quant (per-tensor native)" :
+                         !isKQuant ? "mixed K-quant → Q8" :
+                         (weightQuantType == GGUF_TYPE_Q4_K) ? "Q4_K" :
                          (weightQuantType == GGUF_TYPE_Q5_K) ? "Q5_K" :
                          (weightQuantType == GGUF_TYPE_Q6_K) ? "Q6_K" : "Q8_0";
-    fprintf(stderr, "  Weight format: %s\n", kqName);
+    fprintf(stderr, "  Weight format: %s\n",
+            weightsAreNativeQ4 ? "Q4_0 native" : kqName);
+    auto repackPrimary = [&](const uint8_t* data, uint32_t N, uint32_t K,
+                             GGUFType type) -> Q8Repacked {
+        if (weightsAreNativeQ4 && type == GGUF_TYPE_Q4_0)
+            return repackQ4_0Native(data, N, K);
+        return repackToQ8(data, N, K, type);
+    };
 
     // Infer per-layer dimensions from tensor shapes (Gemma 4 has variable dims)
     cfg.perLayer.resize(cfg.nLayer);
@@ -1066,12 +1194,25 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 uint32_t qOutDim = (uint32_t)qt.shape[1];   // 2*qDim (joint Q+gate)
                 uint32_t kOutDim = (uint32_t)kt.shape[1];   // kvDim (decoupled key_length)
                 uint32_t vOutDim = (uint32_t)vt.shape[1];   // value_length
-                auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset, qOutDim, cfg.nEmbd, (GGUFType)qt.type);
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qj", qr, lw.qjW, lw.qjS);
-                auto kr = repackToQ8(fileData + gguf.data_offset + kt.offset, kOutDim, cfg.nEmbd, (GGUFType)kt.type);
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".kSep", kr, lw.kSepW, lw.kSepS);
-                auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, vOutDim, cfg.nEmbd, (GGUFType)vt.type);
-                uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".vSep", vr, lw.vSepW, lw.vSepS);
+                auto loadExact = [&](const GGUFTensorInfo& t, uint32_t N,
+                                     const std::string& suffix, GPUBuffer& kqBuf,
+                                     GGUFType& type, uint32_t& nb, uint32_t& rs,
+                                     GPUBuffer& q8w, GPUBuffer& q8s) {
+                    type = (GGUFType)t.type;
+                    const uint8_t* src = fileData + gguf.data_offset + t.offset;
+                    if (type == GGUF_TYPE_Q4_K || type == GGUF_TYPE_Q5_K ||
+                        type == GGUF_TYPE_Q6_K) {
+                        auto packed = packKQ(src, N, cfg.nEmbd, type);
+                        nb = packed.nBlocks; rs = packed.rowStrideWords;
+                        uploadKQWeight("L" + std::to_string(i) + suffix, packed, kqBuf);
+                    } else {
+                        auto rep = repackToQ8(src, N, cfg.nEmbd, type);
+                        uploadQ8Weight(*gpu, "L" + std::to_string(i) + suffix, rep, q8w, q8s);
+                    }
+                };
+                loadExact(qt,qOutDim,".qj_kq",lw.qjKQ,lw.qjKQType,lw.qjKQNBlocks,lw.qjKQRowStride,lw.qjW,lw.qjS);
+                loadExact(kt,kOutDim,".k_kq",lw.kSepKQ,lw.kSepKQType,lw.kSepKQNBlocks,lw.kSepKQRowStride,lw.kSepW,lw.kSepS);
+                loadExact(vt,vOutDim,".v_kq",lw.vSepKQ,lw.vSepKQType,lw.vSepKQNBlocks,lw.vSepKQRowStride,lw.vSepW,lw.vSepS);
                 if (i == 3) {
                     fprintf(stderr, "  qwen35 attn layer %u: Q(2x)=%u K=%u V=%u (E=%u)\n",
                             i, qOutDim, kOutDim, vOutDim, cfg.nEmbd);
@@ -1090,7 +1231,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 // Pre-fused QKV (qwen35moe / some MoE archs)
                 auto& qkvt = gguf.tensors[qkvi_pre->second];
                 uint32_t qkvN = (uint32_t)qkvt.shape[1];  // out-dim = qDim + 2*kvDim
-                bool tensorIsKQ = cfg.arch != "qwen35" &&
+                bool tensorIsKQ =
                     (qkvt.type == GGUF_TYPE_Q4_K || qkvt.type == GGUF_TYPE_Q5_K || qkvt.type == GGUF_TYPE_Q6_K);
                 const uint8_t* src = fileData + gguf.data_offset + qkvt.offset;
                 if (tensorIsKQ) {
@@ -1101,6 +1242,9 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         case GGUF_TYPE_Q6_K: kq = pack_q6k(src, qkvN, cfg.nEmbd); break;
                         default: break;
                     }
+                    lw.qkvKQType = (GGUFType)qkvt.type;
+                    lw.qkvKQNBlocks = kq.nBlocks;
+                    lw.qkvKQRowStride = kq.rowStrideWords;
                     if (i == 0) { kqQkvNBlocks = kq.nBlocks; kqQkvRowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", kq, lw.qkvKQ);
                 } else {
@@ -1119,7 +1263,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     // attention path can run at decode time.
                     auto& qt = gguf.tensors[qi->second];
                     uint32_t qN = (uint32_t)qt.shape[1];
-                    auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset,
+                    auto qr = repackPrimary(fileData + gguf.data_offset + qt.offset,
                                          qN, cfg.nEmbd, (GGUFType)qt.type);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qonly",
                                    qr, lw.qOnlyW, lw.qOnlyS);
@@ -1140,19 +1284,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         if (i == 0) { kqQkvNBlocks = fused.nBlocks; kqQkvRowStride = fused.rowStrideWords; }
                         uploadKQWeight("L" + std::to_string(i) + ".qkv_kq", fused, lw.qkvKQ);
                     } else {
-                        auto qr = repackToQ8(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
-                        auto kr = repackToQ8(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
-                        auto vr = repackToQ8(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
-                        Q8Repacked fused;
-                        fused.N = layerQkvOut; fused.K = cfg.nEmbd;
-                        fused.weights.reserve(qr.weights.size() + kr.weights.size() + vr.weights.size());
-                        fused.weights.insert(fused.weights.end(), qr.weights.begin(), qr.weights.end());
-                        fused.weights.insert(fused.weights.end(), kr.weights.begin(), kr.weights.end());
-                        fused.weights.insert(fused.weights.end(), vr.weights.begin(), vr.weights.end());
-                        fused.scales.reserve(qr.scales.size() + kr.scales.size() + vr.scales.size());
-                        fused.scales.insert(fused.scales.end(), qr.scales.begin(), qr.scales.end());
-                        fused.scales.insert(fused.scales.end(), kr.scales.begin(), kr.scales.end());
-                        fused.scales.insert(fused.scales.end(), vr.scales.begin(), vr.scales.end());
+                        auto qr = repackPrimary(fileData + gguf.data_offset + qt.offset, layerQDim, cfg.nEmbd, (GGUFType)qt.type);
+                        auto kr = repackPrimary(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
+                        auto vr = repackPrimary(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
+                        auto fused = concatRepacked(concatRepacked(qr, kr), vr);
                         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
                     }
                 }
@@ -1165,23 +1300,20 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "attn_output.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0 &&
-                    cfg.isAttentionLayer(i)) {
-                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
-                                            cfg.nEmbd, layerQDim, (GGUFType)ti.type);
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
-                } else {
-                    bool tensorIsKQ = isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                    bool tensorIsKQ = (isKQuant || cfg.arch == "qwen35") &&
+                        (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
                     if (tensorIsKQ) {
                         auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim, (GGUFType)ti.type);
+                        lw.oKQType = (GGUFType)ti.type;
+                        lw.oKQNBlocks = kq.nBlocks;
+                        lw.oKQRowStride = kq.rowStrideWords;
                         if (i == 0) { kqONBlocks = kq.nBlocks; kqORowStride = kq.rowStrideWords; }
                         uploadKQWeight("L" + std::to_string(i) + ".o_kq", kq, lw.oKQ);
                     } else {
-                        auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                        auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
                                                 cfg.nEmbd, layerQDim, (GGUFType)ti.type);
                         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
                     }
-                }
             }
         }
 
@@ -1192,45 +1324,25 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (gi != gguf.tensor_index.end() && ui != gguf.tensor_index.end()) {
                 auto& gt = gguf.tensors[gi->second];
                 auto& ut = gguf.tensors[ui->second];
-                if (cfg.arch == "qwen35") {
-                    auto gr = repackToQ8(fileData + gguf.data_offset + gt.offset,
-                                           layerIM, cfg.nEmbd, (GGUFType)gt.type);
-                    auto ur = repackToQ8(fileData + gguf.data_offset + ut.offset,
-                                           layerIM, cfg.nEmbd, (GGUFType)ut.type);
-                    Q8Repacked fused;
-                    fused.N = 2 * layerIM; fused.K = cfg.nEmbd;
-                    fused.weights.reserve(gr.weights.size() + ur.weights.size());
-                    fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
-                    fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
-                    fused.scales.reserve(gr.scales.size() + ur.scales.size());
-                    fused.scales.insert(fused.scales.end(), gr.scales.begin(), gr.scales.end());
-                    fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
-                } else {
-                bool bothKQ = isKQuant &&
+                bool bothKQ = (isKQuant || cfg.arch == "qwen35") && gt.type == ut.type &&
                     (gt.type == GGUF_TYPE_Q4_K || gt.type == GGUF_TYPE_Q5_K || gt.type == GGUF_TYPE_Q6_K) &&
                     (ut.type == GGUF_TYPE_Q4_K || ut.type == GGUF_TYPE_Q5_K || ut.type == GGUF_TYPE_Q6_K);
                 if (bothKQ) {
                     auto gp = packKQ(fileData + gguf.data_offset + gt.offset, layerIM, cfg.nEmbd, (GGUFType)gt.type);
                     auto up = packKQ(fileData + gguf.data_offset + ut.offset, layerIM, cfg.nEmbd, (GGUFType)ut.type);
                     auto fused = fuseKQ(gp, up);
+                    lw.guKQType = (GGUFType)gt.type;
+                    lw.guKQNBlocks = fused.nBlocks;
+                    lw.guKQRowStride = fused.rowStrideWords;
                     if (i == 0) { kqGuNBlocks = fused.nBlocks; kqGuRowStride = fused.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".gu_kq", fused, lw.guKQ);
                 } else {
-                    auto gr = repackToQ8(fileData + gguf.data_offset + gt.offset,
+                    auto gr = repackPrimary(fileData + gguf.data_offset + gt.offset,
                                            layerIM, cfg.nEmbd, (GGUFType)gt.type);
-                    auto ur = repackToQ8(fileData + gguf.data_offset + ut.offset,
+                    auto ur = repackPrimary(fileData + gguf.data_offset + ut.offset,
                                            layerIM, cfg.nEmbd, (GGUFType)ut.type);
-                    Q8Repacked fused;
-                    fused.N = 2 * layerIM; fused.K = cfg.nEmbd;
-                    fused.weights.reserve(gr.weights.size() + ur.weights.size());
-                    fused.weights.insert(fused.weights.end(), gr.weights.begin(), gr.weights.end());
-                    fused.weights.insert(fused.weights.end(), ur.weights.begin(), ur.weights.end());
-                    fused.scales.reserve(gr.scales.size() + ur.scales.size());
-                    fused.scales.insert(fused.scales.end(), gr.scales.begin(), gr.scales.end());
-                    fused.scales.insert(fused.scales.end(), ur.scales.begin(), ur.scales.end());
+                    auto fused = concatRepacked(gr, ur);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
-                }
                 }
             }
         }
@@ -1240,14 +1352,17 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             auto it = gguf.tensor_index.find(pfx + "ffn_down.weight");
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
-                bool tensorIsKQ = cfg.arch != "qwen35" && isKQuant &&
+                bool tensorIsKQ = (isKQuant || cfg.arch == "qwen35") &&
                     (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
                 if (tensorIsKQ) {
                     auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM, (GGUFType)ti.type);
+                    lw.dnKQType = (GGUFType)ti.type;
+                    lw.dnKQNBlocks = kq.nBlocks;
+                    lw.dnKQRowStride = kq.rowStrideWords;
                     if (i == 0) { kqDnNBlocks = kq.nBlocks; kqDnRowStride = kq.rowStrideWords; }
                     uploadKQWeight("L" + std::to_string(i) + ".dn_kq", kq, lw.dnKQ);
                 } else {
-                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
+                    auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
                                             cfg.nEmbd, layerIM, (GGUFType)ti.type);
                     uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
                 }
@@ -1289,9 +1404,17 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto it = gguf.tensor_index.find(name);
                 if (it != gguf.tensor_index.end()) {
                     auto& ti = gguf.tensors[it->second];
-                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
-                                           N, K, (GGUFType)ti.type);
-                    uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                    if (weightsAreNativeQ4 && ti.type == GGUF_TYPE_Q4_0 &&
+                        !std::getenv("BP_Q8_PLE")) {
+                        auto rep = repackQ4_0Native(
+                            fileData + gguf.data_offset + ti.offset, N, K);
+                        uploadQ8Weight(*gpu, name + ".q4", rep, wBuf, sBuf);
+                        pleWeightsUseFp16 = true;
+                    } else {
+                        auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
+                                               N, K, (GGUFType)ti.type);
+                        uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                    }
                 }
             };
             loadWeight(pfx + "inp_gate.weight", cfg.pleSize, cfg.nEmbd,
@@ -1470,6 +1593,21 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
                 return true;
             };
+            auto loadProjKQ = [&](const std::string& name, uint32_t N, uint32_t K,
+                                  GPUBuffer& buf, GGUFType& type,
+                                  uint32_t& nBlocks, uint32_t& rowStride) -> bool {
+                auto it = gguf.tensor_index.find(name);
+                if (it == gguf.tensor_index.end()) return false;
+                auto& ti = gguf.tensors[it->second];
+                type = (GGUFType)ti.type;
+                if (type != GGUF_TYPE_Q4_K && type != GGUF_TYPE_Q5_K &&
+                    type != GGUF_TYPE_Q6_K) return false;
+                auto packed = packKQ(fileData + gguf.data_offset + ti.offset, N, K, type);
+                nBlocks = packed.nBlocks;
+                rowStride = packed.rowStrideWords;
+                uploadKQWeight(name + ".kq", packed, buf);
+                return true;
+            };
             auto repackProjQ8 = [&](const std::string& name, uint32_t N, uint32_t K,
                                     Q8Repacked& rep) -> bool {
                 auto it = gguf.tensor_index.find(name);
@@ -1514,9 +1652,15 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     loaded++;
                 }
             }
-            if (loadProjQ8(pfx + "ssm_out.weight", cfg.nEmbd, cfg.ssmInnerSize,
+            if (loadProjKQ(pfx + "ssm_out.weight", cfg.nEmbd, cfg.ssmInnerSize,
+                           lw.ssmOutKQ, lw.ssmOutKQType,
+                           lw.ssmOutKQNBlocks, lw.ssmOutKQRowStride) ||
+                loadProjQ8(pfx + "ssm_out.weight", cfg.nEmbd, cfg.ssmInnerSize,
                            lw.ssmOutW, lw.ssmOutS)) loaded++;
-            if (loadProjQ8(pfx + "attn_gate.weight", cfg.ssmInnerSize, cfg.nEmbd,
+            if (loadProjKQ(pfx + "attn_gate.weight", cfg.ssmInnerSize, cfg.nEmbd,
+                           lw.attnGateKQ, lw.attnGateKQType,
+                           lw.attnGateKQNBlocks, lw.attnGateKQRowStride) ||
+                loadProjQ8(pfx + "attn_gate.weight", cfg.ssmInnerSize, cfg.nEmbd,
                            lw.attnGateW, lw.attnGateS)) loaded++;
             if (i == 0) {
                 fprintf(stderr, "  SSM/DeltaNet weights loaded for layer 0: %d/8 tensors\n", loaded);
@@ -1538,8 +1682,14 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             uint32_t nel = 1;
             for (auto d : ti.shape) nel *= (uint32_t)d;
             const uint8_t* data = fileData + gguf.data_offset + ti.offset;
-            embeddingCPU.resize(nel);
-            if (ti.type == GGUF_TYPE_F16) {
+            const bool needCpuEmbedding = cfg.arch != "qwen35" ||
+                std::getenv("BP_Q35_SYNC") || std::getenv("BP_SYNC_PREFILL") ||
+                std::getenv("BP_DUMP_BUFFER_STATS");
+            if (needCpuEmbedding) embeddingCPU.resize(nel);
+            if (!needCpuEmbedding) {
+                fprintf(stderr, "  Embedding: %u × %u (GPU-only)\n",
+                        cfg.nVocab, cfg.nEmbd);
+            } else if (ti.type == GGUF_TYPE_F16) {
                 const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(data);
                 for (uint32_t j = 0; j < nel; j++)
                     embeddingCPU[j] = fp16_to_f32(fp16[j]);
@@ -1568,7 +1718,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 uint32_t cols = (uint32_t)ti.shape[0];
                 dequant_tensor(data, embeddingCPU.data(), rows, cols, (GGUFType)ti.type);
             }
-            fprintf(stderr, "  Embedding: %u × %u (%s)\n", cfg.nVocab, cfg.nEmbd,
+            if (needCpuEmbedding) fprintf(stderr, "  Embedding: %u × %u (%s)\n", cfg.nVocab, cfg.nEmbd,
                    ti.type == GGUF_TYPE_Q8_0 ? "Q8_0→f32" :
                    ti.type == GGUF_TYPE_Q4_K ? "Q4_K→f32" :
                    ti.type == GGUF_TYPE_Q5_K ? "Q5_K→f32" :
@@ -1583,13 +1733,14 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             // LM head: use quantized format if embedding is quantized
             if (cfg.tieWordEmbeddings) {
                 if (cfg.arch == "qwen35") {
-                    auto rep = repackToQ8(data, cfg.nVocab, cfg.nEmbd, (GGUFType)ti.type);
-                    uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
-                    lmHeadIsQ8 = true;
-                    uint64_t wBytes = (uint64_t)rep.weights.size() * 4;
-                    uint64_t sBytes = (uint64_t)rep.scales.size() * 4;
-                    fprintf(stderr, "  LM head: tied embeddings (Q8 for qwen35 correctness, %llu MB)\n",
-                           (unsigned long long)((wBytes + sBytes) / 1048576));
+                    lmHeadKQType = (GGUFType)ti.type;
+                    auto kq = packKQ(data, cfg.nVocab, cfg.nEmbd, lmHeadKQType);
+                    kqLmNBlocks = kq.nBlocks;
+                    kqLmRowStride = kq.rowStrideWords;
+                    uploadKQWeight("lm_head_kq", kq, lmHeadKQ);
+                    lmHeadIsKQ = true;
+                    fprintf(stderr, "  LM head: tied embeddings (native Q6_K, %llu MB)\n",
+                           (unsigned long long)(kq.data.size()*4 / 1048576));
                 } else if (isKQuant && (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K ||
                                  ti.type == GGUF_TYPE_Q6_K)) {
                     // Upload as K-quant on GPU
@@ -1612,6 +1763,13 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                            (unsigned long long)((wBytes + sBytes) / 1048576));
                 } else if (ti.type == GGUF_TYPE_Q4_0 || ti.type == GGUF_TYPE_Q4_1 ||
                            ti.type == GGUF_TYPE_Q5_0 || ti.type == GGUF_TYPE_Q5_1) {
+                    if (weightsAreNativeQ4 && ti.type == GGUF_TYPE_Q4_0) {
+                        auto rep = repackQ4_0Native(data, cfg.nVocab, cfg.nEmbd);
+                        uploadQ8Weight(*gpu, "lm_head_q4", rep, lmHeadQ8W, lmHeadQ8S);
+                        lmHeadIsQ4 = true;
+                        fprintf(stderr, "  LM head: tied embeddings (native Q4_0, %llu MB)\n",
+                            (unsigned long long)((rep.weights.size() * 4 + rep.scales.size() * 4) / 1048576));
+                    } else {
                     // Legacy quants (e.g. Gemma 4 Q4_0): repack to Q8 so the LM
                     // head fits the standard Q8 decode dispatch path. The fp16
                     // fallback below would allocate a ~768 MB f16 buffer for a
@@ -1627,6 +1785,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                            ti.type == GGUF_TYPE_Q4_1 ? "Q4_1" :
                            ti.type == GGUF_TYPE_Q5_0 ? "Q5_0" : "Q5_1",
                            (unsigned long long)((wBytes + sBytes) / 1048576));
+                    }
                 } else {
                     // fp16 fallback
                     std::vector<uint16_t> fp16(nel);
@@ -1649,6 +1808,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
     // ─── PLE global weight loading ──────────────────────────────────────
     if (cfg.pleSize > 0) {
+        const bool requestGpuPle = weightsAreNativeQ4 &&
+                                   std::getenv("BP_CPU_PLE") == nullptr;
         // per_layer_token_embd.weight — massive per-layer embedding table
         // Shape: [pleSize * nLayer, nVocab] — dequant to fp32 for CPU lookup
         auto it = gguf.tensor_index.find("per_layer_token_embd.weight");
@@ -1657,15 +1818,24 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             uint32_t rows = 1, cols = 1;
             if (ti.shape.size() >= 2) { cols = (uint32_t)ti.shape[0]; rows = (uint32_t)ti.shape[1]; }
             else if (ti.shape.size() == 1) { cols = (uint32_t)ti.shape[0]; }
-            pleEmbCPU.resize((size_t)rows * cols);
-            dequant_tensor(fileData + gguf.data_offset + ti.offset,
-                           pleEmbCPU.data(), rows, cols, (GGUFType)ti.type);
-            fprintf(stderr, "  PLE embedding: %u × %u (%zu MB fp32)\n",
-                    rows, cols, (size_t)rows * cols * 4 / 1048576);
+            if (requestGpuPle && ti.type == GGUF_TYPE_Q4_0 && cols % 32 == 0) {
+                auto rep = repackQ4_0Native(fileData + gguf.data_offset + ti.offset,
+                                            rows, cols);
+                uploadQ8Weight(*gpu, "ple_token_emb_q4", rep,
+                               pleTokenEmbW, pleTokenEmbS);
+                fprintf(stderr, "  PLE embedding: %u × %u (native Q4 GPU, %zu MB)\n",
+                        rows, cols, (rep.weights.size() + rep.scales.size()) * 4 / 1048576);
+            } else {
+                pleEmbCPU.resize((size_t)rows * cols);
+                dequant_tensor(fileData + gguf.data_offset + ti.offset,
+                               pleEmbCPU.data(), rows, cols, (GGUFType)ti.type);
+                fprintf(stderr, "  PLE embedding: %u × %u (%zu MB fp32)\n",
+                        rows, cols, (size_t)rows * cols * 4 / 1048576);
+            }
         }
 
-        // per_layer_model_proj.weight — Q8 repack for GPU + fp32 CPU copy for
-        // the per-token project_per_layer_inputs computation.
+        // per_layer_model_proj.weight — Q8 repack for future GPU use plus an
+        // fp32 CPU reference used for numerically stable PLE preprocessing.
         {
             auto it2 = gguf.tensor_index.find("per_layer_model_proj.weight");
             if (it2 != gguf.tensor_index.end()) {
@@ -1673,13 +1843,16 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 uint32_t N = (ti.shape.size() >= 2) ? (uint32_t)ti.shape[1] : 0;
                 uint32_t K = (ti.shape.size() >= 2) ? (uint32_t)ti.shape[0] : 0;
                 if (N > 0 && K > 0) {
-                    auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
-                                           N, K, (GGUFType)ti.type);
+                    auto rep = requestGpuPle && ti.type == GGUF_TYPE_Q4_0
+                        ? repackQ4_0Native(fileData + gguf.data_offset + ti.offset, N, K)
+                        : repackToQ8(fileData + gguf.data_offset + ti.offset,
+                                     N, K, (GGUFType)ti.type);
                     uploadQ8Weight(*gpu, "ple_model_proj", rep, pleModelProjW, pleModelProjS);
-                    // CPU fp32 copy: [N=nLayer*pleSize rows, K=E cols]
-                    pleModelProjCPU.resize((size_t)N * K);
-                    dequant_tensor(fileData + gguf.data_offset + ti.offset,
-                                   pleModelProjCPU.data(), N, K, (GGUFType)ti.type);
+                    if (!requestGpuPle) {
+                        pleModelProjCPU.resize((size_t)N * K);
+                        dequant_tensor(fileData + gguf.data_offset + ti.offset,
+                                       pleModelProjCPU.data(), N, K, (GGUFType)ti.type);
+                    }
                 }
             }
         }
@@ -1698,6 +1871,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 else dequant_tensor(data, pleProjNormCPU.data(), 1, nel, (GGUFType)ti.type);
             }
         }
+        pleGpuPreprocess = requestGpuPle && pleTokenEmbW.handle &&
+                           pleModelProjW.handle && pleProjNormW.handle;
+        if (requestGpuPle && !pleGpuPreprocess)
+            fprintf(stderr, "WARNING: GPU PLE requested but required tensors were unavailable; using fallback\n");
     }
 
     // ─── MTP weight loading ──────────────────────────────────────────────
@@ -1739,14 +1916,14 @@ void ModelRunner::computeRopeTables() {
     // For ONNX models with pre-computed RoPE tables, upload directly
     if (hasPrecomputedRope) return;  // already uploaded in loadOnnx()
 
-    uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
-    auto buildTables = [&](float theta, GPUBuffer& cosBuf, GPUBuffer& sinBuf,
+    auto buildTables = [&](float theta, uint32_t ropeDim,
+                           GPUBuffer& cosBuf, GPUBuffer& sinBuf,
                            const char* cosName, const char* sinName) {
+        uint32_t ropeHalf = ropeDim / 2;
         std::vector<float> cosTable(maxSeqLen * ropeHalf), sinTable(maxSeqLen * ropeHalf);
         for (uint32_t pos = 0; pos < maxSeqLen; pos++) {
             for (uint32_t i = 0; i < ropeHalf; i++) {
-                float freq = 1.0f / powf(theta, (float)(2 * i) /
-                    (rotaryDim > 0 ? rotaryDim : cfg.headDim));
+                float freq = 1.0f / powf(theta, (float)(2 * i) / ropeDim);
                 float angle = pos * freq;
                 cosTable[pos * ropeHalf + i] = cosf(angle);
                 sinTable[pos * ropeHalf + i] = sinf(angle);
@@ -1758,7 +1935,9 @@ void ModelRunner::computeRopeTables() {
         gpu->writeBuffer(sinBuf, sinTable.data(), maxSeqLen * ropeHalf * 4);
     };
 
-    buildTables(cfg.ropeTheta, ropeCosBuf, ropeSinBuf, "rope_cos", "rope_sin");
+    uint32_t globalRopeDim = rotaryDim > 0 ? rotaryDim : cfg.headDim;
+    buildTables(cfg.ropeTheta, globalRopeDim,
+                ropeCosBuf, ropeSinBuf, "rope_cos", "rope_sin");
 
     // Gemma 3/4: SWA layers use a separate, smaller theta (default 10000).
     // The GGUF only stores one rope.freq_base; the SWA base is conventionally
@@ -1768,10 +1947,16 @@ void ModelRunner::computeRopeTables() {
     if (needsSwa) {
         // No GGUF accessor here; just use the convention used by llama.cpp.
         const float swaTheta = 10000.0f;
-        buildTables(swaTheta, ropeCosBufSWA, ropeSinBufSWA,
+        uint32_t swaRopeDim = globalRopeDim;
+        for (uint32_t i = 0; i < cfg.nLayer && i < cfg.perLayer.size(); i++) {
+            if (i < cfg.layerAttnTypes.size() &&
+                cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow)
+                swaRopeDim = std::min(swaRopeDim, cfg.perLayer[i].headDim);
+        }
+        buildTables(swaTheta, swaRopeDim, ropeCosBufSWA, ropeSinBufSWA,
                     "rope_cos_swa", "rope_sin_swa");
-        fprintf(stderr, "  RoPE SWA tables: theta=%.0f (global theta=%.0f)\n",
-                swaTheta, cfg.ropeTheta);
+        fprintf(stderr, "  RoPE SWA tables: dim=%u theta=%.0f (global dim=%u theta=%.0f)\n",
+                swaRopeDim, swaTheta, globalRopeDim, cfg.ropeTheta);
     }
 }
 
@@ -1822,8 +2007,15 @@ void ModelRunner::buildDecodePipeline() {
         (qDim % 512u == 0u);
     const bool decodeWideFp16Eligible = canUse256ThreadSubgroupKernels;
     const bool qwen35VulkanDecode =
-        (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12);
+        (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12 &&
+         !std::getenv("BP_Q35_GENERIC_KERNELS"));
     uint32_t Q8_TILE = 8;
+    // Gemma 4 has only a few very wide query heads. Smaller attention chunks
+    // expose enough independent workgroups to occupy Vulkan GPUs; 8 tokens was
+    // the measured optimum on RTX 5080. Keep the general 64-token default for
+    // architectures with more heads and for non-Vulkan backends.
+    if (cfg.arch == "gemma4" && gpu->backendType == WGPUBackendType_Vulkan)
+        gqaChunkSize = 8;
     uint32_t maxChunks = (maxSeqLen + gqaChunkSize - 1) / gqaChunkSize;
 
     // Load kernels from embedded shaders
@@ -1831,15 +2023,14 @@ void ModelRunner::buildDecodePipeline() {
                                             : getKernel("rms_norm");
     auto& plAddRmsNorm = qwen35VulkanDecode ? getKernel("add_rms_norm_qwen_vulkan")
                                             : getKernel("add_rms_norm");
-    auto& plQ8Matmul   = (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12)
+    auto& plQ8Matmul   = (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12 &&
+                          !std::getenv("BP_Q35_GENERIC_KERNELS"))
         ? getKernel("q8_matmul_vec4")
         : getKernel("q8_matmul");
     auto& plQ8MatmulNorm = getKernel("q8_matmul_norm");
 
     // K-quant kernel selection
-    bool useKQ = (weightQuantType == GGUF_TYPE_Q4_K ||
-                  weightQuantType == GGUF_TYPE_Q5_K ||
-                  weightQuantType == GGUF_TYPE_Q6_K);
+    bool useKQ = weightsUseNativeKQ;
     const char* kqKernelName = (weightQuantType == GGUF_TYPE_Q4_K) ? "q4k_matmul" :
                                (weightQuantType == GGUF_TYPE_Q5_K) ? "q5k_matmul" :
                                (weightQuantType == GGUF_TYPE_Q6_K) ? "q6k_matmul" : nullptr;
@@ -1849,6 +2040,18 @@ void ModelRunner::buildDecodePipeline() {
     if (useKQ && kqKernelName) {
         plKQ = &getKernel(kqKernelName);
     }
+    auto kqPipelineFor = [&](GGUFType type) -> const CompiledPipeline* {
+        switch (type) {
+            case GGUF_TYPE_Q4_K: return &getKernel(
+                std::getenv("BP_Q4K_DECODE_256") ? "q4k_matmul" : "q4k_matmul_128");
+            case GGUF_TYPE_Q5_K: return &getKernel("q5k_matmul");
+            case GGUF_TYPE_Q6_K: return &getKernel("q6k_matmul");
+            default: return nullptr;
+        }
+    };
+    auto kqTileFor = [](GGUFType type) {
+        return type == GGUF_TYPE_Q4_K && !std::getenv("BP_Q4K_DECODE_256") ? 4u : 8u;
+    };
 
     const bool subgroupMatrixKernelReady =
         gpu->supportsSubgroupMatrix &&
@@ -1860,6 +2063,184 @@ void ModelRunner::buildDecodePipeline() {
     auto& plFusedRope  = getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope");
     auto& plChunkP1    = getKernelHD("gqa_chunked_pass1");
     auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
+    const CompiledPipeline* plQ4Decode = weightsAreNativeQ4
+        ? &getKernel("matmul_q4_decode") : nullptr;
+    uint32_t Q4_DECODE_TILE_N = 32;
+    int q4Cols = std::getenv("BP_Q4_COLS") ? std::atoi(std::getenv("BP_Q4_COLS")) : 1;
+    if (weightsAreNativeQ4 && (q4Cols >= 1 && q4Cols <= 3)) {
+            std::string src = getEmbeddedKernels().at("matmul_q4_decode").source;
+            auto replaceAll = [&](const std::string& from, const std::string& to) {
+                size_t pos = 0;
+                while ((pos = src.find(from, pos)) != std::string::npos) {
+                    src.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
+            };
+            std::string cols = std::to_string(q4Cols);
+            std::string tile = std::to_string(q4Cols * 8);
+            replaceAll("COLS_PER_WARP: u32 = 4u", "COLS_PER_WARP: u32 = " + cols + "u");
+            replaceAll("array<u32, 4>", "array<u32, " + cols + ">");
+            replaceAll("array<bool, 4>", "array<bool, " + cols + ">");
+            replaceAll("array<f32, 4>", "array<f32, " + cols + ">");
+            replaceAll("wid.x * 32u", "wid.x * " + tile + "u");
+            Q4_DECODE_TILE_N = q4Cols * 8;
+            plQ4Decode = &gpu->getOrCreatePipeline(
+                "matmul_q4_decode_c" + cols, src, 5);
+            fprintf(stderr, "  Native Q4 decode: %d columns/warp (%u outputs/WG)\n",
+                    q4Cols, Q4_DECODE_TILE_N);
+    }
+    const CompiledPipeline* plQ4Gateup = plQ4Decode;
+    uint32_t Q4_GATEUP_TILE_N = Q4_DECODE_TILE_N;
+    if (weightsAreNativeQ4) {
+        int gateCols = std::getenv("BP_Q4_GATEUP_COLS")
+            ? std::atoi(std::getenv("BP_Q4_GATEUP_COLS")) : 2;
+        gateCols = std::max(1, std::min(3, gateCols));
+        std::string src = getEmbeddedKernels().at("matmul_q4_decode").source;
+        auto repl = [&](const std::string& from, const std::string& to) {
+            size_t pos = 0;
+            while ((pos = src.find(from, pos)) != std::string::npos) {
+                src.replace(pos, from.size(), to); pos += to.size();
+            }
+        };
+        const std::string cols = std::to_string(gateCols);
+        const std::string tile = std::to_string(gateCols * 8);
+        repl("COLS_PER_WARP: u32 = 4u", "COLS_PER_WARP: u32 = " + cols + "u");
+        repl("array<u32, 4>", "array<u32, " + cols + ">");
+        repl("array<bool, 4>", "array<bool, " + cols + ">");
+        repl("array<f32, 4>", "array<f32, " + cols + ">");
+        repl("wid.x * 32u", "wid.x * " + tile + "u");
+        plQ4Gateup = &gpu->getOrCreatePipeline(
+            "matmul_q4_decode_gateup_c" + cols, src, 5);
+        Q4_GATEUP_TILE_N = gateCols * 8;
+    }
+    // The vocabulary projection is vastly wider than per-layer projections;
+    // use the embedded four-column tile to amortize activation quantization.
+    const CompiledPipeline* plQ4LmHead = weightsAreNativeQ4
+        ? &getKernel("matmul_q4_decode") : nullptr;
+    constexpr uint32_t Q4_LM_TILE_N = 32;
+    static const char* Q4_A32_WGSL = R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> S: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> P: array<u32>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = P[1]; let K = P[2];
+    let warp = lid.x / 32u; let lane = lid.x % 32u;
+    let row = wid.x * 4u + warp;
+    var acc = 0.0;
+    if (row < N) {
+        for (var k = lane; k < K; k += 32u) {
+            let word = B[row * (K / 8u) + k / 8u];
+            let q = i32((word >> ((k & 7u) * 4u)) & 15u) - 8;
+            let block = row * (K / 32u) + k / 32u;
+            let sp = unpack2x16float(S[block / 2u]);
+            let scale = select(sp.x, sp.y, (block & 1u) != 0u);
+            acc += X[k] * f32(q) * scale;
+        }
+    }
+    let total = subgroupAdd(acc);
+    if (lane == 0u && row < N) { Y[row] = total; }
+}
+)";
+    const CompiledPipeline* plQ4A32 = weightsAreNativeQ4
+        ? &gpu->getOrCreatePipeline("q4_matmul_a32", std::string(Q4_A32_WGSL), 5)
+        : nullptr;
+    static const char* Q4_A32_WIDE_WGSL = R"(
+enable subgroups;
+@group(0) @binding(0)var<storage,read>X:array<f32>;
+@group(0) @binding(1)var<storage,read>B:array<u32>;
+@group(0) @binding(2)var<storage,read>S:array<u32>;
+@group(0) @binding(3)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(4)var<storage,read>P:array<u32>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec3<u32>){
+ let N=P[1];let K=P[2];let warp=lid.x/32u;let lane=lid.x&31u;let r0=wid.x*8u+warp*2u;var acc:array<f32,2>;
+ for(var c=0u;c<2u;c++){let row=r0+c;if(row<N){for(var k=lane;k<K;k+=32u){let w=B[row*(K/8u)+k/8u];let q=i32((w>>((k&7u)*4u))&15u)-8;let b=row*(K/32u)+k/32u;let sp=unpack2x16float(S[b/2u]);let sc=select(sp.x,sp.y,(b&1u)==1u);acc[c]+=X[k]*f32(q)*sc;}}}
+ for(var c=0u;c<2u;c++){let row=r0+c;let v=subgroupAdd(acc[c]);if(lane==0u&&row<N){Y[row]=v;}}
+}
+)";
+    const CompiledPipeline* plQ4A32Ple = weightsAreNativeQ4 &&
+        !std::getenv("BP_PLE_Q4_NARROW")
+        ? &gpu->getOrCreatePipeline("q4_matmul_a32_ple_wide", std::string(Q4_A32_WIDE_WGSL), 5)
+        : plQ4A32;
+    const uint32_t Q4_A32_PLE_TILE = std::getenv("BP_PLE_Q4_NARROW") ? 4u : 8u;
+    static const char* PLE_TOKEN_Q4_GATHER_WGSL = R"(
+@group(0) @binding(0) var<storage, read> B: array<u32>;
+@group(0) @binding(1) var<storage, read> S: array<u32>;
+@group(0) @binding(2) var<storage, read> Token: array<i32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> P: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; let K = P[0];
+    if (i >= K) { return; }
+    let row = u32(max(Token[0], 0));
+    let word = B[row * (K / 8u) + i / 8u];
+    let q = i32((word >> ((i & 7u) * 4u)) & 15u) - 8;
+    let block = row * (K / 32u) + i / 32u;
+    let sp = unpack2x16float(S[block / 2u]);
+    let scale = select(sp.x, sp.y, (block & 1u) != 0u);
+    Y[i] = f32(q) * scale * bitcast<f32>(P[1]);
+}
+)";
+    static const char* PLE_PROJECT_COMBINE_WGSL = R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read> Proj: array<f32>;
+@group(0) @binding(1) var<storage, read> Norm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> TokenSignal: array<f32>;
+@group(0) @binding(3) var<storage, read> P: array<u32>;
+var<workgroup> warpSums: array<f32, 8>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let D = P[0]; let i = lid.x; let idx = wid.x * D + i;
+    let v = Proj[idx];
+    let ws = subgroupAdd(v * v);
+    if ((i & 31u) == 0u) { warpSums[i / 32u] = ws; }
+    workgroupBarrier();
+    var total = 0.0;
+    for (var w = 0u; w < 8u; w++) { total += warpSums[w]; }
+    let rms = inverseSqrt(total / f32(D) + bitcast<f32>(P[2]));
+    TokenSignal[idx] = (v * rms * Norm[i] + TokenSignal[idx]) * 0.7071067811865476;
+}
+)";
+    const CompiledPipeline* plPleTokenGather = pleGpuPreprocess
+        ? &gpu->getOrCreatePipeline("ple_token_q4_gather", std::string(PLE_TOKEN_Q4_GATHER_WGSL), 5)
+        : nullptr;
+    const CompiledPipeline* plPleProjectCombine = pleGpuPreprocess
+        ? &gpu->getOrCreatePipeline("ple_project_combine", std::string(PLE_PROJECT_COMBINE_WGSL), 4)
+        : nullptr;
+    static const char* RMS_NORM_ADD_WGSL = R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> Dst: array<f32>;
+@group(0) @binding(1) var<storage, read> Src: array<f32>;
+@group(0) @binding(2) var<storage, read> W: array<f32>;
+@group(0) @binding(3) var<storage, read> P: array<u32>;
+var<workgroup> warpSums: array<f32, 8>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x; let N = P[0]; let eps = bitcast<f32>(P[1]);
+    var ss = 0.0;
+    for (var j = tid; j < N; j += 256u) { let v = Src[j]; ss += v * v; }
+    let ws = subgroupAdd(ss);
+    if ((tid & 31u) == 0u) { warpSums[tid / 32u] = ws; }
+    workgroupBarrier();
+    var total = 0.0;
+    for (var w = 0u; w < 8u; w++) { total += warpSums[w]; }
+    let rms = inverseSqrt(total / f32(N) + eps);
+    for (var j = tid; j < N; j += 256u) {
+        Dst[j] += Src[j] * rms * W[j];
+    }
+}
+)";
+    const CompiledPipeline* plRmsNormAdd = weightsAreNativeQ4
+        ? &gpu->getOrCreatePipeline("rms_norm_add_inplace", std::string(RMS_NORM_ADD_WGSL), 4)
+        : nullptr;
+    GPUBuffer pleTokenGatherParams, pleModelProjParams, pleCombineParams;
     auto& plFp16Gemm   = getKernel("fp16_gemm");
     auto& plFp16Wide   = getKernel("fp16_gemm_wide");
     auto& plArgmax     = getKernel("argmax");
@@ -1913,6 +2294,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 )";
     auto& plEmbGatherQ8 = gpu->getOrCreatePipeline("embed_gather_q8",
         std::string(EMBED_GATHER_Q8_WGSL), 5);
+    auto& plEmbGatherKQ = getKernel("q6k_gather");
     const bool useGelu = (cfg.activation == ActivationType::GELU);
     auto& plDownSilu   = useGelu ? getKernelGelu("q8_down_silu_add")
                                  : getKernel("q8_down_silu_add");
@@ -1922,7 +2304,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     const CompiledPipeline* plQ8DecDp4a = decodeDp4aReady
         ? &getKernel("q8_matmul_decode_dp4a_d3d12") : nullptr;
 
-    decodeFastVariantsAvailable = decodeFastQ8Eligible && !useKQ;
+    decodeFastVariantsAvailable = decodeFastQ8Eligible && !useKQ && !weightsAreNativeQ4 &&
+                                  !std::getenv("BP_Q8_BASELINE");
     tuning.decodeUseFastQkv = decodeFastVariantsAvailable;
     tuning.decodeUseFastGateup = decodeFastVariantsAvailable;
     tuning.decodeUseFastOproj = false;
@@ -1943,7 +2326,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             decodePoolDepth = std::max(1, std::min(forcedDepth, decodePoolCapacity));
     }
     decodeCbPoolBatch = chooseDecodeCbPoolBatch(*gpu, cfg);
-    const char* lmHeadKind = lmHeadIsKQ ? "k-quant"
+    const char* lmHeadKind = lmHeadIsKQ ? "k-quant" : lmHeadIsQ4 ? "q4"
         : (lmHeadIsQ8 ? "q8" : (tuning.decodeUseWideFp16 ? "fp16_wide" : "fp16"));
         fprintf(stderr, "  Initial decode heuristic: qkv=%s oproj=%s gateup=%s lm_head=%s pool=%d batch=%d\n",
         tuning.decodeUseFastQkv ? "fast" : "base",
@@ -1955,6 +2338,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Static params (shared between both sets — read-only)
     auto makeQ8Params = [&](const std::string& name, uint32_t K, uint32_t N) -> GPUBuffer {
         uint32_t data[4] = {K, N, 0, 0};
+        auto buf = gpu->createBuffer(name, 16);
+        gpu->writeBuffer(buf, data, 16);
+        return buf;
+    };
+    auto makeQ4Params = [&](const std::string& name, uint32_t K, uint32_t N) -> GPUBuffer {
+        uint32_t data[4] = {0, N, K, 0};
         auto buf = gpu->createBuffer(name, 16);
         gpu->writeBuffer(buf, data, 16);
         return buf;
@@ -2014,9 +2403,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // K-quant param buffers: [K, N, n_blocks, row_stride_words]
     auto makeKQParams = [&](const std::string& name, uint32_t K, uint32_t N,
                             uint32_t nBlocks, uint32_t rowStride) -> GPUBuffer {
-        uint32_t data[4] = {K, N, nBlocks, rowStride};
-        auto buf = gpu->createBuffer(name, 16);
-        gpu->writeBuffer(buf, data, 16);
+        // Q5_K/Q6_K kernels also consume word 4 as an output offset. Keep one
+        // common ABI for all K-quant kernels so Dawn's inferred minimum binding
+        // size is satisfied even when the offset is zero.
+        uint32_t data[5] = {K, N, nBlocks, rowStride, 0};
+        auto buf = gpu->createBuffer(name, sizeof(data));
+        gpu->writeBuffer(buf, data, sizeof(data));
         return buf;
     };
     GPUBuffer kqQkvParams, kqOprojParams, kqGuParams, kqDnParams, kqLmParams;
@@ -2025,9 +2417,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         kqOprojParams = makeKQParams("p_kq_oproj", qDim, cfg.nEmbd, kqONBlocks, kqORowStride);
         kqGuParams    = makeKQParams("p_kq_gu", cfg.nEmbd, 2 * cfg.intermediateSize, kqGuNBlocks, kqGuRowStride);
         kqDnParams    = makeKQParams("p_kq_dn", cfg.intermediateSize, cfg.nEmbd, kqDnNBlocks, kqDnRowStride);
-        if (lmHeadIsKQ)
-            kqLmParams = makeKQParams("p_kq_lm", cfg.nEmbd, cfg.nVocab, kqLmNBlocks, kqLmRowStride);
     }
+    if (lmHeadIsKQ)
+        kqLmParams = makeKQParams("p_kq_lm", cfg.nEmbd, cfg.nVocab, kqLmNBlocks, kqLmRowStride);
 
     GPUBuffer rmsParams;
     {
@@ -2068,6 +2460,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         embedParams = gpu->createBuffer("p_embed", 16);
         gpu->writeBuffer(embedParams, p, 16);
     }
+    GPUBuffer embedKQParams;
+    if (lmHeadIsKQ && lmHeadKQType == GGUF_TYPE_Q6_K) {
+        uint32_t p[2] = {cfg.nEmbd, kqLmRowStride};
+        embedKQParams = gpu->createBuffer("p_embed_kq", sizeof(p));
+        gpu->writeBuffer(embedKQParams, p, sizeof(p));
+    }
 
     // Upload embedding table to GPU (shared). Two strategies to keep the
     // resident set small enough to stay under the D3D12 per-process memory
@@ -2076,7 +2474,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // silently kills the device):
     //   1. Tied Q8 LM head resident → gather straight from it (no extra buffer).
     //   2. Otherwise store a dedicated fp16 copy (half the fp32 size).
-    if (lmHeadIsQ8 && cfg.tieWordEmbeddings && lmHeadQ8W.handle) {
+    if (lmHeadIsKQ && lmHeadKQType == GGUF_TYPE_Q6_K &&
+        cfg.tieWordEmbeddings && lmHeadKQ.handle) {
+        embeddingGpuIsF16 = false;
+        embeddingGatherFromKQ = true;
+        embeddingGpuBuf = GPUBuffer{};
+        fprintf(stderr, "  Embedding gather: from tied native Q6_K LM head (no extra buffer)\n");
+    } else if (lmHeadIsQ8 && cfg.tieWordEmbeddings && lmHeadQ8W.handle) {
         embeddingGpuIsF16 = false;         // signal: use Q8 gather from lm head
         embeddingGatherFromQ8 = true;
         embeddingGpuBuf = GPUBuffer{};     // no separate embedding buffer
@@ -2105,14 +2509,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         p[3] = 0;  p[4] = ropeHalf;  p[5] = 0;
         float eps = cfg.rmsNormEps;
         memcpy(&p[6], &eps, 4);
+        // Gemma 4 normalizes V per head (without a learned scale) before it is
+        // written to the KV cache.  The fused QK-norm/RoPE kernel already
+        // implements this via params.v_norm; leaving it disabled corrupts the
+        // donor caches subsequently reused by the shared-KV layers.
+        p[7] = cfg.arch == "gemma4" ? 1 : 0;
     }
     chunkedAttnParamData.resize(32, 0);
     {
         auto* p = reinterpret_cast<uint32_t*>(chunkedAttnParamData.data());
         p[0] = cfg.nKvHeads * cfg.headDim;
         p[1] = cfg.nHead / cfg.nKvHeads;
-        p[2] = 0;  p[3] = gqaChunkSize;  p[4] = 0;
-        float scale = 1.0f / sqrtf((float)cfg.headDim);
+        p[2] = 0;  p[3] = 0;  p[4] = 0;
+        // Gemma 4 defines self.scaling = 1.0; unlike conventional attention it
+        // must not apply the additional 1/sqrt(head_dim) factor here.
+        float scale = cfg.arch == "gemma4" ? 1.0f
+                                             : 1.0f / sqrtf((float)cfg.headDim);
         float neg_inf = -1e9f;
         memcpy(&p[5], &scale, 4);
         memcpy(&p[6], &neg_inf, 4);
@@ -2120,8 +2532,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0) {
         uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
-        uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
-        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
+        uint32_t q[8] = {cfg.nHead, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], 0u, ropeHalf};
+        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], 0u, ropeHalf};
         uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, 0u, 0, 0, 0, 0, 0, 0};
         q35RopeQParamsBuf = gpu->createBuffer("p_q35_rope_q", 32);
         q35RopeKParamsBuf = gpu->createBuffer("p_q35_rope_k", 32);
@@ -2152,11 +2564,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // PLE buffers
     if (cfg.pleSize > 0) {
+        uint32_t totalPleDim = cfg.pleSize * cfg.nLayer;
+        pleInputBuf = gpu->createBuffer("ple_input", totalPleDim * 4);
+        if (pleGpuPreprocess)
+            pleProjRawBuf = gpu->createBuffer("ple_proj_raw", totalPleDim * 4);
         pleBuf = gpu->createBuffer("ple_buf", cfg.pleSize * 4);
         pleOutBuf = gpu->createBuffer("ple_out", cfg.nEmbd * 4);
-        pleSliceBufs.resize(cfg.nLayer);
-        for (uint32_t li = 0; li < cfg.nLayer; li++)
-            pleSliceBufs[li] = gpu->createBuffer("ple_slice_" + std::to_string(li), cfg.pleSize * 4);
     }
 
     // ─── Single set of intermediate buffers ───────────────────────────────
@@ -2271,7 +2684,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // K-quant needs a separate SiLU-mul output buffer (used for down proj input)
     GPUBuffer siluMulOutBuf;
-    if (useKQ) {
+    bool hasNativeKQDown = useKQ;
+    if (!hasNativeKQDown) {
+        for (const auto& lw : layerWeights)
+            if (lw.dnKQ.handle) { hasNativeKQDown = true; break; }
+    }
+    if (hasNativeKQDown) {
         siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
     }
 
@@ -2324,6 +2742,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     q35KvWriteDispatchIndices.assign(cfg.nLayer, -1);
     argmaxDispatchIndex = -1;
     argmaxReduceDispatchIndex = -1;
+    pleTokenGatherDispatchIndex = -1;
+
+    if (pleGpuPreprocess && plPleTokenGather && plQ4A32 && plPleProjectCombine) {
+        uint32_t totalPleDim = cfg.pleSize * cfg.nLayer;
+        uint32_t gatherData[4] = {totalPleDim, 0, 0, 0};
+        float tokenScale = sqrtf((float)cfg.pleSize);
+        memcpy(&gatherData[1], &tokenScale, 4);
+        pleTokenGatherParams = gpu->createBuffer("p_ple_token_gather", 16);
+        gpu->writeBuffer(pleTokenGatherParams, gatherData, 16);
+        pleModelProjParams = makeQ4Params("p_ple_model_proj", cfg.nEmbd, totalPleDim);
+        uint32_t combineData[4] = {cfg.pleSize, cfg.nLayer, 0, 0};
+        memcpy(&combineData[2], &cfg.rmsNormEps, 4);
+        pleCombineParams = gpu->createBuffer("p_ple_combine", 16);
+        gpu->writeBuffer(pleCombineParams, combineData, 16);
+
+        auto bgGather = makeBG(*plPleTokenGather, {
+            {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, argmaxResultBuf},
+            {3, pleInputBuf}, {4, pleTokenGatherParams}});
+        pleTokenGatherDispatchIndex = (int)allDecodeDispatches.size();
+        allDecodeDispatches.push_back({plPleTokenGather->pipeline, bgGather,
+            (totalPleDim + 255) / 256, 1, 1, "ple_token_gather"});
+
+        auto bgProj = makeBG(*plQ4A32, {
+            {0, xBuf}, {1, pleModelProjW}, {2, pleModelProjS},
+            {3, pleProjRawBuf}, {4, pleModelProjParams}});
+        allDecodeDispatches.push_back({plQ4A32->pipeline, bgProj,
+            (totalPleDim + 3) / 4, 1, 1, "ple_model_proj"});
+
+        auto bgCombine = makeBG(*plPleProjectCombine, {
+            {0, pleProjRawBuf}, {1, pleProjNormW},
+            {2, pleInputBuf}, {3, pleCombineParams}});
+        allDecodeDispatches.push_back({plPleProjectCombine->pipeline, bgCombine,
+            cfg.nLayer, 1, 1, "ple_project_combine"});
+    }
 
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
         auto& lw = layerWeights[i];
@@ -2361,7 +2813,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             uint32_t convChannels = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
             uint32_t qkDimSsm = cfg.ssmGroupCount * cfg.ssmStateSize;
             uint32_t headV = cfg.ssmInnerSize / cfg.ssmTimeStepRank;
-            bool useSsmKQ = useKQ && cfg.arch != "qwen35";
+            bool useSsmKQ = lw.qkvKQ.handle != nullptr;
 
             {
                 auto bg = makeBG(plRmsNorm, {
@@ -2371,11 +2823,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             if (useSsmKQ) {
-                auto bg = makeBG(*plKQ, {
+                auto* layerKQ = kqPipelineFor(lw.qkvKQType);
+                uint32_t layerTile = kqTileFor(lw.qkvKQType);
+                auto layerParams = makeKQParams("p_kq_ssm_qkv_" + std::to_string(i),
+                    cfg.nEmbd, convChannels, lw.qkvKQNBlocks, lw.qkvKQRowStride);
+                auto bg = makeBG(*layerKQ, {
                     {0, normOutBuf}, {1, lw.qkvKQ}, {2, zeroBiasQKV},
-                    {3, qkvBuf}, {4, kqQkvParams}});
-                allDecodeDispatches.push_back({plKQ->pipeline, bg,
-                    1, (convChannels + kqTileN - 1) / kqTileN, 1, L+"ssm_qkv"});
+                    {3, qkvBuf}, {4, layerParams}});
+                allDecodeDispatches.push_back({layerKQ->pipeline, bg,
+                    1, (convChannels + layerTile - 1) / layerTile, 1, L+"ssm_qkv"});
             } else {
                 auto p = mkP32("p_ssm_qkv_L"+std::to_string(i), {cfg.nEmbd, convChannels});
                 auto bg = makeBG(plQ8Matmul, {
@@ -2386,12 +2842,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             {
-                auto p = mkP32("p_ssm_z_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmInnerSize});
-                auto bg = makeBG(plQ8Matmul, {
-                    {0, normOutBuf}, {1, lw.attnGateW}, {2, lw.attnGateS},
-                    {3, zeroBiasQKV}, {4, q35SsmZBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
-                    1, (cfg.ssmInnerSize + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_z"});
+                if (lw.attnGateKQ.handle) {
+                    auto* layerKQ = kqPipelineFor(lw.attnGateKQType);
+                    uint32_t tile = kqTileFor(lw.attnGateKQType);
+                    auto p = makeKQParams("p_kq_ssm_z_" + std::to_string(i),
+                        cfg.nEmbd, cfg.ssmInnerSize, lw.attnGateKQNBlocks,
+                        lw.attnGateKQRowStride);
+                    auto bg = makeBG(*layerKQ, {{0,normOutBuf},{1,lw.attnGateKQ},
+                        {2,zeroBiasQKV},{3,q35SsmZBuf},{4,p}});
+                    allDecodeDispatches.push_back({layerKQ->pipeline,bg,1,
+                        (cfg.ssmInnerSize+tile-1)/tile,1,L+"ssm_z"});
+                } else {
+                    auto p = mkP32("p_ssm_z_L"+std::to_string(i), {cfg.nEmbd, cfg.ssmInnerSize});
+                    auto bg = makeBG(plQ8Matmul, {
+                        {0, normOutBuf}, {1, lw.attnGateW}, {2, lw.attnGateS},
+                        {3, zeroBiasQKV}, {4, q35SsmZBuf}, {5, p}});
+                    allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                        1, (cfg.ssmInnerSize + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_z"});
+                }
             }
             bool useFusedBetaAlpha = lw.ssmBetaAlphaW.handle && lw.ssmBetaAlphaS.handle;
             if (useFusedBetaAlpha) {
@@ -2430,6 +2898,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 allDecodeDispatches.push_back({plGate.pipeline, bg,
                     (cfg.ssmTimeStepRank + 63) / 64, 1, 1, L+"ssm_abg"});
             }
+            if (qwen35VulkanDecode && cfg.ssmStateSize == 128u && headV == 128u &&
+                !std::getenv("BP_UNFUSED_Q35_CONV")) {
+                static const char* CONV_SPLIT_WGSL = R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> State: array<f32>;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read> CW: array<f32>;
+@group(0) @binding(3) var<storage, read> Bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(5) var<storage, read_write> KOut: array<f32>;
+@group(0) @binding(6) var<storage, read_write> V: array<f32>;
+@group(0) @binding(7) var<storage, read> P: array<u32>;
+var<workgroup> sums: array<f32, 4>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nk = P[0]; let nv = P[1]; let dk = P[2]; let dv = P[3]; let convK = P[4];
+    let kind = wid.x; let h = wid.y; let d = lid.x;
+    let dim = select(dk, dv, kind == 2u);
+    let heads = select(nk, nv, kind == 2u);
+    if (h >= heads) { return; }
+    let qSize = nk * dk;
+    let channelOffset = select(select(0u, qSize, kind == 1u), qSize * 2u, kind == 2u);
+    let channel = channelOffset + h * dim + d;
+    let base = channel * convK;
+    var acc = Bias[channel];
+    for (var j = 0u; j + 1u < convK; j++) {
+        let old = State[base + j + 1u];
+        State[base + j] = old;
+        acc += CW[base + j] * old;
+    }
+    let newest = X[channel];
+    State[base + convK - 1u] = newest;
+    acc += CW[base + convK - 1u] * newest;
+    let value = acc / (1.0 + exp(-acc));
+    if (kind == 2u) {
+        V[h * dv + d] = value;
+        return;
+    }
+    let ws = subgroupAdd(value * value);
+    if ((d & 31u) == 0u) { sums[d / 32u] = ws; }
+    workgroupBarrier();
+    let eps = bitcast<f32>(P[5]);
+    let inv = 1.0 / max(sqrt(sums[0] + sums[1] + sums[2] + sums[3]), eps);
+    if (kind == 0u) { Q[h * dk + d] = value * inv; }
+    else { KOut[h * dk + d] = value * inv; }
+}
+)";
+                auto& plConvSplit = gpu->getOrCreatePipeline(
+                    "qwen35_conv_silu_split_l2", std::string(CONV_SPLIT_WGSL), 8);
+                uint32_t epsBits; float eps = cfg.rmsNormEps; memcpy(&epsBits, &eps, 4);
+                auto p = mkP32("p_ssm_conv_split_L" + std::to_string(i),
+                    {cfg.ssmGroupCount, cfg.ssmTimeStepRank, cfg.ssmStateSize,
+                     headV, cfg.ssmConvKernel, epsBits});
+                auto bg = makeBG(plConvSplit, {
+                    {0, ssmConvState[i]}, {1, qkvBuf}, {2, lw.ssmConv1dW},
+                    {3, zeroBiasQKV}, {4, q35SsmQBuf}, {5, q35SsmKBuf},
+                    {6, q35SsmVBuf}, {7, p}});
+                allDecodeDispatches.push_back({plConvSplit.pipeline, bg,
+                    3, std::max(cfg.ssmGroupCount, cfg.ssmTimeStepRank), 1,
+                    L+"ssm_conv_split"});
+            } else {
             {
                 auto& plConvSilu = getKernel("qwen35_conv_update_silu");
                 auto p = mkP32("p_ssm_conv_silu_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
@@ -2449,6 +2979,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     {3, q35SsmVBuf}, {4, p}});
                 allDecodeDispatches.push_back({plSplit.pipeline, bg,
                     3, std::max(cfg.ssmGroupCount, cfg.ssmTimeStepRank), 1, L+"ssm_split"});
+            }
             }
             {
                 auto& plDelta = qwen35VulkanDecode ? getKernel("delta_net_decode_x2")
@@ -2475,23 +3006,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     cfg.ssmTimeStepRank, 1, 1, L+"ssm_norm_gate"});
             }
             {
-                auto p = mkP32("p_ssm_out_L"+std::to_string(i), {cfg.ssmInnerSize, cfg.nEmbd});
-                auto bg = makeBG(plQ8Matmul, {
-                    {0, q35SsmNormBuf}, {1, lw.ssmOutW}, {2, lw.ssmOutS},
-                    {3, zeroBiasE}, {4, projOutBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
-                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_out"});
+                if (lw.ssmOutKQ.handle) {
+                    auto* layerKQ = kqPipelineFor(lw.ssmOutKQType);
+                    uint32_t tile = kqTileFor(lw.ssmOutKQType);
+                    auto p = makeKQParams("p_kq_ssm_out_" + std::to_string(i),
+                        cfg.ssmInnerSize, cfg.nEmbd, lw.ssmOutKQNBlocks,
+                        lw.ssmOutKQRowStride);
+                    auto bg = makeBG(*layerKQ, {{0,q35SsmNormBuf},{1,lw.ssmOutKQ},
+                        {2,zeroBiasE},{3,projOutBuf},{4,p}});
+                    allDecodeDispatches.push_back({layerKQ->pipeline,bg,1,
+                        (cfg.nEmbd+tile-1)/tile,1,L+"ssm_out"});
+                } else {
+                    auto p = mkP32("p_ssm_out_L"+std::to_string(i), {cfg.ssmInnerSize, cfg.nEmbd});
+                    auto bg = makeBG(plQ8Matmul, {
+                        {0, q35SsmNormBuf}, {1, lw.ssmOutW}, {2, lw.ssmOutS},
+                        {3, zeroBiasE}, {4, projOutBuf}, {5, p}});
+                    allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
+                        1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"ssm_out"});
+                }
             }
         }
 
-        // ── qwen35moe attention-layer dispatch (correctness wiring) ────────
-        // Replaces the standard fused-QKV path for qwen35moe attention layers.
-        // Output not yet validated against llama.cpp; bugs expected.
-        // (Note: this dispatches ALONGSIDE the dense path below, so residual
-        //  is added twice. Refactoring to skip the dense path requires
-        //  wrapping ~400 lines in if/else; for now we live with the duplication.)
+        // ── Qwen3.5 full-attention layer ───────────────────────────────────
+        // Joint Q+gate, separate K/V, QK normalization, MRoPE, gated output.
+        // q35CustomAttn suppresses the standard attention path below.
         if (cfg.arch == "qwen35" && cfg.fullAttentionInterval > 0 && cfg.isAttentionLayer(i) &&
-            layerWeights[i].qjW.handle && layerWeights[i].kSepW.handle && layerWeights[i].vSepW.handle) {
+            (layerWeights[i].qjKQ.handle || layerWeights[i].qjW.handle) &&
+            (layerWeights[i].kSepKQ.handle || layerWeights[i].kSepW.handle) &&
+            (layerWeights[i].vSepKQ.handle || layerWeights[i].vSepW.handle)) {
             q35CustomAttn = true;
             auto& lwQ35 = layerWeights[i];
             if (i == 3) {
@@ -2503,32 +3045,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             uint32_t headDimAct = pl.headDim;
             uint32_t kvDimAct = pl.kvDim;
 
+            // Full-attention layers need their own pre-attention norm just as
+            // the recurrent layers do. Without this, Q/K/V consumed the stale
+            // pre-FFN norm left by the preceding layer.
+            {
+                auto bg = makeBG(plRmsNorm, {
+                    {0, xBuf}, {1, normOutBuf}, {2, lwQ35.inputNorm},
+                    {3, rstdBuf}, {4, rmsParams}});
+                allDecodeDispatches.push_back({plRmsNorm.pipeline, bg,
+                    1, 1, 1, L+"rms_norm"});
+            }
+
             // 2. Q matmul: normOutBuf @ qjW → q35QjBuf
             {
-                auto p = mkP32("p_q35_q_L"+std::to_string(i), {cfg.nEmbd, qOutDim});
-                auto bg = makeBG(plQ8Matmul, {
-                    {0, normOutBuf}, {1, lwQ35.qjW}, {2, lwQ35.qjS},
-                    {3, zeroBiasV}, {4, q35QjBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
-                    1, (qOutDim + Q8_TILE - 1) / Q8_TILE, 1, L+"q35_q"});
+                if (lwQ35.qjKQ.handle) {
+                    auto* kp=kqPipelineFor(lwQ35.qjKQType);auto tile=kqTileFor(lwQ35.qjKQType);
+                    auto p=makeKQParams("p_kq_q35_q_"+std::to_string(i),cfg.nEmbd,qOutDim,lwQ35.qjKQNBlocks,lwQ35.qjKQRowStride);
+                    auto bg=makeBG(*kp,{{0,normOutBuf},{1,lwQ35.qjKQ},{2,zeroBiasV},{3,q35QjBuf},{4,p}});
+                    allDecodeDispatches.push_back({kp->pipeline,bg,1,(qOutDim+tile-1)/tile,1,L+"q35_q"});
+                } else {
+                    auto p = mkP32("p_q35_q_L"+std::to_string(i), {cfg.nEmbd, qOutDim});
+                    auto bg = makeBG(plQ8Matmul, {{0,normOutBuf},{1,lwQ35.qjW},{2,lwQ35.qjS},{3,zeroBiasV},{4,q35QjBuf},{5,p}});
+                    allDecodeDispatches.push_back({plQ8Matmul.pipeline,bg,1,(qOutDim+Q8_TILE-1)/Q8_TILE,1,L+"q35_q"});
+                }
             }
             // 3. K matmul
             {
-                auto p = mkP32("p_q35_k_L"+std::to_string(i), {cfg.nEmbd, kvDimAct});
-                auto bg = makeBG(plQ8Matmul, {
-                    {0, normOutBuf}, {1, lwQ35.kSepW}, {2, lwQ35.kSepS},
-                    {3, zeroBiasV}, {4, q35KBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
-                    1, (kvDimAct + Q8_TILE - 1) / Q8_TILE, 1, L+"q35_k"});
+                if (lwQ35.kSepKQ.handle) {
+                    auto* kp=kqPipelineFor(lwQ35.kSepKQType);auto tile=kqTileFor(lwQ35.kSepKQType);
+                    auto p=makeKQParams("p_kq_q35_k_"+std::to_string(i),cfg.nEmbd,kvDimAct,lwQ35.kSepKQNBlocks,lwQ35.kSepKQRowStride);
+                    auto bg=makeBG(*kp,{{0,normOutBuf},{1,lwQ35.kSepKQ},{2,zeroBiasV},{3,q35KBuf},{4,p}});
+                    allDecodeDispatches.push_back({kp->pipeline,bg,1,(kvDimAct+tile-1)/tile,1,L+"q35_k"});
+                } else {
+                    auto p=mkP32("p_q35_k_L"+std::to_string(i),{cfg.nEmbd,kvDimAct});
+                    auto bg=makeBG(plQ8Matmul,{{0,normOutBuf},{1,lwQ35.kSepW},{2,lwQ35.kSepS},{3,zeroBiasV},{4,q35KBuf},{5,p}});
+                    allDecodeDispatches.push_back({plQ8Matmul.pipeline,bg,1,(kvDimAct+Q8_TILE-1)/Q8_TILE,1,L+"q35_k"});
+                }
             }
             // 4. V matmul
             {
-                auto p = mkP32("p_q35_v_L"+std::to_string(i), {cfg.nEmbd, kvDimAct});
-                auto bg = makeBG(plQ8Matmul, {
-                    {0, normOutBuf}, {1, lwQ35.vSepW}, {2, lwQ35.vSepS},
-                    {3, zeroBiasV}, {4, q35VBuf}, {5, p}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bg,
-                    1, (kvDimAct + Q8_TILE - 1) / Q8_TILE, 1, L+"q35_v"});
+                if (lwQ35.vSepKQ.handle) {
+                    auto* kp=kqPipelineFor(lwQ35.vSepKQType);auto tile=kqTileFor(lwQ35.vSepKQType);
+                    auto p=makeKQParams("p_kq_q35_v_"+std::to_string(i),cfg.nEmbd,kvDimAct,lwQ35.vSepKQNBlocks,lwQ35.vSepKQRowStride);
+                    auto bg=makeBG(*kp,{{0,normOutBuf},{1,lwQ35.vSepKQ},{2,zeroBiasV},{3,q35VBuf},{4,p}});
+                    allDecodeDispatches.push_back({kp->pipeline,bg,1,(kvDimAct+tile-1)/tile,1,L+"q35_v"});
+                } else {
+                    auto p=mkP32("p_q35_v_L"+std::to_string(i),{cfg.nEmbd,kvDimAct});
+                    auto bg=makeBG(plQ8Matmul,{{0,normOutBuf},{1,lwQ35.vSepW},{2,lwQ35.vSepS},{3,zeroBiasV},{4,q35VBuf},{5,p}});
+                    allDecodeDispatches.push_back({plQ8Matmul.pipeline,bg,1,(kvDimAct+Q8_TILE-1)/Q8_TILE,1,L+"q35_v"});
+                }
             }
             // 5. attn_split_qg: q35QjBuf → q35QBuf + q35GateBuf
             {
@@ -2608,12 +3173,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             // 10. wo matmul to projOutBuf. The shared post-attention block below
             // performs the residual add and post-attention norm.
-            if (useKQ && lwQ35.oKQ.handle && plKQ) {
-                auto bg = makeBG(*plKQ, {
+            if (lwQ35.oKQ.handle) {
+                auto* kp=kqPipelineFor(lwQ35.oKQType);auto tile=kqTileFor(lwQ35.oKQType);
+                auto p=makeKQParams("p_kq_q35_o_"+std::to_string(i),qDimAct,cfg.nEmbd,lwQ35.oKQNBlocks,lwQ35.oKQRowStride);
+                auto bg = makeBG(*kp, {
                     {0, q35AttnOutBuf}, {1, lwQ35.oKQ}, {2, zeroBiasE},
-                    {3, projOutBuf}, {4, kqOprojParams}});
-                allDecodeDispatches.push_back({plKQ->pipeline, bg,
-                    1, (cfg.nEmbd + kqTileN - 1) / kqTileN, 1, L+"q35_kq_oproj"});
+                    {3, projOutBuf}, {4, p}});
+                allDecodeDispatches.push_back({kp->pipeline, bg,
+                    1, (cfg.nEmbd + tile - 1) / tile, 1, L+"q35_kq_oproj"});
             } else if (lwQ35.oW.handle) {
                 auto p = mkP32("p_q35_oproj_L"+std::to_string(i), {qDimAct, cfg.nEmbd});
                 auto bg = makeBG(plQ8Matmul, {
@@ -2624,41 +3191,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // ── qwen35moe attention-layer correctness wiring (WIP scaffold) ────
-        // For qwen35moe attention layers, the dense Q dispatch is JOINT Q+gate
-        // (output is 2x qDim per head: first half = Q, second half = gate).
-        // We need split_qg → QK-norm on Q → MRoPE on Q/K → attention →
-        // attn_out * sigmoid(gate) → wo → residual.
-        //
-        // The existing dense path already runs (incorrect output). This block
-        // emits ADDITIONAL split/MRoPE/gated_output dispatches as scaffolding;
-        // full correctness requires replacing the dense path entirely (the
-        // existing QKV fuse + standard RoPE produce wrong intermediate state).
-        //
-        // NOT YET WIRED — kept as a documentation comment until the dense
-        // path can be cleanly replaced with the correct qwen35moe-specific
-        // attention sequence. Wiring this naively (adding to dense) would
-        // double-rotate and produce worse output than just running dense.
-        //
-        // Wiring steps needed:
-        //   1. Skip backpack's fuse-Q/K/V loader for qwen35moe attn layers
-        //      (Q is 2x sized; fuse pack assumes Q sized = qDim)
-        //   2. Emit 3 separate matmul dispatches: Q (2x), K, V
-        //   3. attn_split_qg: split Q+gate from joint matmul output
-        //   4. QK-norm on Q half, K-norm on K
-        //   5. attn_rope_multi on Q and K (replace standard RoPE)
-        //   6. Reuse existing attention compute (flash attention OK)
-        //   7. attn_gated_output: attn_out * sigmoid(gate)
-        //   8. wo matmul → projOutBuf (existing dense oproj path works)
-        //   9. Residual add to xBuf
-        //
-        // TODO: skip dense attention for qwen35moe attn layers. Naive brace
-        // wrap scopes `pl`/`plIM`/`layerDnP` away from MoE FFN dispatch.
-        // Real fix needs variable-hoist refactor or splitting MoE FFN into
-        // a helper that takes pl by value. For now both dense AND new q35
-        // dispatches run — Dawn flags null qkvW/qkvKQ binds but the run
-        // continues with garbage attention output.
-
+        // Standard attention is used only when the architecture-specific path
+        // above did not claim this layer.
         if (!q35CustomAttn) {
         // Shared KV: attention reads from source layer's cache
         uint32_t kvCacheLayer = (pl.kvSourceLayer >= 0) ? (uint32_t)pl.kvSourceLayer : i;
@@ -2669,7 +3203,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // this to layer 0 left layers 1+ projecting QKV from the previous layer's
         // FFN-normed activation instead of this layer's attention-normed input —
         // producing fluent but factually wrong output for K-quant Gemma models.
-        if (useKQ && !lw.qOnly) {
+        if ((useKQ || weightsAreNativeQ4)) {
             auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, lw.inputNorm},
                 {3, rstdBuf}, {4, rmsParams}});
@@ -2683,13 +3217,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // qkvBuf's Q region; K/V are reused from the source layer's
                 // cache (kvCacheLayer). rope writes its K/V output to a scratch
                 // buffer so the shared cache is not corrupted.
-                vbg.qkvBase = makeBG(plQ8MatmulNorm, {
-                    {0, xBuf}, {1, lw.qOnlyW}, {2, lw.qOnlyS},
-                    {3, zeroBiasQKV}, {4, qkvBuf}, {5, layerQkvNP},
-                    {6, lw.inputNorm}});
-                di.qkv = (int)allDecodeDispatches.size();
-                allDecodeDispatches.push_back({plQ8MatmulNorm.pipeline, vbg.qkvBase,
-                    1, (plQDim + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_q_only"});
+                if (weightsAreNativeQ4 && plQ4Decode) {
+                    auto p = makeQ4Params("p_q4_qonly_" + std::to_string(i), cfg.nEmbd, plQDim);
+                    auto bg = makeBG(*plQ4Decode, {
+                        {0, normOutBuf}, {1, lw.qOnlyW}, {2, lw.qOnlyS},
+                        {3, qkvBuf}, {4, p}});
+                    di.qkv = (int)allDecodeDispatches.size();
+                    allDecodeDispatches.push_back({plQ4Decode->pipeline, bg,
+                        (plQDim + Q4_DECODE_TILE_N - 1) / Q4_DECODE_TILE_N, 1, 1, L+"q4_q_only"});
+                } else {
+                    vbg.qkvBase = makeBG(plQ8MatmulNorm, {
+                        {0, xBuf}, {1, lw.qOnlyW}, {2, lw.qOnlyS},
+                        {3, zeroBiasQKV}, {4, qkvBuf}, {5, layerQkvNP},
+                        {6, lw.inputNorm}});
+                    di.qkv = (int)allDecodeDispatches.size();
+                    allDecodeDispatches.push_back({plQ8MatmulNorm.pipeline, vbg.qkvBase,
+                        1, (plQDim + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_q_only"});
+                }
             } else if (useKQ) {
                 auto bg = makeBG(*plKQ, {
                     {0, normOutBuf}, {1, lw.qkvKQ}, {2, zeroBiasQKV},
@@ -2697,6 +3241,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 di.qkv = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plKQ->pipeline, bg,
                     1, (plQkvOut + 7) / 8, 1, L+"kq_qkv"});
+            } else if (weightsAreNativeQ4 && plQ4Decode) {
+                auto p = makeQ4Params("p_q4_qkv_" + std::to_string(i), cfg.nEmbd, plQkvOut);
+                auto bg = makeBG(*plQ4Decode, {
+                    {0, normOutBuf}, {1, lw.qkvW}, {2, lw.qkvS},
+                    {3, qkvBuf}, {4, p}});
+                di.qkv = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plQ4Decode->pipeline, bg,
+                    (plQkvOut + Q4_DECODE_TILE_N - 1) / Q4_DECODE_TILE_N, 1, 1, L+"q4_qkv"});
             } else {
                 vbg.qkvBase = makeBG(plQ8MatmulNorm, {
                     {0, xBuf}, {1, lw.qkvW}, {2, lw.qkvS},
@@ -2776,6 +3328,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 di.oproj = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({plKQ->pipeline, bg,
                     1, (cfg.nEmbd + kqTileN - 1) / kqTileN, 1, L+"kq_oproj"});
+            } else if (weightsAreNativeQ4 && plQ4Decode) {
+                auto p = makeQ4Params("p_q4_oproj_" + std::to_string(i), plQDim, cfg.nEmbd);
+                auto bg = makeBG(*plQ4Decode, {
+                    {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
+                    {3, projOutBuf}, {4, p}});
+                di.oproj = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plQ4Decode->pipeline, bg,
+                    (cfg.nEmbd + Q4_DECODE_TILE_N - 1) / Q4_DECODE_TILE_N, 1, 1, L+"q4_oproj"});
             } else {
                 vbg.oprojBase = makeBG(plQ8Matmul, {
                     {0, attnOutBuf}, {1, lw.oW}, {2, lw.oS},
@@ -2804,6 +3364,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {3, lw.postNorm}, {4, rstdBuf}, {5, rmsParams}});
             allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg, 1, 1, 1, L+"q35_add_attn_post_norm"});
         } else if (cfg.hasSandwichNorm && lw.postNorm.handle) {
+            if (weightsAreNativeQ4 && !std::getenv("BP_UNFUSED_SANDWICH")) {
+                static const char* FUSED_SANDWICH_ATTN_WGSL = R"(
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> Attn: array<f32>;
+@group(0) @binding(2) var<storage, read> PostW: array<f32>;
+@group(0) @binding(3) var<storage, read> FfnW: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(5) var<storage, read> P: array<u32>;
+var<workgroup> sums: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x; let N = P[0]; let eps = bitcast<f32>(P[1]);
+    var ss = 0.0;
+    for (var j = tid; j < N; j += 256u) { let v = Attn[j]; ss += v * v; }
+    sums[tid] = ss;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { sums[tid] += sums[tid + stride]; }
+        workgroupBarrier();
+    }
+    let postRms = inverseSqrt(sums[0] / f32(N) + eps);
+    for (var j = tid; j < N; j += 256u) {
+        X[j] += Attn[j] * postRms * PostW[j];
+    }
+    storageBarrier();
+    workgroupBarrier();
+    ss = 0.0;
+    for (var j = tid; j < N; j += 256u) { let v = X[j]; ss += v * v; }
+    sums[tid] = ss;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { sums[tid] += sums[tid + stride]; }
+        workgroupBarrier();
+    }
+    let ffnRms = inverseSqrt(sums[0] / f32(N) + eps);
+    for (var j = tid; j < N; j += 256u) { Out[j] = X[j] * ffnRms * FfnW[j]; }
+}
+)";
+                auto& plFusedSandwich = gpu->getOrCreatePipeline(
+                    "fused_sandwich_attn", std::string(FUSED_SANDWICH_ATTN_WGSL), 6);
+                GPUBuffer fusedP;
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                memcpy(&data[1], &cfg.rmsNormEps, 4);
+                fusedP = gpu->createBuffer("p_fused_sandwich_" + std::to_string(i), 16);
+                gpu->writeBuffer(fusedP, data, 16);
+                auto bg = makeBG(plFusedSandwich, {
+                    {0, xBuf}, {1, projOutBuf}, {2, lw.postNorm},
+                    {3, lw.ffnNorm}, {4, normOutBuf}, {5, fusedP}});
+                allDecodeDispatches.push_back({plFusedSandwich.pipeline, bg,
+                    1, 1, 1, L+"fused_post_add_ffn_norm"});
+            } else {
             // Sandwich: RMSNorm(projOutBuf) in-place, then xBuf += projOutBuf, then norm for FFN
             // Pure workgroup shared-memory tree reduction — no subgroup ops.
             // The subgroup+workgroup-shared variant crashed the D3D12 driver
@@ -2876,6 +3487,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {0, xBuf}, {1, normOutBuf}, {2, lw.ffnNorm},
                 {3, rstdBuf}, {4, rmsParams}});
             allDecodeDispatches.push_back({plRmsNorm.pipeline, bgFfnNorm, 1, 1, 1, L+"ffn_norm"});
+            }
         } else {
             // Standard: fused residual-add + pre-FFN norm
             auto bg = makeBG(plAddRmsNorm, {
@@ -3096,13 +3708,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         {
-            if (useKQ && cfg.arch != "qwen35") {
-                auto bg = makeBG(*plKQ, {
+            if (lw.guKQ.handle) {
+                auto* layerKQ = kqPipelineFor(lw.guKQType);
+                uint32_t layerTile = kqTileFor(lw.guKQType);
+                auto layerParams = makeKQParams("p_kq_gu_" + std::to_string(i),
+                    cfg.nEmbd, 2 * plIM, lw.guKQNBlocks, lw.guKQRowStride);
+                auto bg = makeBG(*layerKQ, {
                     {0, normOutBuf}, {1, lw.guKQ}, {2, zeroBiasGU},
-                    {3, gateUpBuf}, {4, kqGuParams}});
+                    {3, gateUpBuf}, {4, layerParams}});
                 di.gateup = (int)allDecodeDispatches.size();
-                allDecodeDispatches.push_back({plKQ->pipeline, bg,
-                    1, (2 * cfg.intermediateSize + kqTileN - 1) / kqTileN, 1, L+"kq_gateup"});
+                allDecodeDispatches.push_back({layerKQ->pipeline, bg,
+                    1, (2 * plIM + layerTile - 1) / layerTile, 1, L+"kq_gateup"});
+            } else if (weightsAreNativeQ4 && plQ4Gateup) {
+                auto p = makeQ4Params("p_q4_gateup_" + std::to_string(i), cfg.nEmbd, 2 * plIM);
+                auto bg = makeBG(*plQ4Gateup, {
+                    {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
+                    {3, gateUpBuf}, {4, p}});
+                di.gateup = (int)allDecodeDispatches.size();
+                allDecodeDispatches.push_back({plQ4Gateup->pipeline, bg,
+                    (2 * plIM + Q4_GATEUP_TILE_N - 1) / Q4_GATEUP_TILE_N, 1, 1, L+"q4_gateup"});
             } else {
                 vbg.gateupBase = makeBG(plQ8Matmul, {
                     {0, normOutBuf}, {1, lw.guW}, {2, lw.guS},
@@ -3122,8 +3746,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // 9. Down projection + SiLU + residual add
         {
-            if (useKQ && cfg.arch != "qwen35") {
+            if (lw.dnKQ.handle) {
                 // K-quant: activation+mul → K-quant matmul → add residual (3 dispatches)
+                auto* layerKQ = kqPipelineFor(lw.dnKQType);
+                uint32_t layerTile = kqTileFor(lw.dnKQType);
+                auto layerParams = makeKQParams("p_kq_dn_" + std::to_string(i),
+                    plIM, cfg.nEmbd, lw.dnKQNBlocks, lw.dnKQRowStride);
                 auto& plActMul = useGelu ? getKernel("gelu_mul_fused")
                                           : getKernel("silu_mul_fused");
                 GPUBuffer siluParams;
@@ -3137,11 +3765,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 allDecodeDispatches.push_back({plActMul.pipeline, bgSilu,
                     (cfg.intermediateSize + 127) / 128, 1, 1, L+"act_mul"});
 
-                auto bgDn = makeBG(*plKQ, {
+                auto bgDn = makeBG(*layerKQ, {
                     {0, siluMulOutBuf}, {1, lw.dnKQ}, {2, zeroBiasE},
-                    {3, projOutBuf}, {4, kqDnParams}});
-                allDecodeDispatches.push_back({plKQ->pipeline, bgDn,
-                    1, (cfg.nEmbd + kqTileN - 1) / kqTileN, 1, L+"kq_down"});
+                    {3, projOutBuf}, {4, layerParams}});
+                allDecodeDispatches.push_back({layerKQ->pipeline, bgDn,
+                    1, (cfg.nEmbd + layerTile - 1) / layerTile, 1, L+"kq_down"});
 
                 // Add residual: xBuf[i] += projOutBuf[i] using inline add_inplace kernel
                 static const char* ADD_INPLACE_WGSL = R"(
@@ -3229,14 +3857,33 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 // is a UNIFORM buffer (for q8_down_silu_add). Binding a uniform
                 // buffer to a storage slot builds an invalid D3D12 descriptor and
                 // removes the device (DXGI_ERROR_DEVICE_REMOVED).
-                auto dnMatmulP = makeQ8Params("p_dn_sw_" + std::to_string(i), plIM, cfg.nEmbd);
-                auto bgDn = makeBG(plQ8Matmul, {
-                    {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
-                    {3, zeroBiasE}, {4, projOutBuf}, {5, dnMatmulP}});
-                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgDn,
-                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_sw"});
+                if (weightsAreNativeQ4 && plQ4Decode) {
+                    auto p = makeQ4Params("p_q4_down_" + std::to_string(i), plIM, cfg.nEmbd);
+                    auto bgDn = makeBG(*plQ4Decode, {
+                        {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
+                        {3, projOutBuf}, {4, p}});
+                    allDecodeDispatches.push_back({plQ4Decode->pipeline, bgDn,
+                        (cfg.nEmbd + Q4_DECODE_TILE_N - 1) / Q4_DECODE_TILE_N, 1, 1, L+"q4_down_sw"});
+                } else {
+                    auto dnMatmulP = makeQ8Params("p_dn_sw_" + std::to_string(i), plIM, cfg.nEmbd);
+                    auto bgDn = makeBG(plQ8Matmul, {
+                        {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
+                        {3, zeroBiasE}, {4, projOutBuf}, {5, dnMatmulP}});
+                    allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgDn,
+                        1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"q8_down_sw"});
+                }
 
                 // 3. Post-FFN sandwich norm (in-place on projOutBuf)
+                if (plRmsNormAdd && lw.postFfwNorm.handle) {
+                    uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                    memcpy(&data[1], &cfg.rmsNormEps, 4);
+                    auto p = gpu->createBuffer("p_ffw_norm_add_" + std::to_string(i), 16);
+                    gpu->writeBuffer(p, data, 16);
+                    auto bg = makeBG(*plRmsNormAdd, {
+                        {0, xBuf}, {1, projOutBuf}, {2, lw.postFfwNorm}, {3, p}});
+                    allDecodeDispatches.push_back({plRmsNormAdd->pipeline, bg,
+                        1, 1, 1, L+"fused_ffw_norm_add"});
+                } else {
                 auto& plRmsIPfw = gpu->getOrCreatePipeline("rms_norm_inplace",
                     std::string(R"(
 enable subgroups;
@@ -3294,6 +3941,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     {0, xBuf}, {1, projOutBuf}, {2, addP2}});
                 allDecodeDispatches.push_back({plAddIPsw.pipeline, bgAdd2,
                     (cfg.nEmbd + 255) / 256, 1, 1, L+"add_res2"});
+                }
             } else {
                 auto bg = makeBG(plDnSilu, {
                     {0, gateUpBuf}, {1, lw.dnW}, {2, lw.dnS},
@@ -3306,67 +3954,64 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // PLE (Per-Layer Embedding) injection
         if (cfg.pleSize > 0 && lw.pleInpGateW.handle && lw.pleProjW.handle) {
             uint32_t pleDim = cfg.pleSize;
-
-            // 1. inp_gate matmul: xBuf [E] → pleBuf [pleSize]
-            GPUBuffer pleGateP = makeQ8Params("p_ple_gate_" + std::to_string(i), cfg.nEmbd, pleDim);
-            auto bgGate = makeBG(plQ8Matmul, {
-                {0, xBuf}, {1, lw.pleInpGateW}, {2, lw.pleInpGateS},
-                {3, zeroBiasE}, {4, pleBuf}, {5, pleGateP}});
-            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgGate,
-                1, (pleDim + Q8_TILE - 1) / Q8_TILE, 1, L+"ple_gate"});
-
-            // 2. GELU activation (in-place on pleBuf)
-            static const char* GELU_INPLACE_WGSL = R"(
-@group(0) @binding(0) var<storage, read_write> X: array<f32>;
-@group(0) @binding(1) var<storage, read> _p_: array<u32>;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _p_[0]; let i = gid.x;
-    if (i >= N) { return; }
-    let x = X[i];
-    X[i] = x * 0.5 * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
-}
-)";
-            auto& plGeluIP = gpu->getOrCreatePipeline("gelu_inplace",
-                std::string(GELU_INPLACE_WGSL), 2);
             GPUBuffer geluP;
             {
-                uint32_t data[4] = {pleDim, 0, 0, 0};
+                uint32_t data[4] = {pleDim, i * pleDim, 0, 0};
                 geluP = gpu->createBuffer("p_ple_gelu_" + std::to_string(i), 16);
                 gpu->writeBuffer(geluP, data, 16);
             }
-            auto bgGelu = makeBG(plGeluIP, {
-                {0, pleBuf}, {1, geluP}});
-            allDecodeDispatches.push_back({plGeluIP.pipeline, bgGelu,
-                (pleDim + 255) / 256, 1, 1, L+"ple_gelu"});
+            // 1. inp_gate matmul: xBuf [E] → pleBuf [pleSize]
+            if (pleWeightsUseFp16 && plQ4A32Ple) {
+                auto p = makeQ4Params("p_q4_ple_gate_" + std::to_string(i), cfg.nEmbd, pleDim);
+                auto bgGate = makeBG(*plQ4A32Ple, {
+                    {0, xBuf}, {1, lw.pleInpGateW}, {2, lw.pleInpGateS},
+                    {3, pleBuf}, {4, p}});
+                allDecodeDispatches.push_back({plQ4A32Ple->pipeline, bgGate,
+                    (pleDim + Q4_A32_PLE_TILE - 1) / Q4_A32_PLE_TILE, 1, 1, L+"q4_ple_gate"});
+            } else {
+                GPUBuffer pleGateP = makeQ8Params("p_ple_gate_" + std::to_string(i), cfg.nEmbd, pleDim);
+                auto bgGate = makeBG(plQ8Matmul, {
+                    {0, xBuf}, {1, lw.pleInpGateW}, {2, lw.pleInpGateS},
+                    {3, zeroBiasE}, {4, pleBuf}, {5, pleGateP}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgGate,
+                    1, (pleDim + Q8_TILE - 1) / Q8_TILE, 1, L+"ple_gate"});
+            }
 
-            // 3. Element-wise multiply: pleBuf *= pleSliceBufs[i]
-            static const char* EMUL_WGSL = R"(
-@group(0) @binding(0) var<storage, read_write> A: array<f32>;
-@group(0) @binding(1) var<storage, read> B: array<f32>;
-@group(0) @binding(2) var<storage, read> _p_: array<u32>;
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _p_[0]; let i = gid.x;
-    if (i < N) { A[i] = A[i] * B[i]; }
-}
-)";
-            auto& plEMul = gpu->getOrCreatePipeline("elementwise_mul",
-                std::string(EMUL_WGSL), 3);
-            auto bgMul = makeBG(plEMul, {
-                {0, pleBuf}, {1, pleSliceBufs[i]}, {2, geluP}});
-            allDecodeDispatches.push_back({plEMul.pipeline, bgMul,
-                (pleDim + 255) / 256, 1, 1, L+"ple_mul"});
+            // 2. Fused GELU + multiply by this layer's PLE input slice.
+            auto& plPleGeluMul = getKernel("ple_gelu_mul");
+            auto bgGeluMul = makeBG(plPleGeluMul, {
+                {0, pleBuf}, {1, pleInputBuf}, {2, geluP}});
+            allDecodeDispatches.push_back({plPleGeluMul.pipeline, bgGeluMul,
+                (pleDim + 255) / 256, 1, 1, L+"ple_gelu_mul"});
 
             // 4. Back-projection: pleBuf [pleSize] → pleOutBuf [E]
-            GPUBuffer pleProjP = makeQ8Params("p_ple_proj_" + std::to_string(i), pleDim, cfg.nEmbd);
-            auto bgProj = makeBG(plQ8Matmul, {
-                {0, pleBuf}, {1, lw.pleProjW}, {2, lw.pleProjS},
-                {3, zeroBiasE}, {4, pleOutBuf}, {5, pleProjP}});
-            allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgProj,
-                1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"ple_proj"});
+            if (pleWeightsUseFp16 && plQ4A32Ple) {
+                auto p = makeQ4Params("p_q4_ple_proj_" + std::to_string(i), pleDim, cfg.nEmbd);
+                auto bgProj = makeBG(*plQ4A32Ple, {
+                    {0, pleBuf}, {1, lw.pleProjW}, {2, lw.pleProjS},
+                    {3, pleOutBuf}, {4, p}});
+                allDecodeDispatches.push_back({plQ4A32Ple->pipeline, bgProj,
+                    (cfg.nEmbd + Q4_A32_PLE_TILE - 1) / Q4_A32_PLE_TILE, 1, 1, L+"q4_ple_proj"});
+            } else {
+                GPUBuffer pleProjP = makeQ8Params("p_ple_proj_" + std::to_string(i), pleDim, cfg.nEmbd);
+                auto bgProj = makeBG(plQ8Matmul, {
+                    {0, pleBuf}, {1, lw.pleProjW}, {2, lw.pleProjS},
+                    {3, zeroBiasE}, {4, pleOutBuf}, {5, pleProjP}});
+                allDecodeDispatches.push_back({plQ8Matmul.pipeline, bgProj,
+                    1, (cfg.nEmbd + Q8_TILE - 1) / Q8_TILE, 1, L+"ple_proj"});
+            }
 
             // 5. RMSNorm on pleOutBuf (in-place)
+            if (plRmsNormAdd && lw.plePostNorm.handle) {
+                uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
+                memcpy(&data[1], &cfg.rmsNormEps, 4);
+                auto p = gpu->createBuffer("p_ple_norm_add_" + std::to_string(i), 16);
+                gpu->writeBuffer(p, data, 16);
+                auto bg = makeBG(*plRmsNormAdd, {
+                    {0, xBuf}, {1, pleOutBuf}, {2, lw.plePostNorm}, {3, p}});
+                allDecodeDispatches.push_back({plRmsNormAdd->pipeline, bg,
+                    1, 1, 1, L+"fused_ple_norm_add"});
+            } else {
             if (lw.plePostNorm.handle) {
                 auto& plRmsIPple = gpu->getOrCreatePipeline("rms_norm_inplace",
                     std::string(R"(
@@ -3374,13 +4019,20 @@ enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
+var<workgroup> wg_warp_sums: array<f32, 8>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
-    let total = subgroupAdd(sum_sq);
-    let rms = 1.0 / sqrt(subgroupBroadcastFirst(total) / f32(N) + eps);
+    let warp_sum = subgroupAdd(sum_sq);
+    let warp_id = tid / 32u;
+    let lane = tid % 32u;
+    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
+    let rms = 1.0 / sqrt(total / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
 }
 )"), 3);
@@ -3419,6 +4071,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {0, xBuf}, {1, pleOutBuf}, {2, addPleP}});
             allDecodeDispatches.push_back({plAddPLE.pipeline, bgPleAdd,
                 (cfg.nEmbd + 255) / 256, 1, 1, L+"ple_add"});
+            }
         }
 
         // Per-layer output scale
@@ -3449,7 +4102,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         // 10. RMSNorm for next layer (only needed for KQ path — Q8 path uses fused kernel)
-        if (i < cfg.nLayer - 1 && useKQ) {
+        bool nextNeedsPrecomputedNorm = i + 1 < cfg.nLayer &&
+            (cfg.arch != "qwen35" || cfg.isAttentionLayer(i + 1));
+        if (useKQ && nextNeedsPrecomputedNorm) {
             auto bg = makeBG(plRmsNorm, {
                 {0, xBuf}, {1, normOutBuf}, {2, layerWeights[i+1].inputNorm},
                 {3, rstdBuf}, {4, rmsParams}});
@@ -3466,12 +4121,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // LM head
-    if (lmHeadIsKQ && plKQ) {
-        auto bg = makeBG(*plKQ, {
+    if (lmHeadIsKQ) {
+        bool useWideQ6 = lmHeadKQType == GGUF_TYPE_Q6_K &&
+            gpu->backendType == WGPUBackendType_Vulkan &&
+            !std::getenv("BP_Q6_LM_NARROW");
+        auto* lmKQ = useWideQ6 ? &getKernel("q6k_matmul_wide")
+                               : kqPipelineFor(lmHeadKQType);
+        uint32_t tile = useWideQ6 ? 16u : kqTileFor(lmHeadKQType);
+        auto bg = makeBG(*lmKQ, {
             {0, normOutBuf}, {1, lmHeadKQ}, {2, zeroBiasV},
             {3, logitsBuf}, {4, kqLmParams}});
-        allDecodeDispatches.push_back({plKQ->pipeline, bg,
-            1, (cfg.nVocab + 7) / 8, 1, "lm_head"});
+        allDecodeDispatches.push_back({lmKQ->pipeline, bg,
+            1, (cfg.nVocab + tile - 1) / tile, 1, "lm_head"});
+    } else if (lmHeadIsQ4 && plQ4LmHead) {
+        auto p = makeQ4Params("p_lmhead_q4", cfg.nEmbd, cfg.nVocab);
+        auto bg = makeBG(*plQ4LmHead, {
+            {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
+            {3, logitsBuf}, {4, p}});
+        allDecodeDispatches.push_back({plQ4LmHead->pipeline, bg,
+            (cfg.nVocab + Q4_LM_TILE_N - 1) / Q4_LM_TILE_N, 1, 1, "lm_head"});
     } else if (lmHeadIsQ8) {
         if (plQ8DecDp4a) {
             // DP4A decode path: Params{M, N, K, pad}, TILE_N=32
@@ -3551,14 +4219,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Gather the token embedding into xBuf (f32). Prefer gathering from the
         // tied Q8 LM head (no extra buffer); otherwise from the fp16 copy.
         std::vector<std::pair<uint32_t, GPUBuffer>> gatherBg =
-            embeddingGatherFromQ8
+            embeddingGatherFromKQ
+            ? std::vector<std::pair<uint32_t, GPUBuffer>>{
+                  {0, lmHeadKQ}, {1, argmaxResultBuf}, {2, xBuf}, {3, embedKQParams}}
+            : embeddingGatherFromQ8
             ? std::vector<std::pair<uint32_t, GPUBuffer>>{
                   {0, lmHeadQ8W}, {1, lmHeadQ8S}, {2, argmaxResultBuf},
                   {3, xBuf}, {4, embedParams}}
             : std::vector<std::pair<uint32_t, GPUBuffer>>{
                   {0, embeddingGpuBuf}, {1, argmaxResultBuf},
                   {2, xBuf}, {3, embedParams}};
-        auto& plGather = embeddingGatherFromQ8 ? plEmbGatherQ8 : plEmbGatherF16;
+        auto& plGather = embeddingGatherFromKQ ? plEmbGatherKQ
+            : (embeddingGatherFromQ8 ? plEmbGatherQ8 : plEmbGatherF16);
         auto bg = makeBG(plGather, gatherBg);
         autoDecodeDispatches.clear();
         autoDecodeDispatches.push_back({plGather.pipeline, bg,
@@ -3626,8 +4298,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (q35RopeQParamsBuf.handle) {
             uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
-            uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
-            uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, 0u, ropeHalf};
+            uint32_t q[8] = {cfg.nHead, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], 0u, ropeHalf};
+            uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], 0u, ropeHalf};
             uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, 0u, 0, 0, 0, 0, 0, 0};
             char ql[32]; snprintf(ql, 32, "p_q35_rope_q_%d", s);
             char kl[32]; snprintf(kl, 32, "p_q35_rope_k_%d", s);
@@ -3647,6 +4319,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             gpu->writeBuffer(ps.attnParamsBufSWA, chunkedAttnParamData.data(), 32);
         }
 
+        if (hasVariableHeadDim) {
+            ps.layerRopeParamsBufs.resize(cfg.nLayer);
+            ps.layerAttnParamsBufs.resize(cfg.nLayer);
+            constexpr uint64_t kParamStride = 256;
+            ps.layerRopeParamsPacked = gpu->createBuffer(
+                "p_frope_packed_" + std::to_string(s), cfg.nLayer * kParamStride);
+            ps.layerAttnParamsPacked = gpu->createBuffer(
+                "p_cattn_packed_" + std::to_string(s), cfg.nLayer * kParamStride);
+            for (uint32_t li = 0; li < cfg.nLayer; li++) {
+                ps.layerRopeParamsBufs[li] = {ps.layerRopeParamsPacked.handle, 32,
+                                               li * kParamStride};
+                ps.layerAttnParamsBufs[li] = {ps.layerAttnParamsPacked.handle, 32,
+                                               li * kParamStride};
+            }
+        }
+
         // Clone autoDecodeDispatches with per-slot bind groups for
         // dispatches that reference dynamic param buffers.
         ps.dispatches = autoDecodeDispatches;
@@ -3655,7 +4343,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         int prefixCount = autoDecodePrefixCount;
         auto& plQ35RopeToQRot = getKernel("qwen35_rope_q_to_qrot");
         auto& plQ35KvWriteRope = getKernel("qwen35_kv_cache_write_rope");
-        if (embeddingGatherFromQ8) {
+        if (embeddingGatherFromKQ) {
+            ps.dispatches[0].bindGroup = makeBG(plEmbGatherKQ, {
+                {0, lmHeadKQ}, {1, ps.tokenInBuf}, {2, xBuf}, {3, embedKQParams}});
+        } else if (embeddingGatherFromQ8) {
             ps.dispatches[0].bindGroup = makeBG(plEmbGatherQ8, {
                 {0, lmHeadQ8W}, {1, lmHeadQ8S}, {2, ps.tokenInBuf},
                 {3, xBuf}, {4, embedParams}});
@@ -3663,6 +4354,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ps.dispatches[0].bindGroup = makeBG(plEmbGatherF16, {
                 {0, embeddingGpuBuf}, {1, ps.tokenInBuf},
                 {2, xBuf}, {3, embedParams}});
+        }
+        if (pleTokenGatherDispatchIndex >= 0 && plPleTokenGather) {
+            int idx = pleTokenGatherDispatchIndex + prefixCount;
+            ps.dispatches[idx].bindGroup = makeBG(*plPleTokenGather, {
+                {0, pleTokenEmbW}, {1, pleTokenEmbS}, {2, ps.tokenInBuf},
+                {3, pleInputBuf}, {4, pleTokenGatherParams}});
         }
         if (argmaxDispatchIndex >= 0) {
             int idx = argmaxDispatchIndex + prefixCount;
@@ -3676,14 +4373,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {0, argmaxPartialsBuf}, {1, ps.tokenOutBuf}, {2, argmaxReduceParams}});
         }
         for (uint32_t layer = 0; layer < cfg.nLayer; layer++) {
+            bool layerIsSWA = hasSWA && layer < cfg.layerAttnTypes.size() &&
+                              cfg.layerAttnTypes[layer] == AttnLayerType::SlidingWindow;
+            uint32_t hdL = cfg.perLayer[layer].headDim;
+            uint32_t kvCacheLayer = cfg.perLayer[layer].kvSourceLayer >= 0
+                ? (uint32_t)cfg.perLayer[layer].kvSourceLayer : layer;
             if (ropeDispatchIndices[layer] >= 0) {
                 int ropeIdx = ropeDispatchIndices[layer] + prefixCount;
-                ps.dispatches[ropeIdx].bindGroup = makeBG(plFusedRope, {
+                auto& plRope = hasVariableHeadDim
+                    ? getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope", hdL)
+                    : plFusedRope;
+                auto& ropeCos = layerIsSWA && ropeCosBufSWA.handle ? ropeCosBufSWA : ropeCosBuf;
+                auto& ropeSin = layerIsSWA && ropeSinBufSWA.handle ? ropeSinBufSWA : ropeSinBuf;
+                auto& lw = layerWeights[layer];
+                auto& ropeK = lw.qOnly && qOnlyScratchK.handle ? qOnlyScratchK : kvCache[kvCacheLayer].K;
+                auto& ropeV = lw.qOnly && qOnlyScratchV.handle ? qOnlyScratchV : kvCache[kvCacheLayer].V;
+                auto& ropeP = hasVariableHeadDim ? ps.layerRopeParamsBufs[layer] : ps.ropeParamsBuf;
+                ps.dispatches[ropeIdx].bindGroup = makeBG(plRope, {
                     {0, qkvBuf}, {1, qRotBuf},
-                    {2, kvCache[layer].K}, {3, kvCache[layer].V},
-                    {4, ropeCosBuf}, {5, ropeSinBuf},
-                    {6, layerWeights[layer].qNorm}, {7, layerWeights[layer].kNorm},
-                    {8, ps.ropeParamsBuf}});
+                    {2, ropeK}, {3, ropeV}, {4, ropeCos}, {5, ropeSin},
+                    {6, lw.qNorm}, {7, lw.kNorm}, {8, ropeP}});
             }
 
             if (q35QRoPEDispatchIndices[layer] >= 0 && ps.q35RopeQParamsBuf.handle) {
@@ -3707,15 +4416,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             int p1Idx = attnP1DispatchIndices[layer] + prefixCount;
             int p2Idx = attnP2DispatchIndices[layer] + prefixCount;
 
-            bool layerIsSWA = hasSWA && layer < cfg.layerAttnTypes.size() &&
-                             cfg.layerAttnTypes[layer] == AttnLayerType::SlidingWindow;
-            auto& slotAttnBuf = layerIsSWA ? ps.attnParamsBufSWA : ps.attnParamsBuf;
+            auto& slotAttnBuf = hasVariableHeadDim ? ps.layerAttnParamsBufs[layer]
+                : (layerIsSWA ? ps.attnParamsBufSWA : ps.attnParamsBuf);
+            auto& plP1 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass1", hdL) : plChunkP1;
+            auto& plP2 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass2", hdL) : plChunkP2;
 
-            ps.dispatches[p1Idx].bindGroup = makeBG(plChunkP1, {
-                {0, qRotBuf}, {1, kvCache[layer].K}, {2, kvCache[layer].V},
+            ps.dispatches[p1Idx].bindGroup = makeBG(plP1, {
+                {0, qRotBuf}, {1, kvCache[kvCacheLayer].K}, {2, kvCache[kvCacheLayer].V},
                 {3, attnPartialsBuf}, {4, slotAttnBuf}});
 
-            ps.dispatches[p2Idx].bindGroup = makeBG(plChunkP2, {
+            ps.dispatches[p2Idx].bindGroup = makeBG(plP2, {
                 {0, attnPartialsBuf}, {1, attnOutBuf},
                 {2, slotAttnBuf}});
         }
@@ -3723,6 +4433,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     for (int s = 0; s < decodePoolCapacity; s++)
         refillCBPool(s);
+    // Slot 0 also has a prompt-only plan that stops before final RMS/logits.
+    // Intermediate known prompt tokens need hidden/KV state, not vocabulary work.
+    refillKnownPrefillCBPool(0);
     fprintf(stderr, "  Pool: %d slots × %d pre-recorded CBs\n",
             decodePoolCapacity, decodeCbPoolBatch);
 
@@ -3731,25 +4444,117 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Also skip for shared-KV models (Gemma 4): the batched prefill path
     // assumes every layer has a full QKV projection, which shared-KV (Q-only)
     // layers lack. Fall back to serial decode for prefill there.
-    bool isKQ = (weightQuantType == GGUF_TYPE_Q4_K ||
-                 weightQuantType == GGUF_TYPE_Q5_K ||
-                 weightQuantType == GGUF_TYPE_Q6_K);
+    bool isKQ = weightsUseNativeKQ;
     bool hasSharedKv = cfg.sharedKvLayers > 0;
     // Batched prefill assumes standard 2-norm layers with a full QKV per layer.
     // Gemma sandwich-norm models (and shared-KV) don't fit it; use serial
     // decode. qwen35 keeps its own path and batched prefill.
     bool isGemma = cfg.arch.rfind("gemma", 0) == 0;
     bool gemmaSerial = isGemma && (cfg.hasSandwichNorm || hasSharedKv);
-    if (!isKQ && !gemmaSerial) {
+    if (cfg.arch == "qwen35") {
+        if (gpu->backendType == WGPUBackendType_Vulkan &&
+            !std::getenv("BP_QWEN35_SERIAL_PREFILL")) {
+            initQwen35PrefillResources();
+        } else {
+            fprintf(stderr, "  Prefill: Qwen3.5 serial path\n");
+        }
+    } else if (!isKQ && !gemmaSerial) {
         initPrefillResources();
     } else if (gemmaSerial) {
-        fprintf(stderr, "  Prefill: skipped (Gemma sandwich/shared-KV, using serial decode)\n");
+        if (cfg.arch == "gemma4" && weightsAreNativeQ4 &&
+            gpu->backendType == WGPUBackendType_Vulkan) {
+            initGemmaPrefillResources();
+        } else {
+            fprintf(stderr, "  Prefill: skipped (Gemma sandwich/shared-KV, using serial decode)\n");
+        }
     } else {
         fprintf(stderr, "  Prefill: skipped (K-quant weights, using serial decode)\n");
     }
 }
 
 // ─── Pre-allocate prefill resources ──────────────────────────────────────────
+
+void ModelRunner::initQwen35PrefillResources() {
+    const uint32_t C=qwen35Pf.capacity,E=cfg.nEmbd;
+    const uint32_t convChannels=cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize;
+    const uint32_t qdim=cfg.nHead*cfg.headDim,kvdim=cfg.nKvHeads*cfg.headDim;
+    const uint32_t im=cfg.intermediateSize;
+    auto mk=[&](const char* n,uint64_t elems){return gpu->createBuffer(n,std::max<uint64_t>(4,elems*4));};
+    qwen35Pf.tokens=mk("qpf_tokens",C);qwen35Pf.x=mk("qpf_x",(uint64_t)C*E);
+    qwen35Pf.norm=mk("qpf_norm",(uint64_t)C*E);qwen35Pf.proj=mk("qpf_proj",(uint64_t)C*E);
+    qwen35Pf.gateup=mk("qpf_gateup",(uint64_t)C*2u*im);qwen35Pf.act=mk("qpf_act",(uint64_t)C*im);
+    qwen35Pf.rstd=mk("qpf_rstd",C);qwen35Pf.qkv=mk("qpf_qkv",(uint64_t)C*convChannels);
+    qwen35Pf.z=mk("qpf_z",(uint64_t)C*cfg.ssmInnerSize);qwen35Pf.beta=mk("qpf_beta",(uint64_t)C*cfg.ssmTimeStepRank);
+    qwen35Pf.gate=mk("qpf_gate",(uint64_t)C*cfg.ssmTimeStepRank);qwen35Pf.conv=mk("qpf_conv",(uint64_t)C*convChannels);
+    qwen35Pf.sq=mk("qpf_sq",(uint64_t)C*cfg.ssmGroupCount*cfg.ssmStateSize);
+    qwen35Pf.sk=mk("qpf_sk",(uint64_t)C*cfg.ssmGroupCount*cfg.ssmStateSize);
+    qwen35Pf.sv=mk("qpf_sv",(uint64_t)C*cfg.ssmInnerSize);qwen35Pf.sy=mk("qpf_sy",(uint64_t)C*cfg.ssmInnerSize);
+    qwen35Pf.snorm=mk("qpf_snorm",(uint64_t)C*cfg.ssmInnerSize);
+    qwen35Pf.qj=mk("qpf_qj",(uint64_t)C*2u*qdim);qwen35Pf.aq=mk("qpf_aq",(uint64_t)C*qdim);
+    qwen35Pf.ag=mk("qpf_ag",(uint64_t)C*qdim);qwen35Pf.ak=mk("qpf_ak",(uint64_t)C*kvdim);
+    qwen35Pf.av=mk("qpf_av",(uint64_t)C*kvdim);qwen35Pf.qrot=mk("qpf_qrot",(uint64_t)C*qdim);
+    qwen35Pf.attn=mk("qpf_attn",(uint64_t)C*qdim);qwen35Pf.aout=mk("qpf_aout",(uint64_t)C*qdim);
+    qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",128u*1024u,
+        BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
+    (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
+    (void)getKernel("q4k_matmul_batched4");
+    (void)getKernel("q4k_matmul_batched8");
+    (void)getKernel("q5k_matmul_batched4");
+    (void)getKernel("q6k_matmul_batched4");
+    (void)getKernel("qwen35_conv_scan_silu");(void)getKernel("qwen35_split_qkv_l2_batched");
+    (void)getKernel("qwen35_conv_scan_split_l2");
+    (void)getKernel("delta_net_scan_x2");(void)getKernel("qwen35_norm_gated_batched");
+    (void)getKernel("qwen35_split_qg_batched");(void)getKernel("head_rmsnorm_batched");
+    (void)getKernel("qwen35_rope_kv_batched");(void)getKernel("gated_output_batched");
+    (void)getKernel("qwen35_alpha_beta_gate_batched");(void)getKernel("silu_mul_batched");
+    (void)getKernel("rms_norm_batched");(void)getKernel("add_rms_norm_batched");
+    (void)getKernel("gemma_norm_add_batched");
+    (void)getKernel("add_inplace_batched");
+    for(const auto& pl:cfg.perLayer)if(pl.headDim)(void)getKernelHD("flash_attn_vulkan",pl.headDim);
+    qwen35Pf.ready=true;
+    fprintf(stderr,"  Qwen3.5 hybrid batched prefill: enabled (chunk=%u)\n",C);
+}
+
+void ModelRunner::initGemmaPrefillResources() {
+    const uint32_t C = gemmaPf.capacity;
+    uint32_t maxQkv = 0, maxQ = 0, maxIM = 0;
+    for (const auto& pl : cfg.perLayer) {
+        maxQ = std::max(maxQ, pl.qDim);
+        maxQkv = std::max(maxQkv, pl.qDim + 2u * pl.kvDim);
+        maxIM = std::max(maxIM, pl.intermediateSize);
+    }
+    auto mk = [&](const char* name, uint64_t elems, uint64_t bytes = 4) {
+        return gpu->createBuffer(name, std::max<uint64_t>(4, elems * bytes));
+    };
+    gemmaPf.tokens = mk("gpf_tokens", C);
+    gemmaPf.x      = mk("gpf_x", C * cfg.nEmbd);
+    gemmaPf.norm   = mk("gpf_norm", C * cfg.nEmbd);
+    gemmaPf.qkv    = mk("gpf_qkv", C * maxQkv);
+    gemmaPf.qrot   = mk("gpf_qrot", C * maxQ);
+    gemmaPf.attn   = mk("gpf_attn", C * maxQ);
+    gemmaPf.proj   = mk("gpf_proj", C * cfg.nEmbd);
+    gemmaPf.gateup = mk("gpf_gateup", C * 2ull * maxIM);
+    gemmaPf.act    = mk("gpf_act", C * maxIM);
+    gemmaPf.rstd   = mk("gpf_rstd", C);
+    if (cfg.pleSize > 0) {
+        uint64_t totalPle = (uint64_t)cfg.pleSize * cfg.nLayer;
+        gemmaPf.pleSignal = mk("gpf_ple_signal", C * totalPle);
+        gemmaPf.pleRaw    = mk("gpf_ple_raw", C * totalPle);
+        gemmaPf.pleGate   = mk("gpf_ple_gate", C * cfg.pleSize);
+        gemmaPf.pleOut    = mk("gpf_ple_out", C * cfg.nEmbd);
+    }
+    // Force compilation at load so unsupported shader features fail before
+    // the first prompt rather than midway through inference.
+    (void)getKernel("matmul_q4_batched");
+    (void)getKernel("q4_gather_batched");
+    (void)getKernel("gemma_sandwich_attn_batched");
+    (void)getKernel("gemma_norm_add_batched");
+    (void)getKernel("gelu_mul_batched");
+    (void)getKernel("ple_gelu_mul_batched");
+    (void)getKernel("ple_combine_batched");
+    gemmaPf.ready = true;
+    fprintf(stderr, "  Gemma batched prefill: enabled (chunk=%u)\n", C);
+}
 
 void ModelRunner::initPrefillResources() {
     uint32_t T = maxSeqLen;
@@ -4104,8 +4909,61 @@ void ModelRunner::refillCBPool(int slot) {
     }
 }
 
+void ModelRunner::refillKnownPrefillCBPool(int slot) {
+    auto& ps = pool[slot];
+    for (int i = ps.knownPrefillCbIdx;
+         i < (int)ps.knownPrefillCBPool.size(); i++)
+        if (ps.knownPrefillCBPool[i])
+            wgpuCommandBufferRelease(ps.knownPrefillCBPool[i]);
+    ps.knownPrefillCBPool.assign(decodeCbPoolBatch, nullptr);
+    ps.knownPrefillCbIdx = 0;
+
+    int stop = (int)ps.dispatches.size();
+    for (int i = 0; i < (int)ps.dispatches.size(); i++) {
+        if (ps.dispatches[i].name == "final_rms") { stop = i; break; }
+    }
+
+    for (int batch = 0; batch < decodeCbPoolBatch; batch++) {
+        WGPUCommandEncoderDescriptor enD{};
+        auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
+        if (passPerDispatch) {
+            for (int d = 0; d < stop; d++) {
+                auto& di = ps.dispatches[d];
+                WGPUComputePassDescriptor cpD{};
+                auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+                wgpuComputePassEncoderSetPipeline(pass, di.pipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, di.bindGroup, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, di.gx, di.gy, di.gz);
+                wgpuComputePassEncoderEnd(pass);
+                wgpuComputePassEncoderRelease(pass);
+            }
+        } else {
+            WGPUComputePassDescriptor cpD{};
+            auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
+            for (int d = 0; d < stop; d++) {
+                auto& di = ps.dispatches[d];
+                wgpuComputePassEncoderSetPipeline(pass, di.pipeline);
+                wgpuComputePassEncoderSetBindGroup(pass, 0, di.bindGroup, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(pass, di.gx, di.gy, di.gz);
+            }
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+        }
+        WGPUCommandBufferDescriptor cbD{};
+        ps.knownPrefillCBPool[batch] = wgpuCommandEncoderFinish(enc, &cbD);
+        wgpuCommandEncoderRelease(enc);
+    }
+}
+
 void ModelRunner::autotuneDecodeDepth() {
     if (!gpu || gpu->backendType != WGPUBackendType_D3D12) return;
+    // Qwen 3.5 interleaves SSM and full-attention layers whose recurrent state
+    // is mutated by benchmarkDecodeConfig. Replaying several speculative token
+    // streams during startup leaves that state inconsistent and caused a
+    // cross-vendor 0xC0000005 immediately after autotuning. Keep the warmed,
+    // hardware-selected pool depth until the tuner can snapshot/restore every
+    // Qwen 3.5 recurrent buffer between candidates.
+    if (cfg.arch == "qwen35") return;
     if (decodePoolCapacity < 3) return;
 
     const int originalDepth = decodePoolDepth;
@@ -4341,7 +5199,7 @@ void ModelRunner::saveDecodeAutotuneCache() const {
 }
 
 void ModelRunner::printActiveDecodeTuning(const char* prefix) const {
-    const char* lmHeadKind = lmHeadIsKQ ? "k-quant"
+    const char* lmHeadKind = lmHeadIsKQ ? "k-quant" : lmHeadIsQ4 ? "q4"
         : (lmHeadIsQ8 ? "q8" : (tuning.decodeUseWideFp16 ? "fp16_wide" : "fp16"));
     fprintf(stderr, "%s: depth=%d/%d qkv=%s oproj=%s gateup=%s lm_head=%s batch=%d\n",
            prefix,
@@ -4404,6 +5262,13 @@ void ModelRunner::destroy() {
         }
         slot.cbPool.clear();
         slot.cbIdx = 0;
+        for (int i = slot.knownPrefillCbIdx;
+             i < (int)slot.knownPrefillCBPool.size(); i++) {
+            if (slot.knownPrefillCBPool[i])
+                wgpuCommandBufferRelease(slot.knownPrefillCBPool[i]);
+        }
+        slot.knownPrefillCBPool.clear();
+        slot.knownPrefillCbIdx = 0;
         if (slot.stagingBuf) {
             wgpuBufferRelease(slot.stagingBuf);
             slot.stagingBuf = nullptr;
@@ -4455,6 +5320,8 @@ void ModelRunner::destroy() {
 
 void ModelRunner::uploadEmbedding(int32_t tokenId) {
     if (tokenId < 0 || (uint32_t)tokenId >= cfg.nVocab) tokenId = 0;
+    if (pleGpuPreprocess && argmaxResultBuf.handle)
+        gpu->writeBuffer(argmaxResultBuf, &tokenId, 4);
     const float* emb = embeddingCPU.data() + tokenId * cfg.nEmbd;
     if (std::getenv("BP_DUMP_BUFFER_STATS")) {
         dumpFloatArrayStats("embeddingCPU[token]", emb, cfg.nEmbd);
@@ -4474,7 +5341,7 @@ void ModelRunner::uploadEmbedding(int32_t tokenId) {
     //   proj = RMSNorm_per_slice(proj, per_layer_proj_norm)
     //   tok  = per_layer_token_embd[token] * sqrt(pleDim)
     //   per_layer_input = (proj + tok) / sqrt(2)
-    if (cfg.pleSize > 0 && !pleEmbCPU.empty() && !pleSliceBufs.empty()) {
+    if (cfg.pleSize > 0 && !pleEmbCPU.empty() && pleInputBuf.handle) {
         uint32_t pleDim = cfg.pleSize;
         uint32_t totalPleDim = pleDim * cfg.nLayer;
         float pleScale = sqrtf((float)pleDim);
@@ -4487,41 +5354,38 @@ void ModelRunner::uploadEmbedding(int32_t tokenId) {
                 perLayerInput[j] = pleEmbCPU[(size_t)tokenId * totalPleDim + j] * pleScale;
         }
 
-        // model-projection side: proj = per_layer_model_proj @ embedding, then
-        // RMSNorm each pleDim slice with per_layer_proj_norm, then combine /sqrt(2).
+        // CPU reference projection. This retains the native Q4 values; the Q8
+        // GPU projection is observably too lossy for Gemma 4's close logits.
         if (pleModelProjCPU.size() == (size_t)totalPleDim * cfg.nEmbd) {
             const float* embSrc = embeddingCPU.data() + (size_t)tokenId * cfg.nEmbd;
             const float invSqrt2 = 0.70710678f;
             float eps = cfg.rmsNormEps;
-            for (uint32_t li = 0; li < cfg.nLayer; li++) {
-                // project this layer's pleDim rows
-                std::vector<float> proj(pleDim);
+            std::vector<float> proj(totalPleDim);
+            std::vector<uint32_t> layers(cfg.nLayer);
+            std::iota(layers.begin(), layers.end(), 0u);
+            std::for_each(std::execution::par, layers.begin(), layers.end(), [&](uint32_t li) {
+                float* projSlice = proj.data() + (size_t)li * pleDim;
                 for (uint32_t r = 0; r < pleDim; r++) {
                     const float* w = pleModelProjCPU.data() +
                         (size_t)(li * pleDim + r) * cfg.nEmbd;
                     float acc = 0.0f;
                     for (uint32_t k = 0; k < cfg.nEmbd; k++) acc += w[k] * embSrc[k];
-                    proj[r] = acc;
+                    projSlice[r] = acc;
                 }
-                // RMSNorm over the pleDim slice with per_layer_proj_norm
                 float ss = 0.0f;
-                for (uint32_t r = 0; r < pleDim; r++) ss += proj[r] * proj[r];
+                for (uint32_t r = 0; r < pleDim; r++) ss += projSlice[r] * projSlice[r];
                 float rms = 1.0f / sqrtf(ss / (float)pleDim + eps);
                 for (uint32_t r = 0; r < pleDim; r++) {
                     float w = (r < pleProjNormCPU.size()) ? pleProjNormCPU[r] : 1.0f;
-                    float projNormed = proj[r] * rms * w;
-                    // combine with token signal, scale by 1/sqrt(2)
+                    float projNormed = projSlice[r] * rms * w;
                     perLayerInput[li * pleDim + r] =
                         (projNormed + perLayerInput[li * pleDim + r]) * invSqrt2;
                 }
-            }
+            });
         }
 
-        // Upload per-layer slices to GPU
-        for (uint32_t li = 0; li < cfg.nLayer && li < (uint32_t)pleSliceBufs.size(); li++) {
-            gpu->writeBuffer(pleSliceBufs[li],
-                             perLayerInput.data() + li * pleDim, pleDim * 4);
-        }
+        // One concatenated upload replaces 35 per-layer queue writes.
+        gpu->writeBuffer(pleInputBuf, perLayerInput.data(), totalPleDim * 4);
     }
 }
 
@@ -4535,8 +5399,8 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
 
     if (q35RopeQParamsBuf.handle) {
         uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
-        uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
-        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
+        uint32_t q[8] = {cfg.nHead, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], pos, ropeHalf};
+        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], pos, ropeHalf};
         uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, cacheLen * cfg.nKvHeads * cfg.headDim, 0, 0, 0, 0, 0, 0};
         gpu->writeBuffer(q35RopeQParamsBuf, q, 32);
         gpu->writeBuffer(q35RopeKParamsBuf, k, 32);
@@ -4547,6 +5411,7 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
     uint32_t n_chunks = (T_total + gqaChunkSize - 1) / gqaChunkSize;
     auto* cp = reinterpret_cast<uint32_t*>(chunkedAttnParamData.data());
     cp[2] = T_total;
+    cp[3] = 0;
     cp[4] = n_chunks;
     gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
 
@@ -4558,6 +5423,7 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
         memcpy(swaData, chunkedAttnParamData.data(), 32);
         auto* sp = reinterpret_cast<uint32_t*>(swaData);
         sp[2] = T_swa;
+        sp[3] = T_total - T_swa;
         sp[4] = n_chunks_swa;
         gpu->writeBuffer(chunkedAttnParamsBufSWA, swaData, 32);
     }
@@ -4579,7 +5445,7 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
             rp[5] = (int)(cacheLen * kvDimL);
             gpu->writeBuffer(perLayerRopeParamBufs[li], rd, 32);
 
-            // attn params: [kvStride, n_rep, T, chunk, n_chunks, scale, -inf, maxChunks]
+            // attn params: [kvStride, n_rep, T, kvStart, n_chunks, scale, -inf, maxChunks]
             bool isSWA = !cfg.layerAttnTypes.empty() && li < cfg.layerAttnTypes.size() &&
                          cfg.layerAttnTypes[li] == AttnLayerType::SlidingWindow;
             uint32_t Tl = (isSWA && cfg.slidingWindow > 0)
@@ -4589,8 +5455,9 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
             auto* ap = reinterpret_cast<uint32_t*>(ad);
             ap[0] = kvDimL;
             ap[1] = cfg.nHead / cfg.nKvHeads;
-            ap[2] = Tl; ap[3] = gqaChunkSize; ap[4] = nchL;
-            float scaleL = 1.0f / sqrtf((float)hdL);
+            ap[2] = Tl; ap[3] = isSWA ? T_total - Tl : 0u; ap[4] = nchL;
+            float scaleL = cfg.arch == "gemma4" ? 1.0f
+                                                  : 1.0f / sqrtf((float)hdL);
             float neg_inf = -1e9f;
             memcpy(&ap[5], &scaleL, 4);
             memcpy(&ap[6], &neg_inf, 4);
@@ -4615,13 +5482,14 @@ void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot)
     memcpy(localAttn, chunkedAttnParamData.data(), 32);
     auto* cp = reinterpret_cast<uint32_t*>(localAttn);
     cp[2] = T_total;
+    cp[3] = 0;
     cp[4] = n_chunks;
     gpu->writeBuffer(ps.attnParamsBuf, localAttn, 32);
 
     if (ps.q35RopeQParamsBuf.handle) {
         uint32_t ropeHalf = (rotaryDim > 0) ? rotaryDim / 2 : cfg.headDim / 2;
-        uint32_t q[8] = {cfg.nHead, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
-        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, 11u, 11u, 10u, 0u, pos, ropeHalf};
+        uint32_t q[8] = {cfg.nHead, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], pos, ropeHalf};
+        uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], pos, ropeHalf};
         uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim,
                           cacheLen * cfg.nKvHeads * cfg.headDim,
                           0, 0, 0, 0, 0, 0};
@@ -4638,24 +5506,94 @@ void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot)
         memcpy(swaAttn, chunkedAttnParamData.data(), 32);
         auto* sp = reinterpret_cast<uint32_t*>(swaAttn);
         sp[2] = T_swa;
+        sp[3] = T_total - T_swa;
         sp[4] = n_chunks_swa;
         gpu->writeBuffer(ps.attnParamsBufSWA, swaAttn, 32);
     }
+
+    if (hasVariableHeadDim) {
+        constexpr uint32_t kParamStride = 256;
+        std::vector<uint8_t> ropePacked(cfg.nLayer * kParamStride, 0);
+        std::vector<uint8_t> attnPacked(cfg.nLayer * kParamStride, 0);
+        for (uint32_t li = 0; li < cfg.nLayer; li++) {
+            uint32_t hdL = cfg.perLayer[li].headDim;
+            uint32_t kvDimL = cfg.nKvHeads * hdL;
+            uint8_t rd[32];
+            memcpy(rd, ropeParamData.data(), 32);
+            auto* rp = reinterpret_cast<int32_t*>(rd);
+            rp[0] = (int)cfg.nHead;
+            rp[1] = (int)(cfg.nHead * hdL);
+            rp[2] = (int)kvDimL;
+            rp[3] = (int)pos;
+            rp[4] = (int)(hdL / 2);
+            rp[5] = (int)(cacheLen * kvDimL);
+            memcpy(ropePacked.data() + li * kParamStride, rd, 32);
+
+            bool isSWA = li < cfg.layerAttnTypes.size() &&
+                         cfg.layerAttnTypes[li] == AttnLayerType::SlidingWindow;
+            uint32_t Tl = isSWA && cfg.slidingWindow > 0
+                ? std::min(T_total, cfg.slidingWindow) : T_total;
+            uint32_t ad[8] = {kvDimL, cfg.nHead / cfg.nKvHeads, Tl,
+                              isSWA ? T_total - Tl : 0u, (Tl + gqaChunkSize - 1) / gqaChunkSize,
+                              0, 0, reinterpret_cast<const uint32_t*>(chunkedAttnParamData.data())[7]};
+            float scaleL = cfg.arch == "gemma4" ? 1.0f : 1.0f / sqrtf((float)hdL);
+            float negInf = -1e9f;
+            memcpy(&ad[5], &scaleL, 4);
+            memcpy(&ad[6], &negInf, 4);
+            memcpy(attnPacked.data() + li * kParamStride, ad, 32);
+        }
+        gpu->writeBuffer(ps.layerRopeParamsPacked, ropePacked.data(), ropePacked.size());
+        gpu->writeBuffer(ps.layerAttnParamsPacked, attnPacked.data(), attnPacked.size());
+    }
+
 }
 
 std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
-    uploadEmbedding(tokenId);
+    bool gatherEmbeddingOnGpu = embeddingCPU.empty();
+    if (gatherEmbeddingOnGpu)
+        seedDecodeTokenInputs(tokenId);
+    else
+        uploadEmbedding(tokenId);
 
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
+    const char* stopEnv = std::getenv("BP_STOP_AFTER_LAYER");
+    uint32_t stopPos = std::getenv("BP_STOP_POS")
+        ? (uint32_t)std::max(0, std::atoi(std::getenv("BP_STOP_POS"))) : 0u;
+    if (stopEnv && tokenId != 0 && posOffset == stopPos) {
+        int stopLayer = std::max(0, std::atoi(stopEnv));
+        std::string prefix = "L" + std::to_string(stopLayer + 1) + "/";
+        size_t end = allDecodeDispatches.size();
+        for (size_t j = 0; j < allDecodeDispatches.size(); j++) {
+            if (allDecodeDispatches[j].name.rfind(prefix, 0) == 0) {
+                end = j; break;
+            }
+        }
+        std::vector<Dispatch> partial(allDecodeDispatches.begin(),
+                                      allDecodeDispatches.begin() + end);
+        auto bytes = gpu->submitAndReadback(partial, xBuf, cfg.nEmbd * 4,
+                                             passPerDispatch);
+        const float* x = reinterpret_cast<const float*>(bytes.data());
+        double ss = 0.0;
+        for (uint32_t j = 0; j < cfg.nEmbd; j++) ss += (double)x[j] * x[j];
+        fprintf(stderr, "[layer-dump] layer=%d token=%d pos=%u norm=%.9g first8=",
+                stopLayer, tokenId, posOffset, sqrt(ss));
+        for (uint32_t j = 0; j < std::min(8u, cfg.nEmbd); j++)
+            fprintf(stderr, "%s%.9g", j ? "," : "", x[j]);
+        fprintf(stderr, "\n"); fflush(stderr);
+        std::exit(0);
+    }
+
     std::vector<uint8_t> result;
+    const auto& decodePlan = gatherEmbeddingOnGpu ? autoDecodeDispatches
+                                                   : allDecodeDispatches;
     if (profiler && profiler->enabled()) {
         result = gpu->submitAndReadbackProfiled(
-            allDecodeDispatches, logitsBuf, cfg.nVocab * 4, *profiler);
+            decodePlan, logitsBuf, cfg.nVocab * 4, *profiler);
     } else {
         result = gpu->submitAndReadback(
-            allDecodeDispatches, logitsBuf, cfg.nVocab * 4, passPerDispatch);
+            decodePlan, logitsBuf, cfg.nVocab * 4, passPerDispatch);
     }
 
     for (uint32_t i = 0; i < cfg.nLayer; i++)
@@ -4724,6 +5662,64 @@ int32_t ModelRunner::decodeArgmax(int32_t tokenId, uint32_t posOffset) {
     int32_t token;
     memcpy(&token, result.data(), 4);
     return token;
+}
+
+int32_t ModelRunner::decodeArgmaxPooled(int32_t tokenId, uint32_t posOffset) {
+    // Unlike throughput benchmarking, generation has a true token dependency:
+    // compute the token-specific embedding/PLE first, then reuse exactly one
+    // pre-recorded slot and wait for its four-byte argmax result.
+    auto t0 = std::chrono::steady_clock::now();
+    uploadEmbedding(tokenId);
+    auto t1 = std::chrono::steady_clock::now();
+    seedDecodeTokenInputs(tokenId);
+    submitDecode(posOffset, 0);
+    auto t2 = std::chrono::steady_clock::now();
+    int32_t result = readArgmax(0);
+    auto t3 = std::chrono::steady_clock::now();
+    if (std::getenv("BP_PROFILE_CPU")) {
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        fprintf(stderr, "[decode-cpu] embedding+PLE=%.2fms prepare+submit=%.2fms wait=%.2fms\n",
+                ms(t0, t1), ms(t1, t2), ms(t2, t3));
+    }
+    return result;
+}
+
+int32_t ModelRunner::prefillPooledKnown(const int32_t* tokenIds, uint32_t count,
+                                        uint32_t posOffset) {
+    if (count == 0 || pool.empty()) return -1;
+    auto& ps = pool[0];
+    for (uint32_t t = 0; t < count; t++) {
+        int32_t token = tokenIds[t];
+        if (token < 0 || (uint32_t)token >= cfg.nVocab) token = 0;
+        if (cfg.pleSize > 0 && !pleGpuPreprocess) uploadEmbedding(token);
+        gpu->writeBuffer(ps.tokenInBuf, &token, 4);
+
+        uint32_t cacheLen = kvCache[0].len;
+        prepareDecodeParams(posOffset + t, cacheLen, 0);
+        if (t + 1 < count) {
+            if (ps.knownPrefillCbIdx >= (int)ps.knownPrefillCBPool.size())
+                refillKnownPrefillCBPool(0);
+            WGPUCommandBuffer cb = ps.knownPrefillCBPool[ps.knownPrefillCbIdx++];
+            wgpuQueueSubmit(gpu->queue, 1, &cb);
+            wgpuCommandBufferRelease(cb);
+        } else {
+            if (ps.cbIdx >= (int)ps.cbPool.size()) refillCBPool(0);
+            for (int g = 0; g < nGroups; g++) {
+                WGPUCommandBuffer cb = ps.cbPool[ps.cbIdx++];
+                wgpuQueueSubmit(gpu->queue, 1, &cb);
+                wgpuCommandBufferRelease(cb);
+            }
+        }
+        for (uint32_t i = 0; i < cfg.nLayer; i++) kvCache[i].len++;
+    }
+
+    WGPUBufferMapCallbackInfo mcb{};
+    mcb.mode = WGPUCallbackMode_WaitAnyOnly;
+    mcb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void*, void*) {};
+    auto future = wgpuBufferMapAsync(ps.stagingBuf, 1, 0, 4, mcb);
+    return gpu->completeAsyncMapI32(ps.stagingBuf, future);
 }
 
 void ModelRunner::submitDecode(uint32_t posOffset, int slot) {
@@ -4805,8 +5801,349 @@ std::vector<float> ModelRunner::prefillFinish(int32_t tokenId, uint32_t posOffse
     return logits;
 }
 
+int32_t ModelRunner::prefillQwen35Batched(
+        const int32_t* tokenIds,uint32_t T,uint32_t posOffset){
+    if(!qwen35Pf.ready||T==0)return -1;
+    const bool traceQpf=std::getenv("BP_PROFILE_QWEN_PREFILL")!=nullptr;
+    if(traceQpf){fprintf(stderr,"[qwen-prefill] enter T=%u\n",T);fflush(stderr);}
+    int32_t result=-1;uint32_t done=0;
+    while(done<T){
+        uint32_t M=std::min(qwen35Pf.capacity,T-done),E=cfg.nEmbd;
+        std::vector<int32_t> toks(M);for(uint32_t i=0;i<M;i++){int32_t v=tokenIds[done+i];toks[i]=(v>=0&&(uint32_t)v<cfg.nVocab)?v:0;}
+        gpu->writeBuffer(qwen35Pf.tokens,toks.data(),M*4);
+        if(traceQpf){fprintf(stderr,"[qwen-prefill] tokens uploaded M=%u\n",M);fflush(stderr);}
+        std::vector<Dispatch> ds;std::vector<WGPUBindGroup>bgs;
+        uint64_t paramCursor=0;
+        std::vector<uint8_t> paramHost(qwen35Pf.paramArena.size,0);
+        auto mkp=[&](const std::string&n,std::initializer_list<uint32_t>v,bool uniform=false){
+            (void)n;(void)uniform;size_t cnt=v.size();uint64_t bytes=cnt<=4?16:((cnt*4+15)/16)*16;
+            if(paramCursor+256>qwen35Pf.paramArena.size){fprintf(stderr,"Qwen prefill parameter arena exhausted\n");std::abort();}
+            std::vector<uint32_t>d(bytes/4,0);size_t i=0;for(auto x:v)d[i++]=x;
+            GPUBuffer b=qwen35Pf.paramArena;b.offset=paramCursor;b.size=bytes;
+            memcpy(paramHost.data()+paramCursor,d.data(),bytes);paramCursor+=256;return b;};
+        auto add=[&](const CompiledPipeline&pl,std::initializer_list<std::pair<uint32_t,GPUBuffer>>bind,uint32_t x,uint32_t y,uint32_t z,const std::string&n){
+            auto bg=makeBG(pl,std::vector<std::pair<uint32_t,GPUBuffer>>(bind));bgs.push_back(bg);ds.push_back({pl.pipeline,bg,x,y,z,n});
+        };
+        uint32_t eb;memcpy(&eb,&cfg.rmsNormEps,4);uint32_t cacheLen=kvCache[0].len;
+        auto&gather=getKernel("q6k_gather_batched");auto ep=mkp("qpf_ep",{M,E,kqLmRowStride});
+        add(gather,{{0,lmHeadKQ},{1,qwen35Pf.tokens},{2,qwen35Pf.x},{3,ep}},(M*E+255)/256,1,1,"qpf_embed");
+        if(traceQpf){fprintf(stderr,"[qwen-prefill] embed encoded\n");fflush(stderr);}
+        auto&rms=getKernel("rms_norm_batched");auto&q8=getKernel("q8_matmul_batched_dp4a");
+        auto&addnorm=getKernel("add_rms_norm_batched");auto&normadd=getKernel("gemma_norm_add_batched");
+        auto&addip=getKernel("add_inplace_batched");
+        auto&silu=getKernel("silu_mul_batched");
+        auto&bagKernel=getKernel("qwen35_alpha_beta_gate_batched");
+        auto&convKernel=getKernel("qwen35_conv_scan_silu");
+        auto&splitSsmKernel=getKernel("qwen35_split_qkv_l2_batched");
+        auto&deltaKernel=getKernel("delta_net_scan_x2");
+        auto&normGateKernel=getKernel("qwen35_norm_gated_batched");
+        auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},(M+3)/4,(N+31)/32,1,n);};
+        auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
+        auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
+            if(t==GGUF_TYPE_Q4_K&&M>=8){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
+            else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
+            else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
+        for(uint32_t li=0;li<cfg.nLayer;li++){
+            if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u build begin\n",li);fflush(stderr);}
+            auto&lw=layerWeights[li];auto&pl=cfg.perLayer[li];std::string L="qpf_L"+std::to_string(li)+"/";
+            auto rp=mkp(L+"rms_p",{E,E,eb});add(rms,{{0,qwen35Pf.x},{1,qwen35Pf.norm},{2,lw.inputNorm},{3,qwen35Pf.rstd},{4,rp}},M,1,1,L+"rms");
+            if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u rms built\n",li);fflush(stderr);}
+            if(!cfg.isAttentionLayer(li)){
+                uint32_t C=cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize;
+                uint32_t R=cfg.ssmTimeStepRank,DV=cfg.ssmInnerSize/R;
+                mmk(qwen35Pf.norm,lw.qkvKQ,lw.qkvKQType,lw.qkvKQNBlocks,lw.qkvKQRowStride,zeroBiasQKV,qwen35Pf.qkv,E,C,L+"qkv");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u qkv built\n",li);fflush(stderr);}
+                mmk(qwen35Pf.norm,lw.attnGateKQ,lw.attnGateKQType,lw.attnGateKQNBlocks,lw.attnGateKQRowStride,zeroBiasQKV,qwen35Pf.z,E,cfg.ssmInnerSize,L+"z");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u z built\n",li);fflush(stderr);}
+                mm(qwen35Pf.norm,lw.ssmBetaAlphaW,lw.ssmBetaAlphaS,zeroBiasQKV,qwen35Pf.qj,E,2u*R,L+"ba");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u ba built\n",li);fflush(stderr);}
+                auto bap=mkp(L+"bag_p",{M,R});
+                add(bagKernel,{{0,qwen35Pf.qj},{1,lw.ssmDtBias},{2,lw.ssmA},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,bap}},(M*R+63)/64,1,1,L+"bag");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u bag built\n",li);fflush(stderr);}
+                auto cp=mkp(L+"conv_p",{C,cfg.ssmConvKernel,M});
+                add(convKernel,{{0,ssmConvState[li]},{1,qwen35Pf.qkv},{2,lw.ssmConv1dW},{3,zeroBiasQKV},{4,qwen35Pf.conv},{5,cp}},(C+255)/256,1,1,L+"conv");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u conv built\n",li);fflush(stderr);}
+                auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
+                add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
+                auto dp=mkp(L+"delta_p",{R,cfg.ssmGroupCount,cfg.ssmStateSize,DV,M});
+                add(deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,(DV+1)/2,1,L+"delta");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u delta built\n",li);fflush(stderr);}
+                auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
+                add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,M,1,L+"normgate");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u normgate built\n",li);fflush(stderr);}
+                mmk(qwen35Pf.snorm,lw.ssmOutKQ,lw.ssmOutKQType,lw.ssmOutKQNBlocks,lw.ssmOutKQRowStride,zeroBiasE,qwen35Pf.proj,cfg.ssmInnerSize,E,L+"out");
+                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u out built\n",li);fflush(stderr);}
+            }else{
+                uint32_t hd=pl.headDim,qd=pl.qDim,kd=pl.kvDim;
+                mmk(qwen35Pf.norm,lw.qjKQ,lw.qjKQType,lw.qjKQNBlocks,lw.qjKQRowStride,zeroBiasV,qwen35Pf.qj,E,2u*qd,L+"q");
+                mmk(qwen35Pf.norm,lw.kSepKQ,lw.kSepKQType,lw.kSepKQNBlocks,lw.kSepKQRowStride,zeroBiasV,qwen35Pf.ak,E,kd,L+"k");
+                mmk(qwen35Pf.norm,lw.vSepKQ,lw.vSepKQType,lw.vSepKQNBlocks,lw.vSepKQRowStride,zeroBiasV,qwen35Pf.av,E,kd,L+"v");
+                auto spp=mkp(L+"split_p",{M,cfg.nHead,hd});auto&sp=getKernel("qwen35_split_qg_batched");
+                add(sp,{{0,qwen35Pf.qj},{1,qwen35Pf.aq},{2,qwen35Pf.ag},{3,spp}},(M*qd+255)/256,1,1,L+"split");
+                auto&hn=getKernel("head_rmsnorm_batched");auto qnp=mkp(L+"qn_p",{M,cfg.nHead,hd,eb});
+                add(hn,{{0,qwen35Pf.aq},{1,lw.qNorm},{2,qnp}},cfg.nHead,M,1,L+"qnorm");
+                auto knp=mkp(L+"kn_p",{M,cfg.nKvHeads,hd,eb});add(hn,{{0,qwen35Pf.ak},{1,lw.kNorm},{2,knp}},cfg.nKvHeads,M,1,L+"knorm");
+                auto ropep=mkp(L+"rope_p",{M,cfg.nHead,cfg.nKvHeads,hd,posOffset+done,cacheLen,(uint32_t)cfg.ropeSections[0],(uint32_t)cfg.ropeSections[1],(uint32_t)cfg.ropeSections[2],(uint32_t)cfg.ropeSections[3],rotaryDim/2});
+                auto&rope=getKernel("qwen35_rope_kv_batched");add(rope,{{0,qwen35Pf.aq},{1,qwen35Pf.ak},{2,qwen35Pf.av},{3,qwen35Pf.qrot},{4,kvCache[li].K},{5,kvCache[li].V},{6,ropeCosBuf},{7,ropeSinBuf},{8,ropep}},std::max(cfg.nHead,cfg.nKvHeads),M,1,L+"rope");
+                float sc=1.0f/sqrtf((float)hd),ni=-1e9f;uint32_t sb,nb;memcpy(&sb,&sc,4);memcpy(&nb,&ni,4);
+                auto ap=mkp(L+"attn_p",{kd,cfg.nHead/cfg.nKvHeads,cacheLen+M,cacheLen,M,sb,nb,0},true);auto&att=getKernelHD("flash_attn_vulkan",hd);
+                add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,(M+15)/16,1,L+"attn");
+                auto gp=mkp(L+"gate_p",{M*qd});auto&go=getKernel("gated_output_batched");add(go,{{0,qwen35Pf.attn},{1,qwen35Pf.ag},{2,qwen35Pf.aout},{3,gp}},(M*qd+255)/256,1,1,L+"gate");
+                mmk(qwen35Pf.aout,lw.oKQ,lw.oKQType,lw.oKQNBlocks,lw.oKQRowStride,zeroBiasE,qwen35Pf.proj,qd,E,L+"oproj");
+            }
+            auto anp=mkp(L+"addnorm_p",{E,E,eb});add(addnorm,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,qwen35Pf.norm},{3,lw.postNorm},{4,qwen35Pf.rstd},{5,anp}},M,1,1,L+"postnorm");
+            if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u postnorm built\n",li);fflush(stderr);}
+            uint32_t im=pl.intermediateSize;mmk(qwen35Pf.norm,lw.guKQ,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
+            if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u gateup built\n",li);fflush(stderr);}
+            auto sap=mkp(L+"silu_p",{M,im});add(silu,{{0,qwen35Pf.gateup},{1,qwen35Pf.act},{2,sap}},(M*im+255)/256,1,1,L+"silu");
+            mmk(qwen35Pf.act,lw.dnKQ,lw.dnKQType,lw.dnKQNBlocks,lw.dnKQRowStride,zeroBiasE,qwen35Pf.proj,im,E,L+"down");
+            if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u down built\n",li);fflush(stderr);}
+            if(lw.postFfwNorm.handle){auto nap=mkp(L+"normadd_p",{E,E,eb});add(normadd,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,lw.postFfwNorm},{3,qwen35Pf.rstd},{4,nap}},M,1,1,L+"ffn_add");}
+            else{auto ap=mkp(L+"add_p",{M*E});add(addip,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,ap}},(M*E+255)/256,1,1,L+"ffn_add");}
+            if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u build end dispatches=%zu\n",li,ds.size());fflush(stderr);}
+            if(std::getenv("BP_PROFILE_QWEN_PREFILL")){
+                gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
+                for(const auto& d:ds){auto t0=std::chrono::steady_clock::now();
+                    fprintf(stderr,"[qwen-prefill] layer=%u dispatch=%s begin\n",li,d.name.c_str());fflush(stderr);
+                    std::vector<Dispatch> one{d};(void)gpu->submitAndReadback(one,qwen35Pf.x,4,passPerDispatch);
+                    auto t1=std::chrono::steady_clock::now();fprintf(stderr,"[qwen-prefill] layer=%u dispatch=%s gpu=%.2fms\n",li,d.name.c_str(),std::chrono::duration<double,std::milli>(t1-t0).count());fflush(stderr);}
+                ds.clear();
+                for(auto old:bgs)if(old)wgpuBindGroupRelease(old);bgs.clear();
+            }
+        }
+        bool last=done+M==T;
+        if(last){
+            auto fp=mkp("qpf_final_p",{E,E,eb});add(rms,{{0,qwen35Pf.x},{1,qwen35Pf.norm},{2,finalNormW},{3,qwen35Pf.rstd},{4,fp}},M,1,1,"qpf_final");
+            GPUBuffer lastn=qwen35Pf.norm;lastn.offset=(uint64_t)(M-1)*E*4;lastn.size=E*4;
+            auto lp=mkp("qpf_lm_p",{E,cfg.nVocab,kqLmNBlocks,kqLmRowStride,0});auto&lmp=getKernel("q6k_matmul_wide");add(lmp,{{0,lastn},{1,lmHeadKQ},{2,zeroBiasV},{3,logitsBuf},{4,lp}},1,(cfg.nVocab+15)/16,1,"qpf_lm");
+            if(softcapPipeline&&softcapBG)ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"softcap"});
+            ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
+            gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
+            auto bytes=gpu->submitAndReadback(ds,argmaxResultBuf,4,true);memcpy(&result,bytes.data(),4);
+        }else{
+            gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
+            // Scratch buffers, parameter-arena slots, and bind groups are
+            // reused by the next chunk. Wait once per chunk (rather than once
+            // per layer) so none of them are overwritten while still in use.
+            (void)gpu->submitAndReadback(ds,qwen35Pf.x,4,true);
+        }
+        for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=M;for(auto bg:bgs)if(bg)wgpuBindGroupRelease(bg);done+=M;
+    }return result;
+}
+
+int32_t ModelRunner::prefillGemmaBatched(
+        const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
+    if (!gemmaPf.ready || T == 0) return -1;
+    using PrefillClock = std::chrono::steady_clock;
+    const bool profileCpu = std::getenv("BP_PROFILE_CPU") != nullptr;
+    double buildMs = 0.0, submitMs = 0.0, cleanupMs = 0.0;
+    int32_t resultToken = -1;
+    uint32_t done = 0;
+    while (done < T) {
+        const uint32_t M = std::min(gemmaPf.capacity, T - done);
+        std::vector<int32_t> tokens(M);
+        for (uint32_t r = 0; r < M; r++) {
+            int32_t t = tokenIds[done + r];
+            tokens[r] = (t >= 0 && (uint32_t)t < cfg.nVocab) ? t : 0;
+        }
+        gpu->writeBuffer(gemmaPf.tokens, tokens.data(), M * 4);
+        auto buildStart = PrefillClock::now();
+
+        std::vector<Dispatch> ds;
+        std::vector<WGPUBindGroup> bgs;
+        std::vector<GPUBuffer> params;
+        auto mkP = [&](const std::string& name, std::initializer_list<uint32_t> v,
+                       bool uniform = false) {
+            uint32_t d[8] = {};
+            size_t n = 0; for (uint32_t x : v) d[n++] = x;
+            uint64_t bytes = n > 4 ? 32 : 16;
+            auto b = gpu->createBuffer(name, bytes,
+                uniform ? (BUF_UNIFORM | BUF_COPY_DST) : (BUF_STORAGE | BUF_COPY_DST));
+            gpu->writeBuffer(b, d, bytes); params.push_back(b); return b;
+        };
+        auto add = [&](const CompiledPipeline& pl,
+                       std::initializer_list<std::pair<uint32_t, GPUBuffer>> binds,
+                       uint32_t gx, uint32_t gy, const std::string& name) {
+            auto bg = makeBG(pl, std::vector<std::pair<uint32_t, GPUBuffer>>(binds));
+            bgs.push_back(bg); ds.push_back({pl.pipeline, bg, gx, gy, 1, name});
+        };
+        uint32_t eb; memcpy(&eb, &cfg.rmsNormEps, 4);
+        uint32_t scaleBits;
+
+        auto& q4Gather = getKernel("q4_gather_batched");
+        float embScale = cfg.embeddingScale > 0 ? cfg.embeddingScale : 1.0f;
+        memcpy(&scaleBits, &embScale, 4);
+        auto embP = mkP("gpf_emb_p", {M, cfg.nEmbd, cfg.nVocab, scaleBits});
+        add(q4Gather, {{0,lmHeadQ8W},{1,lmHeadQ8S},{2,gemmaPf.tokens},
+                       {3,gemmaPf.x},{4,embP}},
+            (M * cfg.nEmbd + 255) / 256, 1, "gpf_embed");
+
+        auto& q4mm = getKernel("matmul_q4_batched");
+        if (cfg.pleSize > 0 && pleGpuPreprocess) {
+            uint32_t totalPle = cfg.pleSize * cfg.nLayer;
+            float ps = sqrtf((float)cfg.pleSize); memcpy(&scaleBits, &ps, 4);
+            auto pg = mkP("gpf_ple_gather_p", {M,totalPle,cfg.nVocab,scaleBits});
+            add(q4Gather, {{0,pleTokenEmbW},{1,pleTokenEmbS},{2,gemmaPf.tokens},
+                           {3,gemmaPf.pleSignal},{4,pg}},
+                (M*totalPle+255)/256,1,"gpf_ple_gather");
+            auto pm = mkP("gpf_ple_model_p", {M,totalPle,cfg.nEmbd});
+            add(q4mm, {{0,gemmaPf.x},{1,pleModelProjW},{2,pleModelProjS},
+                       {3,gemmaPf.pleRaw},{4,pm}},
+                (totalPle+31)/32,(M+3)/4,"gpf_ple_model");
+            auto pc = mkP("gpf_ple_combine_p", {M,cfg.pleSize,cfg.nLayer,eb});
+            auto& combine = getKernel("ple_combine_batched");
+            add(combine, {{0,gemmaPf.pleRaw},{1,pleProjNormW},
+                          {2,gemmaPf.pleSignal},{3,pc}},
+                M,cfg.nLayer,"gpf_ple_combine");
+        }
+
+        uint32_t cacheLen = kvCache[0].len;
+        auto& rms = getKernel("rms_norm_batched");
+        auto& sandwich = getKernel("gemma_sandwich_attn_batched");
+        auto& normAdd = getKernel("gemma_norm_add_batched");
+        auto& geluMul = getKernel("gelu_mul_batched");
+        auto& pleMul = getKernel("ple_gelu_mul_batched");
+        auto& scaleBuf = getKernel("scale_by_buffer");
+        for (uint32_t li = 0; li < cfg.nLayer; li++) {
+            auto& lw = layerWeights[li]; auto& pl = cfg.perLayer[li];
+            const uint32_t hd=pl.headDim,qdim=pl.qDim,kvdim=pl.kvDim,im=pl.intermediateSize;
+            auto rp = mkP("gpf_rms_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
+            add(rms,{{0,gemmaPf.x},{1,gemmaPf.norm},{2,lw.inputNorm},
+                     {3,gemmaPf.rstd},{4,rp}},M,1,"gpf_rms");
+
+            bool qonly = lw.qOnly;
+            uint32_t qkvN = qonly ? qdim : qdim + 2u*kvdim;
+            auto qp=mkP("gpf_qkv_"+std::to_string(li),{M,qkvN,cfg.nEmbd});
+            add(q4mm,{{0,gemmaPf.norm},{1,qonly?lw.qOnlyW:lw.qkvW},
+                      {2,qonly?lw.qOnlyS:lw.qkvS},{3,gemmaPf.qkv},{4,qp}},
+                (qkvN+31)/32,(M+3)/4,"gpf_qkv");
+
+            bool swa = li<cfg.layerAttnTypes.size() &&
+                       cfg.layerAttnTypes[li]==AttnLayerType::SlidingWindow;
+            uint32_t cacheLayer = pl.kvSourceLayer>=0 ? (uint32_t)pl.kvSourceLayer : li;
+            uint32_t flags=(qonly?1u:0u)|2u;
+            auto ropeP=mkP("gpf_rope_"+std::to_string(li),
+                {cfg.nHead,qdim,kvdim,posOffset+done,hd/2,cacheLen,cfg.nKvHeads,flags});
+            auto& rope=getKernelHD("gemma_rope_batched",hd);
+            auto& rc=(swa&&ropeCosBufSWA.handle)?ropeCosBufSWA:ropeCosBuf;
+            auto& rs=(swa&&ropeSinBufSWA.handle)?ropeSinBufSWA:ropeSinBuf;
+            add(rope,{{0,gemmaPf.qkv},{1,gemmaPf.qrot},{2,kvCache[cacheLayer].K},
+                      {3,kvCache[cacheLayer].V},{4,rc},{5,rs},{6,lw.qNorm},
+                      {7,lw.kNorm},{8,ropeP}},
+                cfg.nHead+(qonly?0u:cfg.nKvHeads),M,"gpf_rope");
+
+            uint32_t total=cacheLen+M;
+            uint32_t kvStart=(swa&&cfg.slidingWindow>0&&total>cfg.slidingWindow)
+                ? total-cfg.slidingWindow:0u;
+            float ascale=1.0f,ni=-1e9f;uint32_t asb,nib;
+            memcpy(&asb,&ascale,4);memcpy(&nib,&ni,4);
+            auto ap=mkP("gpf_attn_"+std::to_string(li),
+                {kvdim,cfg.nHead/cfg.nKvHeads,total,cacheLen,M,asb,nib,kvStart},true);
+            auto& attn=getKernelHD("flash_attn_vulkan",hd);
+            add(attn,{{0,gemmaPf.qrot},{1,kvCache[cacheLayer].K},
+                      {2,kvCache[cacheLayer].V},{3,gemmaPf.attn},{4,ap}},
+                cfg.nHead,(M+15)/16,"gpf_attn");
+
+            auto op=mkP("gpf_o_"+std::to_string(li),{M,cfg.nEmbd,qdim});
+            add(q4mm,{{0,gemmaPf.attn},{1,lw.oW},{2,lw.oS},
+                      {3,gemmaPf.proj},{4,op}},
+                (cfg.nEmbd+31)/32,(M+3)/4,"gpf_oproj");
+            auto sp=mkP("gpf_sand_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
+            add(sandwich,{{0,gemmaPf.x},{1,gemmaPf.proj},{2,lw.postNorm},
+                          {3,lw.ffnNorm},{4,gemmaPf.norm},{5,gemmaPf.rstd},{6,sp}},
+                M,1,"gpf_sandwich");
+
+            auto gp=mkP("gpf_gu_"+std::to_string(li),{M,2u*im,cfg.nEmbd});
+            add(q4mm,{{0,gemmaPf.norm},{1,lw.guW},{2,lw.guS},
+                      {3,gemmaPf.gateup},{4,gp}},
+                (2u*im+31)/32,(M+3)/4,"gpf_gateup");
+            auto gap=mkP("gpf_gelu_"+std::to_string(li),{M,im});
+            add(geluMul,{{0,gemmaPf.gateup},{1,gemmaPf.act},{2,gap}},
+                (M*im+255)/256,1,"gpf_gelu");
+            auto dp=mkP("gpf_down_"+std::to_string(li),{M,cfg.nEmbd,im});
+            add(q4mm,{{0,gemmaPf.act},{1,lw.dnW},{2,lw.dnS},
+                      {3,gemmaPf.proj},{4,dp}},
+                (cfg.nEmbd+31)/32,(M+3)/4,"gpf_down");
+            auto np=mkP("gpf_ffn_add_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
+            add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.proj},{2,lw.postFfwNorm},
+                         {3,gemmaPf.rstd},{4,np}},M,1,"gpf_ffn_add");
+
+            if(cfg.pleSize>0&&pleGpuPreprocess&&lw.pleInpGateW.handle){
+                auto p1=mkP("gpf_pg_"+std::to_string(li),{M,cfg.pleSize,cfg.nEmbd});
+                add(q4mm,{{0,gemmaPf.x},{1,lw.pleInpGateW},{2,lw.pleInpGateS},
+                          {3,gemmaPf.pleGate},{4,p1}},
+                    (cfg.pleSize+31)/32,(M+3)/4,"gpf_ple_gate");
+                auto p2=mkP("gpf_pm_"+std::to_string(li),{M,cfg.pleSize,li,cfg.nLayer});
+                add(pleMul,{{0,gemmaPf.pleGate},{1,gemmaPf.pleSignal},{2,p2}},
+                    (M*cfg.pleSize+255)/256,1,"gpf_ple_mul");
+                auto p3=mkP("gpf_pp_"+std::to_string(li),{M,cfg.nEmbd,cfg.pleSize});
+                add(q4mm,{{0,gemmaPf.pleGate},{1,lw.pleProjW},{2,lw.pleProjS},
+                          {3,gemmaPf.pleOut},{4,p3}},
+                    (cfg.nEmbd+31)/32,(M+3)/4,"gpf_ple_proj");
+                auto p4=mkP("gpf_pa_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
+                add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.pleOut},{2,lw.plePostNorm},
+                             {3,gemmaPf.rstd},{4,p4}},M,1,"gpf_ple_add");
+            }
+            if(lw.outScale.handle){
+                auto scp=mkP("gpf_scale_"+std::to_string(li),{M*cfg.nEmbd});
+                add(scaleBuf,{{0,gemmaPf.x},{1,lw.outScale},{2,scp}},
+                    (M*cfg.nEmbd+255)/256,1,"gpf_scale");
+            }
+        }
+
+        bool lastChunk = done + M == T;
+        if (lastChunk) {
+            auto fp=mkP("gpf_final",{cfg.nEmbd,cfg.nEmbd,eb});
+            add(rms,{{0,gemmaPf.x},{1,gemmaPf.norm},{2,finalNormW},
+                     {3,gemmaPf.rstd},{4,fp}},M,1,"gpf_final_rms");
+            GPUBuffer lastNorm=gemmaPf.norm;
+            lastNorm.offset=(uint64_t)(M-1)*cfg.nEmbd*4; lastNorm.size=cfg.nEmbd*4;
+            auto lp=mkP("gpf_lm",{0,cfg.nVocab,cfg.nEmbd,0});
+            auto& lm=getKernel("matmul_q4_decode");
+            add(lm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
+                    {3,logitsBuf},{4,lp}},
+                (cfg.nVocab+31)/32,1,"gpf_lm");
+            if(softcapPipeline&&softcapBG){
+                ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"logit_softcap"});
+            }
+            ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);
+            ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
+            auto buildEnd = PrefillClock::now();
+            auto bytes=gpu->submitAndReadback(ds,argmaxResultBuf,4,passPerDispatch);
+            auto submitEnd = PrefillClock::now();
+            buildMs += std::chrono::duration<double, std::milli>(buildEnd-buildStart).count();
+            submitMs += std::chrono::duration<double, std::milli>(submitEnd-buildEnd).count();
+            memcpy(&resultToken,bytes.data(),4);
+        } else {
+            auto buildEnd = PrefillClock::now();
+            gpu->submitOnly(ds,!passPerDispatch);
+            auto submitEnd = PrefillClock::now();
+            buildMs += std::chrono::duration<double, std::milli>(buildEnd-buildStart).count();
+            submitMs += std::chrono::duration<double, std::milli>(submitEnd-buildEnd).count();
+        }
+        for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=M;
+        auto cleanupStart = PrefillClock::now();
+        for(auto bg:bgs)if(bg)wgpuBindGroupRelease(bg);
+        for(auto p:params)if(p.handle)wgpuBufferRelease(p.handle);
+        cleanupMs += std::chrono::duration<double, std::milli>(PrefillClock::now()-cleanupStart).count();
+        done+=M;
+    }
+    if (profileCpu) {
+        fprintf(stderr, "[gemma-prefill-cpu] T=%u build=%.2fms submit/wait=%.2fms cleanup=%.2fms\n",
+                T, buildMs, submitMs, cleanupMs);
+    }
+    return resultToken;
+}
+
 int32_t ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
+    if (qwen35Pf.ready && !std::getenv("BP_QWEN35_SERIAL_PREFILL"))
+        return prefillQwen35Batched(tokenIds,T,posOffset);
+    if (gemmaPf.ready && !std::getenv("BP_GEMMA_SERIAL_PREFILL"))
+        return prefillGemmaBatched(tokenIds, T, posOffset);
+    if ((pleGpuPreprocess || cfg.arch == "qwen35") &&
+        !std::getenv("BP_SYNC_PREFILL"))
+        return prefillPooledKnown(tokenIds, T, posOffset);
     // For small T or when prefill resources are not available (K-quant), use serial path
     if (T <= 16 || !pfCache.pX.handle) {
         fprintf(stderr, "  [prefillBatched] serial path T=%u\n", T); fflush(stderr);
@@ -5129,6 +6466,20 @@ int32_t ModelRunner::argmax(const std::vector<float>& logits) {
 void ModelRunner::resetKVCache() {
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len = 0;
+
+    // Recurrent models carry state outside the attention KV cache. Leaving
+    // these buffers intact makes warmup/autotuning and previous prompts alter
+    // the next prompt's very first token.
+    uint64_t maxBytes = 0;
+    for (const auto& b : ssmConvState) if (b.handle) maxBytes = std::max(maxBytes, b.size);
+    for (const auto& b : ssmHState)    if (b.handle) maxBytes = std::max(maxBytes, b.size);
+    if (maxBytes > 0) {
+        std::vector<uint8_t> zeros((size_t)maxBytes, 0);
+        for (const auto& b : ssmConvState)
+            if (b.handle) gpu->writeBuffer(b, zeros.data(), b.size);
+        for (const auto& b : ssmHState)
+            if (b.handle) gpu->writeBuffer(b, zeros.data(), b.size);
+    }
 }
 
 void ModelRunner::enableProfiling() {

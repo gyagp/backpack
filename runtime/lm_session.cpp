@@ -822,12 +822,25 @@ struct StandardState {
             if (!ggufTokenizer.load(runner.gguf)) return false;
         }
 
-        runner.decode(0, 0);
-        runner.resetKVCache();
-        if (!runner.loadDecodeAutotuneCache()) {
-            runner.autotuneDecodeDepth();
-            runner.autotuneDecodeKernels();
-            runner.saveDecodeAutotuneCache();
+        // Generic startup replay is unsafe for Qwen 3.5's hybrid recurrent
+        // path: it advances SSM state before the real prompt and can corrupt
+        // pooled decode ownership. Pipelines are already created by load().
+        if (runner.cfg.arch != "qwen35") {
+            if (runner.embeddingCPU.empty() || runner.pleGpuPreprocess) {
+                runner.seedDecodeTokenInputs(0);
+                runner.submitDecode(0, 0);
+                (void)runner.readArgmax(0);
+            } else {
+                runner.decode(0, 0);
+            }
+            runner.resetKVCache();
+        }
+        if (runner.cfg.arch != "qwen35") {
+            if (!runner.loadDecodeAutotuneCache()) {
+                runner.autotuneDecodeDepth();
+                runner.autotuneDecodeKernels();
+                runner.saveDecodeAutotuneCache();
+            }
         }
 
         auto& c = runner.cfg;
@@ -889,10 +902,25 @@ struct StandardState {
     }
 
     int32_t Prefill(const int32_t* tokens, uint32_t n) {
-        std::vector<float> logits;
-        for (uint32_t i = 0; i < n; i++) logits = runner.decode(tokens[i], i);
-        DumpTopLogits("prefill", logits);
-        int32_t next = ModelRunner::argmax(logits);
+        if (std::getenv("BP_DUMP_TOKENS")) {
+            fprintf(stderr, "[debug] prompt tokens:");
+            for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %d", tokens[i]);
+            fprintf(stderr, "\n");
+        }
+        int32_t next;
+        bool pooledPrefill = runner.pleGpuPreprocess || runner.cfg.arch == "qwen35";
+        bool qwenBatched = runner.cfg.arch == "qwen35" && n > 16 &&
+                           !std::getenv("BP_QWEN35_SERIAL_PREFILL");
+        if (qwenBatched && !std::getenv("BP_SYNC_PREFILL")) {
+            next = runner.prefillBatched(tokens, n, 0);
+        } else if (pooledPrefill && !std::getenv("BP_SYNC_PREFILL")) {
+            next = runner.prefillPooledKnown(tokens, n, 0);
+        } else {
+            std::vector<float> logits;
+            for (uint32_t i = 0; i < n; i++) logits = runner.decode(tokens[i], i);
+            DumpTopLogits("prefill", logits);
+            next = ModelRunner::argmax(logits);
+        }
         runner.seedDecodeTokenInputs(next);
         pos = n;
         return next;
@@ -930,6 +958,10 @@ struct StandardState {
     }
 
     int32_t DecodeArgmaxSynchronous(int32_t token) {
+        if (std::getenv("BP_DUMP_TOP_LOGITS")) {
+            auto logits = DecodeSynchronous(token);
+            return ModelRunner::argmax(logits);
+        }
         int32_t next = runner.decodeArgmax(token, pos);
         pos++;
         return next;
@@ -1179,9 +1211,12 @@ int32_t LmSession::Decode() {
                    std::getenv("BP_Q35_SYNC") != nullptr;
     // Gemma models (sandwich norms, per-layer head dims, shared-KV) don't fit
     // the pre-recorded pooled decode path; use synchronous decode.
-    bool gemma4Sync = std->runner.cfg.arch.rfind("gemma", 0) == 0;
+    bool gemma4Sync = std->runner.cfg.arch.rfind("gemma", 0) == 0 &&
+                      !std->runner.pleGpuPreprocess;
     if (q35Sync || gemma4Sync) {
-        next = std->DecodeArgmaxSynchronous(impl_->lastToken);
+        next = gemma4Sync && std::getenv("BP_GEMMA_SYNC") == nullptr
+            ? std->runner.decodeArgmaxPooled(impl_->lastToken, std->pos++)
+            : std->DecodeArgmaxSynchronous(impl_->lastToken);
     } else {
         next = std->DecodePipelined();
     }

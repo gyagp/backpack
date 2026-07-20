@@ -14,6 +14,7 @@
 #include "gpu_context.h"
 #include "wgsl_template.h"
 #include "graph_executor.h"  // for TensorDtype enum
+#include "gguf_loader.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1480,6 +1481,291 @@ TEST(tmpl_matmul_f32) {
     return assertClose((const float*)result.data(), expected.data(), M * N, 1e-3f, 0);
 }
 
+TEST(matmul_q4_batched) {
+    auto wgsl = loadWgsl("onnx_q4", "matmul_q4_batched");
+    if (wgsl.empty()) return {false, "cannot load kernel"};
+    const int M = 5, N = 9, K = 256;
+    Rng rng(123);
+    auto X = rng.randnVec(M * K);
+    std::vector<uint32_t> W(N * K / 8);
+    for (size_t i = 0; i < W.size(); i++) {
+        uint32_t p = 0;
+        for (int j = 0; j < 8; j++) p |= uint32_t((i * 7 + j * 3 + 5) & 15) << (4 * j);
+        W[i] = p;
+    }
+    const int blocks = K / 32;
+    std::vector<uint16_t> scales16(N * blocks);
+    std::vector<uint32_t> scales((scales16.size() + 1) / 2, 0);
+    for (size_t i = 0; i < scales16.size(); i++) {
+        scales16[i] = f32ToF16(0.01f + 0.001f * float(i % 11));
+        scales[i / 2] |= uint32_t(scales16[i]) << (16 * (i & 1));
+    }
+    auto bufX = makeBuffer(gpu, "X", X.data(), M * K);
+    auto bufW = makeBufferU32(gpu, "W", W.data(), (int)W.size());
+    auto bufS = makeBufferU32(gpu, "S", scales.data(), (int)scales.size());
+    auto bufY = makeBuffer(gpu, "Y", nullptr, M * N);
+    auto params = makeParams(gpu, "params", {(uint32_t)M, (uint32_t)N, (uint32_t)K});
+    auto result = dispatchAndReadback(gpu, wgsl,
+        {{0, bufX}, {1, bufW}, {2, bufS}, {3, bufY}, {4, params}},
+        ceilDiv(N, 32), ceilDiv(M, 4), 1, bufY, M * N * 4, 5);
+    std::vector<float> expected(M * N, 0.0f);
+    for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) {
+        for (int b = 0; b < blocks; b++) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) amax = std::max(amax, std::abs(X[m*K+b*32+j]));
+            float as = amax / 127.0f;
+            float ws = f16ToF32(scales16[n * blocks + b]);
+            for (int j = 0; j < 32; j++) {
+                int aq = as == 0.0f ? 0 : std::max(-127, std::min(127,
+                    (int)std::round(X[m*K+b*32+j] / as)));
+                int wi = b * 4 + j / 8;
+                int wq = int((W[n*(K/8)+wi] >> (4*(j&7))) & 15) - 8;
+                expected[m*N+n] += float(aq*wq) * as * ws;
+            }
+        }
+    }
+    return assertClose((const float*)result.data(), expected.data(), M*N, 2e-3f, 2e-4f);
+}
+
+TEST(qwen35_conv_scan_silu) {
+    auto wgsl=loadWgsl("ssm","qwen35_conv_scan_silu");
+    if(wgsl.empty()) return {false,"cannot load kernel"};
+    const int C=5,K=4,T=7; Rng rng(321);
+    auto state=rng.randnVec(C*K), initial=state, x=rng.randnVec(T*C);
+    auto w=rng.randnVec(C*K), bias=rng.randnVec(C), expected=std::vector<float>(T*C);
+    for(int c=0;c<C;c++) for(int t=0;t<T;t++) {
+        float acc=bias[c];
+        for(int k=0;k<K-1;k++){state[c*K+k]=state[c*K+k+1];acc+=w[c*K+k]*state[c*K+k];}
+        state[c*K+K-1]=x[t*C+c];acc+=w[c*K+K-1]*x[t*C+c];
+        expected[t*C+c]=acc/(1.0f+std::exp(-acc));
+    }
+    auto bs=makeBuffer(gpu,"S",initial.data(),C*K),bx=makeBuffer(gpu,"X",x.data(),T*C);
+    auto bw=makeBuffer(gpu,"W",w.data(),C*K),bb=makeBuffer(gpu,"B",bias.data(),C);
+    auto by=makeBuffer(gpu,"Y",nullptr,T*C),p=makeParams(gpu,"P",{C,K,T});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bs},{1,bx},{2,bw},{3,bb},{4,by},{5,p}},
+        ceilDiv(C,256),1,1,by,T*C*4,6);
+    return assertClose((const float*)result.data(),expected.data(),T*C,2e-5f,2e-5f);
+}
+
+TEST(delta_net_scan_x2) {
+    auto wgsl=loadWgsl("ssm","delta_net_scan_x2");
+    if(wgsl.empty()) return {false,"cannot load kernel"};
+    const int T=3,NV=1,NK=1,DK=128,DV=2; Rng rng(654);
+    auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV);
+    auto beta=rng.randnVec(T*NV),gate=rng.randnVec(T*NV),state=rng.randnVec(NV*DK*DV);
+    for(float& b:beta)b=1.0f/(1.0f+std::exp(-b)); for(float& g:gate)g=-std::abs(g)*0.1f;
+    auto ref=state;std::vector<float> expected(T*NV*DV);float qs=1.0f/std::sqrt(float(DK));
+    for(int t=0;t<T;t++)for(int vi=0;vi<DV;vi++){
+        float gh=std::exp(gate[t]),pred=0;for(int d=0;d<DK;d++)pred+=gh*ref[d*DV+vi]*k[t*DK+d];
+        float delta=(v[t*DV+vi]-pred)*beta[t],out=0;
+        for(int d=0;d<DK;d++){float sn=gh*ref[d*DV+vi]+k[t*DK+d]*delta;ref[d*DV+vi]=sn;out+=sn*q[t*DK+d]*qs;}
+        expected[t*DV+vi]=out;
+    }
+    auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size());
+    auto bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size());
+    auto bg=makeBuffer(gpu,"G",gate.data(),gate.size()),bs=makeBuffer(gpu,"S",state.data(),state.size());
+    auto by=makeBuffer(gpu,"Y",nullptr,T*NV*DV),p=makeParams(gpu,"P",{NV,NK,DK,DV,T});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},
+        NV,ceilDiv(DV,2),1,by,T*NV*DV*4,8);
+    return assertClose((const float*)result.data(),expected.data(),T*NV*DV,3e-4f,3e-4f);
+}
+
+TEST(qwen35_split_qkv_l2_batched) {
+    auto wgsl=loadWgsl("ssm","qwen35_split_qkv_l2_batched");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int T=2,NK=1,NV=1,DK=128,DV=128,C=2*NK*DK+NV*DV;Rng rng(991);auto in=rng.randnVec(T*C);
+    auto bi=makeBuffer(gpu,"I",in.data(),in.size()),bq=makeBuffer(gpu,"Q",nullptr,T*NK*DK),bk=makeBuffer(gpu,"K",nullptr,T*NK*DK),bv=makeBuffer(gpu,"V",nullptr,T*NV*DV);float eps=1e-6f;uint32_t eb;memcpy(&eb,&eps,4);auto p=makeParams(gpu,"P",{NK,NV,DK,DV,eb,T});
+    auto qr=dispatchAndReadback(gpu,wgsl,{{0,bi},{1,bq},{2,bk},{3,bv},{4,p}},3,1,T,bq,T*NK*DK*4,5);std::vector<float>e(T*DK);
+    for(int t=0;t<T;t++){double ss=0;for(int d=0;d<DK;d++)ss+=double(in[t*C+d])*in[t*C+d];float inv=1.0f/std::max(std::sqrt(float(ss)),eps);for(int d=0;d<DK;d++)e[t*DK+d]=in[t*C+d]*inv;}
+    return assertClose((const float*)qr.data(),e.data(),e.size(),2e-5f,2e-5f);
+}
+
+TEST(qwen35_conv_scan_split_l2) {
+    auto wgsl=loadWgsl("ssm","qwen35_conv_scan_split_l2");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int T=3,NK=1,NV=1,DK=128,DV=128,CK=4,C=2*DK+DV;Rng rng(818);auto state=rng.randnVec(C*CK),ref=state,x=rng.randnVec(T*C),w=rng.randnVec(C*CK),bias=rng.randnVec(C);std::vector<float>eq(T*DK);
+    for(int t=0;t<T;t++){std::vector<float>q(DK);double ss=0;for(int d=0;d<DK;d++){int c=d;float a=bias[c];for(int j=0;j<CK-1;j++){ref[c*CK+j]=ref[c*CK+j+1];a+=w[c*CK+j]*ref[c*CK+j];}ref[c*CK+CK-1]=x[t*C+c];a+=w[c*CK+CK-1]*x[t*C+c];q[d]=a/(1+std::exp(-a));ss+=double(q[d])*q[d];}float inv=1/std::max(std::sqrt(float(ss)),1e-6f);for(int d=0;d<DK;d++)eq[t*DK+d]=q[d]*inv;}
+    auto bst=makeBuffer(gpu,"S",state.data(),state.size()),bx=makeBuffer(gpu,"X",x.data(),x.size()),bw=makeBuffer(gpu,"W",w.data(),w.size()),bb=makeBuffer(gpu,"B",bias.data(),bias.size()),bq=makeBuffer(gpu,"Q",nullptr,T*DK),bk=makeBuffer(gpu,"K",nullptr,T*DK),bv=makeBuffer(gpu,"V",nullptr,T*DV);float eps=1e-6f;uint32_t eb;memcpy(&eb,&eps,4);auto p=makeParams(gpu,"P",{NK,NV,DK,DV,CK,eb,T});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bst},{1,bx},{2,bw},{3,bb},{4,bq},{5,bk},{6,bv},{7,p}},3,1,1,bq,T*DK*4,8);return assertClose((const float*)r.data(),eq.data(),eq.size(),3e-5f,3e-5f);
+}
+
+TEST(gemma_sandwich_attn_batched) {
+    auto wgsl = loadWgsl("norm", "gemma_sandwich_attn_batched");
+    if (wgsl.empty()) return {false, "cannot load kernel"};
+    const int M = 3, N = 1536;
+    Rng rng(456);
+    auto X = rng.randnVec(M*N); auto A = rng.randnVec(M*N);
+    auto PW = rng.randnVec(N); auto NW = rng.randnVec(N);
+    auto expectedX = X; std::vector<float> expectedY(M*N), rstd(M);
+    const float eps = 1e-6f;
+    for (int m = 0; m < M; m++) {
+        double ss = 0; for (int i = 0; i < N; i++) ss += double(A[m*N+i])*A[m*N+i];
+        float ar = 1.0f / std::sqrt(float(ss/N) + eps);
+        ss = 0;
+        for (int i = 0; i < N; i++) {
+            float v = expectedX[m*N+i] + A[m*N+i]*ar*PW[i];
+            expectedX[m*N+i] = v; ss += double(v)*v;
+        }
+        float xr = 1.0f / std::sqrt(float(ss/N) + eps); rstd[m] = xr;
+        for (int i = 0; i < N; i++) expectedY[m*N+i] = expectedX[m*N+i]*xr*NW[i];
+    }
+    auto bx=makeBuffer(gpu,"X",X.data(),M*N), ba=makeBuffer(gpu,"A",A.data(),M*N);
+    auto bp=makeBuffer(gpu,"PW",PW.data(),N), bn=makeBuffer(gpu,"NW",NW.data(),N);
+    auto by=makeBuffer(gpu,"Y",nullptr,M*N), br=makeBuffer(gpu,"R",nullptr,M);
+    uint32_t eb; memcpy(&eb,&eps,4);
+    auto pp=makeParams(gpu,"P",{(uint32_t)N,(uint32_t)N,eb});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,ba},{2,bp},{3,bn},{4,by},{5,br},{6,pp}},
+        M,1,1,by,M*N*4,7);
+    return assertClose((const float*)result.data(),expectedY.data(),M*N,2e-4f,2e-4f);
+}
+
+TEST(q4_gather_batched) {
+    auto wgsl=loadWgsl("onnx_q4","q4_gather_batched");
+    if(wgsl.empty()) return {false,"cannot load kernel"};
+    const int M=3,D=256,V=4,blocks=D/32;
+    std::vector<uint32_t> W(V*D/8);
+    for(size_t i=0;i<W.size();i++) for(int j=0;j<8;j++) W[i]|=uint32_t((i+j*5)&15)<<(4*j);
+    std::vector<uint16_t> sh(V*blocks); std::vector<uint32_t> S((sh.size()+1)/2,0);
+    for(size_t i=0;i<sh.size();i++){sh[i]=f32ToF16(.02f+.001f*(i%7));S[i/2]|=uint32_t(sh[i])<<(16*(i&1));}
+    int32_t toks[M]={2,-1,3}; float outScale=1.25f; uint32_t sb; memcpy(&sb,&outScale,4);
+    auto bw=makeBufferU32(gpu,"W",W.data(),(int)W.size()), bs=makeBufferU32(gpu,"S",S.data(),(int)S.size());
+    auto bt=makeBufferI32(gpu,"T",toks,M); auto bo=makeBuffer(gpu,"O",nullptr,M*D);
+    auto pp=makeParams(gpu,"P",{M,D,V,sb});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,bs},{2,bt},{3,bo},{4,pp}},ceilDiv(M*D,256),1,1,bo,M*D*4,5);
+    std::vector<float> expected(M*D);
+    for(int m=0;m<M;m++){int t=toks[m]>=0&&toks[m]<V?toks[m]:0;for(int i=0;i<D;i++){
+        uint32_t p=W[t*(D/8)+i/8]; int q=int((p>>(4*(i&7)))&15)-8;
+        expected[m*D+i]=q*f16ToF32(sh[t*blocks+i/32])*outScale;
+    }}
+    return assertClose((const float*)result.data(),expected.data(),M*D,1e-6f,0);
+}
+
+TEST(q8_gather_batched) {
+    auto wgsl=loadWgsl("quant_q8","q8_gather_batched");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int T=3,D=64,V=4,B=D/32;std::vector<uint32_t>W(V*D/4);for(size_t i=0;i<W.size();i++)W[i]=uint32_t(i*2654435761u);
+    std::vector<uint16_t>sh(V*B);std::vector<uint32_t>S((sh.size()+1)/2);for(size_t i=0;i<sh.size();i++){sh[i]=f32ToF16(.01f+.002f*i);S[i/2]|=uint32_t(sh[i])<<(16*(i&1));}
+    int32_t tok[T]={2,-1,3};auto bw=makeBufferU32(gpu,"W",W.data(),W.size()),bs=makeBufferU32(gpu,"S",S.data(),S.size());auto bt=makeBufferI32(gpu,"T",tok,T),bo=makeBuffer(gpu,"O",nullptr,T*D);auto p=makeParams(gpu,"P",{T,D,V});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,bs},{2,bt},{3,bo},{4,p}},ceilDiv(T*D,256),1,1,bo,T*D*4,5);std::vector<float>e(T*D);
+    for(int t=0;t<T;t++){int id=tok[t]>=0?tok[t]:0;for(int d=0;d<D;d++){int q=int8_t((W[id*(D/4)+d/4]>>(8*(d&3)))&255);e[t*D+d]=q*f16ToF32(sh[id*B+d/32]);}}
+    return assertClose((const float*)result.data(),e.data(),T*D,1e-6f,0);
+}
+
+TEST(q8_matmul_batched_dp4a) {
+    auto wgsl=loadWgsl("quant_q8","q8_matmul_batched_dp4a");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int M=5,N=9,K=256,B=K/32;Rng rng(777);auto x=rng.randnVec(M*K),bias=rng.randnVec(N);std::vector<uint32_t>w(N*K/4);for(size_t i=0;i<w.size();i++)w[i]=uint32_t(i*2246822519u);
+    std::vector<uint16_t>sh(N*B);std::vector<uint32_t>s((sh.size()+1)/2);for(size_t i=0;i<sh.size();i++){sh[i]=f32ToF16(.003f+.0002f*(i%13));s[i/2]|=uint32_t(sh[i])<<(16*(i&1));}
+    auto bx=makeBuffer(gpu,"X",x.data(),x.size()),bw=makeBufferU32(gpu,"W",w.data(),w.size()),bs=makeBufferU32(gpu,"S",s.data(),s.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N);auto p=makeParams(gpu,"P",{K,N,M});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bs},{3,bb},{4,by},{5,p}},ceilDiv(M,4),ceilDiv(N,32),1,by,M*N*4,6);std::vector<float>e(M*N);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){float sum=bias[n];for(int b=0;b<B;b++){float am=0;for(int j=0;j<32;j++)am=std::max(am,std::abs(x[m*K+b*32+j]));float as=am/127;for(int j=0;j<32;j++){int aq=as?std::max(-127,std::min(127,int(std::round(x[m*K+b*32+j]/as)))):0;int d=b*32+j;int wq=int8_t((w[n*(K/4)+d/4]>>(8*(d&3)))&255);sum+=aq*wq*as*f16ToF32(sh[n*B+b]);}}e[m*N+n]=sum;}
+    return assertClose((const float*)r.data(),e.data(),M*N,3e-4f,3e-4f);
+}
+
+TEST(q8_matmul_batched_dp4a_real_smoke) {
+    auto wgsl=loadWgsl("quant_q8","q8_matmul_batched_dp4a");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int M=1,N=6144,K=2048;std::vector<float>x(M*K,0.25f),bias(N,0.125f);std::vector<uint32_t>w((size_t)N*K/4,0),s((size_t)N*(K/32)/2,0);
+    auto bx=makeBuffer(gpu,"X",x.data(),x.size()),bw=makeBufferU32(gpu,"W",w.data(),w.size()),bs=makeBufferU32(gpu,"S",s.data(),s.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bs},{3,bb},{4,by},{5,p}},ceilDiv(M,4),ceilDiv(N,32),1,by,M*N*4,6);
+    return assertClose((const float*)r.data(),bias.data(),N,1e-6f,0);
+}
+
+TEST(q5k_matmul_reference) {
+    auto wgsl=loadWgsl("quant_kq","q5k_matmul");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=8,K=256;Rng rng(4242);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*176);
+    for(int n=0;n<N;n++){uint8_t*b=raw.data()+n*176;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0005f*n);memcpy(b,&d,2);memcpy(b+2,&dm,2);for(int i=4;i<176;i++)b[i]=uint8_t((n*37+i*13+7)&255);}
+    auto packed=pack_q5k(raw.data(),N,K);std::vector<float>deq(N*K),expected(N);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q5_K);for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[n]+=x[k]*deq[n*K+k];
+    std::vector<float>bias(N,0);auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",packed.data.data(),(int)packed.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,packed.nBlocks,packed.rowStrideWords,0});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
+}
+
+TEST(q4k_matmul_reference) {
+    auto wgsl=loadWgsl("quant_kq","q4k_matmul");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=8,K=256;Rng rng(4343);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*144);
+    for(int n=0;n<N;n++){uint8_t*b=raw.data()+n*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0005f*n);memcpy(b,&d,2);memcpy(b+2,&dm,2);for(int i=4;i<144;i++)b[i]=uint8_t((n*31+i*17+3)&255);}
+    auto packed=pack_q4k(raw.data(),N,K);std::vector<float>deq(N*K),expected(N);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q4_K);for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[n]+=x[k]*deq[n*K+k];
+    std::vector<float>bias(N,0);auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",packed.data.data(),(int)packed.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,packed.nBlocks,packed.rowStrideWords,0});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
+}
+
+TEST(q4k_matmul_128_reference) {
+ auto wgsl=loadWgsl("quant_kq","q4k_matmul_128");if(wgsl.empty())return{false,"cannot load kernel"};const int N=7,K=512,NB=2;Rng rng(5555);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*144);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);for(int n=0;n<N;n++){bias[n]=.01f*n;exp[n]=bias[n];for(int k=0;k<K;k++)exp[n]+=x[k]*dq[n*K+k];}auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,pk.nBlocks,pk.rowStrideWords,0});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,ceilDiv(N,4),1,by,N*4,5);return assertClose((const float*)r.data(),exp.data(),N,2e-4f,2e-4f);
+}
+
+TEST(q6k_matmul_reference) {
+    auto wgsl=loadWgsl("quant_kq","q6k_matmul");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=8,K=768,NB=K/256;Rng rng(4646);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*210);
+    for(int n=0;n<N;n++)for(int q=0;q<NB;q++){uint8_t*b=raw.data()+(n*NB+q)*210;for(int i=0;i<208;i++)b[i]=uint8_t((n*29+q*23+i*19+5)&255);uint16_t d=f32ToF16(.02f+.001f*n+.0003f*q);memcpy(b+208,&d,2);}
+    auto packed=pack_q6k(raw.data(),N,K);std::vector<float>deq(N*K),expected(N);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q6_K);for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[n]+=x[k]*deq[n*K+k];
+    std::vector<float>bias(N,0);auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",packed.data.data(),(int)packed.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,packed.nBlocks,packed.rowStrideWords,0});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
+}
+
+TEST(q6k_gather_reference) {
+    auto wgsl=loadWgsl("quant_kq","q6k_gather");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=3,K=768,NB=K/256,TOK=2;std::vector<uint8_t>raw(N*NB*210);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*210;for(int i=0;i<208;i++)p[i]=uint8_t((n*41+b*23+i*11+9)&255);uint16_t d=f32ToF16(.015f+.001f*n+.0002f*b);memcpy(p+208,&d,2);}
+    auto packed=pack_q6k(raw.data(),N,K);std::vector<float>deq(N*K);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q6_K);int32_t tok=TOK;
+    auto bw=makeBufferU32(gpu,"W",packed.data.data(),(int)packed.data.size()),bt=makeBufferU32(gpu,"T",reinterpret_cast<uint32_t*>(&tok),1),bx=makeBuffer(gpu,"X",nullptr,K),p=makeParams(gpu,"P",{K,packed.rowStrideWords});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,bt},{2,bx},{3,p}},ceilDiv(K,256),1,1,bx,K*4,4);return assertClose((const float*)r.data(),deq.data()+TOK*K,K,1e-6f,1e-6f);
+}
+
+TEST(q6k_matmul_wide_reference) {
+    auto wgsl=loadWgsl("quant_kq","q6k_matmul_wide");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=19,K=768,NB=K/256;Rng rng(4747);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*210);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*210;for(int i=0;i<208;i++)p[i]=uint8_t((n*37+b*17+i*13+11)&255);uint16_t d=f32ToF16(.018f+.0007f*n+.0002f*b);memcpy(p+208,&d,2);}
+    auto packed=pack_q6k(raw.data(),N,K);std::vector<float>deq(N*K),expected(N),bias(N);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q6_K);for(int n=0;n<N;n++){bias[n]=.01f*n;expected[n]=bias[n];for(int k=0;k<K;k++)expected[n]+=x[k]*deq[n*K+k];}
+    auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",packed.data.data(),(int)packed.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,packed.nBlocks,packed.rowStrideWords,0});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,ceilDiv(N,16),1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
+}
+
+TEST(q6k_gather_batched_reference) {
+    auto wgsl=loadWgsl("quant_kq","q6k_gather_batched");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=4,K=768,NB=3,M=3;std::vector<uint8_t>raw(N*NB*210);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*210;for(int i=0;i<208;i++)p[i]=uint8_t(n*43+b*19+i*7+3);uint16_t d=f32ToF16(.014f+.001f*n);memcpy(p+208,&d,2);}
+    auto pk=pack_q6k(raw.data(),N,K);std::vector<float>deq(N*K),exp(M*K);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q6_K);uint32_t ts[M]={3,0,2};for(int m=0;m<M;m++)memcpy(exp.data()+m*K,deq.data()+ts[m]*K,K*4);
+    auto bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bt=makeBufferU32(gpu,"T",ts,M),bx=makeBuffer(gpu,"X",nullptr,M*K),p=makeParams(gpu,"P",{M,K,pk.rowStrideWords});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,bt},{2,bx},{3,p}},ceilDiv(M*K,256),1,1,bx,M*K*4,4);return assertClose((const float*)r.data(),exp.data(),M*K,1e-6f,1e-6f);
+}
+
+TEST(q4k_matmul_batched4_reference) {
+ auto wgsl=loadWgsl("quant_kq","q4k_matmul_batched4");if(wgsl.empty())return{false,"cannot load kernel"};const int M=5,N=9,K=512,NB=2;Rng rng(4848);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*144);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int i=4;i<144;i++)p[i]=uint8_t(n*31+b*13+i*17);}
+ auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);for(int n=0;n<N;n++)bias[n]=.01f*n;for(int m=0;m<M;m++)for(int n=0;n<N;n++){float a=bias[n];for(int k=0;k<K;k++)a+=x[m*K+k]*dq[n*K+k];exp[m*N+n]=a;}
+ auto bx=makeBuffer(gpu,"X",x.data(),M*K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M,pk.nBlocks,pk.rowStrideWords});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},ceilDiv(M,4),ceilDiv(N,8),1,by,M*N*4,5);return assertClose((const float*)r.data(),exp.data(),M*N,2e-4f,2e-4f);
+}
+
+TEST(q5k_matmul_batched4_reference) {
+ auto wgsl=loadWgsl("quant_kq","q5k_matmul_batched4");if(wgsl.empty())return{false,"cannot load kernel"};const int M=5,N=9,K=512,NB=2;Rng rng(4949);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*176);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*176;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int i=4;i<176;i++)p[i]=uint8_t(n*29+b*11+i*19);}
+ auto pk=pack_q5k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q5_K);for(int n=0;n<N;n++)bias[n]=.01f*n;for(int m=0;m<M;m++)for(int n=0;n<N;n++){float a=bias[n];for(int k=0;k<K;k++)a+=x[m*K+k]*dq[n*K+k];exp[m*N+n]=a;}
+ auto bx=makeBuffer(gpu,"X",x.data(),M*K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M,pk.nBlocks,pk.rowStrideWords});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},ceilDiv(M,4),ceilDiv(N,8),1,by,M*N*4,5);return assertClose((const float*)r.data(),exp.data(),M*N,2e-4f,2e-4f);
+}
+
+TEST(q6k_matmul_batched4_reference) {
+ auto wgsl=loadWgsl("quant_kq","q6k_matmul_batched4");if(wgsl.empty())return{false,"cannot load kernel"};const int M=5,N=9,K=768,NB=3;Rng rng(5050);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*210);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*210;for(int i=0;i<208;i++)p[i]=uint8_t(n*23+b*17+i*13);uint16_t d=f32ToF16(.018f+.0007f*n+.0002f*b);memcpy(p+208,&d,2);}
+ auto pk=pack_q6k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q6_K);for(int n=0;n<N;n++)bias[n]=.01f*n;for(int m=0;m<M;m++)for(int n=0;n<N;n++){float a=bias[n];for(int k=0;k<K;k++)a+=x[m*K+k]*dq[n*K+k];exp[m*N+n]=a;}
+ auto bx=makeBuffer(gpu,"X",x.data(),M*K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M,pk.nBlocks,pk.rowStrideWords});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},ceilDiv(M,4),ceilDiv(N,8),1,by,M*N*4,5);return assertClose((const float*)r.data(),exp.data(),M*N,2e-4f,2e-4f);
+}
+
+TEST(q4k_matmul_batched8_reference) {
+ auto wgsl=loadWgsl("quant_kq","q4k_matmul_batched8");if(wgsl.empty())return{false,"cannot load kernel"};const int M=9,N=9,K=512,NB=2;Rng rng(5151);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*144);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int i=4;i<144;i++)p[i]=uint8_t(n*31+b*13+i*17);}
+ auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);for(int n=0;n<N;n++)bias[n]=.01f*n;for(int m=0;m<M;m++)for(int n=0;n<N;n++){float a=bias[n];for(int k=0;k<K;k++)a+=x[m*K+k]*dq[n*K+k];exp[m*N+n]=a;}
+ auto bx=makeBuffer(gpu,"X",x.data(),M*K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M,pk.nBlocks,pk.rowStrideWords});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},ceilDiv(M,8),ceilDiv(N,8),1,by,M*N*4,5);return assertClose((const float*)r.data(),exp.data(),M*N,2e-4f,2e-4f);
+}
+
+
+TEST(gemma_rope_batched_qonly) {
+    auto wgsl=loadWgsl("attention","gemma_rope_batched");
+    if(wgsl.empty()) return {false,"cannot load kernel"};
+    const int HD=128;
+    Rng rng(789); auto q=rng.randnVec(HD); std::vector<float> ones(HD,1.0f);
+    std::vector<float> cs(HD/2,1.0f), sn(HD/2,0.0f);
+    auto bq=makeBuffer(gpu,"QKV",q.data(),HD), bo=makeBuffer(gpu,"O",nullptr,HD);
+    auto bk=gpu.createBuffer("K",HD*2), bv=gpu.createBuffer("V",HD*2);
+    auto bc=makeBuffer(gpu,"C",cs.data(),HD/2), bs=makeBuffer(gpu,"S",sn.data(),HD/2);
+    auto bw=makeBuffer(gpu,"W",ones.data(),HD);
+    auto pp=makeParams(gpu,"P",{1,HD,HD,0,HD/2,0,1,1});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bo},{2,bk},{3,bv},{4,bc},{5,bs},{6,bw},{7,bw},{8,pp}},
+        1,1,1,bo,HD*4,9);
+    double ss=0;for(float v:q)ss+=double(v)*v;float r=1.0f/std::sqrt(float(ss/HD)+1e-6f);
+    std::vector<float> expected(HD);for(int i=0;i<HD;i++)expected[i]=q[i]*r;
+    return assertClose((const float*)result.data(),expected.data(),HD,2e-5f,2e-5f);
+}
+
 // ── Template gemm f32 ───────────────────────────────────────────────────────
 
 TEST(tmpl_gemm_f32) {
@@ -1639,6 +1925,10 @@ int main(int argc, char* argv[]) {
     if (!fs::exists(g_kernelDir)) {
         // Try in-tree build (runtime/build/Release/)
         g_kernelDir = (exePath / ".." / ".." / "kernels").string();
+    }
+    if (!fs::exists(g_kernelDir)) {
+        // Out-of-tree builds live under gitignore/runtime/build.
+        g_kernelDir = (fs::path(__FILE__).parent_path().parent_path() / "kernels").string();
     }
     if (!fs::exists(g_kernelDir)) {
         fprintf(stderr, "Cannot find kernel directory. Tried:\n  %s\n",

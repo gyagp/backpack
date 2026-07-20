@@ -1,6 +1,4 @@
 // @meta bindings=6
-enable subgroups;
-
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read_write> W_Q8: array<u32>;
 @group(0) @binding(2) var<storage, read_write> Scales: array<u32>;
@@ -9,6 +7,7 @@ enable subgroups;
 @group(0) @binding(5) var<storage, read_write> _params_: array<u32>;
 
 const TILE_N: u32 = 8u;
+var<workgroup> reduce_scratch: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -83,13 +82,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     acc = select(0.0, acc, col_valid);
 
-    // subgroupAdd requires subgroup uniform control flow
-    var warp_sum = acc;
-    warp_sum += subgroupShuffleXor(warp_sum, 16u);
-    warp_sum += subgroupShuffleXor(warp_sum, 8u);
-    warp_sum += subgroupShuffleXor(warp_sum, 4u);
-    warp_sum += subgroupShuffleXor(warp_sum, 2u);
-    warp_sum += subgroupShuffleXor(warp_sum, 1u);
+    reduce_scratch[tid] = acc;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset = offset / 2u) {
+        if (lane < offset) { reduce_scratch[tid] += reduce_scratch[tid + offset]; }
+        workgroupBarrier();
+    }
+    let warp_sum = reduce_scratch[warp_id * 32u];
 
     if (lane == 0u && col_valid) {
         Y[row * N + col] = warp_sum + Bias[col];

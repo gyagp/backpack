@@ -13,23 +13,6 @@
 @group(0) @binding(3) var<storage, read>       Sin:    array<f32>;
 @group(0) @binding(4) var<storage, read>       params: array<u32>;
 
-fn section_local_idx(pair_idx: u32, s0: u32, s1: u32, s2: u32) -> u32 {
-    var local_idx = pair_idx;
-    var section = 0u;
-    if (local_idx >= s0) {
-        local_idx = local_idx - s0;
-        section = 1u;
-    }
-    if (section == 1u && local_idx >= s1) {
-        local_idx = local_idx - s1;
-        section = 2u;
-    }
-    if (section == 2u && local_idx >= s2) {
-        local_idx = local_idx - s2;
-    }
-    return local_idx;
-}
-
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_head    = params[0];
@@ -51,8 +34,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (elem_idx < total_pairs) {
         let pair_idx = elem_idx;
-        let local_idx = section_local_idx(pair_idx, s0, s1, s2);
-        let table_idx = pos * rope_half + local_idx;
+        let table_idx = pos * rope_half + pair_idx;
         let c = Cos[table_idx];
         let s = Sin[table_idx];
         let x0 = X[head_base + pair_idx];
@@ -60,8 +42,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Out[out_idx] = x0 * c - x1 * s;
     } else if (elem_idx < total_pairs * 2u) {
         let pair_idx = elem_idx - total_pairs;
-        let local_idx = section_local_idx(pair_idx, s0, s1, s2);
-        let table_idx = pos * rope_half + local_idx;
+        let table_idx = pos * rope_half + pair_idx;
         let c = Cos[table_idx];
         let s = Sin[table_idx];
         let x0 = X[head_base + pair_idx];

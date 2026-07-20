@@ -1,0 +1,108 @@
+[
+  {
+    "id": "study-ort-webgpu-da90494371",
+    "source": "ONNX Runtime WebGPU",
+    "title": "Portable WebGPU softmax and quantized matmul study",
+    "revision": "da9049437190fa3552d1b31eacb164c3ec48d8b4",
+    "status": "completed",
+    "summary": "Studied current WebGPU softmax, MatMulNBits, DP4A, attention routing, and recent upstream changes. Windows subgroup matrices are excluded; portable DP4A, wide-tile, and generic paths are relevant.",
+    "scope": ["webgpu/math/softmax.cc", "webgpu/quantization/matmul_nbits", "dp4a kernels", "WebGPU attention operators", "recent git history"],
+    "findings": [
+      "Online max/sum softmax replaced two-pass reduction and should be tested for long-context parity and throughput.",
+      "MatMulNBits routes among portable DP4A, wide-tile, and generic kernels when subgroup matrices are unavailable.",
+      "Vendor-sensitive route selection requires NVIDIA, AMD, and Intel measurements."
+    ],
+    "references": ["onnxruntime/core/providers/webgpu/math/softmax.cc", "onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc", "commit 0c0d9aab2a"],
+    "task_proposals": [
+      {"title": "Evaluate online softmax for long-context Gemma 4 and Qwen 3.5", "kind": "correctness", "hypothesis": "ORT's online softmax state merge can improve long-context throughput without logit drift.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "checks": ["short-context-parity", "long-context-parity", "prefill", "decode"]}},
+      {"title": "Audit portable MatMulNBits routing without subgroup matrices", "kind": "correctness", "hypothesis": "Forced DP4A, wide-tile, and generic routes will identify a conformant per-device winner.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "checks": ["dp4a", "wide-tile", "generic"]}}
+    ]
+  },
+  {
+    "id": "study-ort-genai-87047e6d77",
+    "source": "ONNX Runtime GenAI",
+    "title": "Qwen 3.5 recurrent state and Gemma 4 semantics study",
+    "revision": "87047e6d77d55d20b54751e3f2da9d9883603c62",
+    "status": "completed",
+    "summary": "Studied Qwen 3.5 hybrid recurrent state, Gemma 4 per-layer conditioning, WebGPU graph capture, position IDs, and known WebGPU test limitations.",
+    "scope": ["src/config", "src/models/recurrent_state", "decoder_only", "graph_executor", "gemma4_multimodal_processor", "Qwen 3.5 dummy models", "C API tests"],
+    "findings": [
+      "Qwen 3.5 recurrent-state infrastructure is suitable as a differential semantic reference.",
+      "Gemma 4 parity must cover per-layer conditioning and shared-KV inputs, not only final logits.",
+      "UpdatePositionIds in the WebGPU interface is relevant to captured decode replay correctness.",
+      "Batch size greater than one remains skipped for WebGPU in upstream C API tests."
+    ],
+    "references": ["src/models/recurrent_state.cpp", "src/models/gemma4_multimodal_processor.cpp", "test/python/create/create_dummy_qwen_3.5_models.py", "commit e258b88a"],
+    "task_proposals": [
+      {"title": "Build Qwen 3.5 recurrent-state differential harness against ORT GenAI", "kind": "correctness", "hypothesis": "Per-step recurrent tensors will localize the first AMD divergence for Qwen 3.5 2B/4B.", "manifest": {"models": ["qwen3.5-2b", "qwen3.5-4b"], "checks": ["recurrent-tensors", "per-step-logits"]}},
+      {"title": "Validate Gemma 4 conditioning and shared-KV semantics against ORT GenAI", "kind": "correctness", "hypothesis": "Named intermediate parity will identify incorrect Gemma 4 per-layer inputs.", "manifest": {"models": ["gemma-4-e2b-it-qat"], "checks": ["per-layer-conditioning", "shared-kv"]}},
+      {"title": "Validate dynamic position IDs under captured decode replay", "kind": "correctness", "hypothesis": "Dynamic position IDs must match uncaptured decode before replay performance is measured.", "manifest": {"models": ["qwen3.5-2b", "qwen3.5-4b", "gemma-4-e2b-it-qat"]}}
+    ]
+  },
+  {
+    "id": "study-llamacpp-b10068",
+    "source": "llama.cpp Vulkan",
+    "title": "Portable Vulkan decode techniques study",
+    "revision": "b10068",
+    "status": "completed",
+    "summary": "Studied the pinned release through detailed local Vulkan, decode, and KV-cache analyses. Cooperative matrices are excluded; portable DP4A, fusion, batching, and submission techniques remain applicable.",
+    "scope": ["docs/llamacpp-vulkan-analysis.md", "docs/llamacpp-design.md", "docs/kv-cache.md", "release b10068 measurements"],
+    "findings": ["Portable Q8 DP4A and vectorized dequant are relevant decode paths.", "Fused RMSNorm-mul and matmul-bias can reduce dispatch overhead.", "Batched prefill and adaptive submission should be tuned per device."],
+    "references": ["docs/llamacpp-vulkan-analysis.md", "docs/llamacpp-design.md", "docs/kv-cache.md"],
+    "task_proposals": [
+      {"title": "Benchmark and tune portable DP4A Q8 decode against llama.cpp", "kind": "optimization", "hypothesis": "Portable DP4A can close the Q8 decode gap after conformance passes.", "manifest": {"models": ["qwen3.5-2b", "qwen3.5-4b"], "metrics": ["decode_tok_s"]}},
+      {"title": "Evaluate fused RMSNorm-mul and matmul-bias dispatch reduction", "kind": "optimization", "hypothesis": "Portable fusion will reduce dispatch count without logit drift.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "metrics": ["dispatch_count", "decode_tok_s"]}},
+      {"title": "Tune batched prefill and adaptive submission by device", "kind": "optimization", "hypothesis": "Device-specific batching can improve prompt throughput while retaining portable fallbacks.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "metrics": ["prefill_tok_s"]}}
+    ]
+  },
+  {
+    "id": "study-backpack-docs-20260719",
+    "source": "Backpack accumulated experience",
+    "title": "Conformance-first optimization guidance study",
+    "revision": "docs snapshot 2026-07-19",
+    "status": "completed",
+    "summary": "Studied model architecture, fast decode, KV-cache, llama.cpp comparison, and general optimization guidance.",
+    "scope": ["docs/opt-guide.md", "docs/fast-decode.md", "docs/model-arch-catalog.md", "docs/kv-cache.md", "docs/llamacpp-vulkan-analysis.md"],
+    "findings": ["Conformance must gate every optimization.", "Portable levers include residency, reuse, command replay, DP4A, f16, tiling, and fusion.", "Qwen recurrent state must remain excluded from unsafe generic warmup and capture."],
+    "references": ["docs/opt-guide.md", "docs/fast-decode.md", "docs/model-arch-catalog.md", "docs/kv-cache.md"],
+    "task_proposals": [
+      {"title": "Create layerwise cross-device parity bisector", "kind": "correctness", "hypothesis": "Automated tensor comparison can report the first divergent operation on AMD and Intel.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"]}},
+      {"title": "Profile GPU residency, allocations, and dispatch gaps", "kind": "optimization", "hypothesis": "Revision-linked timelines will identify the highest-value portable bottlenecks.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "metrics": ["gpu_time_ms", "dispatch_count"]}}
+    ]
+  },
+  {
+    "id": "study-modular-41222c77ed08",
+    "supersedes": ["study-modular-max-unavailable-20260719"],
+    "source": "Modular",
+    "title": "Ragged attention, paged KV cache, and kernel autotuning study",
+    "revision": "41222c77ed08",
+    "status": "completed",
+    "summary": "Studied the versioned Modular source under D:/workspace/project/modular, focusing on its MAX inference implementation. The most portable ideas for Backpack are layer-level differential harnesses, ragged prefill/decode shape coverage with paged KV state, and reproducible parameter-grid autotuning. CUDA graph and hardware-specific matrix paths are not transferred to Windows WebGPU.",
+    "scope": [
+      "max/python/layer_benchmarks/testbed/harnesses/gemma4_attention.py",
+      "max/python/layer_benchmarks/testbed/harnesses/qwen3_attention.py",
+      "max/python/layer_benchmarks/testbed/harnesses/ragged_attention_harness.py",
+      "max/docs/design-docs/multi-head-flash-attention.md",
+      "max/docs/kernel-benchmarking.md"
+    ],
+    "findings": [
+      "The shared ragged-attention harness varies batch size, new-token sequence length, and existing context length while allocating and releasing paged KV-cache state per request.",
+      "The Gemma 4 harness models local versus global attention, separate head dimensions, per-head Q/K normalization, sliding windows, and the attention K-equals-V case, but explicitly has no correctness reference; Backpack must add differential evidence before using its performance structure.",
+      "The Qwen 3 harness compares layer output with a reference implementation for prefill batch size one, illustrating a useful layer-level correctness pattern, but it is not evidence for Qwen 3.5 recurrent-state correctness.",
+      "The flash-attention design uses tiled K/V traversal and online softmax to avoid materializing the score matrix; only portable WebGPU variants should be considered.",
+      "kbench separates parameter-grid definition, compilation, execution, and structured result output, a useful model for revision-linked per-device WGSL tuning."
+    ],
+    "references": [
+      "max/python/layer_benchmarks/testbed/harnesses/gemma4_attention.py",
+      "max/python/layer_benchmarks/testbed/harnesses/qwen3_attention.py",
+      "max/python/layer_benchmarks/testbed/harnesses/ragged_attention_harness.py",
+      "max/docs/design-docs/multi-head-flash-attention.md",
+      "max/docs/kernel-benchmarking.md"
+    ],
+    "task_proposals": [
+      {"title": "Add Gemma 4 local/global attention differential harness", "kind": "correctness", "hypothesis": "Layer-level comparison across local/global attention, Q/K normalization, sliding windows, and K-equals-V will localize Gemma 4 conformance failures before performance work.", "manifest": {"models": ["gemma-4-e2b-it-qat"], "checks": ["local-attention", "global-attention", "qk-norm", "sliding-window", "attention-k-equals-v"], "source_revision": "modular@41222c77ed08"}},
+      {"title": "Exercise ragged prefill and paged KV decode shape matrix", "kind": "correctness", "hypothesis": "A batch/sequence/context-length matrix with explicit KV page lifecycle will expose decode-state and boundary errors across NVIDIA, AMD, and Intel before recording throughput.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "checks": ["ragged-prefill", "paged-kv-lifecycle", "decode-context-boundaries"], "metrics": ["prefill_tok_s", "decode_tok_s"], "source_revision": "modular@41222c77ed08"}},
+      {"title": "Create revision-linked portable WGSL autotuning grids", "kind": "optimization", "hypothesis": "Reproducible per-device grids for tile size, workgroup size, vector width, and dispatch batching can select portable winners after conformance passes.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "parameters": ["tile-size", "workgroup-size", "vector-width", "dispatch-batching"], "exclusions": ["subgroup-matrix", "cuda-graph"], "metrics": ["gpu_time_ms", "prefill_tok_s", "decode_tok_s"], "source_revision": "modular@41222c77ed08"}}
+    ]
+  }
+]

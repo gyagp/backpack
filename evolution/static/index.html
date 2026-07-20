@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Backpack</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>.status-table{min-width:1350px}.status-table .status-group td{border-top:2px solid #cbd2dc}.status-table tbody tr:first-child td{border-top:0}.status-table td:nth-child(1){min-width:190px}.status-table td:nth-child(2){min-width:190px}.status-table td:nth-child(4){min-width:145px}.status-table td:nth-child(6){min-width:120px}.status-table .performance-blocked td:nth-child(7),.status-table .performance-blocked td:nth-child(8){color:var(--muted);font-style:italic;background:#fff8f0}.format-tag{display:inline-block;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);font:700 10px Consolas,monospace}.provision-prereqs{margin:12px 0;border:1px solid var(--border);border-radius:7px;padding:10px;background:var(--surface-2)}.provision-prereqs summary{cursor:pointer;font-weight:650}.provision-step{padding:5px 0}.provision-step.done{color:var(--green)}.provision-step.waiting{color:var(--muted)}.provision-step.ready{color:var(--accent);font-weight:600}</style>
+  <style>.activity-strip{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:10px;margin-bottom:14px}.health-card{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.health-card strong{display:block}.health-icon{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px #dff3eb}.health-card.warn .health-icon{background:var(--amber);box-shadow:0 0 0 4px #faedd7}.health-card.bad .health-icon{background:var(--red);box-shadow:0 0 0 4px #fde7e4}.status-lower{display:grid;grid-template-columns:minmax(0,1fr) minmax(380px,1fr);gap:16px}.activity-feed{max-height:330px;overflow:auto}.activity-event{display:grid;grid-template-columns:72px 1fr;gap:9px;padding:8px 2px;border-bottom:1px solid var(--border)}.activity-event:last-child{border:0}.activity-event time{color:var(--muted);font:10px Consolas,monospace}.activity-event strong{font-size:12px}.work-state{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 2px;border-bottom:1px solid var(--border)}@media(max-width:1200px){.activity-strip{grid-template-columns:1fr 1fr}.status-lower{grid-template-columns:1fr}}@media(max-width:620px){.activity-strip{grid-template-columns:1fr}}</style>
+  <style>.task-progress{display:block}.task-progress>div{width:100%}.task-progress .meter{height:6px;margin:8px 0 5px}.task-progress-line{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:11px;margin-bottom:3px}.validation-toolbar{display:flex;align-items:end;gap:10px;padding:10px 0 14px}.validation-toolbar>input{flex:1;min-width:240px;margin:0}.validation-toolbar label{display:flex;align-items:center;gap:7px;margin:0;color:var(--muted);font-weight:600;white-space:nowrap}.validation-toolbar select{width:180px;margin:0}.validation-toolbar button{white-space:nowrap}@media(max-width:850px){.validation-toolbar{align-items:stretch;flex-direction:column}.validation-toolbar label{justify-content:space-between}.validation-toolbar select{width:65%}}</style>
+  <style>.activity-log{border-bottom:1px solid var(--border)}.activity-log summary{display:grid;grid-template-columns:72px 1fr;gap:9px;padding:9px 2px;cursor:pointer;list-style:none}.activity-log summary::-webkit-details-marker{display:none}.activity-log summary:before{content:'›';grid-column:1;position:absolute;margin-left:-12px;color:var(--muted)}.activity-log[open] summary:before{transform:rotate(90deg)}.activity-log time{color:var(--muted);font:10px Consolas,monospace}.activity-log summary span{min-width:0}.activity-log summary .meta{display:block}.activity-log-detail{margin:0 0 10px 80px;padding:10px 12px;border-left:2px solid var(--accent);background:var(--surface-2);border-radius:0 6px 6px 0}.activity-log-detail dl{display:grid;grid-template-columns:75px 1fr;gap:4px 10px;margin:0 0 10px}.activity-log-detail dt{color:var(--muted);font-weight:600}.activity-log-detail dd{margin:0}.activity-log-detail pre{margin:5px 0 0;max-height:220px;background:var(--surface)}</style>
+  <style>#validation-tab .table-wrap{max-height:none;overflow-x:auto;overflow-y:visible}#validation-tab .card{overflow:hidden}#validation-tab .status-table{width:100%}</style>
+  <style>.device-task-group{margin-bottom:14px;border:1px solid var(--border);border-radius:8px;overflow:hidden}.device-task-group>header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:var(--surface-2)}.device-task-group>header strong{display:block}.device-task{border-top:1px solid var(--border)}.device-task summary{display:flex;justify-content:space-between;gap:12px;padding:11px 12px;cursor:pointer}.device-task summary>div:last-child{white-space:nowrap}.device-task-detail{padding:0 12px 12px}.device-task-detail .meter{height:6px;margin:6px 0}.step-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;margin:9px 0}.task-step{display:flex;align-items:center;gap:6px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface)}.task-step span:nth-child(2){flex:1}.empty.compact{padding:12px}</style>
+  <style>.task-failure{margin-top:8px;padding:7px 9px;border-left:3px solid var(--red);border-radius:4px;background:#fff4f2;color:var(--red);font-size:11px}</style>
+  <style>.status-lower>*{min-width:0}.activity-feed{max-width:100%;overflow-x:hidden}.activity-log,.activity-log summary,.activity-log-detail{max-width:100%;min-width:0}.activity-log summary span,.activity-log-detail dd,.activity-log-detail pre{overflow-wrap:anywhere;word-break:break-word}.activity-log-detail pre{max-width:100%;overflow-x:auto}</style>
+  <style>.device-table{table-layout:fixed}.device-table td{min-width:0;overflow-wrap:anywhere}.device-table th{position:sticky}.column-resizer{position:absolute;top:0;right:-4px;width:9px;height:100%;cursor:col-resize;touch-action:none;z-index:5}.column-resizer:after{content:'';position:absolute;top:20%;bottom:20%;left:4px;width:1px;background:var(--border)}.column-resizer:hover:after{background:var(--accent);width:2px}</style>
+  <style>.todo-card{border-top:3px solid var(--amber)}.todo-actions{display:flex;align-items:center;gap:12px}.todo-item{display:flex;align-items:flex-start;gap:10px;padding:12px 2px;border-bottom:1px solid var(--border)}.todo-item:last-child{border-bottom:0}.todo-content{flex:1;min-width:0}.todo-reason{margin:5px 0;color:var(--text);overflow-wrap:anywhere}.todo-select{margin:2px 0!important}.todo-select input{width:auto;margin:0}.badge.regression{background:#fde7e4;color:var(--red)}</style>
+  <style>.history-chart{margin:14px 0;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}.history-chart svg{display:block;width:100%;height:230px}.history-chart .axis{stroke:var(--border)}.history-chart polyline{fill:none;stroke-width:3;stroke-linejoin:round}.prefill-line{stroke:var(--accent)}.decode-line{stroke:var(--green)}.prefill-points circle{fill:var(--accent)}.decode-points circle{fill:var(--green)}.chart-legend{display:flex;gap:18px;color:var(--muted);font-size:11px}.chart-legend .prefill:before,.chart-legend .decode:before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:50%;background:var(--accent)}.chart-legend .decode:before{background:var(--green)}</style>
+  <style>.status-lower{display:block}.status-table th:last-child,.status-table td:last-child{display:none}.status-table tbody td{background:#fff}.status-table tbody td:first-child{border-left:4px solid var(--accent)}.status-table tbody td:nth-last-child(2){border-right:1px solid #d7dce5}.status-table .status-group td{border-top:1px solid #d7dce5!important;box-shadow:0 -5px 12px -10px #17203366}.status-table .status-group-end td{border-bottom:1px solid #d7dce5!important;box-shadow:0 6px 12px -10px #17203366}.status-table .status-group td:first-child{border-top-left-radius:8px}.status-table .status-group td:nth-last-child(2){border-top-right-radius:8px}.status-table .status-group-end td:first-child{border-bottom-left-radius:8px}.status-table .status-group-end td:nth-last-child(2){border-bottom-right-radius:8px}.status-table .status-group:not(:first-child) td{border-top-width:9px!important;border-top-color:var(--surface-2)!important;background-clip:padding-box}.status-table tbody tr:hover td{background:#fafaff}.analysis-list{display:grid;gap:8px}.analysis-row{display:grid;grid-template-columns:minmax(0,1fr) repeat(2,110px) auto;gap:12px;align-items:center;padding:11px;border:1px solid var(--border);border-radius:7px}.analysis-metric{font:600 12px Consolas,monospace}.analysis-row button{white-space:nowrap}@media(max-width:800px){.analysis-row{grid-template-columns:1fr auto}.analysis-metric{display:none}}</style>
+  <style>.device-blockers{padding:12px;background:#fff8f0;border-top:1px solid var(--amber)}.device-blockers>div{display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,2fr);gap:12px;padding:6px 0;border-bottom:1px solid var(--border)}.device-blockers>div:last-child{border:0}</style>
+</head>
+<body>
+<div id="app">
+  <header id="appbar">
+    <div class="brand"><span class="brand-mark">BP</span><span>Backpack</span></div>
+    <div class="appbar-right"><span id="server-label">webgfx-104 control plane</span><span id="connection" class="badge unknown">connecting</span></div>
+  </header>
+  <div id="app-layout">
+    <nav id="sidebar">
+      <button class="sidebar-item active" data-tab="status"><span class="nav-icon">◫</span><span>Tasks</span><span id="nav-task-count" class="nav-count"></span></button>
+      <button class="sidebar-item" data-tab="validation"><span class="nav-icon">✓</span><span>Status</span></button>
+      <button class="sidebar-item" data-tab="todo"><span class="nav-icon">!</span><span>Human Intervention</span><span id="nav-todo-count" class="nav-count"></span></button>
+      <button class="sidebar-item" data-tab="evolution"><span class="nav-icon">↻</span><span>Evolution</span><span id="nav-study-count" class="nav-count"></span></button>
+      <button class="sidebar-item" data-tab="analysis"><span class="nav-icon">⌁</span><span>Performance Analysis</span></button>
+      <button class="sidebar-item" data-tab="history"><span class="nav-icon">↗</span><span>History</span></button>
+      <button class="sidebar-item" data-tab="devices"><span class="nav-icon">▤</span><span>Devices</span><span id="nav-device-count" class="nav-count"></span></button>
+      <div class="sidebar-footer"><div>Evidence-driven WebGPU optimization</div></div>
+    </nav>
+    <main id="main">
+      <section id="status-tab" class="tab-page">
+        <div class="page-header"><div><h1>Tasks</h1><p>Active and pending tasks, device assignments, progress, and failure reasons.</p></div><button id="new-task">New task</button></div>
+        <section id="activity-strip" class="hidden"></section>
+        <section id="stats" class="hidden"></section>
+        <div class="status-lower"><section class="card"><div class="card-header"><div><h2>Active tasks</h2><p>Tasks currently running, grouped by assigned device.</p></div><span id="activity-task-count"></span></div><div id="active-work"></div></section></div><div class="hidden"><span id="last-refresh"></span><div id="activity-feed"></div></div>
+        <section class="card"><div class="card-header"><div><h2>Pending tasks</h2><p>Queued, blocked, and awaiting tasks ordered by conformance-first policy.</p></div><span id="task-count"></span></div><div id="tasks"></div></section>
+      </section>
+
+      <section id="todo-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>Human Intervention</h1><p>Regressions, failures, decisions, and other work requiring human intervention.</p></div><div class="todo-actions"><span id="todo-count" class="attention"></span><button id="delete-selected-todos" class="secondary" disabled>Delete selected</button></div></div>
+        <section class="card todo-card"><div id="todos"></div></section>
+      </section>
+
+      <section id="evolution-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>Evolution</h1><p>Completed upstream and experience studies that generate new conformance and performance tasks.</p></div><span id="study-count"></span></div>
+        <section class="card"><div id="studies"></div></section>
+      </section>
+
+      <section id="validation-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>Status</h1><p>Conformance and performance separated by device, model, format, inference framework, and backend.</p></div></div>
+        <section class="card"><div class="validation-toolbar"><input id="validation-search" type="search" placeholder="Search device, model, framework, backend…"><label>Sort by<select id="validation-sort"><option value="device">Device</option><option value="model">Model</option><option value="framework">Inference framework</option><option value="backend">Backend</option><option value="conformance">Conformance</option></select></label><button id="validation-direction" class="secondary" type="button" data-direction="asc">Ascending ↑</button><span id="validation-count" class="muted"></span></div><div id="model-matrix" class="table-wrap"></div></section>
+      </section>
+
+      <section id="devices-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>Devices</h1><p>Provision and monitor hardware participating in required gates.</p></div><button id="provision-device">Provision device</button></div>
+        <section class="card table-card"><div id="device-table" class="table-wrap"></div></section>
+      </section>
+
+      <section id="analysis-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>Performance Analysis</h1><p>Compare measured combinations and inspect performance trends across revisions.</p></div></div>
+        <section class="card"><div class="card-header"><div><h2>Measured combinations</h2><p>Select an exact device, model, framework, format, and backend trend.</p></div><span id="analysis-count"></span></div><div id="performance-analysis"></div></section>
+      </section>
+
+      <section id="history-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>History</h1><p>Task-linked experiment outcomes, overall gains, revisions, and measured evidence for future learning.</p></div><span id="history-count"></span></div>
+        <section class="card"><div id="history"></div></section>
+      </section>
+    </main>
+  </div>
+</div>
+
+<dialog id="task-dialog"><form id="task-form"><h3>Create task</h3><label>Title<input name="title" required></label><label>Hypothesis<textarea name="hypothesis" required></textarea></label><label>Kind<select name="kind"><option>optimization</option><option>correctness</option><option>feature</option><option>maintenance</option></select></label><div class="actions"><button type="button" class="secondary" id="cancel-task">Cancel</button><button>Create</button></div></form></dialog>
+<dialog id="detail-dialog"><div id="detail"></div><div class="actions"><button class="secondary" onclick="this.closest('dialog').close()">Close</button></div></dialog>
+<dialog id="provision-dialog"><form id="provision-form"><h3 id="provision-title">Provision device</h3><p class="muted">webgfx-104 provisions the worker directly over WinRM; no worker-side command is required.</p><details class="provision-prereqs"><summary>Prerequisites</summary><p class="muted">Worker: Windows 10/11, WinRM enabled, Python 3.13+, Git, access to webgfx-104:8787, and enough disk space for cared models. The server uses a DPAPI-protected credential when implicit domain authentication is unavailable.</p></details><label>Hostname<input name="name" placeholder="webgfx-103" pattern="[A-Za-z0-9][A-Za-z0-9-]{0,62}" required></label><label>IP address or DNS name<input name="address" placeholder="webgfx-103.guest.corp.microsoft.com"></label><label>Expected GPU vendor<select name="vendor"><option value="">Detect during enrollment</option><option value="nvidia">NVIDIA</option><option value="amd">AMD</option><option value="intel">Intel</option></select></label><div id="provision-steps" class="hidden"></div><div id="provision-result" class="hidden"><p class="provision-step done">✓ Worker provisioned through WinRM</p><p class="muted">Models and the task worker were installed remotely. Device enrollment will update automatically.</p></div><div class="actions"><button type="button" class="secondary" id="cancel-provision">Close</button><button id="submit-provision">Provision</button></div></form></dialog>
+<script src="/app.js"></script>
+</body>
+</html>

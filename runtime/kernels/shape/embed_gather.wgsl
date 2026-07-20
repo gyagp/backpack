@@ -13,7 +13,9 @@ ${T_WRITE2}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let E = _params_[0];
-    let normalizer = bitcast<f32>(_params_[1]);
+    let normalizer_bits = _params_[1];
+    let normalizer = select(bitcast<f32>(normalizer_bits), 1.0,
+                            normalizer_bits == 0u);
     let token = u32(TokenId[0]);
     let base_offset = token * E;
 

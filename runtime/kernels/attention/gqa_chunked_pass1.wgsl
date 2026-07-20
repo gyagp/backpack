@@ -21,6 +21,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let kv_stride = _params_[0];
     let n_rep = _params_[1];
     let T_total = _params_[2];
+    let kv_start = _params_[3];
     let n_chunks = _params_[4];
     let scale = bitcast<f32>(_params_[5]);
     let neg_inf = bitcast<f32>(_params_[6]);
@@ -53,8 +54,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var l_prev: f32 = 0.0;
 
     for (var i = 0u; i < CHUNK; i = i + 1u) {
-        let t = t_start + i;
-        let valid = t < T_total;
+        let logical_t = t_start + i;
+        let valid = logical_t < T_total;
+        let t = kv_start + logical_t;
 
         let k_base = select(0u, t * kv_stride + kv_off, valid);
         var dot_partial: f32 = 0.0;

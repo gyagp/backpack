@@ -54,11 +54,10 @@ fn main(
     }
     workgroupBarrier();
 
-    var total: f32 = 0.0;
-    if (tid < 4) {
-        total = bitcast<f32>(_smem[tid]);
+    var final_sum: f32 = 0.0;
+    for (var w = 0; w < 4; w++) {
+        final_sum += bitcast<f32>(_smem[w]);
     }
-    let final_sum = subgroupAdd(total);
     let rstd = 1.0 / sqrt(final_sum / f32(N) + params.eps);
     if (tid == 0) {
         Rstd[u32(row)] = rstd;

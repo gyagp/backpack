@@ -1,6 +1,4 @@
 // @meta bindings=8
-enable subgroups;
-
 // Fused qwen35 DeltaNet beta/alpha projection and scalar gates.
 // Computes:
 //   beta = sigmoid(X * W_beta^T)
@@ -19,6 +17,7 @@ enable subgroups;
 @group(0) @binding(7) var<storage, read>       _params_:  array<u32>;
 
 const TILE_N: u32 = 8u;
+var<workgroup> reduce_scratch: array<f32, 256>;
 
 fn softplus(x: f32) -> f32 {
     return max(x, 0.0) + log(1.0 + exp(-abs(x)));
@@ -76,7 +75,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
     }
 
-    let sum = subgroupAdd(acc);
+    reduce_scratch[tid] = acc;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset = offset / 2u) {
+        if (lane < offset) { reduce_scratch[tid] += reduce_scratch[tid + offset]; }
+        workgroupBarrier();
+    }
+    let sum = reduce_scratch[warp_id * 32u];
     if (lane == 0u && col < N) {
         if (col < rank) {
             BetaOut[col] = 1.0 / (1.0 + exp(-sum));

@@ -1,5 +1,3 @@
-enable subgroups;
-
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W_Q5K: array<u32>;
 @group(0) @binding(2) var<storage, read> Bias: array<f32>;
@@ -105,7 +103,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let sum = subgroupAdd(acc);
+    // Keep the eight logical 32-lane columns independent on GPUs whose
+    // hardware subgroup width is not 32.
+    smem_x[tid] = acc;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset = offset / 2u) {
+        if (lane < offset) { smem_x[tid] += smem_x[tid + offset]; }
+        workgroupBarrier();
+    }
+    let sum = smem_x[warp_id * 32u];
     if (lane == 0u && col < N) {
         Y[row * N + col + y_offset] = sum + Bias[col];
     }

@@ -1,5 +1,3 @@
-enable subgroups;
-
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W_Q4K: array<u32>;
 @group(0) @binding(2) var<storage, read> Bias: array<f32>;
@@ -50,32 +48,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             let d = dd.x;
             let dmin = dd.y;
 
-            let d0 = get_u8(block_base, 4u);
-            let d1 = get_u8(block_base, 5u);
-            let d2 = get_u8(block_base, 6u);
-            let d3 = get_u8(block_base, 7u);
-            let m0 = get_u8(block_base, 8u);
-            let m1 = get_u8(block_base, 9u);
-            let m2 = get_u8(block_base, 10u);
-            let m3 = get_u8(block_base, 11u);
-            let md0 = get_u8(block_base, 12u);
-            let md1 = get_u8(block_base, 13u);
-            let md2 = get_u8(block_base, 14u);
-            let md3 = get_u8(block_base, 15u);
-
             for (var sb = 0u; sb < 8u; sb = sb + 1u) {
                 var sc_u: u32;
                 var mn_u: u32;
                 if (sb < 4u) {
-                    let dv = select(select(select(d0, d1, sb == 1u), d2, sb == 2u), d3, sb == 3u);
-                    let mv = select(select(select(m0, m1, sb == 1u), m2, sb == 2u), m3, sb == 3u);
-                    sc_u = dv & 0x3Fu;
-                    mn_u = mv & 0x3Fu;
+                    sc_u = get_u8(block_base, 4u + sb) & 0x3Fu;
+                    mn_u = get_u8(block_base, 8u + sb) & 0x3Fu;
                 } else {
                     let j = sb - 4u;
-                    let dv = select(select(select(d0, d1, j == 1u), d2, j == 2u), d3, j == 3u);
-                    let mv = select(select(select(m0, m1, j == 1u), m2, j == 2u), m3, j == 3u);
-                    let mdv = select(select(select(md0, md1, j == 1u), md2, j == 2u), md3, j == 3u);
+                    let dv = get_u8(block_base, 4u + j);
+                    let mv = get_u8(block_base, 8u + j);
+                    let mdv = get_u8(block_base, 12u + j);
                     sc_u = (mdv & 0x0Fu) | ((dv >> 2u) & 0x30u);
                     mn_u = (mdv >> 4u) | ((mv >> 2u) & 0x30u);
                 }
@@ -96,7 +79,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let sum = subgroupAdd(acc);
+    // Reduce each logical 32-lane column independently. Hardware subgroup
+    // width is vendor-dependent (AMD may expose 64), so subgroupAdd would
+    // incorrectly combine two columns.
+    smem_x[tid] = acc;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset = offset / 2u) {
+        if (lane < offset) { smem_x[tid] += smem_x[tid + offset]; }
+        workgroupBarrier();
+    }
+    let sum = smem_x[warp_id * 32u];
     if (lane == 0u && col < N) {
         Y[row * N + col] = sum + Bias[col];
     }

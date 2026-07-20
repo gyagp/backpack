@@ -92,6 +92,7 @@ struct ModelRunner {
     std::vector<int> q35KvWriteDispatchIndices; // Qwen3.5 K RoPE + KV write per attention layer
     int argmaxDispatchIndex = -1;
     int argmaxReduceDispatchIndex = -1;
+    int pleTokenGatherDispatchIndex = -1;
 
     // Shared argmax result buffer
     GPUBuffer argmaxResultBuf;
@@ -108,10 +109,14 @@ struct ModelRunner {
         // nGroups CBs. cbPool[tokenIdx * nGroups + groupIdx] is one CB.
         std::vector<WGPUCommandBuffer> cbPool;
         int cbIdx = 0;  // index of next token's first CB
+        std::vector<WGPUCommandBuffer> knownPrefillCBPool;
+        int knownPrefillCbIdx = 0;
         // Per-slot param buffers — allow writing next token's params
         // while GPU still reads current token's params.
         GPUBuffer ropeParamsBuf, attnParamsBuf;
         GPUBuffer attnParamsBufSWA; // sliding window layers
+        GPUBuffer layerRopeParamsPacked, layerAttnParamsPacked;
+        std::vector<GPUBuffer> layerRopeParamsBufs, layerAttnParamsBufs;
         GPUBuffer q35RopeQParamsBuf, q35RopeKParamsBuf, q35KvWriteParamsBuf;
         GPUBuffer tokenInBuf, tokenOutBuf;
         // Per-slot dispatch list (cloned from autoDecodeDispatches with
@@ -145,6 +150,12 @@ struct ModelRunner {
         GPUBuffer qOnlyW, qOnlyS;   // Q-only projection (Q8)
         // K-quant: single buffer per weight (raw block data as u32)
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
+        GGUFType qkvKQType = (GGUFType)UINT32_MAX, oKQType = (GGUFType)UINT32_MAX;
+        GGUFType guKQType = (GGUFType)UINT32_MAX, dnKQType = (GGUFType)UINT32_MAX;
+        uint32_t qkvKQNBlocks = 0, qkvKQRowStride = 0;
+        uint32_t oKQNBlocks = 0, oKQRowStride = 0;
+        uint32_t guKQNBlocks = 0, guKQRowStride = 0;
+        uint32_t dnKQNBlocks = 0, dnKQRowStride = 0;
         // Sandwich norms (Gemma 4)
         GPUBuffer postNorm;        // post-attention norm (sandwich, before residual)
         GPUBuffer postLayerNorm;   // Gemma 4 per-layer output norm (post_norm.weight)
@@ -181,6 +192,13 @@ struct ModelRunner {
         GPUBuffer qjW, qjS;    // joint Q+gate (size [2*qDim, E])
         GPUBuffer kSepW, kSepS; // K alone (size [kvDim, E])
         GPUBuffer vSepW, vSepS; // V alone (size [kvDim, E])
+        GPUBuffer qjKQ, kSepKQ, vSepKQ;
+        GGUFType qjKQType = (GGUFType)UINT32_MAX;
+        GGUFType kSepKQType = (GGUFType)UINT32_MAX;
+        GGUFType vSepKQType = (GGUFType)UINT32_MAX;
+        uint32_t qjKQNBlocks = 0, qjKQRowStride = 0;
+        uint32_t kSepKQNBlocks = 0, kSepKQRowStride = 0;
+        uint32_t vSepKQNBlocks = 0, vSepKQRowStride = 0;
 
         // ── SSM / Mamba per-layer weights (hybrid archs like qwen35moe) ─────
         // 31 of 41 qwen35moe layers are SSM-only (full_attention_interval=4).
@@ -194,14 +212,23 @@ struct ModelRunner {
         GPUBuffer ssmAlphaW, ssmAlphaS;  // alpha projection
         GPUBuffer ssmNorm;          // [d_inner] RMSNorm weight
         GPUBuffer ssmOutW, ssmOutS; // output projection
+        GPUBuffer ssmOutKQ, attnGateKQ;
+        GGUFType ssmOutKQType = (GGUFType)UINT32_MAX;
+        GGUFType attnGateKQType = (GGUFType)UINT32_MAX;
+        uint32_t ssmOutKQNBlocks = 0, ssmOutKQRowStride = 0;
+        uint32_t attnGateKQNBlocks = 0, attnGateKQRowStride = 0;
     };
     std::vector<LayerWeights> layerWeights;
     GPUBuffer finalNormW;
     GPUBuffer lmHeadW;           // fp16 LM head (fallback)
     GPUBuffer lmHeadQ8W, lmHeadQ8S;  // Q8 LM head (preferred)
     GPUBuffer lmHeadKQ;          // K-quant LM head
+    GGUFType lmHeadKQType = (GGUFType)UINT32_MAX;
     bool lmHeadIsQ8 = false;
+    bool lmHeadIsQ4 = false;
     bool lmHeadIsKQ = false;
+    bool weightsAreNativeQ4 = false;
+    bool weightsUseNativeKQ = false;
     GGUFType weightQuantType = GGUF_TYPE_Q8_0;
 
     // PLE (Per-Layer Embedding) global buffers
@@ -209,10 +236,14 @@ struct ModelRunner {
     std::vector<float> pleModelProjCPU;  // per_layer_model_proj weights (fp32, [nLayer*pleSize, E])
     std::vector<float> pleProjNormCPU;   // per_layer_proj_norm weights (fp32, [pleSize])
     GPUBuffer pleModelProjW, pleModelProjS;  // [E, pleSize*nLayer] projection
+    GPUBuffer pleTokenEmbW, pleTokenEmbS;    // native Q4 token PLE table
     GPUBuffer pleProjNormW;           // RMSNorm weights [pleSize]
+    bool pleWeightsUseFp16 = false;
+    bool pleGpuPreprocess = false;
+    GPUBuffer pleInputBuf;             // normalized+combined PLE input [nLayer*pleSize]
+    GPUBuffer pleProjRawBuf;           // raw global PLE projection [nLayer*pleSize]
     GPUBuffer pleBuf;                 // intermediate [pleSize] for PLE computation
     GPUBuffer pleOutBuf;              // intermediate [E] for PLE output
-    std::vector<GPUBuffer> pleSliceBufs;  // per-layer PLE slice [pleSize]
 
     // K-quant params per projection type (shared across layers)
     uint32_t kqQkvNBlocks = 0, kqQkvRowStride = 0;
@@ -226,6 +257,7 @@ struct ModelRunner {
     GPUBuffer embeddingGpuBuf;
     bool embeddingGpuIsF16 = false;
     bool embeddingGatherFromQ8 = false;  // gather embeddings from tied Q8 LM head
+    bool embeddingGatherFromKQ = false;  // gather embeddings from tied native K-quant LM head
     GPUBuffer qOnlyScratchK, qOnlyScratchV;  // discard KV targets for shared-KV layers
     // Per-layer rope/attention param buffers for variable head-dim models
     // (Gemma 4: 256-wide sliding-window layers, 512-wide global layers).
@@ -310,6 +342,10 @@ struct ModelRunner {
     std::string ggufPath;  // stored for profile output location
     std::vector<float> decode(int32_t tokenId, uint32_t posOffset);
     int32_t decodeArgmax(int32_t tokenId, uint32_t posOffset);
+    /// Dependent-token decode using a pre-recorded pool command buffer.
+    int32_t decodeArgmaxPooled(int32_t tokenId, uint32_t posOffset);
+    int32_t prefillPooledKnown(const int32_t* tokenIds, uint32_t count,
+                               uint32_t posOffset);
     /// Submit decode to pool slot. Call readArgmax(slot) later.
     void submitDecode(uint32_t posOffset, int slot);
     /// Wait for and read the argmax result from pool slot.
@@ -336,12 +372,13 @@ struct ModelRunner {
     void prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot);
     void resetKVCache();
     void refillCBPool(int slot);
+    void refillKnownPrefillCBPool(int slot);
     void autotuneDecodeDepth();
     void autotuneDecodeKernels();
     bool loadDecodeAutotuneCache();
     void saveDecodeAutotuneCache() const;
     void printActiveDecodeTuning(const char* prefix = "  Active decode tuning") const;
-    bool hasBatchedPrefill() const { return pfCache.ready; }
+    bool hasBatchedPrefill() const { return pfCache.ready || gemmaPf.ready; }
     void destroy();
 
     // ─── MTP (Multi-Token Prediction) ────────────────────────────────────
@@ -403,6 +440,12 @@ private:
     bool appendMoeFfnDispatches(uint32_t layerIdx, GPUBuffer xIn, GPUBuffer xOut);
     void computeRopeTables();
     void initPrefillResources();
+    void initGemmaPrefillResources();
+    void initQwen35PrefillResources();
+    int32_t prefillGemmaBatched(const int32_t* tokenIds, uint32_t T,
+                                uint32_t posOffset);
+    int32_t prefillQwen35Batched(const int32_t* tokenIds, uint32_t T,
+                                 uint32_t posOffset);
 
     const CompiledPipeline& getKernel(const std::string& name);
     const CompiledPipeline& getKernelHD(const std::string& name);
@@ -448,4 +491,18 @@ private:
         GPUBuffer indirectBuf;  // [gx, gy, gz] × N dispatches
     };
     PrefillCache pfCache;
+    struct GemmaPrefillCache {
+        bool ready = false;
+        uint32_t capacity = 128;
+        GPUBuffer tokens, x, norm, qkv, qrot, attn, proj, gateup, act, rstd;
+        GPUBuffer pleSignal, pleRaw, pleGate, pleOut;
+    } gemmaPf;
+    struct Qwen35PrefillCache {
+        bool ready = false;
+        uint32_t capacity = 128;
+        GPUBuffer tokens, x, norm, proj, gateup, act, rstd;
+        GPUBuffer qkv, z, beta, gate, conv, sq, sk, sv, sy, snorm;
+        GPUBuffer qj, aq, ag, ak, av, qrot, attn, aout;
+        GPUBuffer paramArena;
+    } qwen35Pf;
 };

@@ -1,0 +1,65 @@
+[
+  {
+    "key": "experience-amd-quant-parity-v1",
+    "title": "Localize AMD quantized-kernel conformance divergence",
+    "kind": "correctness",
+    "hypothesis": "The cross-backend AMD token divergence originates in a shared quantized matmul, gather, or reduction assumption and can be found with layerwise parity dumps.",
+    "source": {"type": "experience", "references": ["goal.md", "docs/opt-guide.md"], "evidence": "Gemma 4 and Qwen 3.5 fail on RX 7900 XTX with both D3D12 and Vulkan"},
+    "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "method": "layerwise tensor parity", "conformance_first": true},
+    "device_policy": {"required": [{"selector": {"gpu_vendor": "amd"}, "count": 1}]}
+  },
+  {
+    "key": "experience-gemma4-shared-kv-ple-v1",
+    "title": "Validate Gemma 4 shared-KV, PLE, and variable-head semantics",
+    "kind": "correctness",
+    "hypothesis": "Exact shared-KV attention, PLE injection, and per-layer head dimensions will remove Gemma 4 divergence on non-NVIDIA devices.",
+    "source": {"type": "docs", "references": ["goal.md", "docs/todo.md", "docs/kv-cache.md"]},
+    "manifest": {"models": ["gemma-4-e2b-it-qat"], "checks": ["shared-kv", "ple", "head-dim", "layerwise-parity"], "conformance_first": true},
+    "device_policy": {"required": [{"selector": {"role": "required"}, "count": 3}]}
+  },
+  {
+    "key": "ort-gemma4-native-reference-v1",
+    "title": "Establish native ORT WebGPU Gemma 4 parity reference",
+    "kind": "correctness",
+    "hypothesis": "Native ORT WebGPU logits and generated outputs provide a format-independent reference for Backpack ORT and GGUF localization.",
+    "source": {"type": "upstream", "project": "onnxruntime-genai", "url": "https://github.com/microsoft/onnxruntime-genai"},
+    "manifest": {"models": ["gemma-4-e2b-it-qat"], "format": "ort", "runtime": "ort", "backend": "webgpu-native"},
+    "device_policy": {"required": [{"selector": {"role": "required"}, "count": 3}]}
+  },
+  {
+    "key": "llamacpp-portable-quant-kernels-v1",
+    "title": "Study llama.cpp b10068 portable quantized decode kernels",
+    "kind": "optimization",
+    "hypothesis": "Vendor-portable Q4_K/Q6_K decode techniques from llama.cpp can close Backpack throughput gaps after conformance is stable.",
+    "source": {"type": "upstream", "project": "llama.cpp", "revision": "b10068", "url": "https://github.com/ggml-org/llama.cpp/releases/tag/b10068"},
+    "manifest": {"models": ["qwen3.5-2b", "qwen3.5-4b"], "metrics": ["decode_tok_s"], "conformance_first": true},
+    "device_policy": {"required": [{"selector": {"role": "required"}, "count": 3}]}
+  },
+  {
+    "key": "max-kernel-specialization-v1",
+    "title": "Evaluate Modular MAX-style shape specialization and fusion",
+    "kind": "optimization",
+    "hypothesis": "Shape-specialized fused decode paths can reduce dispatch and intermediate-memory overhead while preserving portable fallbacks.",
+    "source": {"type": "upstream", "project": "Modular MAX", "url": "https://github.com/modular/modular", "references": ["docs/opt-guide.md"]},
+    "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "metrics": ["decode_tok_s", "gpu_time_ms"], "conformance_first": true},
+    "device_policy": {"required": [{"selector": {"role": "required"}, "count": 3}]}
+  },
+  {
+    "key": "experience-qwen35-state-parity-v1",
+    "title": "Trace Qwen 3.5 recurrent-state numerical parity on AMD",
+    "kind": "correctness",
+    "hypothesis": "Layerwise comparison of convolution, delta-net scan, normalization, and recurrent state will isolate the first AMD numerical divergence after startup.",
+    "source": {"type": "experience", "references": ["docs/model-arch-catalog.md", "docs/todo.md"], "evidence": "Qwen 3.5 starts after warmup exclusion but produces token salad on RX 7900 XTX"},
+    "manifest": {"models": ["qwen3.5-2b", "qwen3.5-4b"], "checks": ["conv-state", "delta-net-scan", "norm", "first-divergent-layer"], "conformance_first": true},
+    "device_policy": {"required": [{"selector": {"gpu_vendor": "amd"}, "count": 1}]}
+  },
+  {
+    "key": "docs-fast-decode-dispatch-v1",
+    "title": "Reduce decode dispatch and synchronization overhead",
+    "kind": "optimization",
+    "hypothesis": "The staged fusion and persistent-state guidance can improve decode throughput after correctness gates pass.",
+    "source": {"type": "docs", "references": ["docs/fast-decode.md", "docs/opt-guide.md", "docs/llamacpp-vulkan-analysis.md"]},
+    "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "metrics": ["decode_tok_s", "gpu_time_ms", "dispatch_count"], "conformance_first": true},
+    "device_policy": {"required": [{"selector": {"role": "required"}, "count": 3}]}
+  }
+]

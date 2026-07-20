@@ -55,6 +55,20 @@ python build.py clean
 
 GNU Make users can call the same targets through `make`, for example `make runtime`.
 
+## Self-evolution dashboard
+
+An initial evidence-driven evolution control plane is available under
+`evolution/`. It tracks candidate tasks, registered devices, paired performance
+evidence, policy verdicts, human decisions, and an audit trail.
+
+```powershell
+python -m evolution.server
+```
+
+Open <http://127.0.0.1:8787>. See
+[`evolution/README.md`](evolution/README.md) for device registration and paired
+experiment instructions.
+
 ## Kernels
 
 All runtime WGSL sources live in `runtime/kernels/`. Regenerate embedded shader constants after editing kernels:

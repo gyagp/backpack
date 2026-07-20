@@ -1,6 +1,4 @@
 // @meta bindings=8
-enable subgroups;
-
 // DeltaNet decode step, two V columns per workgroup.
 // Each column keeps the same 4-warp reduction shape as delta_net_decode.
 
@@ -13,21 +11,19 @@ enable subgroups;
 @group(0) @binding(6) var<storage, read_write> y:        array<f32>;
 @group(0) @binding(7) var<storage, read>       _params_: array<u32>;
 
-var<workgroup> warp_sums: array<f32, 8>;
+var<workgroup> reduce_scratch: array<f32, 256>;
 
 fn reduce_col_128(x: f32, tid: u32, pair: u32) -> f32 {
-    let lane = tid & 31u;
-    let warp_global = tid >> 5u;
-    let base_warp = pair * 4u;
-    let sum = subgroupAdd(x);
-    if (lane == 0u) {
-        warp_sums[warp_global] = sum;
+    let local = tid & 127u;
+    reduce_scratch[tid] = x;
+    workgroupBarrier();
+    for (var offset = 64u; offset > 0u; offset = offset / 2u) {
+        if (local < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
     }
-    workgroupBarrier();
-    let total = warp_sums[base_warp] + warp_sums[base_warp + 1u] +
-                warp_sums[base_warp + 2u] + warp_sums[base_warp + 3u];
-    workgroupBarrier();
-    return total;
+    return reduce_scratch[pair * 128u];
 }
 
 @compute @workgroup_size(256)

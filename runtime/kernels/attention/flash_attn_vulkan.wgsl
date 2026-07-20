@@ -30,7 +30,7 @@ struct AttnParams {
     T_prefill: u32,
     scale_bits: u32,
     neg_inf_bits: u32,
-    pad1: u32,
+    kv_start: u32,
 };
 @group(0) @binding(4) var<uniform> params: AttnParams;
 
@@ -66,6 +66,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let n_rep = params.n_rep;
     let T_total = params.T_total;
     let cache_offset = params.cache_offset;
+    let kv_window_start = params.kv_start;
     let scale = bitcast<f32>(params.scale_bits);
     let neg_inf = bitcast<f32>(params.neg_inf_bits);
 
@@ -85,10 +86,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     workgroupBarrier();
 
     // Max KV position for any query in this block (uniform)
-    let max_kv = min(cache_offset + q_base + BQ, T_total);
+    let max_kv = min(cache_offset + min(q_base + BQ, params.T_prefill), T_total);
     let n_kv_blocks = (max_kv + BK - 1u) / BK;
 
-    for (var kb = 0u; kb < n_kv_blocks; kb++) {
+    for (var kb = kv_window_start / BK; kb < n_kv_blocks; kb++) {
         let kv_start = kb * BK;
 
         // ── Phase 1: S = Q · K^T via MMA ────────────────────────────
@@ -105,7 +106,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let gq = q_base + r;
                 tile_Q[i] = select(0.0h,
                     f16(Q[gq * n_head_total * HD + head * HD + hd_off + c]),
-                    gq < T_total);
+                    gq < params.T_prefill);
             }
             for (var i = lx; i < 256u; i += WG) {
                 let r = i / MK;  let c = i % MK;
@@ -138,7 +139,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             let gq = q_base + qr;
             let gk = kv_start + kc;
             var s = tile_S[i] * scale;
-            if (gk >= T_total || gk > cache_offset + gq) {
+            if (gk < kv_window_start || gk >= T_total || gk > cache_offset + gq) {
                 s = neg_inf;
             }
             tile_S[i] = s;
@@ -222,7 +223,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let qr = i / HD;
         let hd = i % HD;
         let gq = q_base + qr;
-        if (gq < T_total) {
+        if (gq < params.T_prefill) {
             let l = max(row_l[qr], 1e-10);
             OutBuf[gq * n_head_total * HD + head * HD + hd] = out_acc[i] / l;
         }

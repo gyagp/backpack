@@ -2,7 +2,8 @@
 //
 // Text-only Qwen3.5 uses MRoPE sections over the rotated prefix. For the
 // current GGUFs the 64 rotary dimensions are split as 32 pairs: [11, 11, 10, 0].
-// Each section restarts the frequency index, matching ggml_rope_multi.
+// Sections select independent position channels, but the RoPE frequency index
+// remains continuous across them (matching ggml_rope_multi for MRoPE).
 //
 // Bindings:
 //   0: X        [n_head * head_dim] f32, in-place
@@ -31,22 +32,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pair_idx = gid.x;
     if (head_idx >= n_head || pair_idx >= total_pairs) { return; }
 
-    var section: u32 = 0u;
-    var local_idx: u32 = pair_idx;
-    if (local_idx >= s0) {
-        local_idx = local_idx - s0;
-        section = 1u;
-    }
-    if (section == 1u && local_idx >= s1) {
-        local_idx = local_idx - s1;
-        section = 2u;
-    }
-    if (section == 2u && local_idx >= s2) {
-        local_idx = local_idx - s2;
-        section = 3u;
-    }
-
-    let table_idx = pos * rope_half + local_idx;
+    let table_idx = pos * rope_half + pair_idx;
     let c = Cos[table_idx];
     let s = Sin[table_idx];
 

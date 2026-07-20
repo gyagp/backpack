@@ -42,6 +42,7 @@ using GGUFMetaValue = std::variant<
     uint64_t, int64_t, double,
     std::vector<std::string>,
     std::vector<int32_t>,
+    std::vector<uint8_t>,
     std::vector<float>
 >;
 
@@ -73,6 +74,16 @@ struct GGUFFile {
         auto it = metadata.find(key);
         if (it == metadata.end()) return nullptr;
         return std::get_if<std::vector<std::string>>(&it->second);
+    }
+    const std::vector<int32_t>* getI32Array(const std::string& key) const {
+        auto it = metadata.find(key);
+        if (it == metadata.end()) return nullptr;
+        return std::get_if<std::vector<int32_t>>(&it->second);
+    }
+    const std::vector<uint8_t>* getBoolArray(const std::string& key) const {
+        auto it = metadata.find(key);
+        if (it == metadata.end()) return nullptr;
+        return std::get_if<std::vector<uint8_t>>(&it->second);
     }
 };
 
@@ -204,6 +215,7 @@ struct ModelConfig {
     uint32_t ssmGroupCount = 0;         // number of SSM groups
     uint32_t ssmTimeStepRank = 0;       // dt projection rank
     uint32_t fullAttentionInterval = 0; // every N-th layer is attention, others SSM (0 = all attention)
+    std::vector<int32_t> ropeSections = {11, 11, 10, 0};
 
     /// For hybrid SSM+attention archs (qwen35moe): returns true if layer `i`
     /// uses the attention path, false if it's an SSM-only layer.

@@ -1,8 +1,8 @@
 # Goal
 
 Fix all the correctness issues of **Qwen3.5** and **Gemma 4** (GGUF format), and
-optimize their perf as much as possible, comparing against **llama.cpp Vulkan**
-on Windows (RTX 5080, D3D12 + Vulkan backends).
+optimize their Backpack D3D12 performance as much as possible, comparing
+against **llama.cpp Vulkan** as the reference backend on Windows (RTX 5080).
 
 ## Status snapshot (2026-07-12)
 
@@ -74,4 +74,3 @@ Debug env vars: BP_DUMP_BUFFER_STATS=1, BP_DUMP_TOP_LOGITS=N, BP_TRACE_PIPELINE=
 Match/beat llama.cpp Vulkan decode tok/s on all models. Qwen3.5 gap (~0.62-0.67x)
 is bounded by llama.cpp's NV_coopmat2 (tensor-core) matmul; Dawn reports
 subgroup_matrix=no on this driver so backpack falls back to DP4A/scalar.
-

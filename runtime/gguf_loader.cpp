@@ -69,6 +69,13 @@ static GGUFMetaValue read_meta_value(FILE* f, uint32_t type) {
                 }
                 return arr;
             }
+            if (elem_type == META_BOOL) {
+                std::vector<uint8_t> arr;
+                arr.reserve(count);
+                for (uint64_t i = 0; i < count; i++)
+                    arr.push_back(read_u8(f) != 0);
+                return arr;
+            }
             // Skip non-string arrays
             for (uint64_t i = 0; i < count; i++)
                 read_meta_value(f, elem_type);  // discard
@@ -251,10 +258,17 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
         // Gemma 4: read pattern from metadata if available, else default heuristic
         // llama.cpp stores this as LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN
         if (a == "gemma4") {
-            // Default Gemma 4 pattern: groups of 5 sliding + 1 global
-            for (uint32_t i = 0; i < cfg.nLayer; i++)
-                cfg.layerAttnTypes[i] = ((i + 1) % 6 == 0) ? AttnLayerType::Global
+            const auto* pattern = gguf.getBoolArray(a + ".attention.sliding_window_pattern");
+            if (pattern && pattern->size() == cfg.nLayer) {
+                for (uint32_t i = 0; i < cfg.nLayer; i++)
+                    cfg.layerAttnTypes[i] = (*pattern)[i] ? AttnLayerType::SlidingWindow
+                                                         : AttnLayerType::Global;
+            } else {
+                // Compatibility fallback for older Gemma 4 GGUF files.
+                for (uint32_t i = 0; i < cfg.nLayer; i++)
+                    cfg.layerAttnTypes[i] = ((i + 1) % 6 == 0) ? AttnLayerType::Global
                                                               : AttnLayerType::SlidingWindow;
+            }
         }
     }
 
@@ -294,6 +308,10 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
     cfg.ssmGroupCount          = gguf.getU32(a + ".ssm.group_count", 0);
     cfg.ssmTimeStepRank        = gguf.getU32(a + ".ssm.time_step_rank", 0);
     cfg.fullAttentionInterval  = gguf.getU32(a + ".full_attention_interval", 0);
+    if (const auto* sections = gguf.getI32Array(a + ".rope.dimension_sections");
+        sections && sections->size() >= 4) {
+        cfg.ropeSections.assign(sections->begin(), sections->begin() + 4);
+    }
 
     return cfg;
 }
