@@ -65,6 +65,14 @@ static std::string findOnnxFile(const std::string& dir) {
     return best;
 }
 
+static std::string findGenaiDecoderDir(const std::string& dir) {
+    fs::path root(dir);
+    if (!fs::exists(root / "genai_config.json")) return {};
+    fs::path decoder = root / "decoder";
+    if (fs::exists(decoder / "model.onnx")) return decoder.string();
+    return {};
+}
+
 static std::string resolvePath(const std::string& path, std::string& format,
                                const std::string& formatOverride = "") {
     if (!formatOverride.empty()) {
@@ -79,6 +87,10 @@ static std::string resolvePath(const std::string& path, std::string& format,
         }
         if (formatOverride == "onnx") {
             if (fs::is_directory(path)) {
+                if (auto decoder = findGenaiDecoderDir(path); !decoder.empty()) {
+                    format = "onnx";
+                    return decoder;
+                }
                 format = isNonStandardArch(path) ? "onnx_generic" : "onnx";
                 if (format == "onnx_generic") return findOnnxFile(path);
                 return path;
@@ -99,6 +111,10 @@ static std::string resolvePath(const std::string& path, std::string& format,
         }
     }
     if (fs::is_directory(path)) {
+        if (auto decoder = findGenaiDecoderDir(path); !decoder.empty()) {
+            format = "onnx";
+            return decoder;
+        }
         if (isStandardOnnxDir(path)) {
             format = isNonStandardArch(path) ? "onnx_generic" : "onnx";
             if (format == "onnx_generic") return findOnnxFile(path);
@@ -817,7 +833,10 @@ struct StandardState {
         if (!ok) return false;
 
         if (format == "onnx") {
-            if (!onnxTokenizer.load(resolved)) return false;
+            if (!onnxTokenizer.load(resolved)) {
+                auto parent = fs::path(resolved).parent_path().string();
+                if (!onnxTokenizer.load(parent)) return false;
+            }
         } else {
             if (!ggufTokenizer.load(runner.gguf)) return false;
         }

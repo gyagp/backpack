@@ -689,6 +689,13 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     // ─── 1. Parse model config ────────────────────────────────────────
     std::string configPath = (fs::path(modelDir) / "config.json").string();
     bool useGenaiFormat = false;
+    if (!fs::exists(configPath)) {
+        auto genaiPath = fs::path(modelDir).parent_path() / "genai_config.json";
+        if (fs::exists(genaiPath)) {
+            configPath = genaiPath.string();
+            useGenaiFormat = true;
+        }
+    }
     std::ifstream configFile(configPath);
     if (!configFile.is_open()) {
         fprintf(stderr, "Failed to open config: %s\n", configPath.c_str());
@@ -1135,6 +1142,19 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
 
             fprintf(stderr, "  [onnx] GatherBlockQuantized: emb=%s scale=%s\n",
                     actualEmbName.c_str(), scaleName.c_str());
+
+            // Gemma 4's decoder contains one quantized per-layer embedding
+            // table per transformer layer.  This is not the token embedding:
+            // expanding [V, groups, block] here would allocate roughly 4 GiB
+            // per layer and eventually overwrite embeddingCPU.  Keep this a
+            // clear conformance failure until the packed per-layer embedding
+            // path is wired into ModelRunner.
+            if (actualEmbName.find("embed_tokens_per_layer_split") != std::string::npos) {
+                fprintf(stderr,
+                    "Unsupported ONNX feature: packed Gemma 4 per-layer embedding '%s'\n",
+                    actualEmbName.c_str());
+                return false;
+            }
 
             auto embIt = initializers.find(actualEmbName);
             auto scaleIt = initializers.find(scaleName);
