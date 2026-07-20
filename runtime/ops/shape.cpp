@@ -655,6 +655,42 @@ static void opConcat(OpContext& ex, const OnnxGraphNode& n,
 // GPU Transpose — uses embedded transpose kernel
 // ═══════════════════════════════════════════════════════════════════════════
 
+static const char* kTransposeFp16Packed = R"WGSL(
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<storage, read> params: array<u32>;
+fn input_index(output_index: u32, rank: u32) -> u32 {
+    var remaining = output_index;
+    var result = 0u;
+    for (var axis = 0u; axis < rank; axis++) {
+        let output_stride = params[4u + axis];
+        let input_stride = params[4u + rank + axis];
+        let coordinate = remaining / output_stride;
+        remaining %= output_stride;
+        result += coordinate * input_stride;
+    }
+    return result;
+}
+fn read_fp16(index: u32) -> f32 {
+    let pair = unpack2x16float(input[index / 2u]);
+    return select(pair.x, pair.y, (index & 1u) != 0u);
+}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pair_index = gid.x;
+    let first_output = pair_index * 2u;
+    let count = params[0];
+    if (first_output >= count) { return; }
+    let rank = params[1];
+    let first = read_fp16(input_index(first_output, rank));
+    var second = 0.0;
+    if (first_output + 1u < count) {
+        second = read_fp16(input_index(first_output + 1u, rank));
+    }
+    output[pair_index] = pack2x16float(vec2<f32>(first, second));
+}
+)WGSL";
+
 static void opTranspose(OpContext& ex, const OnnxGraphNode& n,
                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* data = in[0]; if (!data || !data->IsValid()) return;
@@ -763,7 +799,6 @@ static void opTranspose(OpContext& ex, const OnnxGraphNode& n,
         }
 
         if (elemSize == 2 || elemSize == 4) {
-            // fp16 or f32: use templated kernel with element-level read/write
             uint32_t nelU = (uint32_t)nel;
             std::vector<uint32_t> params(4 + 2 * ndim, 0);
             params[0] = nelU;
@@ -775,10 +810,17 @@ static void opTranspose(OpContext& ex, const OnnxGraphNode& n,
             auto paramBuf = ex.getGpu()->createBuffer("tr_p", params.size() * 4);
             ex.getGpu()->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
-            auto& pl = ex.GetPipelineT("transpose" + std::string(dtypeSuffix(data->dtype)), 3,
-                [&]() { return instantiateTemplate(WGSL_TRANSPOSE_T, data->dtype); });
+            // The generic fp16 t_write helper performs a packed-u32
+            // read-modify-write. One invocation per element races with its
+            // neighbor, so transpose fp16 pairs in a single invocation.
+            auto& pl = elemSize == 2
+                ? ex.GetPipeline("transpose_fp16_packed", kTransposeFp16Packed, 3)
+                : ex.GetPipelineT("transpose" + std::string(dtypeSuffix(data->dtype)), 3,
+                    [&]() { return instantiateTemplate(WGSL_TRANSPOSE_T, data->dtype); });
             auto bg = ex.MakeBindGroup(pl, {{0, data->buffer}, {1, out[0]->buffer}, {2, paramBuf}});
-            ex.QueueDispatch(pl.pipeline, bg, (nelU + 255) / 256, 1, 1, "transpose");
+            ex.QueueDispatch(pl.pipeline, bg,
+                elemSize == 2 ? ((nelU + 1) / 2 + 255) / 256 : (nelU + 255) / 256,
+                1, 1, "transpose");
         } else {
             // i64: existing u32-level kernel (2 u32 per i64 element)
             uint32_t elemsU32 = (uint32_t)(nel * 2);

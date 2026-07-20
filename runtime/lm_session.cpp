@@ -401,13 +401,7 @@ struct GenericOnnxState {
 
     int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
         if (T == 0) return -1;
-        // Intel Qwen 3.5 2B still has a batched-prefill parity issue. Other
-        // cared Qwen/device combinations are conformant with the generic batch.
-        // Keep an explicit force switch for parity work on the remaining case.
-        const bool intelQwen2 = arch == "qwen3_5_text" && hiddenSize == 2048 &&
-            gpu->adapterName.find("Intel") != std::string::npos;
-        if ((intelQwen2 && !std::getenv("BP_GENERIC_BATCHED_PREFILL")) ||
-            std::getenv("BP_GENERIC_SERIAL_PREFILL")) {
+        if (std::getenv("BP_GENERIC_SERIAL_PREFILL")) {
             std::vector<float> logits;
             for (uint32_t i = 0; i < T; ++i)
                 logits = RunPrefillStep(tokenIds[i]);
