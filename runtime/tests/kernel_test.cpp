@@ -1758,7 +1758,9 @@ TEST(gemma_rope_batched_qonly) {
     auto bk=gpu.createBuffer("K",HD*2), bv=gpu.createBuffer("V",HD*2);
     auto bc=makeBuffer(gpu,"C",cs.data(),HD/2), bs=makeBuffer(gpu,"S",sn.data(),HD/2);
     auto bw=makeBuffer(gpu,"W",ones.data(),HD);
-    auto pp=makeParams(gpu,"P",{1,HD,HD,0,HD/2,0,1,1});
+    // Exercise a partial rotary prefix: the non-rotary tail must still be
+    // normalized and copied to the output.
+    auto pp=makeParams(gpu,"P",{1,HD,HD,0,HD/8,0,1,1});
     auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bo},{2,bk},{3,bv},{4,bc},{5,bs},{6,bw},{7,bw},{8,pp}},
         1,1,1,bo,HD*4,9);
     double ss=0;for(float v:q)ss+=double(v)*v;float r=1.0f/std::sqrt(float(ss/HD)+1e-6f);

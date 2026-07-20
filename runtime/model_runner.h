@@ -333,6 +333,8 @@ struct ModelRunner {
 
     // ONNX-specific: partial RoPE and pre-computed tables
     uint32_t rotaryDim = 0;         // 0 = full RoPE (rotaryDim == headDim)
+    uint32_t ropeFreqRotaryDim = 0; // active prefix encoded by GGUF rope_freqs.weight
+    uint32_t swaRotaryDim = 0;      // architecture-specific SWA rotary width
     bool hasPrecomputedRope = false; // true = use ONNX cos/sin cache
     std::string modelFormat;        // "gguf" or "onnx"
 
@@ -438,6 +440,7 @@ private:
     //
     // (Phase 3d, currently a stub — returns false until implemented.)
     bool appendMoeFfnDispatches(uint32_t layerIdx, GPUBuffer xIn, GPUBuffer xOut);
+    uint32_t layerRotaryDim(uint32_t layerIdx) const;
     void computeRopeTables();
     void initPrefillResources();
     void initGemmaPrefillResources();
