@@ -1204,29 +1204,29 @@ void GraphExecutor::Execute(
 
     // Execute nodes in topological order
     auto execT0 = std::chrono::steady_clock::now();
+    std::vector<GpuTensor*> inTensors;
+    std::vector<GpuTensor*> outTensors;
+    inTensors.reserve(16);
+    outTensors.reserve(8);
     for (size_t ei = 0; ei < execOrder.size(); ei++) {
         size_t ni = execOrder[ei];
         auto& node = graph_.nodes[ni];
 
-        // Resolve input tensor NAMES (not pointers — map may rehash during output allocation)
-        std::vector<std::string> inNames;
-        for (auto& inName : node.inputs) inNames.push_back(inName);
-
-        // Prepare output tensor slots in per-session store
-        std::vector<std::string> outNames;
-        for (size_t oi = 0; oi < node.outputs.size(); oi++) {
-            outNames.push_back(node.outputs[oi]);
-            if (!node.outputs[oi].empty()) {
+        // Insert every output before resolving input pointers: insertion may
+        // rehash tensorStore_.  Node names themselves are stable graph data,
+        // so copying them into two temporary string vectors is unnecessary.
+        for (const auto& outName : node.outputs) {
+            if (!outName.empty()) {
                 // Check both stores
-                auto* existing = findTensor(node.outputs[oi]);
+                auto* existing = findTensor(outName);
                 if (!existing || !existing->IsValid())
-                    ctx.tensorStore_[node.outputs[oi]] = {};
+                    ctx.tensorStore_[outName] = {};
             }
         }
 
         // NOW resolve pointers (map is stable after all insertions)
-        std::vector<GpuTensor*> inTensors;
-        for (auto& inName : inNames) {
+        inTensors.clear();
+        for (const auto& inName : node.inputs) {
             if (inName.empty()) {
                 inTensors.push_back(nullptr);
                 continue;
@@ -1234,8 +1234,8 @@ void GraphExecutor::Execute(
             inTensors.push_back(findTensor(inName));
         }
 
-        std::vector<GpuTensor*> outTensors;
-        for (auto& outName : outNames) {
+        outTensors.clear();
+        for (const auto& outName : node.outputs) {
             if (outName.empty()) {
                 outTensors.push_back(nullptr);
             } else {
