@@ -2925,6 +2925,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (hasNativeKQDown) {
         siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
+        siluMulDebugBuf = siluMulOutBuf;
     }
 
     rstdBuf       = gpu->createBuffer("rstd", 16);
@@ -4084,6 +4085,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 // 1. Activation: gateUpBuf → siluMulOutBuf (reuse K-quant temp buffer)
                 if (!siluMulOutBuf.handle)
                     siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
+                siluMulDebugBuf = siluMulOutBuf;
                 auto& plActMulSW = useGelu ? getKernel("gelu_mul_fused")
                                             : getKernel("silu_mul_fused");
                 GPUBuffer actParams;
@@ -5826,7 +5828,10 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
-    if (const char* stopDispatch = std::getenv("BP_STOP_AFTER_DISPATCH")) {
+    const uint32_t stopDispatchPos = std::getenv("BP_STOP_POS")
+        ? (uint32_t)std::max(0, std::atoi(std::getenv("BP_STOP_POS"))) : 0u;
+    if (const char* stopDispatch = std::getenv("BP_STOP_AFTER_DISPATCH");
+        stopDispatch && posOffset == stopDispatchPos) {
         size_t end = allDecodeDispatches.size();
         for (size_t j = 0; j < allDecodeDispatches.size(); ++j) {
             if (allDecodeDispatches[j].name == stopDispatch) { end = j + 1; break; }
@@ -5836,12 +5841,18 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
             std::string bufferName = which ? which : "x";
             GPUBuffer buffer = xBuf;
             uint32_t count = cfg.nEmbd;
+            uint32_t diagnosticIM = cfg.intermediateSize;
+            if (stopDispatch[0] == 'L') {
+                const uint32_t li = (uint32_t)std::max(0, std::atoi(stopDispatch + 1));
+                if (li < cfg.perLayer.size()) diagnosticIM = cfg.perLayer[li].intermediateSize;
+            }
             if (bufferName == "qkv") { buffer = qkvBuf; count = qkvOut; }
             else if (bufferName == "qrot") { buffer = qRotBuf; count = qDim; }
             else if (bufferName == "attn") { buffer = attnOutBuf; count = qDim; }
             else if (bufferName == "proj") { buffer = projOutBuf; count = cfg.nEmbd; }
             else if (bufferName == "norm") { buffer = normOutBuf; count = cfg.nEmbd; }
-            else if (bufferName == "gateup") { buffer = gateUpBuf; count = 2 * cfg.intermediateSize; }
+            else if (bufferName == "gateup") { buffer = gateUpBuf; count = 2 * diagnosticIM; }
+            else if (bufferName == "silu") { buffer = siluMulDebugBuf; count = diagnosticIM; }
             else if (bufferName == "ple") { buffer = pleBuf; count = cfg.pleSize; }
             else if (bufferName == "pleinput") { buffer = pleInputBuf; count = cfg.pleSize * cfg.nLayer; }
             else if (bufferName.rfind("kvv", 0) == 0) {
@@ -5873,15 +5884,26 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
             }
             const float* values = reinterpret_cast<const float*>(bytes.data());
             double ss = 0.0; uint32_t nonfinite = 0;
+            uint32_t firstNonfinite = count;
             for (uint32_t j = 0; j < count; ++j) {
-                if (!std::isfinite(values[j])) ++nonfinite;
+                if (!std::isfinite(values[j])) {
+                    if (firstNonfinite == count) firstNonfinite = j;
+                    ++nonfinite;
+                }
                 else ss += (double)values[j] * values[j];
             }
-            fprintf(stderr, "[dispatch-dump] after=%s buffer=%s count=%u nonfinite=%u norm=%.9g first8=",
-                    stopDispatch, bufferName.c_str(), count, nonfinite, sqrt(ss));
+            fprintf(stderr, "[dispatch-dump] after=%s buffer=%s count=%u nonfinite=%u first_nonfinite=%s norm=%.9g first8=",
+                    stopDispatch, bufferName.c_str(), count, nonfinite,
+                    firstNonfinite == count ? "none" : std::to_string(firstNonfinite).c_str(), sqrt(ss));
             for (uint32_t j = 0; j < std::min(8u, count); ++j)
                 fprintf(stderr, "%s%.9g", j ? "," : "", values[j]);
             fprintf(stderr, "\n"); fflush(stderr);
+            if (bufferName == "silu" && firstNonfinite < count) {
+                auto gateBytes = gpu->readBuffer(gateUpBuf, 2 * count * 4);
+                const float* gateUp = reinterpret_cast<const float*>(gateBytes.data());
+                fprintf(stderr, "[dispatch-dump] silu_bad_index=%u gate=%.9g up=%.9g\n",
+                        firstNonfinite, gateUp[firstNonfinite], gateUp[count + firstNonfinite]);
+            }
             std::exit(0);
         }
     }

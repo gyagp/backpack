@@ -3885,7 +3885,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = GateUp[i];
     let u = GateUp[N + i];
     let inner = 0.7978845608 * (g + 0.044715 * g * g * g);
-    let tanh_val = tanh(inner);
+    // GELU is already saturated outside this interval. Clamping avoids an
+    // Intel D3D12 tanh edge case that returns NaN for large cubic arguments.
+    let tanh_val = tanh(clamp(inner, -10.0, 10.0));
     let gelu = 0.5 * g * (1.0 + tanh_val);
     Out[i] = gelu * u;
 }

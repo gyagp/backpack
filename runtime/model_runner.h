@@ -29,7 +29,7 @@ struct ModelRunner {
     // intermediates are safe to share. Only staging buffers need per-slot
     // duplication for async readback.
     GPUBuffer xBuf, normOutBuf, qkvBuf, qRotBuf, attnOutBuf;
-    GPUBuffer projOutBuf, gateUpBuf, rstdBuf, logitsBuf;
+    GPUBuffer projOutBuf, gateUpBuf, siluMulDebugBuf, rstdBuf, logitsBuf;
 
     // ── MoE intermediate buffers (allocated when cfg.numExperts > 0) ──────
     GPUBuffer moeRouterOutBuf;   // [nExperts] f32 — router logits per token
