@@ -516,6 +516,7 @@ std::vector<uint16_t> dequantQ4ToFp16(const uint8_t* wData, const uint8_t* sData
 /// Q4 and Q8_0 both use 32-element blocks with fp16 scale.
 /// Q4 nibbles (-8..+7) fit directly into Q8_0 int8 values.
 Q8Repacked dequantQ4ToQ8(const uint8_t* wData, const uint8_t* sData,
+                          const uint8_t* zpData,
                           uint32_t N, uint32_t K, uint32_t blockSize,
                           uint32_t nGroups, uint32_t blockHalf) {
     // Q4G32 and Q8_0 share the same block_size=32, so we can directly pack
@@ -532,10 +533,15 @@ Q8Repacked dequantQ4ToQ8(const uint8_t* wData, const uint8_t* sData,
             auto& b = blocks[row * nBlocksPerRow + g];
             b.d = scales[row * nGroups + g];  // keep original fp16 scale
             const uint8_t* blockData = wData + (row * nGroups + g) * blockHalf;
+            const size_t block = (size_t)row * nGroups + g;
+            const uint8_t zpByte = zpData ? zpData[block / 2] : 0x88;
+            const int8_t zeroPoint = (block & 1)
+                ? (int8_t)(zpByte >> 4)
+                : (int8_t)(zpByte & 0x0F);
             for (uint32_t j = 0; j < blockHalf; j++) {
                 uint8_t byte = blockData[j];
-                b.qs[j * 2]     = (int8_t)(byte & 0x0F) - 8;  // -8..+7
-                b.qs[j * 2 + 1] = (int8_t)(byte >> 4) - 8;
+                b.qs[j * 2]     = (int8_t)(byte & 0x0F) - zeroPoint;
+                b.qs[j * 2 + 1] = (int8_t)(byte >> 4) - zeroPoint;
             }
         }
     }
@@ -916,7 +922,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             uint32_t K = nGroups * blockSize;
 
             q8Weights[mapping.backpackName] = dequantQ4ToQ8(
-                wT.rawData, sT.rawData,
+                wT.rawData, sT.rawData, nullptr,
                 N, K, blockSize, nGroups, blockHalf);
 
             // Infer intermediate_size from gate/up projections
@@ -1019,8 +1025,14 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
 
             if (bits == 4) {
                 uint32_t blockHalf = blockSize / 2;
+                const uint8_t* zeroPoints = nullptr;
+                if (node.inputs.size() >= 4) {
+                    auto zpIt = initializers.find(node.inputs[3]);
+                    if (zpIt != initializers.end())
+                        zeroPoints = zpIt->second.rawData;
+                }
                 q8Weights[mapping.backpackName] = dequantQ4ToQ8(
-                    wTensor.rawData, sTensor.rawData,
+                    wTensor.rawData, sTensor.rawData, zeroPoints,
                     N, K, blockSize, nGroups, blockHalf);
             } else if (bits == 8) {
                 q8Weights[mapping.backpackName] = dequantQ8ToQ8(
