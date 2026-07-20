@@ -299,28 +299,74 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
 }
 
 const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32_t headDim) {
-    if (headDim == 128 && (name != "gqa_chunked_pass1" || gqaChunkSize == 64))
+    const bool subgroupChunkedP1 = name == "gqa_chunked_pass1_subgroup";
+    const std::string sourceName = subgroupChunkedP1 ? "gqa_chunked_pass1" : name;
+    if (!subgroupChunkedP1 && headDim == 128 &&
+        (name != "gqa_chunked_pass1" || gqaChunkSize == 64))
         return getKernel(name);
 
     // Patched pipeline: keyed by name + "_HD" + headDim
     std::string patchedName = name + "_HD" + std::to_string(headDim);
-    if (name == "gqa_chunked_pass1")
+    if (sourceName == "gqa_chunked_pass1")
         patchedName += "_C" + std::to_string(gqaChunkSize);
 
     auto& kernels = getEmbeddedKernels();
-    auto it = kernels.find(name);
+    auto it = kernels.find(sourceName);
     if (it == kernels.end()) {
         fprintf(stderr, "Kernel not found: %s\n", name.c_str());
         exit(1);
     }
 
     std::string patchedSource = patchShaderHD(it->second.source, headDim);
-    if (name == "gqa_chunked_pass1" && gqaChunkSize != 64) {
+    if (sourceName == "gqa_chunked_pass1" && gqaChunkSize != 64) {
         const std::string from = "const CHUNK: u32 = 64u;";
         const std::string to = "const CHUNK: u32 = " + std::to_string(gqaChunkSize) + "u;";
         size_t pos = patchedSource.find(from);
         if (pos != std::string::npos)
             patchedSource.replace(pos, from.size(), to);
+    }
+    if (subgroupChunkedP1) {
+        const std::string enable = "enable f16;";
+        auto enablePos = patchedSource.find(enable);
+        if (enablePos != std::string::npos)
+            patchedSource.insert(enablePos + enable.size(), "\nenable subgroups;");
+        const std::string signature =
+            "fn main(@builtin(local_invocation_id) lid: vec3<u32>,\n"
+            "        @builtin(workgroup_id) wid: vec3<u32>) {";
+        const std::string subgroupSignature =
+            "fn main(@builtin(local_invocation_id) lid: vec3<u32>,\n"
+            "        @builtin(workgroup_id) wid: vec3<u32>,\n"
+            "        @builtin(subgroup_invocation_id) sg_lane: u32,\n"
+            "        @builtin(subgroup_size) sg_size: u32) {";
+        auto signaturePos = patchedSource.find(signature);
+        if (signaturePos != std::string::npos)
+            patchedSource.replace(signaturePos, signature.size(), subgroupSignature);
+        const std::string reduction =
+            "        dot_scratch[lane] = dot_partial;\n"
+            "        workgroupBarrier();\n"
+            "        for (var stride = 16u; stride > 0u; stride >>= 1u) {\n"
+            "            if (lane < stride) {\n"
+            "                dot_scratch[lane] += dot_scratch[lane + stride];\n"
+            "            }\n"
+            "            workgroupBarrier();\n"
+            "        }\n"
+            "        let dot = dot_scratch[0];";
+        const std::string subgroupReduction =
+            "        let subgroup_sum = subgroupAdd(dot_partial);\n"
+            "        let subgroup_id = lane / sg_size;\n"
+            "        if (sg_lane == 0u) { dot_scratch[subgroup_id] = subgroup_sum; }\n"
+            "        workgroupBarrier();\n"
+            "        if (lane == 0u) {\n"
+            "            var total = 0.0;\n"
+            "            let subgroup_count = (32u + sg_size - 1u) / sg_size;\n"
+            "            for (var s = 0u; s < subgroup_count; s++) { total += dot_scratch[s]; }\n"
+            "            dot_scratch[0] = total;\n"
+            "        }\n"
+            "        workgroupBarrier();\n"
+            "        let dot = dot_scratch[0];";
+        auto reductionPos = patchedSource.find(reduction);
+        if (reductionPos != std::string::npos)
+            patchedSource.replace(reductionPos, reduction.size(), subgroupReduction);
     }
     return gpu->getOrCreatePipeline(patchedName, patchedSource,
                                      it->second.numBindings);
@@ -2260,7 +2306,14 @@ void ModelRunner::buildDecodePipeline() {
            subgroupMatrixKernelReady ? "available (i8×i8→i32 MMA)" : "not available");
     auto& plQ8Fast     = getKernel("q8_matmul_fast");
     auto& plFusedRope  = getKernelHD(cfg.hasQkNorm ? "fused_qknorm_rope" : "fused_rope");
-    auto& plChunkP1    = getKernelHD("gqa_chunked_pass1");
+    // Intel's Windows subgroup path measured slightly slower than the
+    // shared-memory reduction; NVIDIA and AMD both benefit from replacing
+    // five workgroup barriers with the portable two-barrier subgroup merge.
+    const bool useSubgroupChunkedAttention = gpu->supportsSubgroups &&
+        gpu->adapterName.find("Intel") == std::string::npos;
+    const char* chunkP1Kernel = useSubgroupChunkedAttention
+        ? "gqa_chunked_pass1_subgroup" : "gqa_chunked_pass1";
+    auto& plChunkP1    = getKernelHD(chunkP1Kernel);
     auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
     const CompiledPipeline* plQ4Decode = weightsAreNativeQ4
         ? &getKernel("matmul_q4_decode") : nullptr;
@@ -3545,7 +3598,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             uint32_t hdL = cfg.perLayer[i].headDim;
             auto& attnParams = hasVariableHeadDim ? perLayerAttnParamBufs[i]
                              : (isSWA ? chunkedAttnParamsBufSWA : chunkedAttnParamsBuf);
-            auto& plP1 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass1", hdL) : plChunkP1;
+            auto& plP1 = hasVariableHeadDim ? getKernelHD(chunkP1Kernel, hdL) : plChunkP1;
             auto bg = makeBG(plP1, {
                 {0, qRotBuf}, {1, kvCache[kvCacheLayer].K}, {2, kvCache[kvCacheLayer].V},
                 {3, attnPartialsBuf}, {4, attnParams}});
@@ -4688,7 +4741,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             auto& slotAttnBuf = hasVariableHeadDim ? ps.layerAttnParamsBufs[layer]
                 : (layerIsSWA ? ps.attnParamsBufSWA : ps.attnParamsBuf);
-            auto& plP1 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass1", hdL) : plChunkP1;
+            auto& plP1 = hasVariableHeadDim
+                ? getKernelHD(useSubgroupChunkedAttention
+                    ? "gqa_chunked_pass1_subgroup" : "gqa_chunked_pass1", hdL)
+                : plChunkP1;
             auto& plP2 = hasVariableHeadDim ? getKernelHD("gqa_chunked_pass2", hdL) : plChunkP2;
 
             ps.dispatches[p1Idx].bindGroup = makeBG(plP1, {
