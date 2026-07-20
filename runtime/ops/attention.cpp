@@ -93,6 +93,70 @@ static bool readTensorInt64Values(OpContext& ex, GpuTensor* t,
 //
 //   out[0]=output, out[1]=present_key, out[2]=present_value
 
+// Portable batched prefill for adapters where the subgroup width is not the
+// 32 lanes assumed by WGSL_GQA_PREFILL. Each lane independently evaluates the
+// QK scalar and owns up to four output dimensions, avoiding subgroup/shared
+// reductions while retaining one workgroup per (query, head).
+static const char* kGqaPrefillPortable = R"WGSL(
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read> params: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let num_heads = params[0];
+    let head_dim = params[1];
+    let past_seq = params[2];
+    let kv_heads = params[3];
+    let scale = bitcast<f32>(params[4]);
+    let kv_stride = params[5];
+    let head = wid.y % num_heads;
+    let query_index = wid.y / num_heads;
+    let kv_head = head / (num_heads / kv_heads);
+    let q_base = (query_index * num_heads + head) * head_dim;
+    let d0 = lid.x;
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    var acc2 = 0.0;
+    var acc3 = 0.0;
+    var running_max = -1e30;
+    var running_sum = 0.0;
+    let causal_length = past_seq + query_index + 1u;
+    for (var position = 0u; position < causal_length; position++) {
+        let kv_base = (kv_head * kv_stride + position) * head_dim;
+        var score = 0.0;
+        for (var dimension = 0u; dimension < head_dim; dimension++) {
+            score += q[q_base + dimension] * k[kv_base + dimension];
+        }
+        score *= scale;
+        let next_max = max(running_max, score);
+        let previous_factor = exp(running_max - next_max);
+        let score_factor = exp(score - next_max);
+        let next_sum = running_sum * previous_factor + score_factor;
+        let rescale = running_sum * previous_factor / max(next_sum, 1e-10);
+        let weight = score_factor / max(next_sum, 1e-10);
+        acc0 = acc0 * rescale + weight * v[kv_base + d0];
+        if (d0 + 64u < head_dim) {
+            acc1 = acc1 * rescale + weight * v[kv_base + d0 + 64u];
+        }
+        if (d0 + 128u < head_dim) {
+            acc2 = acc2 * rescale + weight * v[kv_base + d0 + 128u];
+        }
+        if (d0 + 192u < head_dim) {
+            acc3 = acc3 * rescale + weight * v[kv_base + d0 + 192u];
+        }
+        running_max = next_max;
+        running_sum = next_sum;
+    }
+    output[q_base + d0] = acc0;
+    if (d0 + 64u < head_dim) { output[q_base + d0 + 64u] = acc1; }
+    if (d0 + 128u < head_dim) { output[q_base + d0 + 128u] = acc2; }
+    if (d0 + 192u < head_dim) { output[q_base + d0 + 192u] = acc3; }
+}
+)WGSL";
+
 static void opGQA(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Q = in[0];
@@ -379,9 +443,13 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
 
         if (seqQ > 1) {
             // Batched prefill: single dispatch for all T query tokens
-            auto& prefillPl = ex.GetPipelineT("gqa_prefill", 5, []() {
-                return std::string(WGSL_GQA_PREFILL);
-            });
+            const bool portablePrefill =
+                ex.getGpu()->adapterName.find("Intel") != std::string::npos;
+            auto& prefillPl = portablePrefill
+                ? ex.GetPipeline("gqa_prefill_portable", kGqaPrefillPortable, 5)
+                : ex.GetPipelineT("gqa_prefill", 5, []() {
+                    return std::string(WGSL_GQA_PREFILL);
+                });
 
             uint32_t prefillParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                           (uint32_t)pastSeq, (uint32_t)kv_heads,
@@ -392,8 +460,13 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
             auto prefillBg = ex.MakeBindGroup(prefillPl, {
                 {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
                 {3, out[0]->buffer}, {4, ppBuf}});
-            ex.QueueDispatch(prefillPl.pipeline, prefillBg,
-                (uint32_t)num_heads, (uint32_t)((seqQ + 3) / 4), 1, "gqa_prefill");
+            if (portablePrefill) {
+                ex.QueueDispatch(prefillPl.pipeline, prefillBg,
+                    1, (uint32_t)(num_heads * seqQ), 1, "gqa_prefill_portable");
+            } else {
+                ex.QueueDispatch(prefillPl.pipeline, prefillBg,
+                    (uint32_t)num_heads, (uint32_t)((seqQ + 3) / 4), 1, "gqa_prefill");
+            }
         } else {
             // Single-token decode path
             auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return instantiateTemplate(WGSL_GQA_DECODE_T, TensorDtype::Float32); });

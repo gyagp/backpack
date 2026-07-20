@@ -92,15 +92,14 @@ GPUBuffer ExecutionContext::getParamBuffer(uint32_t sizeBytes) {
     // During fast decode capture: larger pool to avoid wrapping
     if (fastDecodeState_ == FastDecodeState::Capturing) {
         auto& pool = paramPool_[bucket];
-        if (pool.buffers.empty() || (int)pool.buffers.size() < 2048) {
+        if (pool.buffers.empty() || pool.nextIdx >= (int)pool.buffers.size()) {
             int oldSize = (int)pool.buffers.size();
-            pool.buffers.resize(2048);
-            for (int i = oldSize; i < 2048; i++)
+            int newSize = std::max(2048, oldSize * 2);
+            pool.buffers.resize(newSize);
+            for (int i = oldSize; i < newSize; i++)
                 pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
         }
-        GPUBuffer buf = pool.buffers[pool.nextIdx];
-        pool.nextIdx = (pool.nextIdx + 1) % (int)pool.buffers.size();
-        return buf;
+        return pool.buffers[pool.nextIdx++];
     }
 
     auto& pool = paramPool_[bucket];
@@ -110,9 +109,22 @@ GPUBuffer ExecutionContext::getParamBuffer(uint32_t sizeBytes) {
             pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
         pool.nextIdx = 0;
     }
-    GPUBuffer buf = pool.buffers[pool.nextIdx];
-    pool.nextIdx = (pool.nextIdx + 1) % (int)pool.buffers.size();
-    return buf;
+    if (pool.nextIdx >= (int)pool.buffers.size()) {
+        // All existing buffers may be referenced by pending dispatches. Grow
+        // instead of wrapping; completed non-captured graph executions reset
+        // the cursor after their end-of-Execute fence.
+        int oldSize = (int)pool.buffers.size();
+        int newSize = oldSize * 2;
+        pool.buffers.resize(newSize);
+        for (int i = oldSize; i < newSize; ++i)
+            pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
+    }
+    return pool.buffers[pool.nextIdx++];
+}
+
+void ExecutionContext::ResetParamPoolCursors() {
+    if (fastDecodeState_ != FastDecodeState::Off || !capturedFlushes_.empty()) return;
+    for (auto& pool : paramPool_) pool.nextIdx = 0;
 }
 
 // ─── Dispatch Batching ──────────────────────────────────────────────────────

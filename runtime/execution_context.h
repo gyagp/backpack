@@ -88,7 +88,8 @@ struct ExecutionContext {
 
     // ─── Param Buffer Pool ──────────────────────────────────────────────
     static constexpr int PARAM_POOL_BUCKETS = 4;
-    static constexpr int PARAM_POOL_SIZE = 512;
+    // Grow on demand while a submission is pending; never wrap live buffers.
+    static constexpr int PARAM_POOL_SIZE = 4096;
     struct ParamPool {
         std::vector<GPUBuffer> buffers;
         int nextIdx = 0;
@@ -97,6 +98,7 @@ struct ExecutionContext {
 
     /// Get a reusable param buffer (16/32/48/64 bytes).
     GPUBuffer getParamBuffer(uint32_t sizeBytes);
+    void ResetParamPoolCursors();
 
     // ─── Fast Decode (Capture + Replay) ─────────────────────────────────
 

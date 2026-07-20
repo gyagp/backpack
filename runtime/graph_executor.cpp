@@ -1532,6 +1532,7 @@ void GraphExecutor::Execute(
     // Submit all remaining batched GPU work
     ctx.flushToEncoder();
     gpu->waitForQueue();
+    ctx.ResetParamPoolCursors();
 
     // Release non-output, non-persistent intermediate buffers
     // (GPU work is done, safe to free)

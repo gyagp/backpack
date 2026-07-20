@@ -401,10 +401,12 @@ struct GenericOnnxState {
 
     int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
         if (T == 0) return -1;
-        // Qwen 3.5 recurrent/conv state updates are not yet equivalent in the
-        // batched graph on all D3D12 vendors. Preserve correctness by default;
-        // BP_GENERIC_BATCHED_PREFILL remains available for focused parity work.
-        if ((arch == "qwen3_5_text" && !std::getenv("BP_GENERIC_BATCHED_PREFILL")) ||
+        // Intel Qwen 3.5 2B still has a batched-prefill parity issue. Other
+        // cared Qwen/device combinations are conformant with the generic batch.
+        // Keep an explicit force switch for parity work on the remaining case.
+        const bool intelQwen2 = arch == "qwen3_5_text" && hiddenSize == 2048 &&
+            gpu->adapterName.find("Intel") != std::string::npos;
+        if ((intelQwen2 && !std::getenv("BP_GENERIC_BATCHED_PREFILL")) ||
             std::getenv("BP_GENERIC_SERIAL_PREFILL")) {
             std::vector<float> logits;
             for (uint32_t i = 0; i < T; ++i)
@@ -414,6 +416,19 @@ struct GenericOnnxState {
         if (T == 1) {
             auto logits = RunPrefillStep(tokenIds[0]);
             return argmax(logits.data(), (int64_t)logits.size());
+        }
+
+        // Large fully-dynamic Qwen batches currently exceed the reliable
+        // shape/arena envelope on D3D12. Preserve state across bounded batches;
+        // this still reduces a 128-token prompt from 128 graph executions to 2.
+        constexpr uint32_t kPrefillChunk = 64;
+        if (arch == "qwen3_5_text" && T > kPrefillChunk) {
+            int32_t result = -1;
+            for (uint32_t offset = 0; offset < T; offset += kPrefillChunk) {
+                const uint32_t count = std::min(kPrefillChunk, T - offset);
+                result = RunPrefillBatch(tokenIds + offset, count);
+            }
+            return result;
         }
 
         pos += T;
