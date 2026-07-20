@@ -512,6 +512,7 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     cfg = extractModelConfig(gguf);
     rotaryDim = gguf.getU32(cfg.arch + ".rope.dimension_count", 0);
     if (rotaryDim == cfg.headDim) rotaryDim = 0;
+    swaRotaryDim = gguf.getU32(cfg.arch + ".rope.dimension_count_swa", 0);
     fprintf(stderr, "  [runner.load] config extracted: arch=%s nLayer=%u\n", cfg.arch.c_str(), cfg.nLayer); fflush(stderr);
     if (cfg.numExperts > 0) {
         fprintf(stderr, "  [runner.load] MoE detected: %u experts, top-%u active, expert FFN dim=%u\n",
@@ -590,6 +591,40 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     if (!ggufMap.open(ggufPath)) {
         fprintf(stderr, "Failed to mmap GGUF file: %s\n", ggufPath.c_str());
         return false;
+    }
+
+    // Some GGUFs encode proportional/partial RoPE with a frequency-factor
+    // tensor rather than a smaller rope.dimension_count. Gemma 4 global
+    // attention, for example, declares a 512-wide rotary domain but stores a
+    // contiguous active prefix followed by 1e30 sentinels for unrotated pairs.
+    // Our RoPE kernels represent that layout directly as a smaller rotary
+    // prefix, so derive its width from the tensor instead of rotating the
+    // sentinel dimensions with ordinary frequencies.
+    auto ropeFreqIt = gguf.tensor_index.find("rope_freqs.weight");
+    if (ropeFreqIt != gguf.tensor_index.end()) {
+        const auto& ti = gguf.tensors[ropeFreqIt->second];
+        uint64_t count = 1;
+        for (uint64_t d : ti.shape) count *= d;
+        if (count > 0 && count <= cfg.headDim / 2 &&
+            (ti.type == GGUF_TYPE_F32 || ti.type == GGUF_TYPE_F16)) {
+            const uint8_t* src = ggufMap.data + gguf.data_offset + ti.offset;
+            uint64_t active = 0;
+            for (; active < count; active++) {
+                float factor = ti.type == GGUF_TYPE_F32
+                    ? reinterpret_cast<const float*>(src)[active]
+                    : fp16_to_f32(reinterpret_cast<const uint16_t*>(src)[active]);
+                if (!std::isfinite(factor) || std::fabs(factor) >= 1.0e20f)
+                    break;
+            }
+            if (active > 0 && active < count) {
+                ropeFreqRotaryDim = static_cast<uint32_t>(active * 2);
+                fprintf(stderr,
+                        "  RoPE frequency factors: %llu/%llu active pairs "
+                        "(global rotary_dim=%u)\n",
+                        (unsigned long long)active, (unsigned long long)count,
+                        ropeFreqRotaryDim);
+            }
+        }
     }
 
     // Load weights
@@ -1912,6 +1947,24 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
 // ─── RoPE tables ─────────────────────────────────────────────────────────────
 
+uint32_t ModelRunner::layerRotaryDim(uint32_t layerIdx) const {
+    uint32_t headDim = cfg.headDim;
+    if (layerIdx < cfg.perLayer.size() && cfg.perLayer[layerIdx].headDim > 0)
+        headDim = cfg.perLayer[layerIdx].headDim;
+
+    bool isSwa = layerIdx < cfg.layerAttnTypes.size() &&
+                 cfg.layerAttnTypes[layerIdx] == AttnLayerType::SlidingWindow;
+    uint32_t dim = headDim;
+    if (isSwa && swaRotaryDim > 0)
+        dim = swaRotaryDim;
+    else if (!isSwa && ropeFreqRotaryDim > 0)
+        dim = ropeFreqRotaryDim;
+    else if (rotaryDim > 0)
+        dim = rotaryDim;
+
+    return std::min(dim, headDim) & ~1u;
+}
+
 void ModelRunner::computeRopeTables() {
     // For ONNX models with pre-computed RoPE tables, upload directly
     if (hasPrecomputedRope) return;  // already uploaded in loadOnnx()
@@ -1935,7 +1988,8 @@ void ModelRunner::computeRopeTables() {
         gpu->writeBuffer(sinBuf, sinTable.data(), maxSeqLen * ropeHalf * 4);
     };
 
-    uint32_t globalRopeDim = rotaryDim > 0 ? rotaryDim : cfg.headDim;
+    uint32_t globalRopeDim = ropeFreqRotaryDim > 0
+        ? ropeFreqRotaryDim : (rotaryDim > 0 ? rotaryDim : cfg.headDim);
     buildTables(cfg.ropeTheta, globalRopeDim,
                 ropeCosBuf, ropeSinBuf, "rope_cos", "rope_sin");
 
@@ -1947,12 +2001,15 @@ void ModelRunner::computeRopeTables() {
     if (needsSwa) {
         // No GGUF accessor here; just use the convention used by llama.cpp.
         const float swaTheta = 10000.0f;
-        uint32_t swaRopeDim = globalRopeDim;
+        uint32_t swaRopeDim = swaRotaryDim;
         for (uint32_t i = 0; i < cfg.nLayer && i < cfg.perLayer.size(); i++) {
             if (i < cfg.layerAttnTypes.size() &&
-                cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow)
-                swaRopeDim = std::min(swaRopeDim, cfg.perLayer[i].headDim);
+                cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow) {
+                swaRopeDim = layerRotaryDim(i);
+                break;
+            }
         }
+        if (swaRopeDim == 0) swaRopeDim = globalRopeDim;
         buildTables(swaTheta, swaRopeDim, ropeCosBufSWA, ropeSinBufSWA,
                     "rope_cos_swa", "rope_sin_swa");
         fprintf(stderr, "  RoPE SWA tables: dim=%u theta=%.0f (global dim=%u theta=%.0f)\n",
@@ -5435,7 +5492,7 @@ void ModelRunner::updateDecodeParams(uint32_t pos, uint32_t cacheLen) {
             uint32_t hdL = cfg.perLayer[li].headDim;
             uint32_t qDimL = cfg.nHead * hdL;
             uint32_t kvDimL = cfg.nKvHeads * hdL;
-            uint32_t ropeHalfL = hdL / 2;
+            uint32_t ropeHalfL = layerRotaryDim(li) / 2;
             // rope params: [nHead, qDim, kvDim, pos, ropeHalf, kvWriteOff, eps, 0]
             uint8_t rd[32];
             memcpy(rd, ropeParamData.data(), 32);
@@ -5525,7 +5582,7 @@ void ModelRunner::prepareDecodeParams(uint32_t pos, uint32_t cacheLen, int slot)
             rp[1] = (int)(cfg.nHead * hdL);
             rp[2] = (int)kvDimL;
             rp[3] = (int)pos;
-            rp[4] = (int)(hdL / 2);
+            rp[4] = (int)(layerRotaryDim(li) / 2);
             rp[5] = (int)(cacheLen * kvDimL);
             memcpy(ropePacked.data() + li * kParamStride, rd, 32);
 
@@ -6023,7 +6080,8 @@ int32_t ModelRunner::prefillGemmaBatched(
             uint32_t cacheLayer = pl.kvSourceLayer>=0 ? (uint32_t)pl.kvSourceLayer : li;
             uint32_t flags=(qonly?1u:0u)|2u;
             auto ropeP=mkP("gpf_rope_"+std::to_string(li),
-                {cfg.nHead,qdim,kvdim,posOffset+done,hd/2,cacheLen,cfg.nKvHeads,flags});
+                {cfg.nHead,qdim,kvdim,posOffset+done,layerRotaryDim(li)/2,
+                 cacheLen,cfg.nKvHeads,flags});
             auto& rope=getKernelHD("gemma_rope_batched",hd);
             auto& rc=(swa&&ropeCosBufSWA.handle)?ropeCosBufSWA:ropeCosBuf;
             auto& rs=(swa&&ropeSinBufSWA.handle)?ropeSinBufSWA:ropeSinBuf;

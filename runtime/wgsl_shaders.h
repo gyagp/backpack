@@ -530,7 +530,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 // [attention] gemma_rope_batched
 static const char* WGSL_GEMMA_ROPE_BATCHED = R"WGSL(
 enable f16;
-enable subgroups;
 
 // Gemma batched Q/K normalization, RoPE and cache write. Params:
 // [n_head, q_dim, kv_dim, pos_offset, half_dim, cache_len, n_kv, flags]
@@ -547,17 +546,18 @@ enable subgroups;
 @group(0) @binding(8) var<storage, read> P: array<u32>;
 
 const HD: u32 = 128u;
-var<workgroup> sums: array<f32, 4>;
+var<workgroup> sums: array<f32, 128>;
 
 fn row_rms(base: u32, tid: u32) -> f32 {
     var ss=0.0;
     for(var i=tid;i<HD;i+=128u){let v=QKV[base+i];ss+=v*v;}
-    let lane=tid&31u;let warp=tid/32u;let ws=subgroupAdd(ss);
-    if(lane==0u){sums[warp]=ws;}
+    sums[tid]=ss;
     workgroupBarrier();
-    let total=sums[0]+sums[1]+sums[2]+sums[3];
-    workgroupBarrier();
-    return inverseSqrt(total/f32(HD)+1e-6);
+    for(var stride=64u;stride>0u;stride>>=1u){
+        if(tid<stride){sums[tid]+=sums[tid+stride];}
+        workgroupBarrier();
+    }
+    return inverseSqrt(sums[0]/f32(HD)+1e-6);
 }
 
 @compute @workgroup_size(128)
@@ -575,6 +575,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let a=QKV[src+i]*r*QW[i];let b=QKV[src+j]*r*QW[j];
             let c=Cos[cb+i];let s=Sin[cb+i];QRot[dst+i]=a*c-b*s;QRot[dst+j]=b*c+a*s;
         }
+        for(var i=tid+2u*half;i<HD;i+=128u){QRot[dst+i]=QKV[src+i]*r*QW[i];}
     }else if(!qonly){
         let kh=h-nh;let ks=t*stride+qdim+kh*HD;let vs=ks+kvdim;
         let dst=cache_pos*nkv*HD+kh*HD;let kr=row_rms(ks,tid);let cb=pos*half;
@@ -582,6 +583,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let a=QKV[ks+i]*kr*KW[i];let b=QKV[ks+j]*kr*KW[j];let c=Cos[cb+i];let s=Sin[cb+i];
             KCache[dst+i]=f16(a*c-b*s);KCache[dst+j]=f16(b*c+a*s);
         }
+        for(var i=tid+2u*half;i<HD;i+=128u){KCache[dst+i]=f16(QKV[ks+i]*kr*KW[i]);}
         var vr=1.0;
         if(vnorm){vr=row_rms(vs,tid);}
         for(var i=tid;i<HD;i+=128u){VCache[dst+i]=f16(QKV[vs+i]*vr);}
@@ -6603,7 +6605,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 // [norm] fused_qknorm_rope
 static const char* WGSL_FUSED_QKNORM_ROPE = R"WGSL(
 enable f16;
-enable subgroups;
 
 // Fused QK-norm + RoPE kernel for single-token decode.
 // Applies RMSNorm (with learned weights) to Q/K, then RoPE, then scatters K/V to cache.
@@ -6618,7 +6619,8 @@ enable subgroups;
 
 const WG_SIZE: u32 = 128u;
 
-var<workgroup> _smem: array<f32, 8>;  // [0..3] = QK sum_sq, [4..7] = V sum_sq
+var<workgroup> _q_sums: array<f32, 128>;
+var<workgroup> _v_sums: array<f32, 128>;
 
 @group(0) @binding(0) var<storage, read> buf0: array<f32>;  // QKV
 @group(0) @binding(1) var<storage, read_write> buf1: array<f32>;  // Q_out
@@ -6678,32 +6680,26 @@ fn main(
         }
     }
 
-    // Subgroup reduction (32-wide) — all threads participate uniformly
-    sum_sq = subgroupAdd(sum_sq);
-    v_sum_sq = subgroupAdd(v_sum_sq);
-
-    // Write subgroup result to shared memory
-    let subgroup_id = tid / 32u;
-    let lane = tid % 32u;
-    if (lane == 0u) {
-        _smem[subgroup_id] = sum_sq;
-        if (do_vnorm) {
-            _smem[subgroup_id + 4u] = v_sum_sq;
-        }
-    }
+    // Workgroup reduction. Do not assume a particular hardware subgroup width:
+    // AMD commonly exposes 64-wide subgroups while other adapters use 32.
+    _q_sums[tid] = sum_sq;
+    _v_sums[tid] = v_sum_sq;
     workgroupBarrier();
-
-    // All threads read all 4 subgroup results and sum
-    var total = _smem[0] + _smem[1] + _smem[2] + _smem[3];
+    for (var stride: u32 = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            _q_sums[tid] += _q_sums[tid + stride];
+            _v_sums[tid] += _v_sums[tid + stride];
+        }
+        workgroupBarrier();
+    }
 
     // RMSNorm scale: 1 / sqrt(mean_sq + eps)
-    let rms_scale = 1.0 / sqrt(total / f32(HD) + params.eps);
+    let rms_scale = 1.0 / sqrt(_q_sums[0] / f32(HD) + params.eps);
 
     // V RMSNorm scale (only for KV heads with v_norm enabled)
     var v_rms_scale: f32 = 1.0;
     if (do_vnorm) {
-        let v_total = _smem[4] + _smem[5] + _smem[6] + _smem[7];
-        v_rms_scale = 1.0 / sqrt(v_total / f32(HD) + params.eps);
+        v_rms_scale = 1.0 / sqrt(_v_sums[0] / f32(HD) + params.eps);
     }
 
     // Step 2: Apply RMSNorm + RoPE + scatter

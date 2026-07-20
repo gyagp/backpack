@@ -1,6 +1,5 @@
 // @meta generated=true
 enable f16;
-enable subgroups;
 
 // Fused QK-norm + RoPE kernel for single-token decode.
 // Applies RMSNorm (with learned weights) to Q/K, then RoPE, then scatters K/V to cache.
@@ -15,7 +14,8 @@ enable subgroups;
 
 const WG_SIZE: u32 = 128u;
 
-var<workgroup> _smem: array<f32, 8>;  // [0..3] = QK sum_sq, [4..7] = V sum_sq
+var<workgroup> _q_sums: array<f32, 128>;
+var<workgroup> _v_sums: array<f32, 128>;
 
 @group(0) @binding(0) var<storage, read> buf0: array<f32>;  // QKV
 @group(0) @binding(1) var<storage, read_write> buf1: array<f32>;  // Q_out
@@ -75,32 +75,26 @@ fn main(
         }
     }
 
-    // Subgroup reduction (32-wide) — all threads participate uniformly
-    sum_sq = subgroupAdd(sum_sq);
-    v_sum_sq = subgroupAdd(v_sum_sq);
-
-    // Write subgroup result to shared memory
-    let subgroup_id = tid / 32u;
-    let lane = tid % 32u;
-    if (lane == 0u) {
-        _smem[subgroup_id] = sum_sq;
-        if (do_vnorm) {
-            _smem[subgroup_id + 4u] = v_sum_sq;
-        }
-    }
+    // Workgroup reduction. Do not assume a particular hardware subgroup width:
+    // AMD commonly exposes 64-wide subgroups while other adapters use 32.
+    _q_sums[tid] = sum_sq;
+    _v_sums[tid] = v_sum_sq;
     workgroupBarrier();
-
-    // All threads read all 4 subgroup results and sum
-    var total = _smem[0] + _smem[1] + _smem[2] + _smem[3];
+    for (var stride: u32 = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            _q_sums[tid] += _q_sums[tid + stride];
+            _v_sums[tid] += _v_sums[tid + stride];
+        }
+        workgroupBarrier();
+    }
 
     // RMSNorm scale: 1 / sqrt(mean_sq + eps)
-    let rms_scale = 1.0 / sqrt(total / f32(HD) + params.eps);
+    let rms_scale = 1.0 / sqrt(_q_sums[0] / f32(HD) + params.eps);
 
     // V RMSNorm scale (only for KV heads with v_norm enabled)
     var v_rms_scale: f32 = 1.0;
     if (do_vnorm) {
-        let v_total = _smem[4] + _smem[5] + _smem[6] + _smem[7];
-        v_rms_scale = 1.0 / sqrt(v_total / f32(HD) + params.eps);
+        v_rms_scale = 1.0 / sqrt(_v_sums[0] / f32(HD) + params.eps);
     }
 
     // Step 2: Apply RMSNorm + RoPE + scatter
