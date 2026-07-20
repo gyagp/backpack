@@ -47,7 +47,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var cols: array<u32, 4>;
     var col_valid: array<bool, 4>;
     for (var c = 0u; c < COLS_PER_WARP; c++) {
-        cols[c] = wid.x * 32u + warp_id * COLS_PER_WARP + c;
+        cols[c] = wid.x * (8u * COLS_PER_WARP) + warp_id * COLS_PER_WARP + c;
         col_valid[c] = cols[c] < N;
     }
 
