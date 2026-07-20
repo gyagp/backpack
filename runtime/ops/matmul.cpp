@@ -674,8 +674,13 @@ static void opGatherBlockQuantized(OpContext& ex, const OnnxGraphNode& n,
             }
             idxBuf = ex.getGpu()->createBuffer("gbq_idx32", nIdx * 4);
             ex.getGpu()->writeBuffer(idxBuf, i32.data(), nIdx * 4);
-            // During fast decode capture: register this buffer for replay update.
-            if (ex.fastDecodeState() == ExecutionContext::FastDecodeState::Capturing) {
+            // Only a scalar token-embedding gather follows the generated token.
+            // Fixed int64 gathers (for example LM-head pruning tables) must not
+            // be overwritten during capture replay.
+            const bool tokenEmbeddingGather = nIdx == 1 && !n.inputs.empty() &&
+                n.inputs[0].find("embed_tokens") != std::string::npos;
+            if (ex.fastDecodeState() == ExecutionContext::FastDecodeState::Capturing &&
+                tokenEmbeddingGather) {
                 ex.exec.capturedTokenIdBufs_.push_back({idxBuf, nIdx});
             }
         }
