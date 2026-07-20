@@ -473,7 +473,15 @@ static void opCast(OpContext& ex, const OnnxGraphNode& n,
         n.name.find("/linear_attn/") != std::string::npos &&
         (n.name.find("/decay/g_cast/Cast") != std::string::npos ||
          n.name.find("/gated_norm/gated/Cast") != std::string::npos);
-    if (redundantQwenRecurrentCast) {
+    // Qwen's exported mRoPE subgraphs similarly cast their fp32 Q/K results
+    // to fp16 directly before GroupQueryAttention.  Backpack's native GQA
+    // computes in fp32 and would immediately allocate buffers to promote both
+    // inputs again.  Keep these exact graph edges in their accumulation type.
+    const bool redundantQwenGqaCast =
+        A->dtype == TensorDtype::Float32 && outDtype == TensorDtype::Float16 &&
+        (n.name.find("/attn/q_mrope/output/Cast") != std::string::npos ||
+         n.name.find("/attn/k_mrope/output/Cast") != std::string::npos);
+    if (redundantQwenRecurrentCast || redundantQwenGqaCast) {
         *out[0] = *A;
         return;
     }

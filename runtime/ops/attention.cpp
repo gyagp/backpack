@@ -219,8 +219,12 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
 
     // ─── Full GQA with KV cache and RoPE ─────────────────────────────────
 
-    // Record original dtype for output casting (attention computes in f32 internally)
-    TensorDtype origDtype = Q->dtype;
+    // Record the graph output dtype before promoting attention inputs.  Qwen's
+    // mRoPE Q/K casts may be elided because this kernel computes in fp32, but
+    // V retains the exported GQA input/output dtype.  Using Q here would make
+    // that input-only optimization accidentally change the graph output to
+    // fp32 and penalize downstream fp16 kernels on portable adapters.
+    TensorDtype origDtype = V->dtype;
 
     int64_t num_heads = n.GetInt("num_heads", 32);
     int64_t kv_heads = n.GetInt("kv_num_heads", num_heads);
