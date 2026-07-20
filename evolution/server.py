@@ -300,6 +300,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._error(500, f"internal error: {exc}")
 
+    def do_DELETE(self) -> None:
+        try:
+            path, actor = urlparse(self.path).path, self._actor()
+            match = re.fullmatch(r"/api/tasks/([^/]+)", path)
+            if not match:
+                return self._error(404, "not found")
+            if not self.server.store.delete_task(match.group(1), actor):
+                return self._error(404, "task not found")
+            return self._send_json({"deleted": True, "id": match.group(1)})
+        except Exception as exc:
+            self._error(500, f"internal error: {exc}")
+
     def _events(self) -> None:
         subscriber = self.server.events.subscribe()
         self.send_response(200)

@@ -437,6 +437,25 @@ class Store:
         task["runs"] = self.list_runs(task_id)
         return task
 
+    def delete_task(self, task_id: str, actor: str) -> bool:
+        """Remove an obsolete task and its operational records."""
+        if not self.get_task(task_id):
+            return False
+        with self._lock, self._db:
+            run_ids = [row[0] for row in self._db.execute(
+                "SELECT id FROM task_runs WHERE task_id=?", (task_id,)).fetchall()]
+            self._db.execute("UPDATE machines SET current_run_id=NULL WHERE current_run_id IN "
+                             "(SELECT id FROM task_runs WHERE task_id=?)", (task_id,))
+            for table in ("evidence", "evaluations", "decisions", "milestones", "task_runs"):
+                self._db.execute(f"DELETE FROM {table} WHERE task_id=?", (task_id,))
+            self._db.execute("UPDATE optimization_history SET task_id=NULL WHERE task_id=?", (task_id,))
+            self._db.execute("DELETE FROM audit_events WHERE entity_type='task' AND entity_id=?", (task_id,))
+            for run_id in run_ids:
+                self._db.execute("DELETE FROM audit_events WHERE entity_type='run' AND entity_id=?", (run_id,))
+            self._db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+            self.audit("task", task_id, "deleted", actor, {"reason": "obsolete task"})
+        return True
+
     def ensure_task_runs(self) -> list[dict[str, Any]]:
         created = []
         machines = self.list_machines()
