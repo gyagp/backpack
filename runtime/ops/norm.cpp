@@ -168,7 +168,13 @@ static void opSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
     if (out.size() > 1 && out[1] && out[1]->IsValid()) {
         rstdBuf = out[1]->buffer;
     } else {
-        rstdBuf = ex.getGpu()->createBuffer("rstd", std::max((int64_t)4, nRows * 4));
+        const uint32_t rstdBytes = (uint32_t)std::max((int64_t)4, nRows * 4);
+        // Decode commonly discards Rstd. Its tiny storage binding does not
+        // need a fresh WebGPU allocation for every norm and token; the
+        // execution-context pool provides a distinct buffer until the fence.
+        rstdBuf = rstdBytes <= 64
+            ? ex.getParamBuffer(rstdBytes)
+            : ex.getGpu()->createBuffer("rstd", rstdBytes);
     }
 
     struct { int32_t stride; int32_t N; float eps; } p;
