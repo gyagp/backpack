@@ -2256,11 +2256,18 @@ void ModelRunner::buildDecodePipeline() {
          !std::getenv("BP_Q35_GENERIC_KERNELS"));
     uint32_t Q8_TILE = 8;
     // Gemma 4 has only a few very wide query heads. Smaller attention chunks
-    // expose enough independent workgroups to occupy Vulkan GPUs; 8 tokens was
-    // the measured optimum on RTX 5080. Keep the general 64-token default for
-    // architectures with more heads and for non-Vulkan backends.
-    if (cfg.arch == "gemma4" && gpu->backendType == WGPUBackendType_Vulkan)
-        gqaChunkSize = 8;
+    // expose enough independent workgroups to occupy the GPU. Cross-device
+    // sweeps select 8 on NVIDIA/AMD and 16 on Intel Arc; Intel loses occupancy
+    // again at 8 due to the additional partial-reduction work.
+    if (cfg.arch == "gemma4") {
+        gqaChunkSize = gpu->adapterName.find("Intel") != std::string::npos
+            ? 16u : 8u;
+    }
+    if (const char* chunkEnv = std::getenv("BP_GQA_CHUNK_SIZE")) {
+        const int requested = std::atoi(chunkEnv);
+        if (requested == 8 || requested == 16 || requested == 32 || requested == 64)
+            gqaChunkSize = static_cast<uint32_t>(requested);
+    }
     uint32_t maxChunks = (maxSeqLen + gqaChunkSize - 1) / gqaChunkSize;
 
     // Load kernels from embedded shaders
