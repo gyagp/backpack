@@ -89,8 +89,15 @@ static size_t warmupGraphPipelines(GraphExecutor& ex) {
         addT("matmul_f32", WGSL_MATMUL_T, 4, TensorDtype::Float32);
         if (hasF16) addRaw("matmul_f16", WGSL_MATMUL_F16, 4);
     }
-    if (has("MatMulNBits"))
+    if (has("MatMulNBits")) {
         addRaw("matmul_q4", WGSL_MATMUL_Q4, 5);
+        const bool hasValidatedLogicalWarp =
+            ex.gpu->adapterName.find("AMD") == std::string::npos &&
+            ex.gpu->adapterName.find("Radeon") == std::string::npos;
+        if (ex.gpu->backendType == WGPUBackendType_D3D12 &&
+            ex.gpu->supportsSubgroups && hasValidatedLogicalWarp)
+            addRaw("matmul_q4_decode", WGSL_MATMUL_Q4_DECODE, 5);
+    }
     if (has("Gemm")) {
         addT("gemm", WGSL_GEMM_T, 5, TensorDtype::Float32);
         if (ex.gpu->supportsSubgroups) {

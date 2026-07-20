@@ -422,12 +422,31 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             outDtype = TensorDtype::Float32;
             *out[0] = ex.AllocTensor(outShape, outDtype);
         }
-        auto& pl = ex.GetPipelineT("matmul_q4", 5, []() { return std::string(WGSL_MATMUL_Q4); });
+        // Decode dominates Qwen runtime, and the scalar kernel below leaves
+        // one invocation to dequantize and reduce an entire output row.  The
+        // packed path mirrors ORT/llama.cpp: quantize each 32-value activation
+        // block once, then use dot4I8Packed across 32 output columns per
+        // workgroup.  Keep the scalar shader as the portable fallback.
+        // The shader forms logical 32-lane warps with subgroupShuffleXor.
+        // RDNA exposes 64-lane subgroups through Dawn and therefore needs the
+        // portable path until this kernel has an explicit wave64 reduction.
+        const bool hasValidatedLogicalWarp =
+            ex.getGpu()->adapterName.find("AMD") == std::string::npos &&
+            ex.getGpu()->adapterName.find("Radeon") == std::string::npos;
+        const bool usePackedDecode = M == 1 && (K % 256u) == 0u &&
+            ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
+            ex.getGpu()->supportsSubgroups && hasValidatedLogicalWarp;
+        auto& pl = usePackedDecode
+            ? ex.GetPipelineT("matmul_q4_decode", 5,
+                []() { return std::string(WGSL_MATMUL_Q4_DECODE); })
+            : ex.GetPipelineT("matmul_q4", 5,
+                []() { return std::string(WGSL_MATMUL_Q4); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pl.pipeline, bg,
-            (N + 255) / 256, (uint32_t)M, 1, "matmul_q4");
+            usePackedDecode ? (N + 31) / 32 : (N + 255) / 256,
+            (uint32_t)M, 1, usePackedDecode ? "matmul_q4_decode" : "matmul_q4");
     }
 }
 

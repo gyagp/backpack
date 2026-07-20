@@ -28,6 +28,12 @@ extern const char* g_currentOp;
 ExecutionContext::~ExecutionContext() {
     if (!gpu) return;
 
+    // Tensor-plan allocations are also referenced by tensorStore_ and may be
+    // queued for deferred release.  They are views of the same WebGPU buffer,
+    // not independent ownership.  Track them across all three containers so
+    // shutdown releases every underlying buffer exactly once.
+    std::set<WGPUBuffer> releasedBuffers;
+
     // Release captured bind groups
     ReleaseCaptured();
 
@@ -41,10 +47,8 @@ ExecutionContext::~ExecutionContext() {
 
     // Release tensor plan buffers
     if (tensorPlanValid_) {
-        std::set<WGPUBuffer> released;
         for (auto& [name, alloc] : tensorPlan_) {
-            if (alloc.buffer.handle && released.find(alloc.buffer.handle) == released.end()) {
-                released.insert(alloc.buffer.handle);
+            if (alloc.buffer.handle && releasedBuffers.insert(alloc.buffer.handle).second) {
                 gpu->releaseBuffer(alloc.buffer);
             }
         }
@@ -53,16 +57,15 @@ ExecutionContext::~ExecutionContext() {
 
     // Release deferred buffers
     for (auto& buf : deferredBufferReleases_) {
-        if (buf.handle) gpu->releaseBuffer(buf);
+        if (buf.handle && releasedBuffers.insert(buf.handle).second)
+            gpu->releaseBuffer(buf);
     }
     deferredBufferReleases_.clear();
 
     // Release intermediate tensors
     {
-        std::set<WGPUBuffer> released;
         for (auto& [name, tensor] : tensorStore_) {
-            if (tensor.buffer.handle && released.find(tensor.buffer.handle) == released.end()) {
-                released.insert(tensor.buffer.handle);
+            if (tensor.buffer.handle && releasedBuffers.insert(tensor.buffer.handle).second) {
                 gpu->releaseBuffer(tensor.buffer);
             }
         }
