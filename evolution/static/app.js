@@ -1,6 +1,7 @@
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,options={}){const r=await fetch(path,{headers:{'Content-Type':'application/json','X-Evolution-Actor':'dashboard'},...options});const v=await r.json();if(!r.ok)throw Error(v.error||r.statusText);return v}
-function badge(v){return `<span class="badge ${esc(v)}">${esc(v||'—')}</span>`}function num(v){return v==null?'—':Number(v).toFixed(2)}
+function statusLabel(v){return ({not_applicable:'Not tested',pending:'Pending',unknown:'Unknown'}[v]||v||'—')}
+function badge(v){return `<span class="badge ${esc(v)}">${esc(statusLabel(v))}</span>`}function num(v){return v==null?'—':Number(v).toFixed(2)}
 function shortDate(v){if(!v)return '—';const d=new Date(v);return Number.isNaN(d.valueOf())?String(v).slice(0,10):d.toISOString().slice(0,10)}
 async function refresh(){const [status,tasks,decisions,machines,matrix,history,activity,dismissedTodos,regressions,studies]=await Promise.all([api('/api/status'),api('/api/tasks'),api('/api/decisions?status=pending'),api('/api/machines'),api('/api/models/matrix'),api('/api/history'),api('/api/activity'),api('/api/todos/dismissed'),api('/api/regressions/confirmed'),api('/api/studies')]);
  const states=status.tasks||{};$('#stats').innerHTML=[['Cared models',status.cared_models||0],['Active tasks',Object.entries(states).filter(([k])=>!['integrated','rejected','failed','reverted'].includes(k)).reduce((n,[,v])=>n+v,0)],['Pending decisions',status.pending_decisions],['Configured devices',machines.length]].map(([l,v])=>`<div class="stat"><b>${v}</b><span>${l}</span></div>`).join('');
