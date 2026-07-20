@@ -1234,6 +1234,20 @@ void GraphExecutor::Execute(
             }
         }
 
+        ctx.plannedOutputHints_.clear();
+        ctx.plannedOutputHintCursor_ = 0;
+        if (ctx.tensorPlanValid_) {
+            for (const auto& outName : node.outputs) {
+                auto planned = ctx.tensorPlan_.find(outName);
+                if (planned == ctx.tensorPlan_.end()) continue;
+                GpuTensor hint;
+                hint.buffer = planned->second.buffer;
+                hint.shape = planned->second.shape;
+                hint.dtype = planned->second.dtype;
+                ctx.plannedOutputHints_.push_back(std::move(hint));
+            }
+        }
+
         if (kDebugExecTrace && graph_.nodes.size() > 1000 && ei < 128) {
             auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - execT0).count();

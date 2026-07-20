@@ -217,6 +217,8 @@ struct ExecutionContext {
     };
     std::unordered_map<std::string, TensorAlloc> tensorPlan_;
     bool tensorPlanValid_ = false;
+    std::vector<GpuTensor> plannedOutputHints_;
+    size_t plannedOutputHintCursor_ = 0;
 
     /// Invalidate warm execute caches.
     void InvalidateWarmCaches();

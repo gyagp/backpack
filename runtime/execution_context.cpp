@@ -494,6 +494,21 @@ WGPUBindGroup OpContext::MakeBindGroup(const CompiledPipeline& pl,
 }
 
 GpuTensor OpContext::AllocTensor(std::vector<int64_t> shape, TensorDtype dtype) {
+    // A warm graph execution has stable output shapes and buffers. Operators
+    // traditionally called AllocTensor unconditionally, discarding that plan
+    // and creating hundreds of WebGPU buffers per token. Consume an exact
+    // planned-output match before falling back to a fresh allocation.
+    for (size_t i = exec.plannedOutputHintCursor_;
+         i < exec.plannedOutputHints_.size(); ++i) {
+        auto& hint = exec.plannedOutputHints_[i];
+        if (hint.buffer.handle && hint.dtype == dtype && hint.shape == shape) {
+            GpuTensor result = hint;
+            result.cpuData.clear();
+            result.isCpuOnly = false;
+            exec.plannedOutputHintCursor_ = i + 1;
+            return result;
+        }
+    }
     return graph.AllocTensor(std::move(shape), dtype);
 }
 

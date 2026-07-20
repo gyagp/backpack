@@ -224,6 +224,7 @@ struct GenericOnnxState {
     bool fastDecodeEnabled = false;
     bool fastDecodeCaptured = false;
     bool prefillDone = false;
+    bool decodePlanInitialized = false;
     bool nlkWritten = false;
     std::vector<GPUBuffer> convCastF16Bufs;
     std::vector<WGPUBindGroup> convCastBindGroups;
@@ -327,6 +328,7 @@ struct GenericOnnxState {
     void ResetCaches() {
         pos = 0;
         prefillDone = false;
+        decodePlanInitialized = false;
         nlkWritten = false;
         convState.clear();
         recurrentState.clear();
@@ -589,6 +591,14 @@ struct GenericOnnxState {
 
     std::vector<float> RunStep(int64_t tokenId) {
         pos++;
+
+        // Prefill and decode have fundamentally different tensor shapes. A
+        // plan learned from the prompt cannot be reused for single-token
+        // decode; rebuild it once, then retain the stable decode allocations.
+        if (!decodePlanInitialized) {
+            execCtx.InvalidateWarmCaches();
+            decodePlanInitialized = true;
+        }
 
         // Fast Decode Replay Path
         if (fastDecodeEnabled && fastDecodeCaptured) {
