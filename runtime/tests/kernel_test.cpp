@@ -1639,6 +1639,98 @@ TEST(q4_gather_batched) {
     return assertClose((const float*)result.data(),expected.data(),M*D,1e-6f,0);
 }
 
+TEST(ple_project_combine_gemma_shape) {
+    const char* wgsl = R"(
+@group(0) @binding(0) var<storage, read> Proj: array<f32>;
+@group(0) @binding(1) var<storage, read> Norm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> TokenSignal: array<f32>;
+@group(0) @binding(3) var<storage, read> P: array<u32>;
+var<workgroup> squares: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let D = P[0]; let i = lid.x; let idx = wid.x * D + i;
+    let inRange = i < D;
+    var v = 0.0;
+    if (inRange) { v = Proj[idx]; }
+    squares[i] = v * v;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (i < stride) { squares[i] += squares[i + stride]; }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride /= 2u;
+    }
+    if (inRange) {
+        let rms = inverseSqrt(squares[0] / f32(D) + bitcast<f32>(P[2]));
+        TokenSignal[idx] = (v * rms * Norm[i] + TokenSignal[idx]) * 0.7071067811865476;
+    }
+}
+)";
+    const int D=256,L=3,N=D*L; Rng rng(0x504c45u);
+    auto proj=rng.uniformVec(N,-3.0f,3.0f), norm=rng.uniformVec(D,0.25f,1.75f);
+    auto signal=rng.uniformVec(N,-2.0f,2.0f), expected=signal;
+    const float eps=1.0e-6f;
+    for(int l=0;l<L;l++){
+        double ss=0;for(int i=0;i<D;i++)ss+=double(proj[l*D+i])*proj[l*D+i];
+        float rms=1.0f/std::sqrt(float(ss/D)+eps);
+        for(int i=0;i<D;i++)expected[l*D+i]=(proj[l*D+i]*rms*norm[i]+signal[l*D+i])*0.7071067811865476f;
+    }
+    auto bp=makeBuffer(gpu,"ple_proj",proj.data(),N),bn=makeBuffer(gpu,"ple_norm",norm.data(),D);
+    auto bs=makeBuffer(gpu,"ple_signal",signal.data(),N);
+    auto pp=makeParams(gpu,"ple_params",{D,L,f32AsU32(eps),0u});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bp},{1,bn},{2,bs},{3,pp}},L,1,1,bs,N*4,4);
+    return assertClose((const float*)result.data(),expected.data(),N,2e-5f,2e-5f);
+}
+
+TEST(ple_q4_asymmetric_gather_gemma_shape) {
+    const char* wgsl = R"(
+@group(0) @binding(0) var<storage, read> B: array<u32>;
+@group(0) @binding(1) var<storage, read> S: array<u32>;
+@group(0) @binding(2) var<storage, read> Z: array<u32>;
+@group(0) @binding(3) var<storage, read> Token: array<i32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read> P: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i=gid.x;let K=P[0];if(i>=K){return;}
+    let row=u32(max(Token[0],0));let V=P[2];let D=P[3];
+    let layer=i/D;let col=i%D;let packedRow=layer*V+row;
+    let byteIndex=packedRow*(D/2u)+col/2u;let word=B[byteIndex/4u];
+    let qv=i32((word>>((byteIndex&3u)*8u+(col&1u)*4u))&15u);
+    let block=packedRow*(D/32u)+col/32u;let zpByteIndex=block/2u;
+    let zpWord=Z[zpByteIndex/4u];let zpByte=(zpWord>>((zpByteIndex&3u)*8u))&255u;
+    let zp=i32(select(zpByte&15u,zpByte>>4u,(block&1u)==1u));
+    let sp=unpack2x16float(S[block/2u]);let scale=select(sp.x,sp.y,(block&1u)!=0u);
+    Y[i]=f32(qv-zp)*scale*bitcast<f32>(P[1]);
+}
+)";
+    const int D=256,L=3,V=5,K=D*L,blocks=D/32,rows=L*V;
+    std::vector<uint8_t> wb(rows*D/2),zb(rows*blocks/2);
+    std::vector<uint16_t> sh(rows*blocks);std::vector<float> expected(K);
+    for(size_t i=0;i<wb.size();i++)wb[i]=uint8_t((i*29u+7u)&255u);
+    for(int b=0;b<rows*blocks;b++){
+        int zp=(b*3+1)&15;zb[b/2]|=uint8_t(zp<<(4*(b&1)));
+        sh[b]=f32ToF16(.01f+.001f*float(b%11));
+    }
+    std::vector<uint32_t> W((wb.size()+3)/4),Z((zb.size()+3)/4),S((sh.size()+1)/2);
+    memcpy(W.data(),wb.data(),wb.size());memcpy(Z.data(),zb.data(),zb.size());
+    for(size_t i=0;i<sh.size();i++)S[i/2]|=uint32_t(sh[i])<<(16*(i&1));
+    int32_t token=3;float scale=16.0f;
+    for(int i=0;i<K;i++){
+        int row=(i/D)*V+token,col=i%D,b= row*blocks+col/32;
+        int q=(wb[row*D/2+col/2]>>(4*(col&1)))&15;
+        int zp=(zb[b/2]>>(4*(b&1)))&15;
+        expected[i]=float(q-zp)*f16ToF32(sh[b])*scale;
+    }
+    auto bw=makeBufferU32(gpu,"ple_w",W.data(),W.size()),bs=makeBufferU32(gpu,"ple_s",S.data(),S.size());
+    auto bz=makeBufferU32(gpu,"ple_z",Z.data(),Z.size()),bt=makeBufferI32(gpu,"ple_t",&token,1);
+    auto by=makeBuffer(gpu,"ple_y",nullptr,K);auto pp=makeParams(gpu,"ple_gp",{K,f32AsU32(scale),V,D});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,bs},{2,bz},{3,bt},{4,by},{5,pp}},ceilDiv(K,256),1,1,by,K*4,6);
+    return assertClose((const float*)result.data(),expected.data(),K,1e-6f,0);
+}
+
 TEST(q8_gather_batched) {
     auto wgsl=loadWgsl("quant_q8","q8_gather_batched");if(wgsl.empty())return{false,"cannot load kernel"};
     const int T=3,D=64,V=4,B=D/32;std::vector<uint32_t>W(V*D/4);for(size_t i=0;i<W.size();i++)W[i]=uint32_t(i*2654435761u);
