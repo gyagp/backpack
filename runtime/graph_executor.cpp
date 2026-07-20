@@ -889,7 +889,8 @@ GpuTensor GraphExecutor::AllocTensor(std::vector<int64_t> shape,
     std::string diagnosticLabel = "tmp";
     if (std::getenv("BP_EXEC_STATS") && g_currentOp) {
         std::string op = g_currentOp;
-        if (auto colon = op.find(':'); colon != std::string::npos) op.resize(colon);
+        if (auto colon = op.find(':'); colon != std::string::npos &&
+            op.compare(0, colon, "Cast") != 0) op.resize(colon);
         diagnosticLabel += ":" + op;
     }
     t.buffer = gpu->createBuffer(diagnosticLabel, bufBytes);
@@ -1526,7 +1527,7 @@ void GraphExecutor::Execute(
             return a.second > b.second;
         });
         fprintf(stderr, "  [buffer labels]");
-        for (size_t i = 0; i < std::min<size_t>(labels.size(), 12); ++i)
+        for (size_t i = 0; i < std::min<size_t>(labels.size(), 50); ++i)
             fprintf(stderr, " %s=%d", labels[i].first.c_str(), labels[i].second);
         fprintf(stderr, "\n");
     }

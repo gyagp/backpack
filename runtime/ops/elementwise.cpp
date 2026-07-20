@@ -464,6 +464,20 @@ static void opCast(OpContext& ex, const OnnxGraphNode& n,
         case 9: outDtype = TensorDtype::Bool; break;
     }
 
+    // Qwen 3.5 exports two fp32 -> fp16 casts per recurrent layer even
+    // though the native WebGPU consumers immediately promote those values
+    // back to fp32. Preserve the accumulation dtype across these exact graph
+    // edges, avoiding a lossy round-trip and three transient buffers/layer.
+    const bool redundantQwenRecurrentCast =
+        A->dtype == TensorDtype::Float32 && outDtype == TensorDtype::Float16 &&
+        n.name.find("/linear_attn/") != std::string::npos &&
+        (n.name.find("/decay/g_cast/Cast") != std::string::npos ||
+         n.name.find("/gated_norm/gated/Cast") != std::string::npos);
+    if (redundantQwenRecurrentCast) {
+        *out[0] = *A;
+        return;
+    }
+
     // Same type → alias
     if (outDtype == A->dtype) {
         *out[0] = *A;
