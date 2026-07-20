@@ -131,6 +131,9 @@ class FrameworkTest(unittest.TestCase):
         self.store.add_observation({"model_id": "perf-model", "machine_id": self.machine["id"],
                                     "framework": "backpack", "format": "gguf", "backend": "d3d12",
                                     "conformance": "pass", "metrics": {}, "revision": "test"}, "test")
+        self.store.add_observation({"model_id": "perf-model", "machine_id": self.machine["id"],
+                                    "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
+                                    "conformance": "pass", "metrics": {}, "revision": "test"}, "test")
         tasks = self.store.ensure_automatic_tasks()
         perf = [task for task in tasks if task["kind"] == "benchmark"]
         runtimes = [runtime for task in perf for runtime in task["manifest"]["runtimes"]]

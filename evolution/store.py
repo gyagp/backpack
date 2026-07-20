@@ -849,7 +849,20 @@ class Store:
     def model_matrix(self) -> dict[str, Any]:
         models = self.list_models(cared_only=True)
         machines = self.list_machines()
-        observations = self.latest_observations()
+        # Preserve the newest semantic result and the newest performance result
+        # independently. A benchmark observation uses ``not_applicable`` for
+        # conformance and must not overwrite an earlier pass/fail observation.
+        observations = []
+        evidence: dict[tuple[str, str, str, str, str], dict[str, dict[str, Any]]] = {}
+        for item in self.list_observations({}):
+            key = tuple(item[name] for name in ("model_id", "machine_id", "framework", "format", "backend"))
+            group = evidence.setdefault(key, {})
+            if "metrics" not in group and item.get("metrics"):
+                group["metrics"] = item
+            if "conformance" not in group and item["conformance"] in {"pass", "fail"}:
+                group["conformance"] = item
+        for group in evidence.values():
+            observations.extend({item["id"]: item for item in group.values()}.values())
         by_cell: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for item in observations:
             by_cell.setdefault((item["model_id"], item["machine_id"]), []).append(item)
@@ -895,21 +908,20 @@ class Store:
                 open_tasks.append(task)
 
             for cell in row["cells"]:
-                expected = []
+                candidates = []
                 if "gguf" in model.get("files", {}):
-                    if cell["conformant"]:
-                        expected.append(("backpack", "gguf", "webgpu"))
-                    expected.append(("llamacpp", "gguf", "vulkan"))
+                    candidates += [("backpack", "gguf", "webgpu"), ("llamacpp", "gguf", "vulkan")]
                 if "ort" in model.get("files", {}):
-                    if cell["conformant"]:
-                        expected.append(("backpack", "ort", "webgpu"))
-                    expected.append(("ort", "ort", "webgpu"))
+                    candidates += [("backpack", "ort", "webgpu"), ("ort", "ort", "webgpu")]
                 missing = []
-                for framework, fmt, backend in expected:
-                    result = next((item for item in cell["results"] if item["framework"] == framework
-                                   and item["format"] == fmt and item["backend"] == backend), None)
-                    if (not result or result.get("metrics", {}).get("prefill_tok_s") is None
-                            or result.get("metrics", {}).get("decode_tok_s") is None):
+                for framework, fmt, backend in candidates:
+                    matches = [item for item in cell["results"] if item["framework"] == framework
+                               and item["format"] == fmt and item["backend"] == backend]
+                    passed = any(item["conformance"] == "pass" for item in matches)
+                    measured = next((item for item in matches
+                                     if item.get("metrics", {}).get("prefill_tok_s") is not None
+                                     and item.get("metrics", {}).get("decode_tok_s") is not None), None)
+                    if passed and not measured:
                         missing.append({"framework": framework, "format": fmt, "backend": backend})
                 if not missing:
                     continue
