@@ -5385,16 +5385,27 @@ std::string ModelRunner::decodeAutotuneCachePath() const {
     fs::path modelPath(ggufPath);
     fs::path modelDir = modelPath.parent_path();
     std::string modelName = modelDir.filename().string();
-    if (modelName == "weights")
-        modelName = modelDir.parent_path().filename().string();
+    while (modelName == "weights" || modelName == "decoder" ||
+           modelName == "onnx-webgpu") {
+        modelDir = modelDir.parent_path();
+        modelName = modelDir.filename().string();
+    }
 
     fs::path repoRoot;
-    for (auto p = fs::absolute(modelPath); !p.empty() && p != p.parent_path(); p = p.parent_path()) {
-        if (fs::exists(p / ".gitignore") && fs::exists(p / "runtimes")) {
-            repoRoot = p;
-            break;
+    auto findRepo = [&](fs::path start) {
+        for (auto p = fs::absolute(start); !p.empty() && p != p.parent_path();
+             p = p.parent_path()) {
+            for (const auto& candidate : {p, p / "backpack"}) {
+                if (fs::is_directory(candidate / "gitignore") &&
+                    fs::exists(candidate / "runtime" / "CMakeLists.txt")) {
+                    return candidate;
+                }
+            }
         }
-    }
+        return fs::path{};
+    };
+    repoRoot = findRepo(modelPath);
+    if (repoRoot.empty()) repoRoot = findRepo(fs::current_path());
     if (repoRoot.empty())
         return {};
 
