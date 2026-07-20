@@ -156,13 +156,13 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
         exit(1);
     }
     // The K-quant kernels partition a workgroup into logical 32-lane columns.
-    // AMD can expose wider hardware subgroups, so its shaders use explicit
-    // workgroup-memory reductions. Preserve the lower-overhead subgroup path
-    // on NVIDIA/Intel, where the validated subgroup width is 32.
+    // Subgroup width is adapter/driver dependent. The optimized replacement
+    // below hard-codes 32 logical lanes, which is validated on NVIDIA but not
+    // on Intel Arc or AMD. Keep the portable workgroup-memory reduction there.
     std::string adapter = gpu->adapterName;
     std::transform(adapter.begin(), adapter.end(), adapter.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
-    if (adapter.find("amd") == std::string::npos) {
+    if (adapter.find("nvidia") != std::string::npos) {
         std::string source = it->second.source;
         bool patched = false;
         auto replaceRange = [&](const std::string& begin, const std::string& end,
@@ -2407,24 +2407,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 )";
     static const char* PLE_PROJECT_COMBINE_WGSL = R"(
-enable subgroups;
 @group(0) @binding(0) var<storage, read> Proj: array<f32>;
 @group(0) @binding(1) var<storage, read> Norm: array<f32>;
 @group(0) @binding(2) var<storage, read_write> TokenSignal: array<f32>;
 @group(0) @binding(3) var<storage, read> P: array<u32>;
-var<workgroup> warpSums: array<f32, 8>;
+var<workgroup> squares: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
     let D = P[0]; let i = lid.x; let idx = wid.x * D + i;
-    let v = Proj[idx];
-    let ws = subgroupAdd(v * v);
-    if ((i & 31u) == 0u) { warpSums[i / 32u] = ws; }
+    let inRange = i < D;
+    var v = 0.0;
+    if (inRange) { v = Proj[idx]; }
+    squares[i] = v * v;
     workgroupBarrier();
-    var total = 0.0;
-    for (var w = 0u; w < 8u; w++) { total += warpSums[w]; }
-    let rms = inverseSqrt(total / f32(D) + bitcast<f32>(P[2]));
-    TokenSignal[idx] = (v * rms * Norm[i] + TokenSignal[idx]) * 0.7071067811865476;
+    var stride = 128u;
+    loop {
+        if (i < stride) { squares[i] += squares[i + stride]; }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride /= 2u;
+    }
+    if (inRange) {
+        let rms = inverseSqrt(squares[0] / f32(D) + bitcast<f32>(P[2]));
+        TokenSignal[idx] = (v * rms * Norm[i] + TokenSignal[idx]) * 0.7071067811865476;
+    }
 }
 )";
     const CompiledPipeline* plPleTokenGather = pleGpuPreprocess
@@ -2438,23 +2445,26 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         ? &gpu->getOrCreatePipeline("ple_project_combine", std::string(PLE_PROJECT_COMBINE_WGSL), 4)
         : nullptr;
     static const char* RMS_NORM_ADD_WGSL = R"(
-enable subgroups;
 @group(0) @binding(0) var<storage, read_write> Dst: array<f32>;
 @group(0) @binding(1) var<storage, read> Src: array<f32>;
 @group(0) @binding(2) var<storage, read> W: array<f32>;
 @group(0) @binding(3) var<storage, read> P: array<u32>;
-var<workgroup> warpSums: array<f32, 8>;
+var<workgroup> sums: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x; let N = P[0]; let eps = bitcast<f32>(P[1]);
     var ss = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = Src[j]; ss += v * v; }
-    let ws = subgroupAdd(ss);
-    if ((tid & 31u) == 0u) { warpSums[tid / 32u] = ws; }
+    sums[tid] = ss;
     workgroupBarrier();
-    var total = 0.0;
-    for (var w = 0u; w < 8u; w++) { total += warpSums[w]; }
-    let rms = inverseSqrt(total / f32(N) + eps);
+    var stride = 128u;
+    loop {
+        if (tid < stride) { sums[tid] += sums[tid + stride]; }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride /= 2u;
+    }
+    let rms = inverseSqrt(sums[0] / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) {
         Dst[j] += Src[j] * rms * W[j];
     }
@@ -4033,24 +4043,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (cfg.hasSandwichNorm && lw.postFfwNorm.handle) {
                     auto& plRmsIP2 = gpu->getOrCreatePipeline("rms_norm_inplace",
                         std::string(R"(
-enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
-var<workgroup> wg_warp_sums: array<f32, 8>;
+var<workgroup> wg_sums: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
-    let warp_sum = subgroupAdd(sum_sq);
-    let warp_id = tid / 32u;
-    let lane = tid % 32u;
-    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    wg_sums[tid] = sum_sq;
     workgroupBarrier();
-    var total: f32 = 0.0;
-    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
-    let rms = 1.0 / sqrt(total / f32(N) + eps);
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { wg_sums[tid] += wg_sums[tid + stride]; }
+        workgroupBarrier();
+    }
+    let rms = 1.0 / sqrt(wg_sums[0] / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
 }
 )"), 3);
@@ -4124,24 +4132,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 } else {
                 auto& plRmsIPfw = gpu->getOrCreatePipeline("rms_norm_inplace",
                     std::string(R"(
-enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
-var<workgroup> wg_warp_sums: array<f32, 8>;
+var<workgroup> wg_sums: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
-    let warp_sum = subgroupAdd(sum_sq);
-    let warp_id = tid / 32u;
-    let lane = tid % 32u;
-    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    wg_sums[tid] = sum_sq;
     workgroupBarrier();
-    var total: f32 = 0.0;
-    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
-    let rms = 1.0 / sqrt(total / f32(N) + eps);
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { wg_sums[tid] += wg_sums[tid + stride]; }
+        workgroupBarrier();
+    }
+    let rms = 1.0 / sqrt(wg_sums[0] / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
 }
 )"), 3);
@@ -4253,24 +4259,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (lw.plePostNorm.handle) {
                 auto& plRmsIPple = gpu->getOrCreatePipeline("rms_norm_inplace",
                     std::string(R"(
-enable subgroups;
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<storage, read> _p_: array<u32>;
-var<workgroup> wg_warp_sums: array<f32, 8>;
+var<workgroup> wg_sums: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let N = _p_[0]; let eps = bitcast<f32>(_p_[1]); let tid = lid.x;
     var sum_sq: f32 = 0.0;
     for (var j = tid; j < N; j += 256u) { let v = X[j]; sum_sq += v * v; }
-    let warp_sum = subgroupAdd(sum_sq);
-    let warp_id = tid / 32u;
-    let lane = tid % 32u;
-    if (lane == 0u) { wg_warp_sums[warp_id] = warp_sum; }
+    wg_sums[tid] = sum_sq;
     workgroupBarrier();
-    var total: f32 = 0.0;
-    for (var w = 0u; w < 8u; w++) { total += wg_warp_sums[w]; }
-    let rms = 1.0 / sqrt(total / f32(N) + eps);
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) { wg_sums[tid] += wg_sums[tid + stride]; }
+        workgroupBarrier();
+    }
+    let rms = 1.0 / sqrt(wg_sums[0] / f32(N) + eps);
     for (var j = tid; j < N; j += 256u) { X[j] = X[j] * rms * W[j]; }
 }
 )"), 3);
