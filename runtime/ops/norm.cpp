@@ -258,12 +258,21 @@ static void opSkipSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*Skip);
         ex.EnsureGpu(*W);
-        auto& pl = ex.GetPipelineT("skip_rmsnorm_f16w", 6, []() { return std::string(WGSL_SKIP_RMSNORM_F16W); });
+        // ORT's workgroup-per-row reduction is substantially faster on
+        // NVIDIA and AMD. Intel's current D3D12 driver regresses with this
+        // layout, so retain the conformant serial row fallback there.
+        const bool useParallel = ex.getGpu()->adapterName.find("Intel") == std::string::npos;
+        auto& pl = useParallel
+            ? ex.GetPipelineT("skip_rmsnorm_f16w", 6,
+                []() { return std::string(WGSL_SKIP_RMSNORM_F16W); })
+            : ex.GetPipelineT("skip_rmsnorm_f16w_serial", 6,
+                []() { return std::string(WGSL_SKIP_RMSNORM_F16W_SERIAL); });
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, Skip->buffer}, {2, W->buffer},
             {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
         ex.QueueDispatch(pl.pipeline, bg,
-            (uint32_t)((nRows + 255) / 256), 1, 1, "skip_rmsnorm_f16w");
+            useParallel ? (uint32_t)nRows : (uint32_t)((nRows + 255) / 256),
+            1, 1, useParallel ? "skip_rmsnorm_f16w" : "skip_rmsnorm_f16w_serial");
         return;
     }
 

@@ -6,33 +6,23 @@ enable f16;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(4) var<storage, read_write> SkipOut: array<f32>;
 @group(0) @binding(5) var<storage, read> _params_: array<u32>;
-var<workgroup> sum_sq_shared: array<f32, 128>;
 
-@compute @workgroup_size(128)
-fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let N = _params_[0];
     let nRows = _params_[1];
     let eps = bitcast<f32>(_params_[2]);
-    let row = wid.x;
+    let row = gid.x;
     if (row >= nRows) { return; }
     let base = row * N;
     var sum_sq: f32 = 0.0;
-    for (var i = lid.x; i < N; i += 128u) {
+    for (var i = 0u; i < N; i++) {
         let v = X[base + i] + Skip[base + i];
         SkipOut[base + i] = v;
         sum_sq += v * v;
     }
-    sum_sq_shared[lid.x] = sum_sq;
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride >>= 1u) {
-        if (lid.x < stride) {
-            sum_sq_shared[lid.x] += sum_sq_shared[lid.x + stride];
-        }
-        workgroupBarrier();
-    }
-    let inv_rms = inverseSqrt(sum_sq_shared[0] / f32(N) + eps);
-    for (var i = lid.x; i < N; i += 128u) {
+    let inv_rms = inverseSqrt(sum_sq / f32(N) + eps);
+    for (var i = 0u; i < N; i++) {
         Y[base + i] = SkipOut[base + i] * inv_rms * f32(W[i]);
     }
 }
