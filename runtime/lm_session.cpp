@@ -218,7 +218,8 @@ struct GenericOnnxState {
     std::vector<int> convLayerIndices, attnLayerIndices;
 
     GPUBuffer idsBuf, positionBuf, maskBuf, nlkBuf, logitsBuf;
-    std::vector<GPUBuffer> convOutBufs;
+    std::vector<GPUBuffer> convOutBufs, convOutAltBufs;
+    std::vector<GPUBuffer> recurrentOutBufs, recurrentOutAltBufs;
     uint32_t maskBufCapacity = 0;
 
     bool fastDecodeEnabled = false;
@@ -391,9 +392,21 @@ struct GenericOnnxState {
         maskBuf = gpu->createBuffer("mask", maxSeqLen * 8);
         maskBufCapacity = (uint32_t)maxSeqLen;
         convOutBufs.resize(convLayerIndices.size());
+        convOutAltBufs.resize(convLayerIndices.size());
+        recurrentOutBufs.resize(convLayerIndices.size());
+        recurrentOutAltBufs.resize(convLayerIndices.size());
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string name = "conv_out_" + std::to_string(convLayerIndices[i]);
             convOutBufs[i] = gpu->createBuffer(name, convChannels * convLCache * 4);
+            convOutAltBufs[i] = gpu->createBuffer(name + "_alt", convChannels * convLCache * 4);
+            if (recurrentHeads > 0) {
+                const size_t bytes = static_cast<size_t>(recurrentHeads) *
+                    recurrentKeyDim * recurrentValueDim * 4;
+                recurrentOutBufs[i] = gpu->createBuffer(
+                    "recurrent_out_" + std::to_string(convLayerIndices[i]), bytes);
+                recurrentOutAltBufs[i] = gpu->createBuffer(
+                    "recurrent_out_alt_" + std::to_string(convLayerIndices[i]), bytes);
+            }
         }
     }
 
@@ -496,7 +509,10 @@ struct GenericOnnxState {
             std::string name = "present." + std::to_string(convLayerIndices[i]) + ".conv_state";
             convOuts[i].shape = {1, convChannels, convLCache};
             convOuts[i].dtype = TensorDtype::Float32;
-            convOuts[i].buffer = convOutBufs[i];
+            const std::string inputName = "past_key_values." +
+                std::to_string(convLayerIndices[i]) + ".conv_state";
+            convOuts[i].buffer = convState[inputName].buffer.handle == convOutBufs[i].handle
+                ? convOutAltBufs[i] : convOutBufs[i];
             outputs[name] = &convOuts[i];
         }
 
@@ -506,6 +522,11 @@ struct GenericOnnxState {
                                ".recurrent_state";
             recurrentOuts[i].shape = {1, recurrentHeads, recurrentKeyDim, recurrentValueDim};
             recurrentOuts[i].dtype = TensorDtype::Float32;
+            const std::string inputName = "past_key_values." +
+                std::to_string(convLayerIndices[i]) + ".recurrent_state";
+            recurrentOuts[i].buffer =
+                recurrentState[inputName].buffer.handle == recurrentOutBufs[i].handle
+                    ? recurrentOutAltBufs[i] : recurrentOutBufs[i];
             outputs[name] = &recurrentOuts[i];
         }
 
@@ -818,7 +839,10 @@ private:
             std::string name = "present." + std::to_string(convLayerIndices[i]) + ".conv_state";
             convOuts[i].shape = {1, convChannels, convLCache};
             convOuts[i].dtype = TensorDtype::Float32;
-            convOuts[i].buffer = convOutBufs[i];
+            const std::string inputName = "past_key_values." +
+                std::to_string(convLayerIndices[i]) + ".conv_state";
+            convOuts[i].buffer = convState[inputName].buffer.handle == convOutBufs[i].handle
+                ? convOutAltBufs[i] : convOutBufs[i];
             outputs[name] = &convOuts[i];
         }
 
@@ -828,6 +852,11 @@ private:
                                ".recurrent_state";
             recurrentOuts[i].shape = {1, recurrentHeads, recurrentKeyDim, recurrentValueDim};
             recurrentOuts[i].dtype = TensorDtype::Float32;
+            const std::string inputName = "past_key_values." +
+                std::to_string(convLayerIndices[i]) + ".recurrent_state";
+            recurrentOuts[i].buffer =
+                recurrentState[inputName].buffer.handle == recurrentOutBufs[i].handle
+                    ? recurrentOutAltBufs[i] : recurrentOutBufs[i];
             outputs[name] = &recurrentOuts[i];
         }
 

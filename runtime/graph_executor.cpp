@@ -1246,11 +1246,18 @@ void GraphExecutor::Execute(
         if (ctx.tensorPlanValid_) {
             for (const auto& outName : node.outputs) {
                 auto planned = ctx.tensorPlan_.find(outName);
-                if (planned == ctx.tensorPlan_.end()) continue;
                 GpuTensor hint;
-                hint.buffer = planned->second.buffer;
-                hint.shape = planned->second.shape;
-                hint.dtype = planned->second.dtype;
+                if (auto external = outputs.find(outName);
+                    external != outputs.end() && external->second &&
+                    external->second->buffer.handle) {
+                    hint = *external->second;
+                } else if (planned != ctx.tensorPlan_.end()) {
+                    hint.buffer = planned->second.buffer;
+                    hint.shape = planned->second.shape;
+                    hint.dtype = planned->second.dtype;
+                } else {
+                    continue;
+                }
                 ctx.plannedOutputHints_.push_back(std::move(hint));
             }
         }
