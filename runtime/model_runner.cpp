@@ -4807,8 +4807,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     bool isGemma = cfg.arch.rfind("gemma", 0) == 0;
     bool gemmaSerial = isGemma && (cfg.hasSandwichNorm || hasSharedKv);
     if (cfg.arch == "qwen35") {
-        if (gpu->backendType == WGPUBackendType_Vulkan &&
-            !std::getenv("BP_QWEN35_SERIAL_PREFILL")) {
+        const bool intelQwen4B = gpu->adapterName.find("Intel") != std::string::npos &&
+                                cfg.nEmbd > 2048;
+        if (!std::getenv("BP_QWEN35_SERIAL_PREFILL") && !intelQwen4B) {
             initQwen35PrefillResources();
         } else {
             fprintf(stderr, "  Prefill: Qwen3.5 serial path\n");
@@ -4866,7 +4867,9 @@ void ModelRunner::initQwen35PrefillResources() {
     (void)getKernel("rms_norm_batched");(void)getKernel("add_rms_norm_batched");
     (void)getKernel("gemma_norm_add_batched");
     (void)getKernel("add_inplace_batched");
-    for(const auto& pl:cfg.perLayer)if(pl.headDim)(void)getKernelHD("flash_attn_vulkan",pl.headDim);
+    for(const auto& pl:cfg.perLayer)if(pl.headDim)(void)getKernelHD(
+        gpu->backendType == WGPUBackendType_D3D12 ? "causal_attn" : "flash_attn_vulkan",
+        pl.headDim);
     qwen35Pf.ready=true;
     fprintf(stderr,"  Qwen3.5 hybrid batched prefill: enabled (chunk=%u)\n",C);
 }
@@ -6291,8 +6294,8 @@ int32_t ModelRunner::prefillQwen35Batched(
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},(M+3)/4,(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
-            if(t==GGUF_TYPE_Q4_K&&M>=8){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
-            else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
+            if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
+            else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
             else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
         for(uint32_t li=0;li<cfg.nLayer;li++){
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u build begin\n",li);fflush(stderr);}
@@ -6337,8 +6340,10 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto ropep=mkp(L+"rope_p",{M,cfg.nHead,cfg.nKvHeads,hd,posOffset+done,cacheLen,(uint32_t)cfg.ropeSections[0],(uint32_t)cfg.ropeSections[1],(uint32_t)cfg.ropeSections[2],(uint32_t)cfg.ropeSections[3],rotaryDim/2});
                 auto&rope=getKernel("qwen35_rope_kv_batched");add(rope,{{0,qwen35Pf.aq},{1,qwen35Pf.ak},{2,qwen35Pf.av},{3,qwen35Pf.qrot},{4,kvCache[li].K},{5,kvCache[li].V},{6,ropeCosBuf},{7,ropeSinBuf},{8,ropep}},std::max(cfg.nHead,cfg.nKvHeads),M,1,L+"rope");
                 float sc=1.0f/sqrtf((float)hd),ni=-1e9f;uint32_t sb,nb;memcpy(&sb,&sc,4);memcpy(&nb,&ni,4);
-                auto ap=mkp(L+"attn_p",{kd,cfg.nHead/cfg.nKvHeads,cacheLen+M,cacheLen,M,sb,nb,0},true);auto&att=getKernelHD("flash_attn_vulkan",hd);
-                add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,(M+15)/16,1,L+"attn");
+                auto ap=mkp(L+"attn_p",{kd,cfg.nHead/cfg.nKvHeads,cacheLen+M,cacheLen,M,sb,nb,0},true);
+                const bool mmaAttn=gpu->backendType!=WGPUBackendType_D3D12&&gpu->supportsSubgroupMatrix;
+                auto&att=getKernelHD(mmaAttn?"flash_attn_vulkan":"causal_attn",hd);
+                add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),1,L+"attn");
                 auto gp=mkp(L+"gate_p",{M*qd});auto&go=getKernel("gated_output_batched");add(go,{{0,qwen35Pf.attn},{1,qwen35Pf.ag},{2,qwen35Pf.aout},{3,gp}},(M*qd+255)/256,1,1,L+"gate");
                 mmk(qwen35Pf.aout,lw.oKQ,lw.oKQType,lw.oKQNBlocks,lw.oKQRowStride,zeroBiasE,qwen35Pf.proj,qd,E,L+"oproj");
             }
