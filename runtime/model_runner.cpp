@@ -1266,9 +1266,16 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                      weightQuantType == GGUF_TYPE_Q5_K ||
                      weightQuantType == GGUF_TYPE_Q6_K);
     weightsUseNativeKQ = isKQuant;
+    // The decode kernels below implement logical 32-lane warps with XOR
+    // shuffles.  NVIDIA and Intel D3D12 adapters have been validated with
+    // that mapping, while AMD exposes wave64 here and produces incorrect
+    // Gemma logits.  Keep AMD on the conformant Q8-expanded path until a
+    // wave64-native kernel is available.
+    const bool nativeQ4AdapterValidated =
+        gpu->adapterName.find("AMD") == std::string::npos;
     weightsAreNativeQ4 = cfg.arch == "gemma4" &&
                          weightQuantType == GGUF_TYPE_Q4_0 &&
-                         gpu->backendType != WGPUBackendType_D3D12 &&
+                         nativeQ4AdapterValidated &&
                          !std::getenv("BP_DISABLE_NATIVE_Q4");
     auto packKQ = [&](const void* data, uint32_t N, uint32_t K, GGUFType type) -> KQuantPacked {
         switch (type) {
@@ -5405,19 +5412,19 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
         auto& di = decodeDispatchIndices[i];
         auto& vbg = decodeVariantBGs[i];
 
-        if (di.qkv >= 0) {
+        if (di.qkv >= 0 && vbg.qkvBase) {
             auto& d = allDecodeDispatches[di.qkv];
             d.pipeline = tuning.decodeUseFastQkv && vbg.qkvFast ? plQ8Fast.pipeline : plQ8MatmulNorm.pipeline;
             d.bindGroup = tuning.decodeUseFastQkv && vbg.qkvFast ? vbg.qkvFast : vbg.qkvBase;
             autoDecodeDispatches[di.qkv + autoDecodePrefixCount] = d;
         }
-        if (di.oproj >= 0) {
+        if (di.oproj >= 0 && vbg.oprojBase) {
             auto& d = allDecodeDispatches[di.oproj];
             d.pipeline = tuning.decodeUseFastOproj && vbg.oprojFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
             d.bindGroup = tuning.decodeUseFastOproj && vbg.oprojFast ? vbg.oprojFast : vbg.oprojBase;
             autoDecodeDispatches[di.oproj + autoDecodePrefixCount] = d;
         }
-        if (di.gateup >= 0) {
+        if (di.gateup >= 0 && vbg.gateupBase) {
             auto& d = allDecodeDispatches[di.gateup];
             d.pipeline = tuning.decodeUseFastGateup && vbg.gateupFast ? plQ8Fast.pipeline : plQ8Matmul.pipeline;
             d.bindGroup = tuning.decodeUseFastGateup && vbg.gateupFast ? vbg.gateupFast : vbg.gateupBase;
@@ -5430,11 +5437,11 @@ void ModelRunner::applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
         if (!ps.dispatches.empty()) {
             for (uint32_t i = 0; i < cfg.nLayer; i++) {
                 auto& di = decodeDispatchIndices[i];
-                if (di.qkv >= 0)
+                if (di.qkv >= 0 && decodeVariantBGs[i].qkvBase)
                     ps.dispatches[di.qkv + autoDecodePrefixCount] = autoDecodeDispatches[di.qkv + autoDecodePrefixCount];
-                if (di.oproj >= 0)
+                if (di.oproj >= 0 && decodeVariantBGs[i].oprojBase)
                     ps.dispatches[di.oproj + autoDecodePrefixCount] = autoDecodeDispatches[di.oproj + autoDecodePrefixCount];
-                if (di.gateup >= 0)
+                if (di.gateup >= 0 && decodeVariantBGs[i].gateupBase)
                     ps.dispatches[di.gateup + autoDecodePrefixCount] = autoDecodeDispatches[di.gateup + autoDecodePrefixCount];
             }
         }
@@ -5524,6 +5531,8 @@ std::string ModelRunner::decodeAutotuneCacheKey() const {
         << ";head_dim=" << cfg.headDim
         << ";kv_heads=" << cfg.nKvHeads
         << ";intermediate=" << cfg.intermediateSize
+        << ";native_kq=" << (weightsUseNativeKQ ? 1 : 0)
+        << ";native_q4=" << (weightsAreNativeQ4 ? 1 : 0)
         << ";invocations=" << effectiveLimits(*gpu).maxComputeInvocationsPerWorkgroup
         << ";wgmem=" << effectiveLimits(*gpu).maxComputeWorkgroupStorageSize
         << ";pool_cap=" << decodePoolCapacity
