@@ -820,6 +820,31 @@ TEST(fused_silu) {
     assertCloseVec(outputs["Y"].asFloat32(), expected, 1e-4f, 1e-4f, "fused_silu");
 }
 
+TEST(fused_silu_broadcast) {
+    Rng rng(2718);
+    auto x = rng.randnVec(24);
+    std::vector<float> gate = {0.5f, -1.25f, 2.0f};
+    std::vector<float> expected(x.size());
+    for (int i = 0; i < 24; ++i) {
+        int channel = (i / 4) % 3;
+        expected[i] = x[i] / (1.0f + expf(-x[i])) * gate[channel];
+    }
+
+    auto model = buildOnnxModel(
+        {{"Sigmoid", {"/mlp/gate"}, {"S"}, {}},
+         {"Mul", {"S", "/mlp/gate"}, {"A"}, {}},
+         {"Mul", {"A", "/mlp/up"}, {"Y"}, {}}},
+        {{"/mlp/gate", ONNX_FLOAT, {2, 3, 4}},
+         {"/mlp/up", ONNX_FLOAT, {1, 3, 1}}},
+        {{"Y", ONNX_FLOAT, {2, 3, 4}}});
+
+    auto outputs = runOnnxModel(gpu, model,
+        {{"/mlp/gate", makeInputF32("/mlp/gate", {2, 3, 4}, x)},
+         {"/mlp/up", makeInputF32("/mlp/up", {1, 3, 1}, gate)}}, {"Y"});
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 1e-4f, 1e-4f,
+                   "fused_silu_broadcast");
+}
+
 TEST(relu) {
     std::vector<float> x = {-2, -1, 0, 1, 2};
     std::vector<float> expected = {0, 0, 0, 1, 2};
@@ -1708,6 +1733,7 @@ int main(int argc, char** argv) {
     RUN(mul);
     RUN(sigmoid);
     RUN(fused_silu);
+    RUN(fused_silu_broadcast);
     RUN(relu);
     RUN(neg);
 

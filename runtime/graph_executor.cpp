@@ -1303,11 +1303,21 @@ void GraphExecutor::Execute(
             }
 
             if (ok) {
-                EnsureGpu(*primaryIn);
+                std::vector<GPUBuffer> extBuffers;
+                std::vector<std::vector<int64_t>> extShapes;
+                for (auto* input : extInputs) {
+                    if (!input || !input->IsValid() || input->shape.size() > 4) {
+                        ok = false;
+                        break;
+                    }
+                    EnsureGpu(*input);
+                    extBuffers.push_back(input->buffer);
+                    extShapes.push_back(input->shape);
+                }
+                if (!ok) continue;
                 int64_t N = 1;
-                for (auto d : primaryIn->shape) N *= d;
-                const auto primaryShape = primaryIn->shape;
-                const GPUBuffer primaryBuffer = primaryIn->buffer;
+                for (auto d : extShapes[0]) N *= d;
+                const auto primaryShape = extShapes[0];
 
                 // Ensure output tensor exists (last node's output) in per-session store
                 auto& outTensor = ctx.tensorStore_[group.outputName];
@@ -1320,16 +1330,14 @@ void GraphExecutor::Execute(
                         return group.shaderGenerator(dtype);
                     });
 
-                // Build params: [N, N_E0, N_E1, ...]
+                // Build right-aligned rank-4 shape params for ONNX broadcasting.
                 std::vector<uint32_t> params = {(uint32_t)N};
-                for (size_t ei2 = 1; ei2 < extInputs.size(); ei2++) {
-                    if (extInputs[ei2] && extInputs[ei2]->IsValid()) {
-                        int64_t en = 1;
-                        for (auto d : extInputs[ei2]->shape) en *= d;
-                        params.push_back((uint32_t)en);
-                    } else {
-                        params.push_back((uint32_t)N);
-                    }
+                for (auto& shape : extShapes) {
+                    uint32_t dims[4] = {1, 1, 1, 1};
+                    size_t pad = 4 - shape.size();
+                    for (size_t d = 0; d < shape.size(); ++d)
+                        dims[pad + d] = (uint32_t)shape[d];
+                    params.insert(params.end(), dims, dims + 4);
                 }
                 size_t pbSize = std::max((size_t)16, params.size() * 4);
                 auto paramBuf = ctx.getParamBuffer((uint32_t)pbSize);
@@ -1337,16 +1345,12 @@ void GraphExecutor::Execute(
 
                 // Build bind group
                 std::vector<std::pair<uint32_t, GPUBuffer>> bindings = {
-                    {0, primaryBuffer},
+                    {0, extBuffers[0]},
                     {1, outTensor.buffer},
                     {2, paramBuf}
                 };
-                for (size_t ei2 = 1; ei2 < extInputs.size(); ei2++) {
-                    if (extInputs[ei2] && extInputs[ei2]->IsValid()) {
-                        EnsureGpu(*extInputs[ei2]);
-                        bindings.push_back({(uint32_t)(2 + ei2), extInputs[ei2]->buffer});
-                    }
-                }
+                for (size_t ei2 = 1; ei2 < extBuffers.size(); ei2++)
+                    bindings.push_back({(uint32_t)(2 + ei2), extBuffers[ei2]});
 
                 auto bg = MakeBindGroup(pl, bindings, &ctx);
                 uint32_t nwg = (uint32_t)(((N + 1) / 2 + 255) / 256);

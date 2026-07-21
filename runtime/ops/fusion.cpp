@@ -179,9 +179,17 @@ static std::string generateFusedElementwiseShader(
     ss << "\n@compute @workgroup_size(256)\n";
     ss << "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n";
     ss << "    let N = _params_[0];\n";
-    // Extra N values for broadcasting
+    // Shapes are right-aligned to rank 4. Params are:
+    // [N, X.d0, X.d1, X.d2, X.d3, E0.d0..d3, E1.d0..d3, ...].
+    ss << "    let X0 = _params_[1]; let X1 = _params_[2];\n";
+    ss << "    let X2 = _params_[3]; let X3 = _params_[4];\n";
     for (int b = 3; b < totalBindings; b++) {
-        ss << "    let N_E" << (b - 3) << " = _params_[" << (b - 2) << "];\n";
+        const int bi = b - 3;
+        const int off = 5 + bi * 4;
+        ss << "    let E" << bi << "0 = _params_[" << off << "]; ";
+        ss << "let E" << bi << "1 = _params_[" << off + 1 << "];\n";
+        ss << "    let E" << bi << "2 = _params_[" << off + 2 << "]; ";
+        ss << "let E" << bi << "3 = _params_[" << off + 3 << "];\n";
     }
     ss << "    let base = gid.x * 2u;\n";
     ss << "    if (base >= N) { return; }\n\n";
@@ -208,10 +216,20 @@ static std::string generateFusedElementwiseShader(
                 int shaderBinding = stepExtraBindings[si];
                 if (shaderBinding >= 0) {
                     int bi = shaderBinding - 3;
-                    otherRead = "t_read(&E" + std::to_string(bi) +
-                        ", select(" + idxExpr + ", " + idxExpr + " % N_E" +
-                        std::to_string(bi) + ", N_E" + std::to_string(bi) +
-                        " < N && N_E" + std::to_string(bi) + " > 0u))";
+                    const std::string p = std::to_string(bi);
+                    const std::string idx = idxExpr;
+                    const std::string c3 = "((" + idx + ") % X3)";
+                    const std::string q3 = "((" + idx + ") / X3)";
+                    const std::string c2 = "(" + q3 + " % X2)";
+                    const std::string q2 = "(" + q3 + " / X2)";
+                    const std::string c1 = "(" + q2 + " % X1)";
+                    const std::string c0 = "(" + q2 + " / X1)";
+                    const std::string eidx =
+                        "(((select(0u, " + c0 + ", E" + p + "0 > 1u) * E" + p + "1 + " +
+                        "select(0u, " + c1 + ", E" + p + "1 > 1u)) * E" + p + "2 + " +
+                        "select(0u, " + c2 + ", E" + p + "2 > 1u)) * E" + p + "3 + " +
+                        "select(0u, " + c3 + ", E" + p + "3 > 1u))";
+                    otherRead = "t_read(&E" + p + ", " + eidx + ")";
                 } else {
                     // Reuse X (the chain's primary input)
                     otherRead = std::string("t_read(&X, ") + idxExpr + ")";
@@ -263,8 +281,8 @@ void GraphExecutor::DetectFusions() {
 
         // Start with the shape-preserving SiLU identity only:
         //   sigmoid(x) -> mul(sigmoid(x), x)
-        // Longer chains can introduce multidimensional ONNX broadcasting and
-        // are handled by a later shape-aware fusion stage.
+        // A third Mul is the common SiLU(x) * gate pattern. Its external input
+        // is indexed with full right-aligned ONNX broadcasting in the shader.
         const auto& first = graph_.nodes[chain[0]];
         const auto& second = graph_.nodes[chain[1]];
         if (first.opType != "Sigmoid" || second.opType != "Mul" ||
@@ -274,7 +292,10 @@ void GraphExecutor::DetectFusions() {
             (second.inputs[0] == first.outputs[0] && second.inputs[1] == first.inputs[0]) ||
             (second.inputs[1] == first.outputs[0] && second.inputs[0] == first.inputs[0]);
         if (!exactSilu) continue;
-        chain.resize(2);
+        const bool fuseMlpGate = chain.size() >= 3 &&
+            graph_.nodes[chain[2]].opType == "Mul" &&
+            first.inputs[0].find("/mlp/") != std::string::npos;
+        chain.resize(fuseMlpGate ? 3 : 2);
 
         // Build step descriptors
         std::vector<FusedElemStep> steps;
