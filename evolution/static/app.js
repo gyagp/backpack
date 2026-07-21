@@ -130,7 +130,6 @@ async function refresh() {
   ]
     .map(([l, v]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`)
     .join("");
-  $("#nav-task-count").textContent = tasks.length || "";
   $("#nav-device-count").textContent = machines.length || "";
   const enriched = activity.tasks || activity.active_tasks || [],
     terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
@@ -760,24 +759,25 @@ function taskDisplayStatus(task) {
 function renderTaskDirectory(tasks, history) {
   const search = $("#task-search"), status = $("#task-status-filter"),
     source = $("#task-source-filter"), target = $("#all-tasks");
-  const populate = (select, values, label) => {
-    const current = select.value;
-    select.innerHTML = `<option value="">All ${label}</option>${[...new Set(values)].sort().map((x) => `<option value="${esc(x)}">${esc(statusLabel(x))}</option>`).join("")}`;
-    select.value = current;
+  const populate = (container, values) => {
+    const current = new Set([...container.querySelectorAll("input:checked")].map((x) => x.value));
+    container.innerHTML = [...new Set(values)].sort().map((x) =>
+      `<label><input type="checkbox" value="${esc(x)}"${current.has(x) ? " checked" : ""}><span>${esc(statusLabel(x))}</span></label>`).join("");
   };
-  populate(status, tasks.map(taskDisplayStatus), "statuses");
-  populate(source, tasks.map(taskSource), "sources");
+  populate(status, tasks.map(taskDisplayStatus));
+  populate(source, tasks.map(taskSource));
   const apply = () => {
-    const query = search.value.trim().toLowerCase(), statusValue = status.value,
-      sourceValue = source.value;
+    const query = search.value.trim().toLowerCase(),
+      statusValues = new Set([...status.querySelectorAll("input:checked")].map((x) => x.value)),
+      sourceValues = new Set([...source.querySelectorAll("input:checked")].map((x) => x.value));
     const filtered = tasks.filter((task) => {
       const haystack = [taskLabel(task), task.id, task.title, taskSource(task),
         taskResult(task), task.verdict_reason,
         ...(task.runs || []).flatMap((run) => [run.machine_name, run.machine_id, run.error])]
         .filter(Boolean).join(" ").toLowerCase();
       return (!query || haystack.includes(query)) &&
-        (!statusValue || taskDisplayStatus(task) === statusValue) &&
-        (!sourceValue || taskSource(task) === sourceValue);
+        (!statusValues.size || statusValues.has(taskDisplayStatus(task))) &&
+        (!sourceValues.size || sourceValues.has(taskSource(task)));
     });
     target.innerHTML = renderTaskTable(filtered, history, "matching");
     $("#task-list-count").textContent = `${filtered.length} of ${tasks.length}`;
@@ -786,7 +786,10 @@ function renderTaskDirectory(tasks, history) {
   };
   search.oninput = apply; status.onchange = apply; source.onchange = apply;
   $("#clear-task-filters").onclick = () => {
-    search.value = ""; status.value = ""; source.value = ""; apply();
+    search.value = "";
+    document.querySelectorAll("#task-status-filter input,#task-source-filter input")
+      .forEach((input) => input.checked = false);
+    apply();
   };
   apply();
 }

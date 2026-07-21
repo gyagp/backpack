@@ -105,6 +105,26 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("b10069", metric["revision"])
         self.assertEqual(20, metric["metrics"]["decode_tok_s"])
 
+    def test_valid_latest_measurement_closes_automatic_task(self) -> None:
+        model = self.store.upsert_model({"id": "measured", "name": "Measured", "files": {"gguf": {}}})
+        task = self.store.create_task({
+            "title": "Collect measured performance", "kind": "benchmark",
+            "hypothesis": "A valid measurement completes collection",
+            "origin": {"type": "automatic", "model_id": model["id"],
+                       "machine_id": self.machine["id"]},
+            "manifest": {"metrics": ["prefill_tok_s", "decode_tok_s"],
+                         "runtimes": [{"framework": "llamacpp", "format": "gguf",
+                                       "backend": "vulkan"}]},
+        }, "test")
+        self.store.add_observation({
+            "model_id": model["id"], "machine_id": self.machine["id"],
+            "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
+            "conformance": "pass", "revision": "b1",
+            "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20},
+        }, "test")
+        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
+
     def test_history_keeps_detailed_gain(self) -> None:
         item = self.store.add_history({
             "title": "Fused projection", "summary": "Removed two dispatches",

@@ -911,6 +911,56 @@ class Store:
         ) x ON o.model_id=x.model_id AND o.machine_id=x.machine_id AND o.framework=x.framework
           AND o.format=x.format AND o.backend=x.backend AND o.created_at=x.latest""")
 
+    def reconcile_completed_tasks(self) -> int:
+        """Close operational tasks only when their authoritative evidence is complete."""
+        latest = {(o["model_id"], o["machine_id"], o["framework"],
+                   o["format"], o["backend"]): o for o in self.latest_observations()}
+        closed: list[tuple[str, str]] = []
+        terminal = {"integrated", "rejected", "reverted"}
+        for task in self.list_tasks():
+            if task["state"] in terminal:
+                continue
+            origin, manifest = task.get("origin", {}), task.get("manifest", {})
+            reason = ""
+            if origin.get("type") == "automatic" and manifest.get("metrics"):
+                model_id, machine_id = origin.get("model_id"), origin.get("machine_id")
+                runtimes = manifest.get("runtimes") or []
+                valid = bool(model_id and machine_id and runtimes)
+                for runtime in runtimes:
+                    backend = runtime.get("backend")
+                    if backend in {"d3d12", "webgpu-native"}:
+                        backend = "webgpu"
+                    observation = latest.get((model_id, machine_id,
+                                              runtime.get("framework"),
+                                              runtime.get("format"), backend))
+                    metrics = observation.get("metrics", {}) if observation else {}
+                    valid = valid and bool(observation and observation.get("conformance") == "pass"
+                                           and metrics.get("prefill_tok_s") is not None
+                                           and metrics.get("decode_tok_s") is not None)
+                if valid:
+                    reason = "Latest matching conformance and prefill/decode measurements are valid"
+            elif origin.get("type") == "scheduled" or (
+                    origin.get("type") == "continuous-learning"
+                    and task["title"].startswith("Profile ")):
+                runs = self.list_runs(task["id"])
+                if runs and all(run["status"] == "completed"
+                                and run.get("result", {}).get("exit_code") == 0 for run in runs):
+                    reason = "All assigned operational runs completed successfully"
+            if reason:
+                closed.append((task["id"], reason))
+        if not closed:
+            return 0
+        now = utc_now()
+        with self._lock, self._db:
+            for task_id, reason in closed:
+                old = self.get_task(task_id)
+                self._db.execute("""UPDATE tasks SET state='integrated',aggregate_verdict='accepted',
+                  verdict_reason=?,updated_at=? WHERE id=?""", (reason, now, task_id))
+                self.audit("task", task_id, "reconciled", "task-reconciler",
+                           {"from": old["state"] if old else "unknown", "to": "integrated",
+                            "reason": reason})
+        return len(closed)
+
     def list_observations(self, filters: dict[str, str]) -> list[dict[str, Any]]:
         allowed = {"model_id", "machine_id", "framework", "format", "backend"}
         where, values = [], []
@@ -1007,6 +1057,7 @@ class Store:
 
     def ensure_automatic_tasks(self) -> list[dict[str, Any]]:
         """Create conformance work first, then perf collection for passing cells."""
+        self.reconcile_completed_tasks()
         created = []
         matrix = self.model_matrix()
         open_tasks = self.list_tasks()
