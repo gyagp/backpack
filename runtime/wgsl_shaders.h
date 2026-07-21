@@ -12507,28 +12507,30 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             if (valid[c]) {
                 let base = cols[c] * rs + b * BLOCK_WORDS;
                 let dm = unpack2x16float(W[base]);
-                let dv = u8_at(base, 4u + j);
-                let mv = u8_at(base, 8u + j);
+                let shift = j * 8u;
+                let dv = (W[base + 1u] >> shift) & 255u;
+                let mv = (W[base + 2u] >> shift) & 255u;
                 var sc: u32;
                 var mn: u32;
                 if (sb < 4u) {
                     sc = dv & 63u;
                     mn = mv & 63u;
                 } else {
-                    let md = u8_at(base, 12u + j);
+                    let md = (W[base + 3u] >> shift) & 255u;
                     sc = (md & 15u) | ((dv >> 2u) & 48u);
                     mn = (md >> 4u) | ((mv >> 2u) & 48u);
                 }
-                var w0 = 0u;
-                var w1 = 0u;
-                for (var i = 0u; i < 4u; i++) {
-                    let qb0 = u8_at(base, 16u + qgroup * 32u + elem0 + i);
-                    let qb1 = u8_at(base, 20u + qgroup * 32u + elem0 + i);
-                    let q0 = select(qb0 & 15u, qb0 >> 4u, high);
-                    let q1 = select(qb1 & 15u, qb1 >> 4u, high);
-                    w0 |= q0 << (i * 8u);
-                    w1 |= q1 << (i * 8u);
-                }
+                // Eight consecutive payload bytes are two aligned words.
+                // Masking their low/high nibbles directly produces the packed
+                // signed-dot operands without eight byte-addressed loads.
+                let payload = base + 4u + qgroup * 8u + elem0 / 4u;
+                let packed0 = W[payload];
+                let packed1 = W[payload + 1u];
+                let nibble_mask = 0x0F0F0F0Fu;
+                let w0 = select(packed0 & nibble_mask,
+                    (packed0 >> 4u) & nibble_mask, high);
+                let w1 = select(packed1 & nibble_mask,
+                    (packed1 >> 4u) & nibble_mask, high);
                 let dot = dot4I8Packed(aq0, w0) + dot4I8Packed(aq1, w1);
                 acc[c] += xs[sb] * (dm.x * f32(sc) * f32(dot) -
                                      dm.y * f32(mn) * f32(asum));
@@ -12610,31 +12612,30 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             let dm = unpack2x16float(W[base]);
             let sb = lane / 4u;
             let j = sb & 3u;
-            let dv = u8_at(base, 4u + j);
-            let mv = u8_at(base, 8u + j);
+            let shift = j * 8u;
+            let dv = (W[base + 1u] >> shift) & 255u;
+            let mv = (W[base + 2u] >> shift) & 255u;
             var sc: u32;
             var mn: u32;
             if (sb < 4u) {
                 sc = dv & 63u;
                 mn = mv & 63u;
             } else {
-                let md = u8_at(base, 12u + j);
+                let md = (W[base + 3u] >> shift) & 255u;
                 sc = (md & 15u) | ((dv >> 2u) & 48u);
                 mn = (md >> 4u) | ((mv >> 2u) & 48u);
             }
             let qgroup = sb / 2u;
             let high = (sb & 1u) != 0u;
             let elem0 = (lane & 3u) * 8u;
-            var w0 = 0u;
-            var w1 = 0u;
-            for (var i = 0u; i < 4u; i++) {
-                let qb0 = u8_at(base, 16u + qgroup * 32u + elem0 + i);
-                let qb1 = u8_at(base, 20u + qgroup * 32u + elem0 + i);
-                let q0 = select(qb0 & 15u, qb0 >> 4u, high);
-                let q1 = select(qb1 & 15u, qb1 >> 4u, high);
-                w0 |= q0 << (i * 8u);
-                w1 |= q1 << (i * 8u);
-            }
+            let payload = base + 4u + qgroup * 8u + elem0 / 4u;
+            let packed0 = W[payload];
+            let packed1 = W[payload + 1u];
+            let nibble_mask = 0x0F0F0F0Fu;
+            let w0 = select(packed0 & nibble_mask,
+                (packed0 >> 4u) & nibble_mask, high);
+            let w1 = select(packed1 & nibble_mask,
+                (packed1 >> 4u) & nibble_mask, high);
             let aq0 = xq[lane * 2u];
             let aq1 = xq[lane * 2u + 1u];
             let dot = dot4I8Packed(aq0, w0) + dot4I8Packed(aq1, w1);
