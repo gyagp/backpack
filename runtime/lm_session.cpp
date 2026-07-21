@@ -1803,8 +1803,21 @@ void LmSession::EnableProfiling() {
 void LmSession::PrintProfileReport(const std::string& htmlPath) {
     if (!impl_) return;
     if (impl_->backend == Impl::Backend::GenericOnnx) {
-        // Run a profiled decode step
         auto* gen = impl_->gen_.get();
+        if (std::getenv("BP_PROFILE_PREFILL")) {
+            constexpr uint32_t kProfileTokens = 64;
+            std::vector<int32_t> tokens(kProfileTokens, 1);
+            gen->ResetCaches();
+            gen->execCtx.enableGpuProfiling();
+            auto pt0 = std::chrono::steady_clock::now();
+            gen->RunPrefillBatch(tokens.data(), kProfileTokens);
+            auto pt1 = std::chrono::steady_clock::now();
+            double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
+            gen->execCtx.printGpuProfileReport(kProfileTokens, profMs, htmlPath);
+            return;
+        }
+
+        // Run a profiled decode step.
         gen->ResetCaches();
         int32_t tok = 1;
         auto logits = gen->RunPrefillStep(tok);

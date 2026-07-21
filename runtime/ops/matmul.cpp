@@ -435,14 +435,23 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         // packed path mirrors ORT/llama.cpp: quantize each 32-value activation
         // block once, then use dot4I8Packed across 32 output columns per
         // workgroup.  Keep the scalar shader as the portable fallback.
-        const bool usePackedDecode = M == 1 && (K % 256u) == 0u &&
+        const bool usePacked = (K % 256u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
+        // This kernel maps logical warps with a fixed 32-lane layout. AMD and
+        // Intel expose different subgroup widths through Dawn and fail factual
+        // Qwen validation, so retain their scalar conformant prefill path.
+        const bool usePackedPrefill = M > 1 && usePacked &&
+            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
+        const bool usePackedDecode = M == 1 && usePacked;
         const bool useTwoColumnDecode = usePackedDecode &&
             (K == 2048u || K == 6144u);
         const bool useOneColumnDecode = useTwoColumnDecode &&
             ex.getGpu()->adapterName.find("Intel") == std::string::npos;
-        auto& pl = useTwoColumnDecode
+        auto& pl = usePackedPrefill
+            ? ex.GetPipelineT("matmul_q4_batched", 5,
+                []() { return std::string(WGSL_MATMUL_Q4_BATCHED); })
+            : useTwoColumnDecode
             ? ex.GetPipelineT(useOneColumnDecode ? "matmul_q4_decode_1col" :
                                                "matmul_q4_decode_2col", 5,
               [useOneColumnDecode]() {
@@ -462,10 +471,13 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pl.pipeline, bg,
-            useOneColumnDecode ? (N + 7) / 8
+            usePackedPrefill ? (N + 31) / 32
+                : useOneColumnDecode ? (N + 7) / 8
                 : useTwoColumnDecode ? (N + 15) / 16
                 : usePackedDecode ? (N + 31) / 32 : (N + 255) / 256,
-            (uint32_t)M, 1, useOneColumnDecode ? "matmul_q4_decode_1col"
+            usePackedPrefill ? ((uint32_t)M + 3) / 4 : (uint32_t)M, 1,
+            usePackedPrefill ? "matmul_q4_batched"
+                : useOneColumnDecode ? "matmul_q4_decode_1col"
                 : useTwoColumnDecode ? "matmul_q4_decode_2col"
                 : usePackedDecode ? "matmul_q4_decode" : "matmul_q4");
     }
