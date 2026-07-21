@@ -874,6 +874,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [attention] gqa_decode — dtype template
 static const char* WGSL_GQA_DECODE_T = R"WGSL(
+enable subgroups;
 // GQA decode — single query attending to all KV cache entries.
 // Q: [num_heads * head_dim]  (f32, single token)
 // K: [kv_heads, kv_stride, head_dim]  (f32, kv_stride >= total_seq)
@@ -893,9 +894,14 @@ ${T_WRITE}
 @group(0) @binding(3) var<storage, read_write> Out: array<${T}>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
 
+var<workgroup> score_scratch: array<f32, 8>;
+
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(subgroup_invocation_id) sg_lane: u32,
+        @builtin(subgroup_id) sg_id: u32,
+        @builtin(num_subgroups) num_sg: u32) {
     let num_heads = _params_[0];
     let head_dim = _params_[1];
     let total_seq = _params_[2];
@@ -922,12 +928,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     for (var s = 0u; s < total_seq; s++) {
         let k_base = (kv_h * kv_stride + s) * head_dim;
 
-        // Compute Q·K score once per position (same for all dims)
+        // Compute Q·K once cooperatively instead of repeating the full dot
+        // product in every output-dimension thread.
         var score: f32 = 0.0;
-        for (var dd = 0u; dd < head_dim; dd++) {
+        for (var dd = d0; dd < head_dim; dd += 64u) {
             score += t_read(&Q, q_base + dd) * t_read(&K, k_base + dd);
         }
-        score *= scale;
+        score = subgroupAdd(score);
+        if (sg_lane == 0u) { score_scratch[sg_id] = score; }
+        workgroupBarrier();
+        if (d0 == 0u) {
+            var total = 0.0;
+            for (var sg = 0u; sg < num_sg; sg++) { total += score_scratch[sg]; }
+            score_scratch[0] = total;
+        }
+        workgroupBarrier();
+        score = score_scratch[0] * scale;
 
         // Online softmax
         let m_new = max(m_prev, score);

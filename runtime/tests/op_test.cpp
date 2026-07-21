@@ -1832,6 +1832,63 @@ TEST(linear_attention_gated_delta_vec4) {
                    "linear_attention state");
 }
 
+TEST(gqa_decode_subgroup_score) {
+    constexpr int H = 2, KVH = 1, D = 64, PAST = 3, TOTAL = PAST + 1;
+    std::vector<float> q(H * D), k(D), v(D);
+    std::vector<float> pastK(PAST * D), pastV(PAST * D);
+    for (int i = 0; i < H * D; ++i) q[i] = float((i % 17) - 8) * 0.009f;
+    for (int i = 0; i < D; ++i) {
+        k[i] = float((i % 11) - 5) * 0.012f;
+        v[i] = float((i % 13) - 6) * 0.015f;
+    }
+    for (int i = 0; i < PAST * D; ++i) {
+        pastK[i] = float((i % 19) - 9) * 0.007f;
+        pastV[i] = float((i % 23) - 11) * 0.006f;
+    }
+
+    std::vector<float> allK(TOTAL * D), allV(TOTAL * D), expected(H * D);
+    std::copy(pastK.begin(), pastK.end(), allK.begin());
+    std::copy(pastV.begin(), pastV.end(), allV.begin());
+    std::copy(k.begin(), k.end(), allK.begin() + PAST * D);
+    std::copy(v.begin(), v.end(), allV.begin() + PAST * D);
+    const float scale = 1.0f / sqrtf(float(D));
+    for (int h = 0; h < H; ++h) {
+        std::vector<float> scores(TOTAL), weights(TOTAL);
+        float maxScore = -1e30f, sum = 0.0f;
+        for (int s = 0; s < TOTAL; ++s) {
+            float dot = 0.0f;
+            for (int d = 0; d < D; ++d) dot += q[h * D + d] * allK[s * D + d];
+            scores[s] = dot * scale;
+            maxScore = std::max(maxScore, scores[s]);
+        }
+        for (int s = 0; s < TOTAL; ++s) { weights[s] = expf(scores[s] - maxScore); sum += weights[s]; }
+        for (int d = 0; d < D; ++d)
+            for (int s = 0; s < TOTAL; ++s)
+                expected[h * D + d] += weights[s] / sum * allV[s * D + d];
+    }
+
+    auto model = buildOnnxModel(
+        {{"GroupQueryAttention", {"Q", "K", "V", "PK", "PV", "", ""},
+          {"Y", "PresentK", "PresentV"},
+          {{"num_heads", AttrDef::INT, H}, {"kv_num_heads", AttrDef::INT, KVH},
+           {"scale", AttrDef::FLOAT, 0, scale}, {"do_rotary", AttrDef::INT, 0}}}},
+        {{"Q", ONNX_FLOAT, {1, 1, H * D}}, {"K", ONNX_FLOAT, {1, 1, KVH * D}},
+         {"V", ONNX_FLOAT, {1, 1, KVH * D}}, {"PK", ONNX_FLOAT, {1, KVH, PAST, D}},
+         {"PV", ONNX_FLOAT, {1, KVH, PAST, D}}},
+        {{"Y", ONNX_FLOAT, {1, 1, H * D}}, {"PresentK", ONNX_FLOAT, {1, KVH, TOTAL, D}},
+         {"PresentV", ONNX_FLOAT, {1, KVH, TOTAL, D}}});
+    auto outputs = runOnnxModel(gpu, model,
+        {{"Q", makeInputF32("Q", {1, 1, H * D}, q)},
+         {"K", makeInputF32("K", {1, 1, KVH * D}, k)},
+         {"V", makeInputF32("V", {1, 1, KVH * D}, v)},
+         {"PK", makeInputF32("PK", {1, KVH, PAST, D}, pastK)},
+         {"PV", makeInputF32("PV", {1, KVH, PAST, D}, pastV)}},
+        {"Y", "PresentK", "PresentV"});
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 2e-5f, 2e-4f, "gqa output");
+    assertCloseVec(outputs["PresentK"].asFloat32(), allK, 1e-6f, 1e-6f, "gqa present key");
+    assertCloseVec(outputs["PresentV"].asFloat32(), allV, 1e-6f, 1e-6f, "gqa present value");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -1878,6 +1935,7 @@ int main(int argc, char** argv) {
     RUN(matmul);
     RUN(matmul_nbits_q4_decode);
     RUN(linear_attention_gated_delta_vec4);
+    RUN(gqa_decode_subgroup_score);
     RUN(softmax);
     RUN(simplified_layer_norm);
     RUN(softplus);
