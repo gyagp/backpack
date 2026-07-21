@@ -1772,6 +1772,45 @@ TEST(matmul_nbits_q4_decode) {
                    "matmul_nbits_q4_decode");
 }
 
+TEST(matmul_nbits_q8_decode) {
+    constexpr int K = 256, N = 37, block = 32;
+    std::vector<float> x(K), expected(N, 0.0f);
+    for (int g = 0; g < K / block; ++g) {
+        x[g * block] = 127.0f;
+        for (int j = 1; j < block; ++j)
+            x[g * block + j] = float((j * 17 + g * 3) % 127 - 63);
+    }
+
+    InitializerDef weights{"W", ONNX_UINT8, {N, K / block, block}, {}};
+    weights.rawData.resize(N * K);
+    std::vector<float> scaleValues(N * (K / block));
+    for (int n = 0; n < N; ++n) {
+        for (int g = 0; g < K / block; ++g) {
+            const float requested = 0.003f * float(1 + (n + 2 * g) % 7);
+            scaleValues[n * (K / block) + g] =
+                f16ToF32(f32ToF16(requested));
+        }
+        for (int k = 0; k < K; ++k) {
+            const uint8_t q = uint8_t((n * 13 + k * 7) & 255);
+            weights.rawData[n * K + k] = q;
+            expected[n] += x[k] * float(int(q) - 128) *
+                scaleValues[n * (K / block) + k / block];
+        }
+    }
+
+    auto model = buildOnnxModel(
+        {{"MatMulNBits", {"X", "W", "S"}, {"Y"},
+          {{"K", AttrDef::INT, K}, {"N", AttrDef::INT, N},
+           {"bits", AttrDef::INT, 8}, {"block_size", AttrDef::INT, block}}}},
+        {{"X", ONNX_FLOAT, {1, 1, K}}},
+        {{"Y", ONNX_FLOAT, {1, 1, N}}},
+        {weights, makeInitF16("S", {N, K / block}, scaleValues)});
+    auto outputs = runOnnxModel(gpu, model,
+        {{"X", makeInputF32("X", {1, 1, K}, x)}}, {"Y"});
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 5e-2f, 5e-4f,
+                   "matmul_nbits_q8_decode");
+}
+
 TEST(linear_attention_gated_delta_vec4) {
     constexpr int T = 1, DK = 128, DV = 8;
     std::vector<float> q(T * DK), k(T * DK), v(T * DV);
@@ -1934,6 +1973,7 @@ int main(int argc, char** argv) {
     // Compute
     RUN(matmul);
     RUN(matmul_nbits_q4_decode);
+    RUN(matmul_nbits_q8_decode);
     RUN(linear_attention_gated_delta_vec4);
     RUN(gqa_decode_subgroup_score);
     RUN(softmax);

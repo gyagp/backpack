@@ -538,7 +538,11 @@ class Store:
                     argv.append("--benchmark")
             else:
                 spec = (model or {}).get("conformance_spec", {})
-                argv += ["--prompt", spec.get("prompt", "What is 2 + 2?"), "--max-tokens", "32"]
+                # Some conformant models emit a short reasoning/preamble before
+                # the required fact. Keep this bounded, but avoid false failures
+                # caused solely by truncating a correct answer.
+                argv += ["--prompt", spec.get("prompt", "What is 2 + 2?"),
+                         "--max-tokens", str(spec.get("max_tokens", 64))]
             manifest = {**manifest, "adapter": "argv", "argv": argv}
             with self._lock, self._db:
                 self._db.execute("UPDATE tasks SET manifest_json=?,updated_at=? WHERE id=?",
