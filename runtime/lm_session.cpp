@@ -506,24 +506,20 @@ struct GenericOnnxState {
             return argmax(logits.data(), (int64_t)logits.size());
         }
 
-        // Large fully-dynamic Qwen batches currently exceed the reliable
-        // shape/arena envelope on D3D12. Preserve state across bounded batches;
-        // this still reduces a 128-token prompt from 128 graph executions to 2.
-        // The exported Qwen 3.5 recurrent graph is not sequence-parallel:
-        // Conv and GatedDeltaNet carry state from token t to t+1. Executing
-        // M>1 as independent rows corrupts that recurrence. ORT GenAI updates
-        // these states in token order, so use single-token chunks until the
-        // graph executor has a fused causal recurrent scan.
-        uint32_t qwenPrefillChunk = 1;
-        if (const char* value = std::getenv("BP_QWEN_PREFILL_CHUNK"))
-            qwenPrefillChunk = std::max(1, atoi(value));
-        if (arch == "qwen3_5_text" && T > qwenPrefillChunk) {
-            int32_t result = -1;
-            for (uint32_t offset = 0; offset < T; offset += qwenPrefillChunk) {
-                const uint32_t count = std::min(qwenPrefillChunk, T - offset);
-                result = RunPrefillBatch(tokenIds + offset, count);
-            }
-            return result;
+        // Qwen's exported recurrent graph must advance one token at a time,
+        // but its per-token shape is identical during prompt ingestion and
+        // generation.  Route the serial prompt through the stable single-token
+        // plan so graph capture can amortize command encoding after the first
+        // few tokens.  RunPrefillStep() used to rebuild/submit the full ONNX
+        // graph for every prompt token, leaving the GPU idle for ~98% of wall
+        // time.  RunStep() preserves exactly the same recurrent/KV ordering
+        // while reusing the two Qwen ping-pong capture variants.
+        if (arch == "qwen3_5_text") {
+            prefillDone = true;
+            std::vector<float> logits;
+            for (uint32_t i = 0; i < T; ++i)
+                logits = RunStep(tokenIds[i]);
+            return argmax(logits.data(), (int64_t)logits.size());
         }
 
         pos += T;
