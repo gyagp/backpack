@@ -254,15 +254,27 @@ void GraphExecutor::DetectFusions() {
     fusedGroups_.clear();
     fusedNodeIndices_.clear();
 
-    // Fusion disabled for now — focus on dynamic shader generation first
-    return;
-
     auto consumers = buildConsumerMap(graph_);
     auto chains = findElementwiseChains(graph_, consumers);
 
     int totalFused = 0;
     for (auto& chain : chains) {
         if (chain.size() < 2) continue;
+
+        // Start with the shape-preserving SiLU identity only:
+        //   sigmoid(x) -> mul(sigmoid(x), x)
+        // Longer chains can introduce multidimensional ONNX broadcasting and
+        // are handled by a later shape-aware fusion stage.
+        const auto& first = graph_.nodes[chain[0]];
+        const auto& second = graph_.nodes[chain[1]];
+        if (first.opType != "Sigmoid" || second.opType != "Mul" ||
+            first.inputs.empty() || first.outputs.empty() || second.inputs.size() < 2)
+            continue;
+        const bool exactSilu =
+            (second.inputs[0] == first.outputs[0] && second.inputs[1] == first.inputs[0]) ||
+            (second.inputs[1] == first.outputs[0] && second.inputs[0] == first.inputs[0]);
+        if (!exactSilu) continue;
+        chain.resize(2);
 
         // Build step descriptors
         std::vector<FusedElemStep> steps;

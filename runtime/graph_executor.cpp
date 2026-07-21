@@ -1306,10 +1306,12 @@ void GraphExecutor::Execute(
                 EnsureGpu(*primaryIn);
                 int64_t N = 1;
                 for (auto d : primaryIn->shape) N *= d;
+                const auto primaryShape = primaryIn->shape;
+                const GPUBuffer primaryBuffer = primaryIn->buffer;
 
                 // Ensure output tensor exists (last node's output) in per-session store
                 auto& outTensor = ctx.tensorStore_[group.outputName];
-                outTensor = AllocTensor(primaryIn->shape, dtype);
+                outTensor = AllocTensor(primaryShape, dtype);
 
                 // Build pipeline with dtype suffix
                 std::string pname = group.pipelineName + dtypeSuffix(dtype);
@@ -1335,7 +1337,7 @@ void GraphExecutor::Execute(
 
                 // Build bind group
                 std::vector<std::pair<uint32_t, GPUBuffer>> bindings = {
-                    {0, primaryIn->buffer},
+                    {0, primaryBuffer},
                     {1, outTensor.buffer},
                     {2, paramBuf}
                 };

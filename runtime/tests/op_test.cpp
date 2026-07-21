@@ -802,6 +802,24 @@ TEST(sigmoid) {
     assertCloseVec(outputs["Y"].asFloat32(), expected);
 }
 
+TEST(fused_silu) {
+    Rng rng(31415);
+    auto x = rng.randnVec(513);  // exercise paired writes and the odd tail
+    std::vector<float> expected(x.size());
+    for (size_t i = 0; i < x.size(); i++)
+        expected[i] = x[i] / (1.0f + expf(-x[i]));
+
+    auto model = buildOnnxModel(
+        {{"Sigmoid", {"X"}, {"S"}, {}},
+         {"Mul", {"S", "X"}, {"Y"}, {}}},
+        {{"X", ONNX_FLOAT, {513}}},
+        {{"Y", ONNX_FLOAT, {513}}});
+
+    auto outputs = runOnnxModel(gpu, model,
+        {{"X", makeInputF32("X", {513}, x)}}, {"Y"});
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 1e-4f, 1e-4f, "fused_silu");
+}
+
 TEST(relu) {
     std::vector<float> x = {-2, -1, 0, 1, 2};
     std::vector<float> expected = {0, 0, 0, 1, 2};
@@ -1689,6 +1707,7 @@ int main(int argc, char** argv) {
     RUN(sub);
     RUN(mul);
     RUN(sigmoid);
+    RUN(fused_silu);
     RUN(relu);
     RUN(neg);
 
