@@ -52,8 +52,10 @@ function taskSource(t) {
   return (
     {
       "continuous-learning": "Evolution",
+      "learning-study": "Evolution",
       automatic: "Automation",
       scheduled: "Scheduled automation",
+      "history-import": "Performance history",
       human: "Manual",
     }[type] || type.replaceAll("-", " ")
   );
@@ -119,24 +121,9 @@ async function refresh() {
       (t) =>
         !terminal.has(t.state) &&
         !(t.runs || []).some((r) => r.status === "running"),
-    );
+  );
   $("#task-count").textContent = `${pending.length} pending`;
-  $("#tasks").innerHTML = pending.length
-    ? pending
-        .map((t) => {
-          const p = t.activity || {
-              percent: progress(t.state),
-              elapsed_seconds: (Date.now() - Date.parse(t.created_at)) / 1000,
-              basis: "lifecycle",
-            },
-            assignments = (t.runs || [])
-              .map((r) => `${r.machine_name}: ${r.status}`)
-              .join(" · "),
-            reason = failureReason(t);
-          return `<div class="row"><div><strong>${esc(t.title)}</strong><div class="meta">Created ${esc(t.created_at ? new Date(t.created_at).toLocaleString() : "not recorded")} · Start not yet assigned · ${formatDuration(p.elapsed_seconds)} queued</div><div class="meter"><i style="width:${p.percent}%"></i></div><div class="meta">${p.percent}% toward goal${assignments ? ` · ${esc(assignments)}` : ""}</div>${reason ? `<div class="task-failure"><strong>Failure reason:</strong> ${esc(reason)}</div>` : ""}</div><div>${renderImpactBadge(classifyHistoryImpact(null))} ${badge(t.state)} ${t.aggregate_verdict ? badge(t.aggregate_verdict) : ""}<button class="secondary detail" data-id="${esc(t.id)}">View</button></div></div>`;
-        })
-        .join("")
-    : '<div class="empty">No pending tasks.</div>';
+  $("#tasks").innerHTML = renderTaskTable(pending, history, "pending");
   const todoHistory = [
     ...history,
     ...regressions.map((r) => ({
@@ -151,13 +138,19 @@ async function refresh() {
   renderMatrix(matrix);
   renderPerformanceAnalysis();
   renderPerformanceTrend(observations);
-  renderDoneTasks(history, enriched, machines);
-  renderDigest(history);
+  const done = enriched.filter((t) => terminal.has(t.state));
+  $("#done-tasks").innerHTML = renderTaskTable(done, history, "done");
+  $("#done-count").textContent = `${done.length} done`;
+  $("#done-tab-count").textContent = done.length || "";
+  renderDigest(history, enriched);
   renderStudies(studies, tasks);
   renderStudyFeedback(studies, tasks, history);
   renderDevices(machines);
   renderActivity(activity);
-  $("#active-work").innerHTML = renderDeviceTaskGroups(activity);
+  const active = enriched.filter((task) =>
+    (task.runs || []).some((run) => run.status === "running"),
+  );
+  $("#active-work").innerHTML = renderTaskTable(active, history, "active");
   updateTaskTabs(enriched);
   document
     .querySelectorAll(".activity-toggle")
@@ -712,6 +705,47 @@ function taskTiming(task, finishedAt) {
       start && end ? (Date.parse(end) - Date.parse(start)) / 1000 : null;
   return { start, duration };
 }
+function renderTaskTable(tasks, history = [], mode = "pending") {
+  if (!tasks.length)
+    return `<div class="empty">No ${esc(mode)} tasks.</div>`;
+  const historyByTask = new Map();
+  for (const item of history) {
+    if (!item.task_id) continue;
+    if (!historyByTask.has(item.task_id)) historyByTask.set(item.task_id, []);
+    historyByTask.get(item.task_id).push(item);
+  }
+  const terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
+    stamp = (value) => value ? new Date(value).toLocaleString() : "—";
+  const rows = [...tasks]
+    .sort((a, b) => (a.task_number || Infinity) - (b.task_number || Infinity))
+    .map((task) => {
+      const runs = task.runs || [],
+        records = historyByTask.get(task.id) || [],
+        running = runs.find((run) => run.status === "running"),
+        latestRun = [...runs].sort((a, b) =>
+          String(b.updated_at || "").localeCompare(String(a.updated_at || "")),
+        )[0],
+        starts = runs.map((run) => run.started_at).filter(Boolean).sort(),
+        ends = runs.map((run) => run.completed_at).filter(Boolean).sort(),
+        started = starts[0] || null,
+        done = terminal.has(task.state)
+          ? ends.at(-1) || records.map((item) => item.created_at).filter(Boolean).sort().at(-1) || task.updated_at
+          : null,
+        durationEnd = done || (running ? new Date().toISOString() : null),
+        duration = started && durationEnd
+          ? Math.max(0, (Date.parse(durationEnd) - Date.parse(started)) / 1000)
+          : null,
+        devices = [...new Map(runs.map((run) => [
+          run.machine_id,
+          `${run.machine_name || run.machine_id} · ${run.status}`,
+        ])).values()],
+        impact = records.length ? historyGroupImpact(records) : classifyHistoryImpact(null),
+        result = records[0]?.summary || taskResult(task, running || latestRun),
+        reason = failureReason(task);
+      return `<tr><td class="task-id-cell"><strong>${esc(taskLabel(task))}</strong></td><td><strong>${esc(task.title)}</strong><div class="meta mono">${esc(task.id)}</div></td><td>${esc(taskSource(task))}</td><td>${badge(running?.status || task.state)}</td><td><div class="task-table-result">${renderImpactBadge(impact)}<span>${esc(reason || result)}</span></div></td><td>${esc(stamp(task.created_at))}</td><td>${esc(stamp(started))}</td><td>${esc(stamp(done))}</td><td>${duration == null ? "—" : formatDuration(duration)}</td><td>${devices.length ? devices.map((device) => `<span class="task-device-chip">${esc(device)}</span>`).join("") : "—"}</td><td><button class="secondary detail" data-id="${esc(task.id)}">View</button></td></tr>`;
+    }).join("");
+  return `<div class="table-wrap task-table-wrap"><table class="task-table"><thead><tr><th>ID</th><th>Task</th><th>Source</th><th>Status</th><th>Result</th><th>Created</th><th>Started</th><th>Done</th><th>Duration</th><th>Devices</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
 function renderDoneTasks(items, tasks = [], machines = []) {
   const taskById = new Map(tasks.map((t) => [t.id, t])),
     groups = new Map();
@@ -832,17 +866,21 @@ function digestItems(items) {
         title,
         summary: normalize(item.summary),
         digestModels: new Set(),
+        digestTaskIds: new Set(),
       });
     const group = groups.get(key);
     if (item.model_id) group.digestModels.add(item.model_id);
+    if (item.task_id) group.digestTaskIds.add(item.task_id);
   }
   return [...groups.values()].map((item) => {
     const models = [...item.digestModels].map((id) =>
       id.replace("qwen3.5-", "").toUpperCase(),
-    );
+    ), taskIds = [...item.digestTaskIds];
     delete item.digestModels;
+    delete item.digestTaskIds;
     return {
       ...item,
+      task_ids: taskIds,
       summary: `${item.summary}${models.length > 1 ? ` Affected models: ${models.join(", ")}.` : ""}`,
     };
   });
@@ -920,7 +958,7 @@ function digestCalendar(items) {
       level = !entries.length ? 0 : major ? 4 : Math.min(3, entries.length),
       tone = negative ? "regression" : "gain",
       details = entries
-        .map((x) => `${x.title} — ${x.impact?.name || "Measured result"}`)
+        .map((x) => `${(x.task_labels || []).join(", ") || "#—"} ${x.title} — ${x.impact?.name || "Measured result"}`)
         .join("\n");
     cells.push(
       `<button type="button" class="digest-square ${entries.length ? `${tone} level-${level}` : ""}" data-date="${esc(key)}" title="${esc(`${key}: ${entries.length} item${entries.length === 1 ? "" : "s"}${details ? `\n${details}` : ""}`)}" aria-label="${esc(`${key}, ${entries.length} progress items`)}"></button>`,
@@ -929,10 +967,14 @@ function digestCalendar(items) {
   }
   return `<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w, label]) => `<span style="left:${w * 15}px">${esc(label)}</span>`).join("")}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join("")}</div></div><div class="digest-heatmap-footer"><span class="digest-regression-key">Regression</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`;
 }
-function renderDigest(items) {
+function renderDigest(items, tasks = []) {
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
   const digest = digestItems(items).map((item) => ({
     ...item,
     impact: { ...item.impact, name: digestImpactName(item.impact) },
+    task_labels: (item.task_ids || []).map((id) =>
+      taskById.has(id) ? taskLabel(taskById.get(id)) : id,
+    ),
   }));
   $("#digest").innerHTML = `${digestCalendar(digest)}<div id="digest-day-detail" class="digest-day-detail empty compact">Select a date to see its detailed findings.</div>`;
   document.querySelectorAll(".digest-square").forEach((button) => {
@@ -946,7 +988,7 @@ function renderDigest(items) {
       const detail = $("#digest-day-detail");
       detail.className = "digest-day-detail";
       detail.innerHTML = selected.length
-        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><strong>${esc(item.title)}</strong>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
+        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
         : `<h2>${esc(button.dataset.date)}</h2><div class="empty compact">No progress was recorded on this date.</div>`;
     };
   });
@@ -996,7 +1038,7 @@ function renderStudies(studies, tasks) {
           const generated = (study.generated_tasks || []).map(
             (id) => taskById.get(id) || { id, title: "Generated task" },
           );
-          return `<article class="study-card"><header><div><div class="study-project">${esc(study.source)}</div><h2>${esc(study.title)}</h2><div class="meta mono">${esc(study.revision || "revision unavailable")} · ${esc(study.completed_at || study.created_at || "not completed")}</div></div>${badge(study.status)}</header><p>${esc(study.summary || "")}</p><div class="study-columns"><section><h3>Studied scope</h3>${study.scope?.length ? `<ul>${study.scope.map((x) => `<li class="mono">${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No source scope recorded.</div>'}</section><section><h3>Detailed findings</h3>${study.findings?.length ? `<ul>${study.findings.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No findings recorded.</div>'}</section></div><details><summary>References (${study.references?.length || 0})</summary>${study.references?.length ? `<ul>${study.references.map((x) => `<li class="mono">${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No references recorded.</div>'}</details><section class="study-tasks"><h3>Potential Tasks</h3>${generated.length ? generated.map((t) => `<button class="study-task-link secondary detail" data-id="${esc(t.id)}"><span>${esc(t.title)}</span><span class="mono">${esc(t.id)}</span></button>`).join("") : '<div class="empty compact">No tasks generated from this study.</div>'}</section></article>`;
+          return `<article class="study-card"><header><div><div class="study-project">${esc(study.source)}</div><h2>${esc(study.title)}</h2><div class="meta mono">${esc(study.revision || "revision unavailable")} · ${esc(study.completed_at || study.created_at || "not completed")}</div></div>${badge(study.status)}</header><p>${esc(study.summary || "")}</p><div class="study-columns"><section><h3>Studied scope</h3>${study.scope?.length ? `<ul>${study.scope.map((x) => `<li class="mono">${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No source scope recorded.</div>'}</section><section><h3>Detailed findings</h3>${study.findings?.length ? `<ul>${study.findings.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No findings recorded.</div>'}</section></div><details><summary>References (${study.references?.length || 0})</summary>${study.references?.length ? `<ul>${study.references.map((x) => `<li class="mono">${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No references recorded.</div>'}</details><section class="study-tasks"><h3>Potential Tasks</h3>${generated.length ? generated.map((t) => `<button class="study-task-link secondary detail" data-id="${esc(t.id)}"><span><strong>${esc(taskLabel(t))} · ${esc(t.title)}</strong><small>Source: Evolution · ${esc(study.source)}</small></span><span class="mono">${esc(t.id)}</span></button>`).join("") : '<div class="empty compact">No tasks generated from this study.</div>'}</section></article>`;
         })
         .join("")
     : '<div class="empty">No upstream studies have been recorded.</div>';
@@ -1092,6 +1134,7 @@ function renderTodos(tasks, decisions, history, dismissed = []) {
   for (const d of decisions)
     items.push({
       id: `decision:${d.id}`,
+      task_id: d.task_id,
       title: taskById.get(d.task_id)?.title || d.task_id,
       reason: d.question,
       meta: `${d.task_id}${d.recommendation ? ` · recommends ${d.recommendation}` : ""}`,
@@ -1104,6 +1147,7 @@ function renderTodos(tasks, decisions, history, dismissed = []) {
   ))
     items.push({
       id: `task:${t.id}`,
+      task_id: t.id,
       title: t.title,
       reason:
         t.verdict_reason ||
@@ -1115,6 +1159,7 @@ function renderTodos(tasks, decisions, history, dismissed = []) {
     for (const run of (t.runs || []).filter((r) => r.status === "failed"))
       items.push({
         id: `run:${run.id}`,
+        task_id: t.id,
         title: t.title,
         reason: run.error || "The device run failed without a recorded reason.",
         meta: `${run.machine_name} · ${run.id}`,
@@ -1125,23 +1170,22 @@ function renderTodos(tasks, decisions, history, dismissed = []) {
       if (Number(gain) < 0)
         items.push({
           id: `regression:${h.id}:${metric}`,
+          task_id: h.task_id,
           title: `Regression: ${h.title}`,
           reason: `${metric} regressed by ${Math.abs(Number(gain)).toFixed(2)}%.`,
           meta: h.commit_sha || h.created_at,
           status: "regression",
         });
   const visible = items.filter((x) => !hidden.has(x.id));
-  $("#nav-todo-count").textContent = visible.length || "";
+  $("#intervention-tab-count").textContent = visible.length || "";
   $("#todo-count").textContent = visible.length
     ? `${visible.length} require attention`
     : "All clear";
   $("#todos").innerHTML = visible.length
-    ? visible
-        .map(
-          (item) =>
-            `<div class="todo-item"><label class="todo-select"><input type="checkbox" value="${esc(item.id)}"><span></span></label><div class="todo-content"><strong>${esc(item.title)}</strong><div class="todo-reason">${esc(item.reason)}</div><div class="meta">${esc(item.meta)}</div></div>${badge(item.status)}<button class="secondary delete-todo" data-id="${esc(item.id)}">Delete</button></div>`,
-        )
-        .join("")
+    ? `<div class="table-wrap task-table-wrap"><table class="task-table intervention-table"><thead><tr><th></th><th>ID</th><th>Task</th><th>Source</th><th>Status</th><th>Intervention reason</th><th>Device / context</th><th>Created</th><th></th></tr></thead><tbody>${visible.map((item) => {
+        const task = taskById.get(item.task_id);
+        return `<tr><td><label class="todo-select"><input type="checkbox" value="${esc(item.id)}"><span></span></label></td><td class="task-id-cell"><strong>${esc(taskLabel(task))}</strong></td><td><strong>${esc(item.title)}</strong></td><td>${esc(task ? taskSource(task) : "Regression monitor")}</td><td>${badge(item.status)}</td><td class="todo-reason">${esc(item.reason)}</td><td>${esc(item.meta)}</td><td>${esc(task?.created_at ? new Date(task.created_at).toLocaleString() : "—")}</td><td><div class="table-actions">${task ? `<button class="secondary detail" data-id="${esc(task.id)}">View</button>` : ""}<button class="secondary delete-todo" data-id="${esc(item.id)}">Delete</button></div></td></tr>`;
+      }).join("")}</tbody></table></div>`
     : '<div class="empty">Nothing currently requires human intervention.</div>';
   const bulk = $("#delete-selected-todos"),
     checks = [...document.querySelectorAll(".todo-select input")];
@@ -1402,7 +1446,6 @@ $("#task-form").onsubmit = async (e) => {
 const tabPaths = {
     status: "tasks",
     evolution: "evolution",
-    todo: "human-intervention",
     validation: "status",
     analysis: "performance-analysis",
     digest: "digest",
@@ -1414,6 +1457,10 @@ const tabPaths = {
 pathTabs.history = "digest";
 function tabFromUrl(url = new URL(location.href)) {
   const path = url.pathname.replace(/^\/+|\/+$/g, "");
+  if (path === "human-intervention") {
+    activeTaskTab = "intervention";
+    return "status";
+  }
   return (
     pathTabs[path] ||
     url.searchParams.get("view") ||

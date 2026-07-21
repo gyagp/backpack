@@ -137,9 +137,44 @@ class Store:
             next_number = self._db.execute("SELECT COALESCE(MAX(task_number),0)+1 FROM tasks").fetchone()[0]
             for offset, row in enumerate(unnumbered):
                 self._db.execute("UPDATE tasks SET task_number=? WHERE id=?", (next_number + offset, row[0]))
+            self._backfill_history_tasks()
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS tasks_number_idx ON tasks(task_number)")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
+
+    def _backfill_history_tasks(self) -> None:
+        """Turn legacy performance history into stable, numbered done tasks.
+
+        Older records were written once per device without a task_id.  Grouping
+        by optimization title and revision preserves those device measurements
+        as one task instead of manufacturing a separate task for every row.
+        """
+        groups = self._db.execute("""
+          SELECT title,COALESCE(commit_sha,'') revision,MIN(id) first_id,
+                 MIN(summary) summary,MIN(created_at) started_at,MAX(created_at) completed_at
+          FROM optimization_history WHERE task_id IS NULL
+          GROUP BY title,COALESCE(commit_sha,'') ORDER BY MIN(created_at),MIN(id)
+        """).fetchall()
+        next_number = self._db.execute(
+            "SELECT COALESCE(MAX(task_number),0)+1 FROM tasks").fetchone()[0]
+        for offset, row in enumerate(groups):
+            task_id = f"done-{row['first_id']}"
+            origin = {"type": "history-import", "history_id": row["first_id"]}
+            manifest = {"atomic_experiment": True, "historical": True}
+            self._db.execute("""INSERT OR IGNORE INTO tasks(
+              id,task_number,title,kind,state,hypothesis,origin_json,base_sha,candidate_sha,
+              manifest_json,device_policy_json,decision_policy_json,aggregate_verdict,
+              verdict_reason,created_at,updated_at
+              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                task_id, next_number + offset, row["title"], "optimization", "integrated",
+                row["summary"] or row["title"], json_text(origin), None,
+                row["revision"] or None, json_text(manifest), json_text({}), json_text({}),
+                "accepted", "Imported from measured optimization history",
+                row["started_at"], row["completed_at"],
+            ))
+            self._db.execute("""UPDATE optimization_history SET task_id=?
+              WHERE task_id IS NULL AND title=? AND COALESCE(commit_sha,'')=?""",
+              (task_id, row["title"], row["revision"]))
 
     def close(self) -> None:
         self._db.close()

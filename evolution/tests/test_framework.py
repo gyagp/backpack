@@ -113,6 +113,22 @@ class FrameworkTest(unittest.TestCase):
         }, "test")
         self.assertEqual(8.5, item["gains"]["decode_tok_s"])
 
+    def test_legacy_history_is_grouped_into_numbered_done_task(self) -> None:
+        for device in ("gpu-1", "gpu-2"):
+            self.store.add_history({
+                "title": "Fused projection", "summary": "Measured improvement",
+                "commit_sha": "abc123", "gains": {device: {"decode_gain_percent": 4.0}},
+            }, "test")
+        path = self.store.path
+        self.store.close()
+        self.store = Store(path)
+        rows = self.store.list_history()
+        self.assertEqual(1, len({row["task_id"] for row in rows}))
+        task = self.store.get_task(rows[0]["task_id"])
+        self.assertEqual(2, task["task_number"])
+        self.assertEqual("integrated", task["state"])
+        self.assertEqual("history-import", task["origin"]["type"])
+
     def test_history_resolves_devices_and_classifies_impact(self) -> None:
         self.store.add_history({
             "title": "Faster projection", "summary": "Measured on the enrolled GPU",
