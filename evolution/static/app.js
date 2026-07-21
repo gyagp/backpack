@@ -130,7 +130,6 @@ async function refresh() {
   ]
     .map(([l, v]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`)
     .join("");
-  $("#nav-device-count").textContent = machines.length || "";
   const enriched = activity.tasks || activity.active_tasks || [],
     terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
     pending = enriched.filter(
@@ -1089,7 +1088,6 @@ function updateTaskTabs(tasks) {
 }
 function renderStudies(studies, tasks) {
   const taskById = new Map(tasks.map((t) => [t.id, t]));
-  $("#nav-study-count").textContent = studies.length || "";
   $("#study-count").textContent =
     `${studies.filter((s) => s.status === "completed").length} completed · ${studies.length} total`;
   $("#studies").innerHTML = studies.length
