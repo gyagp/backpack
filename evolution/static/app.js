@@ -46,8 +46,23 @@ function taskLabel(t) {
 }
 function taskSource(t) {
   const o = t?.origin || {},
-    type = o.type || "human";
-  if (o.source) return o.source;
+    type = o.type || "human",
+    source = o.source;
+  if (typeof source === "string" && source.trim()) return source.trim();
+  if (source && typeof source === "object") {
+    const kind = source.type,
+      rawProject = source.project || source.name,
+      project = rawProject === "Backpack Evolution" ? "Backpack" : rawProject,
+      detail = project || {
+        docs: "project documentation",
+        experience: "accumulated experience",
+        upstream: "upstream",
+      }[kind] || "structured source";
+    if (["continuous-learning", "learning-study", "atomic-split"].includes(type))
+      return `Evolution · ${detail}`;
+    if (["human", "human_goal"].includes(type)) return `Manual · ${detail}`;
+    return detail;
+  }
   if (type === "learning-study") return o.study_source || "Evolution";
   return (
     {
@@ -56,6 +71,8 @@ function taskSource(t) {
       automatic: "Automation",
       scheduled: "Scheduled automation",
       "history-import": "Performance history",
+      "atomic-split": "Evolution",
+      human_goal: "Manual",
       human: "Manual",
     }[type] || type.replaceAll("-", " ")
   );
