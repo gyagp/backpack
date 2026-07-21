@@ -185,7 +185,7 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
         runtime = (manifest.get("runtimes") or [{}])[0]
         if canonical:
             metrics = json.loads(canonical.group(1))
-            revision_match = re.search(r"(?m)^LLAMACPP_REVISION (\S+)$", completed.stdout)
+            revision_match = re.search(r"(?m)^(?:RUNTIME|LLAMACPP)_REVISION (\S+)$", completed.stdout)
             conformance_match = re.search(r"(?m)^EVOLUTION_CONFORMANCE (\{.*\})$", completed.stdout)
             conformance = json.loads(conformance_match.group(1)) if conformance_match else {}
             origin = task.get("origin", {})
