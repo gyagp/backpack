@@ -994,6 +994,7 @@ function digestCalendar(items) {
   }
   return `<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w, label]) => `<span style="left:${w * 15}px">${esc(label)}</span>`).join("")}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join("")}</div></div><div class="digest-heatmap-footer"><span class="digest-regression-key">Regression</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`;
 }
+let selectedDigestDate = null;
 function renderDigest(items, tasks = []) {
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const digest = digestItems(items).map((item) => ({
@@ -1006,6 +1007,7 @@ function renderDigest(items, tasks = []) {
   $("#digest").innerHTML = `${digestCalendar(digest)}<div id="digest-day-detail" class="digest-day-detail empty compact">Select a date to see its detailed findings.</div>`;
   document.querySelectorAll(".digest-square").forEach((button) => {
     button.onclick = () => {
+      selectedDigestDate = button.dataset.date;
       document.querySelectorAll(".digest-square").forEach((square) =>
         square.classList.toggle("selected", square === button),
       );
@@ -1019,6 +1021,17 @@ function renderDigest(items, tasks = []) {
         : `<h2>${esc(button.dataset.date)}</h2><div class="empty compact">No progress was recorded on this date.</div>`;
     };
   });
+  const validDays = [...new Set(digest
+    .map((item) => shortDate(item.created_at))
+    .filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day)))].sort();
+  const defaultDay = validDays.includes(selectedDigestDate)
+    ? selectedDigestDate
+    : validDays.at(-1);
+  if (defaultDay) {
+    const defaultButton = [...document.querySelectorAll(".digest-square")]
+      .find((button) => button.dataset.date === defaultDay);
+    defaultButton?.click();
+  }
   const days = new Set(items.map((item) => shortDate(item.created_at)));
   $("#digest-count").textContent =
     `${days.size} day${days.size === 1 ? "" : "s"}`;
