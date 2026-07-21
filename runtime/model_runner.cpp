@@ -2238,6 +2238,7 @@ void ModelRunner::buildDecodePipeline() {
     std::transform(decodeAdapter.begin(), decodeAdapter.end(), decodeAdapter.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     const bool isNvidiaAdapter = decodeAdapter.find("nvidia") != std::string::npos;
+    const bool isIntelAdapter = decodeAdapter.find("intel") != std::string::npos;
     const bool canUse512ThreadKernels =
         gpu->supportsSubgroups &&
         limits.maxComputeInvocationsPerWorkgroup >= 512u &&
@@ -2275,10 +2276,31 @@ void ModelRunner::buildDecodePipeline() {
                                             : getKernel("rms_norm");
     auto& plAddRmsNorm = qwen35VulkanDecode ? getKernel("add_rms_norm_qwen_vulkan")
                                             : getKernel("add_rms_norm");
-    auto& plQ8Matmul   = (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12 &&
-                          !std::getenv("BP_Q35_GENERIC_KERNELS"))
-        ? getKernel("q8_matmul_vec4")
-        : getKernel("q8_matmul");
+    const CompiledPipeline* plQ8IntelUnpack = nullptr;
+    if (isIntelAdapter) {
+        std::string source(WGSL_Q8_MATMUL);
+        const std::string wv0 =
+            "let wv0 = vec4<f32>(f32(extractBits(i32(pw0), 0u, 8u)),\n"
+            "                                f32(extractBits(i32(pw0), 8u, 8u)),\n"
+            "                                f32(extractBits(i32(pw0), 16u, 8u)),\n"
+            "                                f32(extractBits(i32(pw0), 24u, 8u)));";
+        const std::string wv1 =
+            "let wv1 = vec4<f32>(f32(extractBits(i32(pw1), 0u, 8u)),\n"
+            "                                f32(extractBits(i32(pw1), 8u, 8u)),\n"
+            "                                f32(extractBits(i32(pw1), 16u, 8u)),\n"
+            "                                f32(extractBits(i32(pw1), 24u, 8u)));";
+        if (auto pos = source.find(wv0); pos != std::string::npos)
+            source.replace(pos, wv0.size(), "let wv0 = vec4<f32>(unpack4xI8(pw0));");
+        if (auto pos = source.find(wv1); pos != std::string::npos)
+            source.replace(pos, wv1.size(), "let wv1 = vec4<f32>(unpack4xI8(pw1));");
+        plQ8IntelUnpack = &gpu->getOrCreatePipeline(
+            "q8_matmul_intel_unpack4xi8", source, 6);
+    }
+    auto& plQ8Matmul = plQ8IntelUnpack ? *plQ8IntelUnpack
+        : (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12 &&
+           !std::getenv("BP_Q35_GENERIC_KERNELS"))
+            ? getKernel("q8_matmul_vec4")
+            : getKernel("q8_matmul");
     auto& plQ8MatmulNorm = getKernel("q8_matmul_norm");
 
     // K-quant kernel selection
