@@ -2422,7 +2422,8 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,
         ? &gpu->getOrCreatePipeline("q4_prequant_down", std::string(Q4_PREQUANT_DOWN_WGSL), 6)
         : nullptr;
     uint32_t Q4_DECODE_TILE_N = 32;
-    int q4Cols = std::getenv("BP_Q4_COLS") ? std::atoi(std::getenv("BP_Q4_COLS")) : 1;
+    int q4Cols = std::getenv("BP_Q4_COLS") ? std::atoi(std::getenv("BP_Q4_COLS"))
+                                             : isIntelAdapter ? 2 : 1;
     if (weightsAreNativeQ4 && (q4Cols >= 1 && q4Cols <= 3)) {
             std::string src = getEmbeddedKernels().at("matmul_q4_decode").source;
             auto replaceAll = [&](const std::string& from, const std::string& to) {
@@ -2449,7 +2450,8 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,
     uint32_t Q4_GATEUP_TILE_N = Q4_DECODE_TILE_N;
     if (weightsAreNativeQ4) {
         int gateCols = std::getenv("BP_Q4_GATEUP_COLS")
-            ? std::atoi(std::getenv("BP_Q4_GATEUP_COLS")) : 2;
+            ? std::atoi(std::getenv("BP_Q4_GATEUP_COLS"))
+            : isIntelAdapter ? 3 : 2;
         gateCols = std::max(1, std::min(3, gateCols));
         std::string src = getEmbeddedKernels().at("matmul_q4_decode").source;
         auto repl = [&](const std::string& from, const std::string& to) {
