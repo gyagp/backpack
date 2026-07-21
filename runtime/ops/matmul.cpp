@@ -443,6 +443,7 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         // Qwen validation, so retain their scalar conformant prefill path.
         const bool usePackedPrefill = M > 1 && usePacked &&
             ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
+        const bool useWidePrefill = M > 1 && !usePackedPrefill;
         const bool usePackedDecode = M == 1 && usePacked;
         const bool useTwoColumnDecode = usePackedDecode &&
             (K == 2048u || K == 6144u);
@@ -451,6 +452,21 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         auto& pl = usePackedPrefill
             ? ex.GetPipelineT("matmul_q4_batched", 5,
                 []() { return std::string(WGSL_MATMUL_Q4_BATCHED); })
+            : useWidePrefill
+            ? ex.GetPipelineT("matmul_q4_wide", 5, []() {
+                std::string source(WGSL_MATMUL_Q4_ZP_WIDE);
+                const std::string binding =
+                    "@group(0) @binding(5) var<storage, read> ZeroPoints: array<u32>;";
+                if (auto pos = source.find(binding); pos != std::string::npos)
+                    source.erase(pos, binding.size());
+                const std::string zp =
+                    "let zp_byte_idx = scale_flat / 2u;\n"
+                    "            let zp_byte = (ZeroPoints[zp_byte_idx / 4u] >> ((zp_byte_idx % 4u) * 8u)) & 0xFFu;\n"
+                    "            let zp = f32(select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (scale_flat & 1u) != 0u));";
+                if (auto pos = source.find(zp); pos != std::string::npos)
+                    source.replace(pos, zp.size(), "let zp = 8.0;");
+                return source;
+            })
             : useTwoColumnDecode
             ? ex.GetPipelineT(useOneColumnDecode ? "matmul_q4_decode_1col" :
                                                "matmul_q4_decode_2col", 5,
@@ -472,11 +488,14 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pl.pipeline, bg,
             usePackedPrefill ? (N + 31) / 32
+                : useWidePrefill ? (N + 127) / 128
                 : useOneColumnDecode ? (N + 7) / 8
                 : useTwoColumnDecode ? (N + 15) / 16
                 : usePackedDecode ? (N + 31) / 32 : (N + 255) / 256,
-            usePackedPrefill ? ((uint32_t)M + 3) / 4 : (uint32_t)M, 1,
+            usePackedPrefill ? ((uint32_t)M + 3) / 4
+                : useWidePrefill ? ((uint32_t)M + 7) / 8 : (uint32_t)M, 1,
             usePackedPrefill ? "matmul_q4_batched"
+                : useWidePrefill ? "matmul_q4_wide"
                 : useOneColumnDecode ? "matmul_q4_decode_1col"
                 : useTwoColumnDecode ? "matmul_q4_decode_2col"
                 : usePackedDecode ? "matmul_q4_decode" : "matmul_q4");
