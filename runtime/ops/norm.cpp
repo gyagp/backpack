@@ -268,9 +268,12 @@ static void opSkipSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
         // NVIDIA and AMD. Intel's current D3D12 driver regresses with this
         // layout, so retain the conformant serial row fallback there.
         const bool useParallel = ex.getGpu()->adapterName.find("Intel") == std::string::npos;
+        const bool useVec4 = ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+                             hiddenDim % 4 == 0;
         auto& pl = useParallel
-            ? ex.GetPipelineT("skip_rmsnorm_f16w", 6,
-                []() { return std::string(WGSL_SKIP_RMSNORM_F16W); })
+            ? ex.GetPipelineT(useVec4 ? "skip_rmsnorm_f16w_vec4" : "skip_rmsnorm_f16w", 6,
+                [useVec4]() { return std::string(useVec4 ? WGSL_SKIP_RMSNORM_F16W_VEC4
+                                                         : WGSL_SKIP_RMSNORM_F16W); })
             : ex.GetPipelineT("skip_rmsnorm_f16w_serial", 6,
                 []() { return std::string(WGSL_SKIP_RMSNORM_F16W_SERIAL); });
         auto bg = ex.MakeBindGroup(pl, {
@@ -278,7 +281,8 @@ static void opSkipSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
             {3, out[0]->buffer}, {4, skipOutBuf}, {5, paramBuf}});
         ex.QueueDispatch(pl.pipeline, bg,
             useParallel ? (uint32_t)nRows : (uint32_t)((nRows + 255) / 256),
-            1, 1, useParallel ? "skip_rmsnorm_f16w" : "skip_rmsnorm_f16w_serial");
+            1, 1, useVec4 ? "skip_rmsnorm_f16w_vec4" :
+                  (useParallel ? "skip_rmsnorm_f16w" : "skip_rmsnorm_f16w_serial"));
         return;
     }
 
