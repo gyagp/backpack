@@ -1027,7 +1027,129 @@ class Store:
         return self._row(self._db.execute("SELECT * FROM optimization_history WHERE id=?", (history_id,)).fetchone())  # type: ignore[return-value]
 
     def list_history(self) -> list[dict[str, Any]]:
-        return self._all("SELECT * FROM optimization_history ORDER BY created_at DESC")
+        records = self._all("SELECT * FROM optimization_history ORDER BY created_at DESC")
+        machines = self.list_machines()
+        machine_by_id = {item["id"]: item for item in machines}
+        machine_names = {item["name"] for item in machines}
+
+        def normalize_device(value: Any) -> str | None:
+            text = str(value or "")
+            match = re.search(r"webgfx[-_](104|103|31)(?:\D|$)", text, re.IGNORECASE)
+            if match:
+                candidate = f"webgfx-{match.group(1)}"
+                return candidate if candidate in machine_names else None
+            return text if text in machine_names else None
+
+        def collect_devices(value: Any, found: set[str]) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    device = normalize_device(key)
+                    if device:
+                        found.add(device)
+                    if key in {"device", "machine", "machine_name"}:
+                        device = normalize_device(child)
+                        if device:
+                            found.add(device)
+                    collect_devices(child, found)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_devices(child, found)
+            elif isinstance(value, str):
+                device = normalize_device(value)
+                if device:
+                    found.add(device)
+
+        def vendor_for(machine: dict[str, Any]) -> str:
+            gpu = " ".join(str(machine.get("fingerprint", {}).get(key, ""))
+                           for key in ("gpu_vendor", "gpu"))
+            for vendor in ("NVIDIA", "AMD", "Intel"):
+                if vendor.lower() in gpu.lower():
+                    return vendor.lower()
+            return ""
+
+        def percent_values(value: Any, device: str, vendor: str,
+                           single_device: bool, path: tuple[str, ...] = ()) -> list[tuple[str, float]]:
+            result: list[tuple[str, float]] = []
+            if not isinstance(value, dict):
+                return result
+            for key, child in value.items():
+                next_path = path + (str(key),)
+                path_text = ".".join(next_path).lower()
+                path_device = normalize_device(path_text)
+                belongs = single_device or path_device == device or (vendor and vendor in path_text)
+                percent_metric = "percent" in path_text or str(key).lower() in {"decode_tps", "prefill_tps"}
+                if isinstance(child, (int, float)) and percent_metric and belongs:
+                    # Resource-count and dispatch reductions are useful evidence,
+                    # but their sign is opposite to throughput and must not drive
+                    # the performance impact classification.
+                    if any(token in path_text for token in
+                           ("decode", "prefill", "throughput", "overall", "impact", "latency")) or path_device:
+                        result.append((" / ".join(next_path), float(child)))
+                elif isinstance(child, dict):
+                    result.extend(percent_values(child, device, vendor, single_device, next_path))
+            return result
+
+        def classify(value: float | None) -> dict[str, Any]:
+            if value is None:
+                return {"key": "unquantified", "name": "Measured outcome", "value": None, "rank": 7}
+            if value >= 20:
+                key, name, rank = "transformative", "Transformative improvement", 0
+            elif value >= 5:
+                key, name, rank = "strong", "Strong improvement", 1
+            elif value >= 1:
+                key, name, rank = "measured_gain", "Measured improvement", 2
+            elif value > -1:
+                key, name, rank = "noise", "Within measurement noise", 3
+            elif value > -5:
+                key, name, rank = "measured_regression", "Measured regression", 4
+            elif value > -20:
+                key, name, rank = "serious_regression", "Serious regression", 5
+            else:
+                key, name, rank = "critical_regression", "Critical regression", 6
+            return {"key": key, "name": name, "value": value, "rank": rank}
+
+        for record in records:
+            devices: set[str] = set()
+            collect_devices(record.get("evidence", []), devices)
+            collect_devices(record.get("gains", {}), devices)
+            collect_devices(record.get("id", ""), devices)
+            collect_devices(record.get("title", ""), devices)
+            if record.get("task_id"):
+                rows = self._all("SELECT machine_id FROM evaluations WHERE task_id=?", (record["task_id"],))
+                rows += self._all("SELECT machine_id FROM task_runs WHERE task_id=?", (record["task_id"],))
+                devices.update(machine_by_id[row["machine_id"]]["name"] for row in rows
+                               if row["machine_id"] in machine_by_id)
+
+            impacts = []
+            for device in sorted(devices):
+                machine = next(item for item in machines if item["name"] == device)
+                values = percent_values(record.get("gains", {}), device, vendor_for(machine), len(devices) == 1)
+                impact_value = sum(value for _, value in values) / len(values) if values else None
+                metrics: dict[str, Any] = {}
+                for item in record.get("evidence", []):
+                    if not isinstance(item, dict) or normalize_device(item.get("device")) != device:
+                        continue
+                    for source, target in (("prefill_tok_s", "prefill_tok_s"), ("prefill_tps", "prefill_tok_s"),
+                                           ("decode_tok_s", "decode_tok_s"), ("decode_tps", "decode_tok_s"),
+                                           ("candidate_prefill_tps", "prefill_tok_s"),
+                                           ("candidate_decode_tps", "decode_tok_s")):
+                        if item.get(source) is not None:
+                            metrics[target] = item[source]
+                if len(devices) == 1:
+                    metrics = {**record.get("after", {}), **metrics}
+                impacts.append({"machine_id": machine["id"], "device": device,
+                                "gpu": machine.get("fingerprint", {}).get("gpu"),
+                                "metrics": metrics,
+                                "deltas": [{"metric": name, "percent": value} for name, value in values],
+                                "impact": classify(impact_value)})
+            record["device_impacts"] = impacts
+            quantified = [item["impact"]["value"] for item in impacts if item["impact"]["value"] is not None]
+            # A material device regression takes precedence in the group label;
+            # otherwise use the fleet mean to describe the milestone.
+            representative = min(quantified) if any(value <= -5 for value in quantified) else (
+                sum(quantified) / len(quantified) if quantified else None)
+            record["impact"] = classify(representative)
+        return records
 
     def create_milestone(self, task_id: str, commit_sha: str, remote: str, remote_ref: str) -> dict[str, Any]:
         milestone_id = f"milestone-{uuid.uuid4().hex[:10]}"

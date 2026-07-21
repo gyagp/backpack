@@ -97,6 +97,17 @@ class FrameworkTest(unittest.TestCase):
         }, "test")
         self.assertEqual(8.5, item["gains"]["decode_tok_s"])
 
+    def test_history_resolves_devices_and_classifies_impact(self) -> None:
+        self.store.add_history({
+            "title": "Faster projection", "summary": "Measured on the enrolled GPU",
+            "gains": {"gpu-1": {"decode_gain_percent": 8.5}},
+            "evidence": [{"kind": "benchmark", "device": "gpu-1", "decode_tps": 108.5}],
+        }, "test")
+        item = self.store.list_history()[0]
+        self.assertEqual("gpu-1", item["device_impacts"][0]["device"])
+        self.assertEqual(108.5, item["device_impacts"][0]["metrics"]["decode_tok_s"])
+        self.assertEqual("Strong improvement", item["device_impacts"][0]["impact"]["name"])
+
     def test_failed_milestone_does_not_replace_active_base(self) -> None:
         first = self.store.create_milestone(self.task["id"], "sha-one", "origin", "refs/heads/evolution/base")
         self.store.finish_milestone(first["id"], True)
