@@ -2344,7 +2344,10 @@ void ModelRunner::buildDecodePipeline() {
     // overrides so cross-device experiments can compare either path.
     const bool useQ4KDecode256 = std::getenv("BP_Q4K_DECODE_256") ||
         (isNvidiaAdapter && !std::getenv("BP_Q4K_DECODE_128"));
-    const bool useQ4KDp4a = isNvidiaAdapter &&
+    // Packed 4x8 integer dot products are conformant and faster on NVIDIA and
+    // Intel. AMD exposes the operation but changes cared-model logits, so it
+    // retains the floating-point Q4_K reduction.
+    const bool useQ4KDp4a = (isNvidiaAdapter || isIntelAdapter) &&
         !std::getenv("BP_Q4K_DISABLE_DP4A");
     auto kqPipelineFor = [&](GGUFType type) -> const CompiledPipeline* {
         switch (type) {
