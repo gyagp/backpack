@@ -1731,6 +1731,47 @@ TEST(moe_router_pipeline) {
     assertCloseVec(got, expected_vals, 1e-3f);
 }
 
+TEST(matmul_nbits_q4_decode) {
+    constexpr int K = 256, N = 16, block = 32;
+    std::vector<float> x(K), expected(N, 0.0f);
+    for (int k = 0; k < K; ++k)
+        x[k] = float((k % 3) - 1);  // exactly representable after Q8 activation quantization
+
+    InitializerDef weights{"W", ONNX_UINT8, {N, K / block, block / 2}, {}};
+    weights.rawData.resize(N * K / 2);
+    std::vector<float> scaleValues(N * (K / block));
+    for (int n = 0; n < N; ++n) {
+        for (int g = 0; g < K / block; ++g) {
+            // Use the rounded fp16 value in the CPU reference.
+            const float requested = 0.01f * float(1 + (n + g) % 3);
+            scaleValues[n * (K / block) + g] =
+                f16ToF32(f32ToF16(requested));
+        }
+        for (int k = 0; k < K; k += 2) {
+            const uint8_t q0 = uint8_t((n + k) & 15);
+            const uint8_t q1 = uint8_t((n + k + 1) & 15);
+            weights.rawData[n * (K / 2) + k / 2] = uint8_t(q0 | (q1 << 4));
+            const int g = k / block;
+            const float scale = scaleValues[n * (K / block) + g];
+            expected[n] += x[k] * float(int(q0) - 8) * scale;
+            expected[n] += x[k + 1] * float(int(q1) - 8) * scale;
+        }
+    }
+
+    auto model = buildOnnxModel(
+        {{"MatMulNBits", {"X", "W", "S"}, {"Y"},
+          {{"K", AttrDef::INT, K}, {"N", AttrDef::INT, N},
+           {"bits", AttrDef::INT, 4}, {"block_size", AttrDef::INT, block},
+           {"accuracy_level", AttrDef::INT, 4}}}},
+        {{"X", ONNX_FLOAT, {1, 1, K}}},
+        {{"Y", ONNX_FLOAT, {1, 1, N}}},
+        {weights, makeInitF16("S", {N, K / block}, scaleValues)});
+    auto outputs = runOnnxModel(gpu, model,
+        {{"X", makeInputF32("X", {1, 1, K}, x)}}, {"Y"});
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 2e-3f, 2e-3f,
+                   "matmul_nbits_q4_decode");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -1775,6 +1816,7 @@ int main(int argc, char** argv) {
 
     // Compute
     RUN(matmul);
+    RUN(matmul_nbits_q4_decode);
     RUN(softmax);
     RUN(simplified_layer_norm);
     RUN(softplus);
