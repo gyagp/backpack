@@ -2463,11 +2463,13 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec
  for(var c=0u;c<2u;c++){let row=r0+c;let v=subgroupAdd(acc[c]);if(lane==0u&&row<N){Y[row]=v;}}
 }
 )";
+    const bool useNarrowPleQ4 = std::getenv("BP_PLE_Q4_NARROW") ||
+        (isNvidiaAdapter && !std::getenv("BP_PLE_Q4_WIDE"));
     const CompiledPipeline* plQ4A32Ple = weightsAreNativeQ4 &&
-        !std::getenv("BP_PLE_Q4_NARROW")
+        !useNarrowPleQ4
         ? &gpu->getOrCreatePipeline("q4_matmul_a32_ple_wide", std::string(Q4_A32_WIDE_WGSL), 5)
         : plQ4A32;
-    const uint32_t Q4_A32_PLE_TILE = std::getenv("BP_PLE_Q4_NARROW") ? 4u : 8u;
+    const uint32_t Q4_A32_PLE_TILE = useNarrowPleQ4 ? 4u : 8u;
     static const char* PLE_TOKEN_Q4_GATHER_WGSL = R"(
 @group(0) @binding(0) var<storage, read> B: array<u32>;
 @group(0) @binding(1) var<storage, read> S: array<u32>;
