@@ -352,11 +352,18 @@ static void dispatchBinaryOp(OpContext& ex, const OnnxGraphNode& node,
         {0, A->buffer}, {1, B->buffer}, {2, outputs[0]->buffer}, {3, params}});
     // Each thread handles 2 elements
     uint32_t numWorkgroups = (uint32_t)(((N + 1) / 2 + 255) / 256);
-    if (ex.getGpu()->adapterName.find("Intel") != std::string::npos)
+    const bool intel = ex.getGpu()->adapterName.find("Intel") != std::string::npos;
+    if (intel && ex.fastDecodeState() == ExecutionContext::FastDecodeState::Off)
         ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
-    else
+    else {
         ex.QueueDispatch(pl.pipeline, bg, numWorkgroups, 1, 1,
                          node.opType.c_str());
+        // Intel needs the original one-operation submission boundaries for
+        // conformance. During capture, record those same boundaries instead
+        // of bypassing the reusable command stream entirely.
+        if (intel)
+            ex.SubmitPending();
+    }
 }
 
 // ─── Unary elementwise dispatch ──────────────────────────────────────────────
@@ -389,11 +396,15 @@ static void dispatchUnaryOp(OpContext& ex, const OnnxGraphNode& node,
         {0, A->buffer}, {1, outputs[0]->buffer}, {2, params}});
     // Each thread handles 2 elements
     uint32_t numWorkgroups = (uint32_t)(((N + 1) / 2 + 255) / 256);
-    if (ex.getGpu()->adapterName.find("Intel") != std::string::npos)
+    const bool intel = ex.getGpu()->adapterName.find("Intel") != std::string::npos;
+    if (intel && ex.fastDecodeState() == ExecutionContext::FastDecodeState::Off)
         ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
-    else
+    else {
         ex.QueueDispatch(pl.pipeline, bg, numWorkgroups, 1, 1,
                          node.opType.c_str());
+        if (intel)
+            ex.SubmitPending();
+    }
 }
 
 // ─── Op Registrations ────────────────────────────────────────────────────────

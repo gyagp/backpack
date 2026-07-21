@@ -226,11 +226,50 @@ struct GenericOnnxState {
     bool fastDecodeCaptured = false;
     bool prefillDone = false;
     bool decodePlanInitialized = false;
+    int decodeWarmupRemaining = 0;
     bool nlkWritten = false;
     std::vector<GPUBuffer> convCastF16Bufs;
+    std::vector<GPUBuffer> capturedConvOutputBufs;
+    std::vector<GPUBuffer> capturedRecurrentInputBufs;
+    std::vector<GPUBuffer> capturedRecurrentOutputBufs;
     std::vector<WGPUBindGroup> convCastBindGroups;
     const CompiledPipeline* convCastPipeline = nullptr;
     uint32_t convCastWorkgroups = 0;
+    struct CaptureVariant {
+        std::vector<ExecutionContext::CapturedFlush> flushes;
+        std::vector<ExecutionContext::CapturedWrite> writes;
+        std::vector<ExecutionContext::ReplayParamUpdate> params;
+        std::vector<ExecutionContext::ReplayScalarUpdate> scalars;
+        std::vector<ExecutionContext::CapturedTokenIdBuf> tokenIds;
+        std::vector<WGPUBuffer> skipBuffers;
+        GPUBuffer logits;
+    } qwenCaptureVariants[4];
+    int qwenCapturedVariants = 0;
+    int qwenActiveVariant = -1;
+    int qwenNextReplayVariant = 0;
+
+    void SwapCaptureVariant(int index) {
+        auto& variant = qwenCaptureVariants[index];
+        execCtx.capturedFlushes_.swap(variant.flushes);
+        execCtx.capturedWrites_.swap(variant.writes);
+        execCtx.replayParamUpdates_.swap(variant.params);
+        execCtx.replayScalarUpdates_.swap(variant.scalars);
+        execCtx.capturedTokenIdBufs_.swap(variant.tokenIds);
+        execCtx.replaySkipBuffers_.swap(variant.skipBuffers);
+    }
+
+    void StoreCurrentQwenCapture(int index) {
+        SwapCaptureVariant(index);
+        qwenActiveVariant = -1;
+    }
+
+    void ActivateQwenCapture(int index) {
+        if (qwenActiveVariant == index) return;
+        if (qwenActiveVariant >= 0) SwapCaptureVariant(qwenActiveVariant);
+        SwapCaptureVariant(index);
+        qwenActiveVariant = index;
+        logitsBuf = qwenCaptureVariants[index].logits;
+    }
 
     bool Load(GPUContext& gpuCtx, const std::string& onnxPath, int64_t maxSeqOverride) {
         gpu = &gpuCtx;
@@ -330,10 +369,21 @@ struct GenericOnnxState {
         pos = 0;
         prefillDone = false;
         decodePlanInitialized = false;
+        decodeWarmupRemaining = 0;
         nlkWritten = false;
         convState.clear();
         recurrentState.clear();
         kvState.clear();
+        if (qwenActiveVariant >= 0) {
+            SwapCaptureVariant(qwenActiveVariant);
+            qwenActiveVariant = -1;
+        }
+        for (int i = 0; i < qwenCapturedVariants; i++) {
+            SwapCaptureVariant(i);
+            execCtx.ReleaseCaptured();
+        }
+        qwenCapturedVariants = 0;
+        qwenNextReplayVariant = 0;
         if (fastDecodeCaptured) {
             execCtx.ReleaseCaptured();
             fastDecodeCaptured = false;
@@ -346,14 +396,26 @@ struct GenericOnnxState {
             GpuTensor t;
             t.shape = {1, convChannels, convLCache};
             t.dtype = TensorDtype::Float32;
-            size_t bytes = (size_t)(convChannels * convLCache * 4);
+            const size_t elements = (size_t)(convChannels * convLCache);
+            size_t bytes = elements * 4;
             if (fastDecodeEnabled && ci < convCastF16Bufs.size()) {
+                // Replay feeds the previous f32 convolution output through
+                // cache_cast_f16 into this stable captured input buffer.
+                // Initialize it in that same dtype and byte width; writing
+                // f32 zeros here overran the f16 allocation for Qwen 3.5.
                 t.buffer = convCastF16Bufs[ci];
-                std::vector<float> zeros((size_t)(convChannels * convLCache), 0.0f);
-                gpu->writeBuffer(t.buffer, zeros.data(), bytes);
+                if (arch == "qwen3_5_text") {
+                    t.dtype = TensorDtype::Float32;
+                    std::vector<float> zeros(elements, 0.0f);
+                    gpu->writeBuffer(t.buffer, zeros.data(), elements * 4);
+                } else {
+                    t.dtype = TensorDtype::Float16;
+                    std::vector<uint16_t> zeros(elements, 0);
+                    gpu->writeBuffer(t.buffer, zeros.data(), elements * 2);
+                }
             } else {
                 t.buffer = gpu->createBuffer(name, bytes);
-                std::vector<float> zeros((size_t)(convChannels * convLCache), 0.0f);
+                std::vector<float> zeros(elements, 0.0f);
                 gpu->writeBuffer(t.buffer, zeros.data(), bytes);
             }
             convState[name] = t;
@@ -511,8 +573,10 @@ struct GenericOnnxState {
             convOuts[i].dtype = TensorDtype::Float32;
             const std::string inputName = "past_key_values." +
                 std::to_string(convLayerIndices[i]) + ".conv_state";
-            convOuts[i].buffer = convState[inputName].buffer.handle == convOutBufs[i].handle
-                ? convOutAltBufs[i] : convOutBufs[i];
+            convOuts[i].buffer = fastDecodeEnabled && T == 1
+                ? convState[inputName].buffer
+                : (convState[inputName].buffer.handle == convOutBufs[i].handle
+                    ? convOutAltBufs[i] : convOutBufs[i]);
             outputs[name] = &convOuts[i];
         }
 
@@ -524,9 +588,10 @@ struct GenericOnnxState {
             recurrentOuts[i].dtype = TensorDtype::Float32;
             const std::string inputName = "past_key_values." +
                 std::to_string(convLayerIndices[i]) + ".recurrent_state";
-            recurrentOuts[i].buffer =
-                recurrentState[inputName].buffer.handle == recurrentOutBufs[i].handle
-                    ? recurrentOutAltBufs[i] : recurrentOutBufs[i];
+            recurrentOuts[i].buffer = fastDecodeEnabled && T == 1
+                ? recurrentState[inputName].buffer
+                : (recurrentState[inputName].buffer.handle == recurrentOutBufs[i].handle
+                    ? recurrentOutAltBufs[i] : recurrentOutBufs[i]);
             outputs[name] = &recurrentOuts[i];
         }
 
@@ -589,13 +654,74 @@ struct GenericOnnxState {
         if (!decodePlanInitialized) {
             execCtx.InvalidateWarmCaches();
             decodePlanInitialized = true;
+            // Capture must bind the stable single-token tensor plan. Capturing
+            // this first decode would keep one-off allocations alive but also
+            // suppress plan finalization, freezing transient bindings.
+            if (fastDecodeEnabled) {
+                decodeWarmupRemaining = 2;
+                return runExecutePath(tokenId);
+            }
+        }
+
+        if (fastDecodeEnabled && !fastDecodeCaptured &&
+            decodeWarmupRemaining > 0) {
+            decodeWarmupRemaining--;
+            return runExecutePath(tokenId);
         }
 
         // Fast Decode Replay Path
         if (fastDecodeEnabled && fastDecodeCaptured) {
+            if (arch == "qwen3_5_text") {
+                ActivateQwenCapture(qwenNextReplayVariant);
+            }
             execCtx.replayPosition_ = (uint32_t)(pos - 1);
             execCtx.replayTokenId_ = tokenId;
+            // CPU-produced constants and shape results are part of each ONNX
+            // execution. Restore the capture variant's writes before applying
+            // the token/position-specific overrides below.
+            for (const auto& write : execCtx.capturedWrites_) {
+                if (!write.handle || write.data.empty()) continue;
+                gpu->writeBufferRaw(write.handle, write.offset,
+                                    write.data.data(), write.data.size());
+            }
+            const int64_t replayToken = tokenId;
+            const int64_t replayPosition = static_cast<int64_t>(execCtx.replayPosition_);
+            gpu->writeBufferRaw(idsBuf.handle, idsBuf.offset,
+                                &replayToken, sizeof(replayToken));
+            gpu->writeBufferRaw(positionBuf.handle, positionBuf.offset,
+                                &replayPosition, sizeof(replayPosition));
+            const int64_t maskOne = 1;
+            gpu->writeBufferRaw(maskBuf.handle,
+                maskBuf.offset + static_cast<uint64_t>(execCtx.replayPosition_) * 8,
+                &maskOne, sizeof(maskOne));
             execCtx.ReplayWrites();
+
+            // The exported Qwen graph selects one 32-float RoPE cache row on
+            // the CPU through Where nodes. Capture freezes those six writes;
+            // refresh them from the immutable ONNX cache at replay position.
+            const auto* sinCache = executor.GetInitData("model.rotary_emb.sin_cache");
+            const auto* cosCache = executor.GetInitData("model.rotary_emb.cos_cache");
+            for (const auto& write : execCtx.capturedWrites_) {
+                if (write.opName.find("Range:/model/attn/synthetic_pos_ids/range/Range") !=
+                        std::string::npos && write.data.size() == 4) {
+                    const int32_t position = static_cast<int32_t>(execCtx.replayPosition_);
+                    gpu->writeBufferRaw(write.handle, write.offset, &position, sizeof(position));
+                    continue;
+                }
+                const OnnxInitData* cache = nullptr;
+                if (write.opName.find("/rotary_emb/sin/") != std::string::npos)
+                    cache = sinCache;
+                else if (write.opName.find("/rotary_emb/cos/") != std::string::npos)
+                    cache = cosCache;
+                if (!cache || !cache->data || cache->shape.size() != 2 ||
+                    cache->shape[0] <= 0 || cache->shape[1] <= 0) continue;
+                const uint64_t rowBytes = static_cast<uint64_t>(cache->shape[1]) * 4;
+                const uint64_t row = std::min<uint64_t>(execCtx.replayPosition_,
+                    static_cast<uint64_t>(cache->shape[0] - 1));
+                if (write.data.size() != rowBytes) continue;
+                gpu->writeBufferRaw(write.handle, write.offset,
+                    cache->data + row * rowBytes, rowBytes);
+            }
 
             uint64_t logitBytes = (uint64_t)vocabSize * 4;
             auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
@@ -609,30 +735,91 @@ struct GenericOnnxState {
             for (size_t i = 0; i < convLayerIndices.size(); i++) {
                 std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
                                      ".conv_state";
-                wgpuBindGroupAddRef(convCastBindGroups[i]);
-                execCtx.QueueDispatch(convCastPipeline->pipeline, convCastBindGroups[i],
-                    convCastWorkgroups, 1, 1, "cache_cast_f16");
-                convState[inName].buffer = convCastF16Bufs[i];
-                convState[inName].dtype = TensorDtype::Float16;
+                if (arch != "qwen3_5_text") {
+                    wgpuBindGroupAddRef(convCastBindGroups[i]);
+                    execCtx.QueueDispatch(convCastPipeline->pipeline, convCastBindGroups[i],
+                        convCastWorkgroups, 1, 1, "cache_cast_f16");
+                    convState[inName].buffer = convCastF16Bufs[i];
+                    convState[inName].dtype = TensorDtype::Float16;
+                }
+                if (arch != "qwen3_5_text" &&
+                    i < capturedRecurrentInputBufs.size() &&
+                    i < capturedRecurrentOutputBufs.size()) {
+                    const uint64_t bytes = static_cast<uint64_t>(recurrentHeads) *
+                        recurrentKeyDim * recurrentValueDim * 4;
+                    execCtx.QueueCopy(capturedRecurrentOutputBufs[i], 0,
+                                      capturedRecurrentInputBufs[i], 0, bytes);
+                    std::string recurrentName = "past_key_values." +
+                        std::to_string(convLayerIndices[i]) + ".recurrent_state";
+                    recurrentState[recurrentName].buffer = capturedRecurrentInputBufs[i];
+                }
             }
             execCtx.SubmitPending();
-
             for (int idx : attnLayerIndices) {
                 kvState["past_key_values." + std::to_string(idx) + ".key"].shape
                     = {1, numKvHeads, (int64_t)pos, headDim};
                 kvState["past_key_values." + std::to_string(idx) + ".value"].shape
                     = {1, numKvHeads, (int64_t)pos, headDim};
             }
+            if (arch == "qwen3_5_text")
+                qwenNextReplayVariant =
+                    (qwenNextReplayVariant + 1) % qwenCapturedVariants;
             return logits;
         }
 
         // Capture Stage
         if (fastDecodeEnabled && !fastDecodeCaptured && prefillDone) {
+            capturedRecurrentInputBufs.clear();
+            capturedRecurrentInputBufs.reserve(convLayerIndices.size());
+            for (int idx : convLayerIndices) {
+                std::string name = "past_key_values." + std::to_string(idx) +
+                                   ".recurrent_state";
+                capturedRecurrentInputBufs.push_back(recurrentState[name].buffer);
+            }
             execCtx.capturePosition_ = (uint32_t)(pos - 1);
             execCtx.CaptureBegin();
             auto logits = runExecutePath(tokenId);
             execCtx.CaptureEnd();
+
+            if (arch == "qwen3_5_text") {
+                const int variant = qwenCapturedVariants;
+                qwenCaptureVariants[variant].logits = logitsBuf;
+                int nDisp = 0;
+                for (auto& f : execCtx.capturedFlushes_)
+                    nDisp += static_cast<int>(f.dispatches.size());
+                fprintf(stderr,
+                    "  [fast decode capture %d/2] %zu flushes, %d dispatches, %zu param updates\n",
+                    variant + 1,
+                    execCtx.capturedFlushes_.size(), nDisp,
+                    execCtx.replayParamUpdates_.size());
+                StoreCurrentQwenCapture(variant);
+                qwenCapturedVariants++;
+                execCtx.ResetParamPoolCursors();
+                // Qwen's recurrent and convolution state buffers ping-pong
+                // every token. Preserve both binding parities and alternate
+                // them during replay, just as the ordinary graph does.
+                const int requiredVariants = 2;
+                if (qwenCapturedVariants == requiredVariants) {
+                    fastDecodeCaptured = true;
+                    // Three ordinary decode steps settle the tensor plan
+                    // before capture. Recurrent caches are safely in-place,
+                    // leaving one stable command stream to replay.
+                    qwenNextReplayVariant = 0;
+                }
+                return logits;
+            }
+
             fastDecodeCaptured = true;
+
+            capturedConvOutputBufs.resize(convLayerIndices.size());
+            capturedRecurrentOutputBufs.resize(convLayerIndices.size());
+            for (size_t i = 0; i < convLayerIndices.size(); i++) {
+                const std::string prefix = "past_key_values." +
+                    std::to_string(convLayerIndices[i]);
+                capturedConvOutputBufs[i] = convState[prefix + ".conv_state"].buffer;
+                capturedRecurrentOutputBufs[i] =
+                    recurrentState[prefix + ".recurrent_state"].buffer;
+            }
 
             if (!execCtx.capturedFlushes_.empty()) {
                 auto& lastF = execCtx.capturedFlushes_.back();
@@ -645,8 +832,9 @@ struct GenericOnnxState {
             {
                 int nDisp = 0;
                 for (auto& f : execCtx.capturedFlushes_) nDisp += (int)f.dispatches.size();
-                fprintf(stderr, "  [fast decode capture] %zu flushes, %d dispatches, %zu param updates\n",
-                        execCtx.capturedFlushes_.size(), nDisp, execCtx.replayParamUpdates_.size());
+                fprintf(stderr, "  [fast decode capture] %zu flushes, %d dispatches, %zu param updates, %zu token inputs\n",
+                        execCtx.capturedFlushes_.size(), nDisp, execCtx.replayParamUpdates_.size(),
+                        execCtx.capturedTokenIdBufs_.size());
             }
 
             if (!convLayerIndices.empty()) {
@@ -660,10 +848,32 @@ struct GenericOnnxState {
                 convCastBindGroups.resize(convLayerIndices.size());
                 for (size_t i = 0; i < convLayerIndices.size(); i++) {
                     convCastBindGroups[i] = executor.MakeBindGroup(*convCastPipeline, {
-                        {0, {convOutBufs[i].handle, convOutBufs[i].size}},
+                        {0, capturedConvOutputBufs[i]},
                         {1, convCastF16Bufs[i]},
                         {2, paramBuf}});
                 }
+
+                // Feed the capture step's outputs back into the stable input
+                // buffers before the first replay. Subsequent replays queue
+                // the same feedback after each captured graph execution.
+                for (size_t i = 0; i < convLayerIndices.size(); i++) {
+                    if (arch == "qwen3_5_text") {
+                        execCtx.QueueCopy(capturedConvOutputBufs[i], 0,
+                                          convCastF16Bufs[i], 0,
+                                          static_cast<uint64_t>(convChannels) * convLCache * 4);
+                    } else {
+                        wgpuBindGroupAddRef(convCastBindGroups[i]);
+                        execCtx.QueueDispatch(convCastPipeline->pipeline, convCastBindGroups[i],
+                            convCastWorkgroups, 1, 1, "cache_cast_f16");
+                    }
+                    if (i < capturedRecurrentInputBufs.size()) {
+                        const uint64_t bytes = static_cast<uint64_t>(recurrentHeads) *
+                            recurrentKeyDim * recurrentValueDim * 4;
+                        execCtx.QueueCopy(capturedRecurrentOutputBufs[i], 0,
+                                          capturedRecurrentInputBufs[i], 0, bytes);
+                    }
+                }
+                execCtx.SubmitPending();
             }
 
             return logits;
@@ -679,8 +889,6 @@ struct GenericOnnxState {
             if (node.opType == "If" || node.opType == "Loop" || node.opType == "Scan")
                 return "model contains dynamic control flow (" + node.opType + " op: " + node.name + ")";
         }
-        if (arch == "qwen3_5_text")
-            return "Qwen 3.5 recurrent graph capture is pending state-buffer alias validation";
         if (convLayerIndices.empty() && attnLayerIndices.empty())
             return "model has no conv or attention layers";
         return "";
@@ -692,7 +900,8 @@ struct GenericOnnxState {
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             size_t nel = (size_t)(convChannels * convLCache);
             convCastF16Bufs[i] = gpu->createBuffer(
-                "conv_cast_f16_" + std::to_string(i), nel * 2);
+                "conv_replay_input_" + std::to_string(i),
+                nel * (arch == "qwen3_5_text" ? 4 : 2));
         }
     }
 

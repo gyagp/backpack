@@ -259,7 +259,9 @@ void ExecutionContext::ReplayWrites() {
             case ReplayParamUpdate::PastSeq:   value = replayPosition_; break;
             case ReplayParamUpdate::TotalSeq:  value = replayPosition_ + 1; break;
         }
-        gpu->writeBufferRaw(update.paramBuf.handle, update.offsetBytes, &value, 4);
+        gpu->writeBufferRaw(update.paramBuf.handle,
+                            update.paramBuf.offset + update.offsetBytes,
+                            &value, 4);
     }
 
     for (auto& tok : capturedTokenIdBufs_) {

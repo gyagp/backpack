@@ -1023,14 +1023,9 @@ void GraphExecutor::Execute(
             w.offset = offset;
             w.data.resize((size_t)size);
             memcpy(w.data.data(), data, (size_t)size);
+            if (g_currentOp) w.opName = g_currentOp;
             execCtx->capturedWrites_.push_back(std::move(w));
 
-            // Log non-trivial writes for debugging
-            if (size > 64) {
-                fprintf(stderr, "    [capture-write] %zu bytes to %p (op=%s)\n",
-                        (size_t)size, (void*)handle,
-                        g_currentOp ? g_currentOp : "?");
-            }
         };
         gpu->captureWritesCtx_ = &ctx;
     }

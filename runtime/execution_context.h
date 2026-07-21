@@ -127,6 +127,7 @@ struct ExecutionContext {
         WGPUBuffer handle;
         uint64_t offset;
         std::vector<uint8_t> data;
+        std::string opName;
     };
     std::vector<CapturedWrite> capturedWrites_;
 
