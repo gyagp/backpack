@@ -24,6 +24,14 @@ def required_machine_ids(task: dict[str, Any], machines: list[dict[str, Any]]) -
     required: set[str] = set()
     missing: list[str] = []
     for item in task.get("device_policy", {}).get("required", []):
+        if isinstance(item, str):
+            match = next((machine for machine in machines
+                          if machine["id"] == item or machine.get("name") == item), None)
+            if match:
+                required.add(match["id"])
+            else:
+                missing.append(item)
+            continue
         selector = item.get("selector", {})
         count = int(item.get("count", 1))
         matches = [m["id"] for m in machines if machine_matches(m, selector)]

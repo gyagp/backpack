@@ -42,6 +42,22 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("accept", result["aggregate_verdict"])
         self.assertEqual("positive", result["evaluations"][0]["verdict"])
 
+    def test_named_required_device_is_resolved(self) -> None:
+        named = self.store.create_task({
+            "title": "Named device", "hypothesis": "Named policies are evaluable",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s"]},
+            "device_policy": {"required": [self.machine["name"]]},
+        })
+        common = {"task_id": named["id"], "machine_id": self.machine["id"],
+                  "metric": "decode_tok_s", "correctness": {"passed": True}}
+        self.store.add_evidence({**common, "variant": "base", "samples": [100],
+                                 "commit_sha": "base"}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [105],
+                                 "commit_sha": "candidate"}, "test")
+        result = PolicyEngine(self.store).evaluate(named["id"])
+        self.assertEqual("accept", result["aggregate_verdict"])
+
     def test_correctness_failure_is_rejected(self) -> None:
         self.add_pair([100, 101], [120, 121], passed=False)
         result = PolicyEngine(self.store).evaluate(self.task["id"])
