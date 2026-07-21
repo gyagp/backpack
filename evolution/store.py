@@ -968,7 +968,7 @@ class Store:
                                            and metrics.get("decode_tok_s") is not None)
                 if valid:
                     reason = "Latest matching conformance and prefill/decode measurements are valid"
-            elif origin.get("type") == "scheduled" or (
+            elif origin.get("type") in {"scheduled", "profiling"} or (
                     origin.get("type") == "continuous-learning"
                     and task["title"].startswith("Profile ")):
                 runs = self.list_runs(task["id"])

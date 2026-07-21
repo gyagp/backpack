@@ -141,6 +141,26 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(1, self.store.reconcile_completed_tasks())
         self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
 
+    def test_successful_profiling_run_closes_task(self) -> None:
+        task = self.store.create_task({
+            "title": "Profile cared model", "kind": "profiling",
+            "hypothesis": "A completed profile identifies the next bottleneck",
+            "origin": {"type": "profiling"},
+            "manifest": {"adapter": "argv", "argv": ["profile"]},
+            "device_policy": {"machine_ids": [self.machine["id"]]},
+        }, "test")
+        self.store.ensure_task_runs()
+        run = self.store.list_runs(task["id"])[0]
+        self.store.update_run(run["id"], {
+            "status": "completed", "progress": 100,
+            "result": {"exit_code": 0},
+        }, "agent")
+
+        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        closed = self.store.get_task(task["id"])
+        self.assertEqual("integrated", closed["state"])
+        self.assertEqual("accepted", closed["aggregate_verdict"])
+
     def test_history_keeps_detailed_gain(self) -> None:
         item = self.store.add_history({
             "title": "Fused projection", "summary": "Removed two dispatches",
