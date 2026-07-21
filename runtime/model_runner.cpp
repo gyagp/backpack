@@ -2262,6 +2262,9 @@ void ModelRunner::buildDecodePipeline() {
     const bool qwen35VulkanDecode =
         (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12 &&
          !std::getenv("BP_Q35_GENERIC_KERNELS"));
+    const bool qwen35SubgroupSuite = cfg.arch == "qwen35" &&
+        gpu->supportsSubgroups && isNvidiaAdapter &&
+        !std::getenv("BP_Q35_GENERIC_KERNELS");
     uint32_t Q8_TILE = 8;
     // Gemma 4 has only a few very wide query heads. Smaller attention chunks
     // expose enough independent workgroups to occupy the GPU. Cross-device
@@ -2279,9 +2282,9 @@ void ModelRunner::buildDecodePipeline() {
     uint32_t maxChunks = (maxSeqLen + gqaChunkSize - 1) / gqaChunkSize;
 
     // Load kernels from embedded shaders
-    auto& plRmsNorm    = qwen35VulkanDecode ? getKernel("rms_norm_qwen_vulkan")
+    auto& plRmsNorm    = (qwen35VulkanDecode || qwen35SubgroupSuite) ? getKernel("rms_norm_qwen_vulkan")
                                             : getKernel("rms_norm");
-    auto& plAddRmsNorm = qwen35VulkanDecode ? getKernel("add_rms_norm_qwen_vulkan")
+    auto& plAddRmsNorm = (qwen35VulkanDecode || qwen35SubgroupSuite) ? getKernel("add_rms_norm_qwen_vulkan")
                                             : getKernel("add_rms_norm");
     const CompiledPipeline* plQ8IntelUnpack = nullptr;
     if (isIntelAdapter) {
@@ -3245,7 +3248,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 allDecodeDispatches.push_back({plGate.pipeline, bg,
                     (cfg.ssmTimeStepRank + 63) / 64, 1, 1, L+"ssm_abg"});
             }
-            if (qwen35VulkanDecode && cfg.ssmStateSize == 128u && headV == 128u &&
+            if ((qwen35VulkanDecode || qwen35SubgroupSuite) &&
+                cfg.ssmStateSize == 128u && headV == 128u &&
                 !std::getenv("BP_UNFUSED_Q35_CONV")) {
                 static const char* CONV_SPLIT_WGSL = R"(
 enable subgroups;
@@ -3329,15 +3333,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             }
             }
             {
-                auto& plDelta = qwen35VulkanDecode ? getKernel("delta_net_decode_x2")
-                                                   : getKernel("delta_net_decode");
+                auto& plDelta = (qwen35VulkanDecode || qwen35SubgroupSuite)
+                    ? getKernel("delta_net_decode_x2") : getKernel("delta_net_decode");
                 auto p = mkP32("p_ssm_delta_L"+std::to_string(i),
                                {cfg.ssmTimeStepRank, cfg.ssmGroupCount, cfg.ssmStateSize, headV});
                 auto bg = makeBG(plDelta, {
                     {0, q35SsmQBuf}, {1, q35SsmKBuf}, {2, q35SsmVBuf},
                     {3, q35SsmBetaBuf}, {4, q35SsmGateBuf}, {5, ssmHState[i]},
                     {6, q35SsmYBuf}, {7, p}});
-                const uint32_t deltaY = qwen35VulkanDecode ? ((headV + 1u) / 2u) : headV;
+                const uint32_t deltaY = (qwen35VulkanDecode || qwen35SubgroupSuite)
+                    ? ((headV + 1u) / 2u) : headV;
                 allDecodeDispatches.push_back({plDelta.pipeline, bg,
                     cfg.ssmTimeStepRank, deltaY, 1, L+"ssm_delta"});
             }
