@@ -10,3 +10,4 @@
 .trend-chart-card .date-grid{stroke:#d3d9e3;stroke-width:1;stroke-dasharray:3 4}.trend-chart-card .date-label{font-size:10px;fill:var(--muted)}
 .trend-controls.status-trend-filters{grid-template-columns:minmax(360px,2fr) minmax(220px,1fr)}@media(max-width:900px){.trend-controls.status-trend-filters{grid-template-columns:1fr}}
 .status-trend #trend-latest{display:none}.status-device-trends .trend-chart-card{padding:8px 0;border:0;border-radius:0;background:transparent}
+.status-comparison .runtime-revision{min-width:150px;font:11px Consolas,monospace}.status-comparison .reference-revision{border-left:1px solid var(--border)}
