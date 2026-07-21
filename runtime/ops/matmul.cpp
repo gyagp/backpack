@@ -382,10 +382,19 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
-        auto& pipeline = useSubgroupDecode
-            ? ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
-                []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); })
-            : ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
+        const bool useDp4aDecode = useSubgroupDecode && (K % 256u) == 0u &&
+            ex.getGpu()->adapterName.find("Intel") == std::string::npos;
+        const CompiledPipeline* pipelinePtr = nullptr;
+        if (useDp4aDecode) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_dp4a", 5,
+                []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_DP4A); });
+        } else if (useSubgroupDecode) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
+                []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); });
+        } else {
+            pipelinePtr = &ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
+        }
+        auto& pipeline = *pipelinePtr;
         auto group = ex.MakeBindGroup(pipeline, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
