@@ -122,8 +122,6 @@ async function refresh() {
         !terminal.has(t.state) &&
         !(t.runs || []).some((r) => r.status === "running"),
   );
-  $("#task-count").textContent = `${pending.length} pending`;
-  $("#tasks").innerHTML = renderTaskTable(pending, history, "pending");
   const todoHistory = [
     ...history,
     ...regressions.map((r) => ({
@@ -134,24 +132,15 @@ async function refresh() {
       created_at: "confirmed by two measurements",
     })),
   ];
-  renderTodos(enriched, decisions, todoHistory, dismissedTodos);
   renderMatrix(matrix);
   renderPerformanceAnalysis();
   renderPerformanceTrend(observations);
-  const done = enriched.filter((t) => terminal.has(t.state));
-  $("#done-tasks").innerHTML = renderTaskTable(done, history, "done");
-  $("#done-count").textContent = `${done.length} done`;
-  $("#done-tab-count").textContent = done.length || "";
+  renderTaskDirectory(enriched, history);
   renderDigest(history, enriched);
   renderStudies(studies, tasks);
   renderStudyFeedback(studies, tasks, history);
   renderDevices(machines);
   renderActivity(activity);
-  const active = enriched.filter((task) =>
-    (task.runs || []).some((run) => run.status === "running"),
-  );
-  $("#active-work").innerHTML = renderTaskTable(active, history, "active");
-  updateTaskTabs(enriched);
   document
     .querySelectorAll(".activity-toggle")
     .forEach((b) => (b.onclick = () => toggleDeviceActivity(b)));
@@ -746,6 +735,44 @@ function renderTaskTable(tasks, history = [], mode = "pending") {
     }).join("");
   return `<div class="table-wrap task-table-wrap"><table class="task-table"><thead><tr><th>ID</th><th>Task</th><th>Source</th><th>Status</th><th>Result</th><th>Created</th><th>Started</th><th>Done</th><th>Duration</th><th>Devices</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
+function taskDisplayStatus(task) {
+  return (task.runs || []).some((run) => run.status === "running")
+    ? "running"
+    : task.state;
+}
+function renderTaskDirectory(tasks, history) {
+  const search = $("#task-search"), status = $("#task-status-filter"),
+    source = $("#task-source-filter"), target = $("#all-tasks");
+  const populate = (select, values, label) => {
+    const current = select.value;
+    select.innerHTML = `<option value="">All ${label}</option>${[...new Set(values)].sort().map((x) => `<option value="${esc(x)}">${esc(statusLabel(x))}</option>`).join("")}`;
+    select.value = current;
+  };
+  populate(status, tasks.map(taskDisplayStatus), "statuses");
+  populate(source, tasks.map(taskSource), "sources");
+  const apply = () => {
+    const query = search.value.trim().toLowerCase(), statusValue = status.value,
+      sourceValue = source.value;
+    const filtered = tasks.filter((task) => {
+      const haystack = [taskLabel(task), task.id, task.title, taskSource(task),
+        taskResult(task), task.verdict_reason,
+        ...(task.runs || []).flatMap((run) => [run.machine_name, run.machine_id, run.error])]
+        .filter(Boolean).join(" ").toLowerCase();
+      return (!query || haystack.includes(query)) &&
+        (!statusValue || taskDisplayStatus(task) === statusValue) &&
+        (!sourceValue || taskSource(task) === sourceValue);
+    });
+    target.innerHTML = renderTaskTable(filtered, history, "matching");
+    $("#task-list-count").textContent = `${filtered.length} of ${tasks.length}`;
+    target.querySelectorAll(".detail").forEach((button) =>
+      button.onclick = () => showTask(button.dataset.id));
+  };
+  search.oninput = apply; status.onchange = apply; source.onchange = apply;
+  $("#clear-task-filters").onclick = () => {
+    search.value = ""; status.value = ""; source.value = ""; apply();
+  };
+  apply();
+}
 function renderDoneTasks(items, tasks = [], machines = []) {
   const taskById = new Map(tasks.map((t) => [t.id, t])),
     groups = new Map();
@@ -1081,7 +1108,8 @@ function renderActivity(a) {
         `<div class="health-card ${c.state === "ok" ? "" : c.state}"><i class="health-icon"></i><div><strong>${esc(c.value)}</strong><div class="meta">${esc(c.label)} · ${esc(c.detail)}</div></div></div>`,
     )
     .join("");
-  $("#activity-task-count").textContent = `${active} running`;
+  const activityTaskCount = $("#activity-task-count");
+  if (activityTaskCount) activityTaskCount.textContent = `${active} running`;
   $("#last-refresh").textContent =
     `${(a.events || []).length} events · updated ${new Date(a.server_time).toLocaleTimeString()}`;
   $("#activity-feed").innerHTML = (a.events || []).length
@@ -1458,7 +1486,6 @@ pathTabs.history = "digest";
 function tabFromUrl(url = new URL(location.href)) {
   const path = url.pathname.replace(/^\/+|\/+$/g, "");
   if (path === "human-intervention") {
-    activeTaskTab = "intervention";
     return "status";
   }
   return (
