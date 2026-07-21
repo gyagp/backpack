@@ -338,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path: str) -> None:
         app_routes = {
             "", "/", "/tasks", "/evolution", "/human-intervention",
-            "/status", "/performance-analysis", "/history", "/devices",
+            "/status", "/performance-analysis", "/digest", "/history", "/devices",
         }
         relative = "index.html" if path in app_routes else path.lstrip("/")
         candidate = (STATIC_DIR / relative).resolve()
