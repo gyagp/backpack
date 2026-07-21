@@ -1726,10 +1726,11 @@ static void opSplit(OpContext& ex, const OnnxGraphNode& n,
         }
         offset += splits[i];
     }
-    // Flush pending dispatches+copies so downstream ops see the copy results.
-    // Even when all splits used aliases (no copies), flush pending dispatches
-    // for CPU-GPU pipelining — submitting work early gives the GPU a head start.
-    if (!ex.exec.pendingDispatches_.empty() || !ex.exec.pendingCopies_.empty()) {
+    // Copies are encoded after queued compute work, so submit them before
+    // downstream dispatches are appended. Zero-copy aliases need no boundary:
+    // producer and consumer dispatches remain ordered in the same compute pass.
+    const bool nvidia = ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
+    if (!ex.exec.pendingCopies_.empty() || !nvidia) {
         ex.exec.flushToEncoder();
     }
 }
