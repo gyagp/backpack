@@ -253,5 +253,14 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "\n\n--- Performance ---\n");
     fprintf(stderr, "  Prompt:   %zu tokens\n", promptTokens.size());
     fprintf(stderr, "  Generate: %d tokens in %.0fms (%.1f tok/s)\n", tokenCount, genMs, tps);
+    if (profile) {
+        fprintf(stderr, "\n=== GPU Hardware Timestamp Profile ===\n");
+        fs::path modelName = fs::path(modelPath).parent_path().filename();
+        if (modelName.empty())
+            modelName = fs::path(modelPath).stem();
+        fs::path profileDir = fs::path("gitignore") / "models" / modelName;
+        fs::create_directories(profileDir);
+        session.PrintProfileReport((profileDir / "profile.html").string());
+    }
     return 0;
 }
