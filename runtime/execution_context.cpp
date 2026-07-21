@@ -100,7 +100,9 @@ GPUBuffer ExecutionContext::getParamBuffer(uint32_t sizeBytes) {
             int newSize = std::max(2048, oldSize * 2);
             pool.buffers.resize(newSize);
             for (int i = oldSize; i < newSize; i++)
-                pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
+                pool.buffers[i] = gpu->createBuffer(
+                    "param_pool", sizeBytes,
+                    BUF_UNIFORM | BUF_STORAGE | BUF_COPY_DST);
         }
         return pool.buffers[pool.nextIdx++];
     }
@@ -109,7 +111,9 @@ GPUBuffer ExecutionContext::getParamBuffer(uint32_t sizeBytes) {
     if (pool.buffers.empty()) {
         pool.buffers.resize(PARAM_POOL_SIZE);
         for (int i = 0; i < PARAM_POOL_SIZE; i++)
-            pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
+            pool.buffers[i] = gpu->createBuffer(
+                "param_pool", sizeBytes,
+                BUF_UNIFORM | BUF_STORAGE | BUF_COPY_DST);
         pool.nextIdx = 0;
     }
     if (pool.nextIdx >= (int)pool.buffers.size()) {
@@ -120,7 +124,9 @@ GPUBuffer ExecutionContext::getParamBuffer(uint32_t sizeBytes) {
         int newSize = oldSize * 2;
         pool.buffers.resize(newSize);
         for (int i = oldSize; i < newSize; ++i)
-            pool.buffers[i] = gpu->createBuffer("param_pool", sizeBytes);
+            pool.buffers[i] = gpu->createBuffer(
+                "param_pool", sizeBytes,
+                BUF_UNIFORM | BUF_STORAGE | BUF_COPY_DST);
     }
     return pool.buffers[pool.nextIdx++];
 }

@@ -355,7 +355,7 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
     d.usage = usage;
     d.size = size;
     d.mappedAtCreation = mappedAtCreation ? 1u : 0u;
-    GPUBuffer buf{wgpuDeviceCreateBuffer(device, &d), size};
+    GPUBuffer buf{wgpuDeviceCreateBuffer(device, &d), size, 0, usage};
     // Dawn may return a non-null "error" buffer on OOM. Check via the error callback flag.
     if (lastAllocFailed) {
         lastAllocFailed = false;
@@ -368,7 +368,7 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
         fflush(stderr);
         flushBufferPool();
         lastAllocFailed = false;
-        buf = {wgpuDeviceCreateBuffer(device, &d), size};
+        buf = {wgpuDeviceCreateBuffer(device, &d), size, 0, usage};
         if (lastAllocFailed) {
             lastAllocFailed = false;
             if (buf.handle) { wgpuBufferRelease(buf.handle); buf.handle = nullptr; }
@@ -403,7 +403,8 @@ void GPUContext::releaseBuffer(GPUBuffer buf) {
     // Large buffers are destroyed immediately to free VRAM.
     constexpr uint64_t POOL_MAX_POOLED = 2ull * 1024 * 1024;
     int bucket = poolBucket(buf.size);
-    if (buf.size <= POOL_MAX_POOLED && pool_[bucket].size() < 256) {
+    if (buf.usage == BUF_DEFAULT && buf.size <= POOL_MAX_POOLED &&
+        pool_[bucket].size() < 256) {
         pool_[bucket].push_back(buf);
     } else {
         wgpuBufferDestroy(buf.handle);

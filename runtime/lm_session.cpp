@@ -479,7 +479,14 @@ struct GenericOnnxState {
 
     int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
         if (T == 0) return -1;
-        if (std::getenv("BP_GENERIC_SERIAL_PREFILL")) {
+        // Intel's current Qwen 3.5 batched graph path is numerically
+        // non-conformant (the factual gate produces punctuation instead of
+        // "Paris"). Keep the portable serial path as a correctness fallback
+        // until the offending batched kernel is isolated; AMD and NVIDIA keep
+        // the faster batched prefill path.
+        const bool intelQwenSerial = arch == "qwen3_5_text" &&
+            gpu->adapterName.find("Intel") != std::string::npos;
+        if (std::getenv("BP_GENERIC_SERIAL_PREFILL") || intelQwenSerial) {
             std::vector<float> logits;
             for (uint32_t i = 0; i < T; ++i)
                 logits = RunPrefillStep(tokenIds[i]);

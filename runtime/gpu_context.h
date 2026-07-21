@@ -48,6 +48,7 @@ struct GPUBuffer {
     WGPUBuffer handle = nullptr;
     uint64_t   size   = 0;
     uint64_t   offset = 0;   // bind offset (for buffer views/aliases)
+    uint64_t   usage  = 0;   // creation usage; prevents incompatible pool reuse
 };
 
 /// GPU profiler using WebGPU timestamp queries.

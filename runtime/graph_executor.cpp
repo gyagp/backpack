@@ -1576,6 +1576,12 @@ void GraphExecutor::Execute(
             std::set<WGPUBuffer> keepHandles;
             for (auto& [name, tensor] : outputs)
                 if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
+            // External inputs are borrowed by this Execute call. Shape/view
+            // operators may alias them into tensorStore_, but those aliases
+            // must never become owned warm-plan allocations: callers can
+            // release or replace the input immediately after Execute returns.
+            for (auto& [name, tensor] : inputs)
+                if (tensor && tensor->buffer.handle) keepHandles.insert(tensor->buffer.handle);
             for (auto& name : persistentTensors_) {
                 auto it = weightStore_.find(name);
                 if (it != weightStore_.end() && it->second.buffer.handle)
