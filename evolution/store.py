@@ -907,17 +907,38 @@ class Store:
         # Preserve the newest semantic result and the newest performance result
         # independently. A benchmark observation uses ``not_applicable`` for
         # conformance and must not overwrite an earlier pass/fail observation.
+        def compatible_revision(metric_revision: Any, pass_revision: Any) -> bool:
+            metric = str(metric_revision or "").lower().strip("-")
+            passed = str(pass_revision or "").lower().strip("-")
+            if not metric or not passed:
+                return False
+            # Benchmark-mode and date suffixes do not change runtime code.
+            suffixes = ("-reuse-generator", "-reuse_generator")
+            for suffix in suffixes:
+                if metric.endswith(suffix):
+                    metric = metric[:-len(suffix)]
+                if passed.endswith(suffix):
+                    passed = passed[:-len(suffix)]
+            metric = re.sub(r"-(?:19|20)\d{6}$", "", metric)
+            passed = re.sub(r"-(?:19|20)\d{6}$", "", passed)
+            return metric == passed or metric.startswith(passed + "-") or passed.startswith(metric + "-")
+
         observations = []
-        evidence: dict[tuple[str, str, str, str, str], dict[str, dict[str, Any]]] = {}
+        grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
         for item in self.list_observations({}):
             key = tuple(item[name] for name in ("model_id", "machine_id", "framework", "format", "backend"))
-            group = evidence.setdefault(key, {})
-            if "metrics" not in group and item.get("metrics"):
-                group["metrics"] = item
-            if "conformance" not in group and item["conformance"] in {"pass", "fail"}:
-                group["conformance"] = item
-        for group in evidence.values():
-            observations.extend({item["id"]: item for item in group.values()}.values())
+            grouped.setdefault(key, []).append(item)
+        for items in grouped.values():
+            passes = [item for item in items if item["conformance"] == "pass"]
+            conformance = next((item for item in items if item["conformance"] in {"pass", "fail"}), None)
+            metrics = next((item for item in items if item.get("metrics") and (
+                item["conformance"] == "pass" or any(
+                    compatible_revision(item.get("revision"), passed.get("revision")) for passed in passes
+                ))), None)
+            if metrics:
+                metrics = dict(metrics)
+                metrics["performance_validated"] = True
+            observations.extend({item["id"]: item for item in (conformance, metrics) if item}.values())
         by_cell: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for item in observations:
             by_cell.setdefault((item["model_id"], item["machine_id"]), []).append(item)

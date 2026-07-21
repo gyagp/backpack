@@ -89,6 +89,21 @@ class FrameworkTest(unittest.TestCase):
         self.assertTrue(any(task["origin"].get("automation_key") == "conformance:model-a" for task in created))
         self.assertEqual([], self.store.ensure_automatic_tasks())
 
+    def test_matrix_uses_latest_metric_with_matching_conformance_revision(self) -> None:
+        model = self.store.upsert_model({"id": "model-valid", "name": "Valid", "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "llamacpp", "format": "gguf", "backend": "vulkan"}
+        self.store.add_observation({**common, "conformance": "pass", "revision": "b10069-20260720"}, "test")
+        self.store.add_observation({**common, "conformance": "not_applicable", "revision": "b10069",
+                                    "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20}}, "test")
+        self.store.add_observation({**common, "conformance": "not_applicable", "revision": "unverified-newer",
+                                    "metrics": {"prefill_tok_s": 999, "decode_tok_s": 999}}, "test")
+        cell = next(row for row in self.store.model_matrix()["models"]
+                    if row["model"]["id"] == model["id"])["cells"][0]
+        metric = next(item for item in cell["results"] if item.get("performance_validated"))
+        self.assertEqual("b10069", metric["revision"])
+        self.assertEqual(20, metric["metrics"]["decode_tok_s"])
+
     def test_history_keeps_detailed_gain(self) -> None:
         item = self.store.add_history({
             "title": "Fused projection", "summary": "Removed two dispatches",
