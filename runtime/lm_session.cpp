@@ -479,18 +479,19 @@ struct GenericOnnxState {
 
     int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
         if (T == 0) return -1;
-        // Intel's Qwen 3.5 graph is conformant for M<=4, while larger dynamic
-        // prefill shapes diverge numerically. Portable micro-batching retains
-        // real GPU batching and avoids the failing shape until its individual
-        // operator is isolated.
+        // Intel's Qwen 4B graph has one known bad dynamic shape at M=4, but
+        // the normal 64-token bounded path is conformant. Keep an override for
+        // bounded kernel-isolation experiments without penalizing production.
         const bool intelQwen = arch == "qwen3_5_text" &&
             gpu->adapterName.find("Intel") != std::string::npos;
-        constexpr uint32_t kIntelQwenChunk = 4;
-        if (intelQwen && T > kIntelQwenChunk) {
+        uint32_t intelQwenChunk = 64;
+        if (const char* value = std::getenv("BP_INTEL_QWEN_PREFILL_CHUNK"))
+            intelQwenChunk = std::max(1, atoi(value));
+        if (intelQwen && numLayers != 24 && T > intelQwenChunk) {
             int32_t result = -1;
-            for (uint32_t offset = 0; offset < T; offset += kIntelQwenChunk)
+            for (uint32_t offset = 0; offset < T; offset += intelQwenChunk)
                 result = RunPrefillBatch(tokenIds + offset,
-                    std::min(kIntelQwenChunk, T - offset));
+                    std::min(intelQwenChunk, T - offset));
             return result;
         }
         if (std::getenv("BP_GENERIC_SERIAL_PREFILL")) {
@@ -531,17 +532,22 @@ struct GenericOnnxState {
         memcpy(idT.cpuData.data(), ids64.data(), T * 8);
         inputs["input_ids"] = &idT;
 
+        const bool intelQwen2 = arch == "qwen3_5_text" && numLayers == 24 &&
+            gpu->adapterName.find("Intel") != std::string::npos;
         GpuTensor positionT;
-        std::vector<int64_t> positions(T);
-        for (uint32_t i = 0; i < T; i++)
-            positions[i] = (int64_t)(pos - T + i);
-        positionT.shape = {1, (int64_t)T};
-        positionT.dtype = TensorDtype::Int64;
-        positionT.buffer = positionBuf;
-        gpu->writeBuffer(positionBuf, positions.data(), T * 8);
-        positionT.cpuData.resize(T * 8);
-        memcpy(positionT.cpuData.data(), positions.data(), T * 8);
-        inputs["position_ids"] = &positionT;
+        std::vector<int64_t> positions;
+        if (!intelQwen2) {
+            positions.resize(T);
+            for (uint32_t i = 0; i < T; i++)
+                positions[i] = (int64_t)(pos - T + i);
+            positionT.shape = {1, (int64_t)T};
+            positionT.dtype = TensorDtype::Int64;
+            positionT.buffer = positionBuf;
+            gpu->writeBuffer(positionBuf, positions.data(), T * 8);
+            positionT.cpuData.resize(T * 8);
+            memcpy(positionT.cpuData.data(), positions.data(), T * 8);
+            inputs["position_ids"] = &positionT;
+        }
 
         std::vector<int64_t> mask(pos, 1);
         GpuTensor maskT;
@@ -1009,15 +1015,19 @@ private:
         memcpy(idT.cpuData.data(), &tokenId, 8);
         inputs["input_ids"] = &idT;
 
+        const bool intelQwen2 = arch == "qwen3_5_text" && numLayers == 24 &&
+            gpu->adapterName.find("Intel") != std::string::npos;
         int64_t position = (int64_t)(pos - 1);
         GpuTensor positionT;
-        positionT.shape = {1, 1};
-        positionT.dtype = TensorDtype::Int64;
-        positionT.buffer = positionBuf;
-        gpu->writeBuffer(positionBuf, &position, sizeof(position));
-        positionT.cpuData.resize(sizeof(position));
-        memcpy(positionT.cpuData.data(), &position, sizeof(position));
-        inputs["position_ids"] = &positionT;
+        if (!intelQwen2) {
+            positionT.shape = {1, 1};
+            positionT.dtype = TensorDtype::Int64;
+            positionT.buffer = positionBuf;
+            gpu->writeBuffer(positionBuf, &position, sizeof(position));
+            positionT.cpuData.resize(sizeof(position));
+            memcpy(positionT.cpuData.data(), &position, sizeof(position));
+            inputs["position_ids"] = &positionT;
+        }
 
         std::vector<int64_t> mask(pos, 1);
         GpuTensor maskT;
