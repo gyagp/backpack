@@ -141,6 +141,29 @@ class Store:
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS tasks_number_idx ON tasks(task_number)")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
+            self._cancel_terminal_task_runs()
+
+    def _cancel_terminal_task_runs(self, task_id: str | None = None) -> int:
+        """Reconcile non-terminal runs whose owning task has already ended."""
+        now = utc_now()
+        params: list[Any] = []
+        task_filter = ""
+        if task_id:
+            task_filter = " AND r.task_id=?"
+            params.append(task_id)
+        rows = self._db.execute(f"""SELECT r.id FROM task_runs r
+          JOIN tasks t ON t.id=r.task_id
+          WHERE t.state IN ('integrated','rejected','failed','reverted')
+            AND r.status IN ('pending','running','blocked'){task_filter}""", params).fetchall()
+        if not rows:
+            return 0
+        run_ids = [row[0] for row in rows]
+        placeholders = ",".join("?" for _ in run_ids)
+        self._db.execute(f"UPDATE machines SET current_run_id=NULL WHERE current_run_id IN ({placeholders})", run_ids)
+        self._db.execute(f"""UPDATE task_runs SET status='cancelled',phase='task finished',
+          progress=100,completed_at=COALESCE(completed_at,?),updated_at=?
+          WHERE id IN ({placeholders})""", [now, now, *run_ids])
+        return len(run_ids)
 
     def _backfill_history_tasks(self) -> None:
         """Turn legacy performance history into stable, numbered done tasks.
@@ -245,7 +268,12 @@ class Store:
         validate_transition(task["state"], target)
         with self._lock, self._db:
             self._db.execute("UPDATE tasks SET state=?,updated_at=? WHERE id=?", (target, utc_now(), task_id))
+            cancelled = self._cancel_terminal_task_runs(task_id) if target in {
+                "integrated", "rejected", "failed", "reverted"
+            } else 0
             self.audit("task", task_id, "transition", actor, {"from": task["state"], "to": target, "reason": reason})
+            if cancelled:
+                self.audit("task", task_id, "terminal_runs_cancelled", "scheduler", {"count": cancelled})
         return self.get_task(task_id)  # type: ignore[return-value]
 
     def has_conformance_gaps(self) -> bool:
@@ -655,6 +683,7 @@ class Store:
             rows = self._db.execute("""SELECT r.id,t.manifest_json FROM task_runs r
               JOIN tasks t ON t.id=r.task_id
               WHERE r.machine_id=? AND r.status='pending'
+                AND t.state NOT IN ('integrated','rejected','failed','reverted')
               ORDER BY CASE t.kind WHEN 'correctness' THEN 0 WHEN 'conformance' THEN 0 ELSE 1 END,
                        r.created_at,r.id""", (machine["id"],)).fetchall()
             chosen = None

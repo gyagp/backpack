@@ -186,14 +186,21 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
         if canonical:
             metrics = json.loads(canonical.group(1))
             revision_match = re.search(r"(?m)^LLAMACPP_REVISION (\S+)$", completed.stdout)
+            conformance_match = re.search(r"(?m)^EVOLUTION_CONFORMANCE (\{.*\})$", completed.stdout)
+            conformance = json.loads(conformance_match.group(1)) if conformance_match else {}
             origin = task.get("origin", {})
             request_json(server + "/api/observations", "POST", {
                 "model_id": origin.get("model_id") or next(iter(manifest.get("models") or []), ""),
                 "machine_id": run["machine_id"], "framework": runtime.get("framework", "llamacpp"),
                 "format": runtime.get("format", "gguf"), "backend": runtime.get("backend", "vulkan"),
-                "conformance": "not_applicable",
+                "conformance": "pass" if conformance.get("passed") else "not_applicable",
                 "revision": revision_match.group(1) if revision_match else "unknown",
-                "conformance_details": {"source": f"benchmark task {task.get('id', run['task_id'])}"},
+                "conformance_details": {
+                    "source": f"benchmark task {task.get('id', run['task_id'])}",
+                    "prompt": conformance.get("prompt"),
+                    "required_fact": conformance.get("required_fact"),
+                    "output": conformance.get("output"),
+                },
                 "metrics": metrics, "artifacts": [],
             }, name)
         rows = re.findall(

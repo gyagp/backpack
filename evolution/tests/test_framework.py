@@ -247,6 +247,20 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("running", claimed["status"])
         self.assertIsNone(self.store.claim_run("gpu-1", ["argv"], "gpu-1"))
 
+    def test_terminal_task_cancels_pending_runs_and_cannot_be_claimed(self) -> None:
+        task = self.store.create_task({
+            "title": "Discarded diagnostic", "kind": "correctness", "hypothesis": "Run",
+            "manifest": {"adapter": "argv", "argv": ["python", "--version"]},
+            "device_policy": {"machine_ids": [self.machine["id"]]},
+        })
+        self.store.ensure_task_runs()
+        run = self.store.list_runs(task["id"])[0]
+        self.assertEqual("pending", run["status"])
+        self.store.transition_task(task["id"], "rejected", "test", "superseded")
+        self.assertEqual("cancelled", self.store.get_run(run["id"])["status"])
+        self.assertIsNotNone(self.store.get_run(run["id"])["completed_at"])
+        self.assertIsNone(self.store.claim_run("gpu-1", ["argv"], "gpu-1"))
+
     def test_activity_hides_catalog_and_seed_import_noise(self) -> None:
         self.store.upsert_model({"id": "noise-model", "name": "Noise", "files": {}})
         self.store.audit("model", "noise-model", "observation_added", "documented-status-import", {})

@@ -13,6 +13,9 @@ def main() -> int:
     parser.add_argument("--prompt-tokens", type=int, default=128)
     parser.add_argument("--generation-tokens", type=int, default=128)
     parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument("--prompt")
+    parser.add_argument("--required-fact")
+    parser.add_argument("--conformance-tokens", type=int, default=64)
     parser.add_argument("--root", type=Path,
                         default=Path(r"D:\backup\x64\llamacpp"))
     args = parser.parse_args()
@@ -25,6 +28,26 @@ def main() -> int:
     if not versions:
         raise SystemExit(f"No llama-bench.exe found below {args.root}")
     executable = versions[0]
+    revision = executable.parent.parent.name
+    if args.required_fact:
+        completion = executable.with_name("llama-completion.exe")
+        if not completion.exists():
+            raise SystemExit(f"llama-completion.exe is missing beside {executable}")
+        prompt = args.prompt or "What is 2 + 2?"
+        check_command = [str(completion), "-m", str(args.model), "-p", prompt,
+                         "--temp", "0", "-ngl", "99", "--no-display-prompt",
+                         "-st", "--jinja", "--reasoning", "off",
+                         "--reasoning-budget", "0", "-n", str(args.conformance_tokens)]
+        checked = subprocess.run(check_command, cwd=completion.parent, text=True, encoding="utf-8",
+                                 errors="replace", capture_output=True, timeout=300, shell=False)
+        output = (checked.stdout + "\n" + checked.stderr).strip()
+        passed = checked.returncode == 0 and args.required_fact.lower() in output.lower()
+        print("EVOLUTION_CONFORMANCE " + json.dumps({
+            "passed": passed, "prompt": prompt, "required_fact": args.required_fact,
+            "output": output[-4000:], "revision": revision,
+        }, separators=(",", ":")))
+        if not passed:
+            return checked.returncode or 2
     command = [str(executable), "-m", str(args.model), "-p", str(args.prompt_tokens),
                "-n", str(args.generation_tokens), "-r", str(args.repetitions),
                "-ngl", "99", "-o", "json"]
@@ -48,7 +71,7 @@ def main() -> int:
         "decode_stddev_tok_s": float(decode.get("stddev_ts", 0)),
     }
     print("EVOLUTION_METRICS " + json.dumps(metrics, separators=(",", ":")))
-    print(f"LLAMACPP_REVISION {executable.parent.parent.name}")
+    print(f"LLAMACPP_REVISION {revision}")
     return 0
 
 
