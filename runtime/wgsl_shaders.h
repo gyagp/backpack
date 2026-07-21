@@ -3067,7 +3067,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 )WGSL";
 
 // [elementwise] binary_elementwise — dtype template
-static const char* WGSL_BINARY_ELEMENTWISE_T = R"WGSL(
+static const char* WGSL_BINARY_ELEMENTWISE_BROADCAST_T = R"WGSL(
 // Binary elementwise ops: Add(0), Sub(1), Mul(2), Div(3)
 // With broadcasting support.
 // Dispatch: (ceil(N/512), 1, 1) — each thread handles 2 elements
@@ -3090,29 +3090,82 @@ fn compute_op(a: f32, b: f32, op: u32) -> f32 {
     }
 }
 
+fn broadcast_index(flat: u32, dims_offset: u32) -> u32 {
+    let rank = _params_[0];
+    if (rank == 0u) { return flat % _params_[dims_offset]; }
+    var input_idx = 0u;
+    var input_stride = 1u;
+    var output_stride = 1u;
+    var axis = rank;
+    loop {
+        if (axis == 0u) { break; }
+        axis -= 1u;
+        let output_dim = _params_[12u + axis];
+        let coord = (flat / output_stride) % output_dim;
+        let input_dim = _params_[dims_offset + axis];
+        input_idx += select(coord * input_stride, 0u, input_dim == 1u);
+        input_stride *= input_dim;
+        output_stride *= output_dim;
+    }
+    return input_idx;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let N = _params_[0];
-    let op = _params_[1];
-    let A_N = _params_[2];
-    let B_N = _params_[3];
+    let N = _params_[1];
+    let op = _params_[2];
 
     let base = gid.x * 2u;
     if (base >= N) { return; }
 
     let i0 = base;
-    let a0_idx = select(i0, i0 % A_N, A_N < N && A_N > 0u);
-    let b0_idx = select(i0, i0 % B_N, B_N < N && B_N > 0u);
+    let a0_idx = broadcast_index(i0, 4u);
+    let b0_idx = broadcast_index(i0, 8u);
     let r0 = compute_op(t_read(&A, a0_idx), t_read(&B, b0_idx), op);
 
     var r1: f32 = 0.0;
     if (base + 1u < N) {
         let i1 = base + 1u;
-        let a1_idx = select(i1, i1 % A_N, A_N < N && A_N > 0u);
-        let b1_idx = select(i1, i1 % B_N, B_N < N && B_N > 0u);
+        let a1_idx = broadcast_index(i1, 4u);
+        let b1_idx = broadcast_index(i1, 8u);
         r1 = compute_op(t_read(&A, a1_idx), t_read(&B, b1_idx), op);
     }
 
+    t_write2(&C, base, r0, r1);
+}
+)WGSL";
+
+// Fast path for equal-shaped tensors and scalar broadcasting.
+static const char* WGSL_BINARY_ELEMENTWISE_T = R"WGSL(
+${T_READ}
+${T_WRITE2}
+@group(0) @binding(0) var<storage, read> A: array<${T}>;
+@group(0) @binding(1) var<storage, read> B: array<${T}>;
+@group(0) @binding(2) var<storage, read_write> C: array<${T}>;
+@group(0) @binding(3) var<storage, read> _params_: array<u32>;
+fn compute_op(a: f32, b: f32, op: u32) -> f32 {
+    switch (op) {
+        case 0u: { return a + b; } case 1u: { return a - b; }
+        case 2u: { return a * b; } case 3u: { return a / b; }
+        default: { return a + b; }
+    }
+}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let N = _params_[0]; let op = _params_[1];
+    let A_N = _params_[2]; let B_N = _params_[3];
+    let base = gid.x * 2u;
+    if (base >= N) { return; }
+    let a0 = select(base, base % A_N, A_N < N);
+    let b0 = select(base, base % B_N, B_N < N);
+    let r0 = compute_op(t_read(&A, a0), t_read(&B, b0), op);
+    var r1: f32 = 0.0;
+    if (base + 1u < N) {
+        let i = base + 1u;
+        let a1 = select(i, i % A_N, A_N < N);
+        let b1 = select(i, i % B_N, B_N < N);
+        r1 = compute_op(t_read(&A, a1), t_read(&B, b1), op);
+    }
     t_write2(&C, base, r0, r1);
 }
 )WGSL";

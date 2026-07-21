@@ -52,6 +52,11 @@ static GPUBuffer makeScalarParamBuf(OpContext& ex, uint32_t p0) {
     return buf;
 }
 
+static bool broadcastShape(const std::vector<int64_t>&, const std::vector<int64_t>&,
+                           std::vector<int64_t>&);
+static size_t broadcastIndex(size_t, const std::vector<int64_t>&,
+                             const std::vector<int64_t>&);
+
 static bool isSmallIntTensor(const GpuTensor* t) {
     if (!t) return false;
     return (t->dtype == TensorDtype::Int64 || t->dtype == TensorDtype::Int32) &&
@@ -260,8 +265,10 @@ static void cpuBinaryInt64(OpContext& ex, const OnnxGraphNode& node,
     auto* A = inputs[0]; auto* B = inputs[1];
     int64_t N_A = tensorNel(A);
     int64_t N_B = tensorNel(B);
-    int64_t N = std::max<int64_t>(1, std::max(N_A, N_B));
-    std::vector<int64_t> outShape = preferredIntOutputShape(A, B, N_A, N_B);
+    std::vector<int64_t> outShape;
+    if (!broadcastShape(A->shape, B->shape, outShape)) return;
+    int64_t N = 1;
+    for (int64_t dim : outShape) N *= dim;
 
         if (kDebugSmallIntOps) {
         fprintf(stderr, "    [binint] %s op=%d N_A=%lld N_B=%lld dtypeA=%d dtypeB=%d\n",
@@ -289,7 +296,8 @@ static void cpuBinaryInt64(OpContext& ex, const OnnxGraphNode& node,
     }
 
     for (int64_t i = 0; i < N; i++) {
-        int64_t av = a[i % N_A], bv = b[i % N_B];
+        int64_t av = a[broadcastIndex((size_t)i, A->shape, outShape)];
+        int64_t bv = b[broadcastIndex((size_t)i, B->shape, outShape)];
         switch (op) {
             case 0: c[i] = av + bv; break;
             case 1: c[i] = av - bv; break;
@@ -337,16 +345,39 @@ static void dispatchBinaryOp(OpContext& ex, const OnnxGraphNode& node,
     ex.EnsureGpu(*A);
     ex.EnsureGpu(*B);
 
-    int64_t N_A = tensorNel(A);
-    int64_t N_B = tensorNel(B);
-    int64_t N = std::max(N_A, N_B);
-    auto& outShape = (N_A >= N_B) ? A->shape : B->shape;
+    std::vector<int64_t> outShape;
+    if (!broadcastShape(A->shape, B->shape, outShape)) return;
+    int64_t N = 1;
+    for (int64_t dim : outShape) N *= dim;
     *outputs[0] = ex.AllocTensor(outShape, dtype);
 
-    auto params = makeParamBuf(ex, (uint32_t)N, opCode, (uint32_t)N_A, (uint32_t)N_B);
-    std::string pipelineName = "binary_t" + std::string(dtypeSuffix(dtype));
-    auto& pl = ex.GetPipelineT(pipelineName, 4, [dtype]() {
-        return instantiateTemplate(WGSL_BINARY_ELEMENTWISE_T, dtype);
+    uint32_t data[16] = {};
+    const bool simpleBroadcast = A->shape == B->shape || tensorNel(A) == 1 || tensorNel(B) == 1;
+    data[0] = simpleBroadcast ? 0u : (uint32_t)outShape.size();
+    data[1] = (uint32_t)N; data[2] = opCode;
+    const size_t rank = outShape.size();
+    for (size_t i = 0; i < rank; ++i) {
+        data[4 + i] = i < rank - A->shape.size() ? 1u : (uint32_t)A->shape[i - (rank - A->shape.size())];
+        data[8 + i] = i < rank - B->shape.size() ? 1u : (uint32_t)B->shape[i - (rank - B->shape.size())];
+        data[12 + i] = (uint32_t)outShape[i];
+    }
+    if (simpleBroadcast) {
+        data[4] = (uint32_t)tensorNel(A);
+        data[8] = (uint32_t)tensorNel(B);
+    }
+    GPUBuffer params;
+    if (simpleBroadcast) {
+        params = makeParamBuf(ex, (uint32_t)N, opCode,
+                              (uint32_t)tensorNel(A), (uint32_t)tensorNel(B));
+    } else {
+        params = ex.getParamBuffer(sizeof(data));
+        ex.getGpu()->writeBuffer(params, data, sizeof(data));
+    }
+    std::string pipelineName = (simpleBroadcast ? "binary_t" : "binary_broadcast_t") +
+                               std::string(dtypeSuffix(dtype));
+    auto& pl = ex.GetPipelineT(pipelineName, 4, [dtype, simpleBroadcast]() {
+        return instantiateTemplate(simpleBroadcast ? WGSL_BINARY_ELEMENTWISE_T
+                                                   : WGSL_BINARY_ELEMENTWISE_BROADCAST_T, dtype);
     });
     auto bg = ex.MakeBindGroup(pl, {
         {0, A->buffer}, {1, B->buffer}, {2, outputs[0]->buffer}, {3, params}});
@@ -405,6 +436,36 @@ static void dispatchUnaryOp(OpContext& ex, const OnnxGraphNode& node,
         if (intel)
             ex.SubmitPending();
     }
+}
+
+static bool broadcastShape(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
+                           std::vector<int64_t>& out) {
+    const size_t rank = std::max(a.size(), b.size());
+    if (rank > 4) return false;
+    out.assign(rank, 1);
+    for (size_t i = 0; i < rank; ++i) {
+        const int64_t ad = i < rank - a.size() ? 1 : a[i - (rank - a.size())];
+        const int64_t bd = i < rank - b.size() ? 1 : b[i - (rank - b.size())];
+        if (ad != bd && ad != 1 && bd != 1) return false;
+        out[i] = std::max(ad, bd);
+    }
+    return true;
+}
+
+static size_t broadcastIndex(size_t outIndex, const std::vector<int64_t>& shape,
+                             const std::vector<int64_t>& outShape) {
+    size_t inputIndex = 0, inputStride = 1, outputStride = 1;
+    for (size_t axis = outShape.size(); axis-- > 0;) {
+        const size_t coord = (outIndex / outputStride) % (size_t)outShape[axis];
+        if (axis >= outShape.size() - shape.size()) {
+            const size_t inputAxis = axis - (outShape.size() - shape.size());
+            const size_t dim = (size_t)shape[inputAxis];
+            inputIndex += (dim == 1 ? 0 : coord) * inputStride;
+            inputStride *= dim;
+        }
+        outputStride *= (size_t)outShape[axis];
+    }
+    return inputIndex;
 }
 
 // ─── Op Registrations ────────────────────────────────────────────────────────

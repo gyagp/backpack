@@ -786,6 +786,29 @@ TEST(mul) {
     assertCloseVec(outputs["C"].asFloat32(), expected);
 }
 
+TEST(binary_multidimensional_broadcast) {
+    std::vector<float> a(24), b = {10, 20, 30}, expectedAdd(24), expectedMul(24);
+    for (int i = 0; i < 24; ++i) {
+        a[i] = (float)(i + 1);
+        const float bv = b[(i / 4) % 3];
+        expectedAdd[i] = a[i] + bv;
+        expectedMul[i] = a[i] * bv;
+    }
+    for (const auto& item : std::vector<std::pair<std::string, std::vector<float>>>{
+             {"Add", expectedAdd}, {"Mul", expectedMul}}) {
+        auto model = buildOnnxModel(
+            {{item.first, {"A", "B"}, {"C"}, {}}},
+            {{"A", ONNX_FLOAT, {2, 3, 4}}, {"B", ONNX_FLOAT, {1, 3, 1}}},
+            {{"C", ONNX_FLOAT, {2, 3, 4}}});
+        auto outputs = runOnnxModel(gpu, model,
+            {{"A", makeInputF32("A", {2, 3, 4}, a)},
+             {"B", makeInputF32("B", {1, 3, 1}, b)}}, {"C"});
+        const std::string label = "binary_multidimensional_broadcast_" + item.first;
+        assertCloseVec(outputs["C"].asFloat32(), item.second, 1e-5f, 1e-5f,
+                       label.c_str());
+    }
+}
+
 TEST(sigmoid) {
     Rng rng(42);
     auto x = rng.randnVec(16);
@@ -1731,6 +1754,7 @@ int main(int argc, char** argv) {
     RUN(add);
     RUN(sub);
     RUN(mul);
+    RUN(binary_multidimensional_broadcast);
     RUN(sigmoid);
     RUN(fused_silu);
     RUN(fused_silu_broadcast);
