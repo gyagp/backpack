@@ -12401,6 +12401,152 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 )WGSL";
 
 // [quant_kq] q4k_matmul
+// [quant_kq] q8_quantize_dp4a
+static const char* WGSL_Q8_QUANTIZE_DP4A = R"WGSL(
+requires packed_4x8_integer_dot_product;
+enable subgroups;
+
+// Quantize one f32 activation vector into the Q8 layout consumed by the
+// prequantized Q4_K DP4A matvec. One workgroup handles 256 values.
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> XQ: array<u32>;
+@group(0) @binding(2) var<storage, read_write> XS: array<f32>;
+@group(0) @binding(3) var<storage, read> P: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let tid = lid.x;
+    let lane = tid & 31u;
+    let block32 = tid / 32u;
+    let pack_lane = lane & 3u;
+    let pack_group = lane / 4u;
+    let K = P[0];
+    let k = wid.x * 256u + tid;
+    let xv = select(0.0, X[k], k < K);
+    var amax = abs(xv);
+    amax = max(amax, subgroupShuffleXor(amax, 16u));
+    amax = max(amax, subgroupShuffleXor(amax, 8u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    let scale = amax / 127.0;
+    let global_block = wid.x * 8u + block32;
+    if (lane == 0u) { XS[global_block] = scale; }
+    let safe_scale = select(1.0, scale, scale != 0.0);
+    let qi = clamp(i32(round(xv / safe_scale)), -127, 127);
+    var packed = u32(qi & 255) << (pack_lane * 8u);
+    packed |= subgroupShuffleXor(packed, 1u);
+    packed |= subgroupShuffleXor(packed, 2u);
+    if (pack_lane == 0u) {
+        XQ[wid.x * 64u + block32 * 8u + pack_group] = packed;
+    }
+}
+)WGSL";
+
+// [quant_kq] q4k_matmul_prequant_dp4a
+static const char* WGSL_Q4K_MATMUL_PREQUANT_DP4A = R"WGSL(
+requires packed_4x8_integer_dot_product;
+enable subgroups;
+
+// Q4_K matvec over an activation quantized once by q8_quantize_dp4a.
+// Each workgroup produces eight output rows (one per subgroup). Keeping one
+// accumulator per subgroup isolates activation reuse from register-heavy
+// multi-column tiling.
+@group(0) @binding(0) var<storage, read> XQ: array<u32>;
+@group(0) @binding(1) var<storage, read> XS: array<f32>;
+@group(0) @binding(2) var<storage, read> W: array<u32>;
+@group(0) @binding(3) var<storage, read> Bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read> P: array<u32>;
+
+const BLOCK_WORDS: u32 = 36u;
+const COLS_PER_WARP: u32 = 1u;
+var<workgroup> xq: array<u32, 64>;
+var<workgroup> xs: array<f32, 8>;
+
+fn u8_at(base: u32, off: u32) -> u32 {
+    return (W[base + off / 4u] >> ((off & 3u) * 8u)) & 255u;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let tid = lid.x;
+    let warp = tid / 32u;
+    let lane = tid & 31u;
+    let K = P[0];
+    let N = P[1];
+    let nb = P[2];
+    let rs = P[3];
+    var cols: array<u32, 1>;
+    var valid: array<bool, 1>;
+    var acc: array<f32, 1>;
+    for (var c = 0u; c < COLS_PER_WARP; c++) {
+        cols[c] = wid.y * 8u + warp;
+        valid[c] = cols[c] < N;
+        acc[c] = 0.0;
+    }
+
+    for (var b = 0u; b < nb; b++) {
+        if (tid < 64u) { xq[tid] = XQ[b * 64u + tid]; }
+        if (tid < 8u) { xs[tid] = XS[b * 8u + tid]; }
+        workgroupBarrier();
+
+        let sb = lane / 4u;
+        let j = sb & 3u;
+        let qgroup = sb / 2u;
+        let high = (sb & 1u) != 0u;
+        let elem0 = (lane & 3u) * 8u;
+        let aq0 = xq[lane * 2u];
+        let aq1 = xq[lane * 2u + 1u];
+        let asum = dot4I8Packed(aq0, 0x01010101u) +
+                   dot4I8Packed(aq1, 0x01010101u);
+
+        for (var c = 0u; c < COLS_PER_WARP; c++) {
+            if (valid[c]) {
+                let base = cols[c] * rs + b * BLOCK_WORDS;
+                let dm = unpack2x16float(W[base]);
+                let dv = u8_at(base, 4u + j);
+                let mv = u8_at(base, 8u + j);
+                var sc: u32;
+                var mn: u32;
+                if (sb < 4u) {
+                    sc = dv & 63u;
+                    mn = mv & 63u;
+                } else {
+                    let md = u8_at(base, 12u + j);
+                    sc = (md & 15u) | ((dv >> 2u) & 48u);
+                    mn = (md >> 4u) | ((mv >> 2u) & 48u);
+                }
+                var w0 = 0u;
+                var w1 = 0u;
+                for (var i = 0u; i < 4u; i++) {
+                    let qb0 = u8_at(base, 16u + qgroup * 32u + elem0 + i);
+                    let qb1 = u8_at(base, 20u + qgroup * 32u + elem0 + i);
+                    let q0 = select(qb0 & 15u, qb0 >> 4u, high);
+                    let q1 = select(qb1 & 15u, qb1 >> 4u, high);
+                    w0 |= q0 << (i * 8u);
+                    w1 |= q1 << (i * 8u);
+                }
+                let dot = dot4I8Packed(aq0, w0) + dot4I8Packed(aq1, w1);
+                acc[c] += xs[sb] * (dm.x * f32(sc) * f32(dot) -
+                                     dm.y * f32(mn) * f32(asum));
+            }
+        }
+        workgroupBarrier();
+    }
+
+    for (var c = 0u; c < COLS_PER_WARP; c++) {
+        let total = subgroupAdd(acc[c]);
+        if (lane == 0u && valid[c]) {
+            Y[cols[c]] = total + Bias[cols[c]];
+        }
+    }
+}
+)WGSL";
+
+
 static const char* WGSL_Q4K_MATMUL_DP4A = R"WGSL(
 requires packed_4x8_integer_dot_product;
 enable subgroups;
@@ -19542,7 +19688,9 @@ inline const std::unordered_map<std::string, ShaderInfo>& getEmbeddedKernels() {
         {"q4_gather_batched", {WGSL_Q4_GATHER_BATCHED, 5, false}},
         {"q4k_down_gelu", {WGSL_Q4K_DOWN_GELU, 5, false}},
         {"q4k_matmul", {WGSL_Q4K_MATMUL, 5, false}},
+        {"q4k_matmul_prequant_dp4a", {WGSL_Q4K_MATMUL_PREQUANT_DP4A, 6, false}},
         {"q4k_matmul_dp4a", {WGSL_Q4K_MATMUL_DP4A, 5, false}},
+        {"q8_quantize_dp4a", {WGSL_Q8_QUANTIZE_DP4A, 4, false}},
         {"q4k_matmul_128", {WGSL_Q4K_MATMUL_128, 5, false}},
         {"q4k_matmul_batched4", {WGSL_Q4K_MATMUL_BATCHED4, 5, false}},
         {"q4k_matmul_batched8", {WGSL_Q4K_MATMUL_BATCHED8, 5, false}},

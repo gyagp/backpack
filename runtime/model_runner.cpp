@@ -3028,6 +3028,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
         siluMulDebugBuf = siluMulOutBuf;
     }
+    // llama.cpp quantizes the activation once before quantized matvec and
+    // reuses it across output rows. Keep one scratch pair because decode
+    // dispatches consume it sequentially.
+    GPUBuffer kqActQ8Buf, kqActScaleBuf;
+    if (useQ4KDp4a) {
+        kqActQ8Buf = gpu->createBuffer("kq_act_q8", maxIMBuf);
+        kqActScaleBuf = gpu->createBuffer("kq_act_scales", maxIMBuf / 8);
+    }
 
     rstdBuf       = gpu->createBuffer("rstd", 16);
     logitsBuf     = gpu->createBuffer("logits", cfg.nVocab * 4);
@@ -4065,9 +4073,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 uint32_t layerTile = kqTileFor(lw.guKQType);
                 auto layerParams = makeKQParams("p_kq_gu_" + std::to_string(i),
                     cfg.nEmbd, 2 * plIM, lw.guKQNBlocks, lw.guKQRowStride);
-                auto bg = makeBG(*layerKQ, {
-                    {0, normOutBuf}, {1, lw.guKQ}, {2, zeroBiasGU},
-                    {3, gateUpBuf}, {4, layerParams}});
+                const bool prequantQ4K = useQ4KDp4a && lw.guKQType == GGUF_TYPE_Q4_K;
+                if (prequantQ4K) {
+                    auto& plQuant = getKernel("q8_quantize_dp4a");
+                    auto bgQuant = makeBG(plQuant, {
+                        {0, normOutBuf}, {1, kqActQ8Buf},
+                        {2, kqActScaleBuf}, {3, layerParams}});
+                    allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
+                        (cfg.nEmbd + 255) / 256, 1, 1, L+"kq_gateup_quant"});
+                    layerKQ = &getKernel("q4k_matmul_prequant_dp4a");
+                    layerTile = 8;
+                }
+                auto bg = prequantQ4K
+                    ? makeBG(*layerKQ, {{0, kqActQ8Buf}, {1, kqActScaleBuf},
+                        {2, lw.guKQ}, {3, zeroBiasGU}, {4, gateUpBuf}, {5, layerParams}})
+                    : makeBG(*layerKQ, {{0, normOutBuf}, {1, lw.guKQ},
+                        {2, zeroBiasGU}, {3, gateUpBuf}, {4, layerParams}});
                 di.gateup = (int)allDecodeDispatches.size();
                 allDecodeDispatches.push_back({layerKQ->pipeline, bg,
                     1, (2 * plIM + layerTile - 1) / layerTile, 1, L+"kq_gateup"});
@@ -4117,9 +4138,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 allDecodeDispatches.push_back({plActMul.pipeline, bgSilu,
                     (cfg.intermediateSize + 127) / 128, 1, 1, L+"act_mul"});
 
-                auto bgDn = makeBG(*layerKQ, {
-                    {0, siluMulOutBuf}, {1, lw.dnKQ}, {2, zeroBiasE},
-                    {3, projOutBuf}, {4, layerParams}});
+                const bool prequantQ4K = useQ4KDp4a && lw.dnKQType == GGUF_TYPE_Q4_K;
+                if (prequantQ4K) {
+                    auto& plQuant = getKernel("q8_quantize_dp4a");
+                    auto bgQuant = makeBG(plQuant, {
+                        {0, siluMulOutBuf}, {1, kqActQ8Buf},
+                        {2, kqActScaleBuf}, {3, layerParams}});
+                    allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
+                        (plIM + 255) / 256, 1, 1, L+"kq_down_quant"});
+                    layerKQ = &getKernel("q4k_matmul_prequant_dp4a");
+                    layerTile = 8;
+                }
+                auto bgDn = prequantQ4K
+                    ? makeBG(*layerKQ, {{0, kqActQ8Buf}, {1, kqActScaleBuf},
+                        {2, lw.dnKQ}, {3, zeroBiasE}, {4, projOutBuf}, {5, layerParams}})
+                    : makeBG(*layerKQ, {{0, siluMulOutBuf}, {1, lw.dnKQ},
+                        {2, zeroBiasE}, {3, projOutBuf}, {4, layerParams}});
                 allDecodeDispatches.push_back({layerKQ->pipeline, bgDn,
                     1, (cfg.nEmbd + layerTile - 1) / layerTile, 1, L+"kq_down"});
 
