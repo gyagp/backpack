@@ -321,12 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--models-dir", type=Path, default=Path(r"D:\workspace\project\agents\ai-models"))
     sync_base_parser = sub.add_parser("sync-base")
     sync_base_parser.add_argument("--repo", type=Path, default=Path.cwd())
-    sync_base_parser.add_argument("--worktrees", type=Path,
-                                  default=Path.cwd() / "gitignore" / "evolution" / "worktrees")
+    sync_base_parser.add_argument("--worktrees", type=Path)
     watch = sub.add_parser("watch")
     watch.add_argument("--repo", type=Path, default=Path.cwd())
-    watch.add_argument("--worktrees", type=Path,
-                       default=Path.cwd() / "gitignore" / "evolution" / "worktrees")
+    watch.add_argument("--worktrees", type=Path)
     watch.add_argument("--interval", type=int, default=60)
     args = parser.parse_args(argv)
     if args.command == "register":
@@ -360,19 +358,21 @@ def main(argv: list[str] | None = None) -> int:
                     temporary.replace(destination)
         print("Model synchronization complete")
     elif args.command == "sync-base":
-        if not sync_base(args.server, args.repo, args.worktrees):
+        worktrees = args.worktrees or args.repo / "gitignore" / "evolution" / "worktrees"
+        if not sync_base(args.server, args.repo, worktrees):
             print("Evolution base is already current or not yet published")
     else:
         if args.interval < 10:
             parser.error("watch interval must be at least 10 seconds")
         labels = dict(item.split("=", 1) for item in args.label)
+        worktrees = args.worktrees or args.repo / "gitignore" / "evolution" / "worktrees"
         print(f"Watching {args.server} for milestones every {args.interval}s")
         try:
             request_json(args.server + "/api/machines/register", "POST",
                          {"name": args.name, "fingerprint": fingerprint(), "labels": labels}, args.name)
             while True:
                 try:
-                    sync_base(args.server, args.repo, args.worktrees)
+                    sync_base(args.server, args.repo, worktrees)
                     run = request_json(args.server + "/api/runs/claim", "POST",
                                        {"machine": args.name, "capabilities": ["argv"]}, args.name)
                     if run:
