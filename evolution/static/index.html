@@ -32,12 +32,11 @@
   </header>
   <div id="app-layout">
     <nav id="sidebar">
-      <button class="sidebar-item active" data-tab="status"><span class="nav-icon">◫</span><span>Tasks</span><span id="nav-task-count" class="nav-count"></span></button>
-      <button class="sidebar-item" data-tab="validation"><span class="nav-icon">✓</span><span>Status</span></button>
+      <button class="sidebar-item active" data-tab="validation"><span class="nav-icon">✓</span><span>Status</span></button>
+      <button class="sidebar-item" data-tab="status"><span class="nav-icon">◫</span><span>Tasks</span><span id="nav-task-count" class="nav-count"></span></button>
       <button class="sidebar-item" data-tab="todo"><span class="nav-icon">!</span><span>Human Intervention</span><span id="nav-todo-count" class="nav-count"></span></button>
       <button class="sidebar-item" data-tab="evolution"><span class="nav-icon">↻</span><span>Evolution</span><span id="nav-study-count" class="nav-count"></span></button>
       <button class="sidebar-item" data-tab="analysis"><span class="nav-icon">⌁</span><span>Performance Analysis</span></button>
-      <button class="sidebar-item" data-tab="trend"><span class="nav-icon">⌇</span><span>Performance Trend</span></button>
       <button class="sidebar-item" data-tab="history"><span class="nav-icon">↗</span><span>History</span></button>
       <button class="sidebar-item" data-tab="devices"><span class="nav-icon">▤</span><span>Devices</span><span id="nav-device-count" class="nav-count"></span></button>
       <div class="sidebar-footer"><div>Evidence-driven WebGPU optimization</div></div>
@@ -63,7 +62,7 @@
 
       <section id="validation-tab" class="tab-page hidden">
         <div class="page-header"><div><h1>Status</h1><p>Conformance and performance separated by device, model, format, inference framework, and backend.</p></div></div>
-        <section class="card"><div id="status-model-tabs" class="status-model-tabs" role="tablist" aria-label="Models"></div><div id="status-chart"></div><div class="validation-toolbar"><input id="validation-search" type="search" placeholder="Search device, framework, backend…"><label>Sort by<select id="validation-sort"><option value="device">Device</option><option value="framework">Inference framework</option><option value="backend">Backend</option><option value="conformance">Conformance</option></select></label><button id="validation-direction" class="secondary" type="button" data-direction="asc">Ascending ↑</button><span id="validation-count" class="muted"></span></div><div id="model-matrix" class="table-wrap"></div></section>
+        <section class="card"><div id="status-model-tabs" class="status-model-tabs" role="tablist" aria-label="Models"></div><section class="status-trend"><div class="card-header"><div><h2>Performance improvement trend</h2><p>Track selected devices, runtimes, and TPS metrics across revisions for this model.</p></div><span id="trend-count" class="muted"></span></div><div id="performance-trend"></div></section><div id="status-chart"></div><div class="validation-toolbar"><input id="validation-search" type="search" placeholder="Search device, framework, backend…"><label>Sort by<select id="validation-sort"><option value="device">Device</option><option value="framework">Inference framework</option><option value="backend">Backend</option><option value="conformance">Conformance</option></select></label><button id="validation-direction" class="secondary" type="button" data-direction="asc">Ascending ↑</button><span id="validation-count" class="muted"></span></div><div id="model-matrix" class="table-wrap"></div></section>
       </section>
 
       <section id="devices-tab" class="tab-page hidden">
@@ -74,11 +73,6 @@
       <section id="analysis-tab" class="tab-page hidden">
         <div class="page-header"><div><h1>Performance Analysis</h1><p>Compare measured combinations and inspect performance trends across revisions.</p></div></div>
         <section class="card"><div class="card-header"><div><h2>Performance comparison</h2><p>Compare devices, models, runtimes, revisions, prompt processing, and token generation.</p></div><span id="analysis-count"></span></div><div id="performance-analysis"></div></section>
-      </section>
-
-      <section id="trend-tab" class="tab-page hidden">
-        <div class="page-header"><div><h1>Performance Trend</h1><p>Track prefill and decode performance across revisions and dates for every device and runtime.</p></div><span id="trend-count"></span></div>
-        <section class="card"><div id="performance-trend"></div></section>
       </section>
 
       <section id="history-tab" class="tab-page hidden">
