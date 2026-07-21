@@ -1772,6 +1772,66 @@ TEST(matmul_nbits_q4_decode) {
                    "matmul_nbits_q4_decode");
 }
 
+TEST(linear_attention_gated_delta_vec4) {
+    constexpr int T = 1, DK = 128, DV = 8;
+    std::vector<float> q(T * DK), k(T * DK), v(T * DV);
+    std::vector<float> state(DK * DV), decay = {-0.03f};
+    std::vector<float> beta = {0.35f};
+    for (int i = 0; i < T * DK; ++i) {
+        q[i] = float((i % 11) - 5) * 0.013f;
+        k[i] = float((i % 7) - 3) * 0.017f;
+    }
+    for (int i = 0; i < T * DV; ++i) v[i] = float((i % 9) - 4) * 0.021f;
+    for (int i = 0; i < DK * DV; ++i) state[i] = float((i % 13) - 6) * 0.002f;
+
+    std::vector<float> expectedOutput(T * DV);
+    auto expectedState = state;
+    const float scale = 1.0f / sqrtf(float(DK));
+    for (int t = 0; t < T; ++t) {
+        const float factor = expf(decay[t]);
+        for (float& value : expectedState) value *= factor;
+        float kq = 0.0f;
+        for (int d = 0; d < DK; ++d) kq += k[t * DK + d] * q[t * DK + d];
+        for (int j = 0; j < DV; ++j) {
+            float retrieved = 0.0f, pre = 0.0f;
+            for (int d = 0; d < DK; ++d) {
+                const float s = expectedState[d * DV + j];
+                retrieved += s * k[t * DK + d];
+                pre += s * q[t * DK + d];
+            }
+            const float delta = beta[t] * (v[t * DV + j] - retrieved);
+            expectedOutput[t * DV + j] = (pre + delta * kq) * scale;
+            for (int d = 0; d < DK; ++d)
+                expectedState[d * DV + j] += k[t * DK + d] * delta;
+        }
+    }
+
+    std::vector<AttrDef> attrs = {
+        {"q_num_heads", AttrDef::INT, 1}, {"kv_num_heads", AttrDef::INT, 1},
+        {"scale", AttrDef::FLOAT, 0, scale}};
+    AttrDef rule{"update_rule", AttrDef::STRING};
+    rule.strVal = "gated_delta";
+    attrs.push_back(rule);
+    auto model = buildOnnxModel(
+        {{"LinearAttention", {"Q", "K", "V", "S", "D", "B"},
+          {"Y", "P"}, attrs}},
+        {{"Q", ONNX_FLOAT, {1, T, DK}}, {"K", ONNX_FLOAT, {1, T, DK}},
+         {"V", ONNX_FLOAT, {1, T, DV}}, {"S", ONNX_FLOAT, {1, 1, DK, DV}},
+         {"D", ONNX_FLOAT, {1, T, 1}}, {"B", ONNX_FLOAT, {1, T, 1}}},
+        {{"Y", ONNX_FLOAT, {1, T, DV}}, {"P", ONNX_FLOAT, {1, 1, DK, DV}}});
+    auto outputs = runOnnxModel(gpu, model,
+        {{"Q", makeInputF32("Q", {1, T, DK}, q)},
+         {"K", makeInputF32("K", {1, T, DK}, k)},
+         {"V", makeInputF32("V", {1, T, DV}, v)},
+         {"S", makeInputF32("S", {1, 1, DK, DV}, state)},
+         {"D", makeInputF32("D", {1, T, 1}, decay)},
+         {"B", makeInputF32("B", {1, T, 1}, beta)}}, {"Y", "P"});
+    assertCloseVec(outputs["Y"].asFloat32(), expectedOutput, 2e-5f, 2e-4f,
+                   "linear_attention output");
+    assertCloseVec(outputs["P"].asFloat32(), expectedState, 2e-5f, 2e-4f,
+                   "linear_attention state");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -1817,6 +1877,7 @@ int main(int argc, char** argv) {
     // Compute
     RUN(matmul);
     RUN(matmul_nbits_q4_decode);
+    RUN(linear_attention_gated_delta_vec4);
     RUN(softmax);
     RUN(simplified_layer_norm);
     RUN(softplus);

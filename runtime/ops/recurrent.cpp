@@ -238,6 +238,80 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 )WGSL";
 
+// ORT WebGPU's decode layout packs four adjacent value columns into vec4.
+// This preserves the same reduction order as the scalar kernel while replacing
+// four shared-memory streams and inner loops with native vector operations.
+static const char* kLinearAttentionGatedDeltaVec4 = R"WGSL(
+struct Params {
+    batch: u32, heads: u32, length: u32, dk: u32,
+    dv: u32, q_heads: u32, k_heads: u32, dv_tiles: u32,
+    scale: f32, decay_broadcast: u32, _p0: u32, _p1: u32,
+};
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> initial_state: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> decay: array<f32>;
+@group(0) @binding(5) var<storage, read> beta: array<f32>;
+@group(0) @binding(6) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> present_state: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: Params;
+
+var<workgroup> retrieved: array<vec4<f32>, 128>;
+var<workgroup> pre_output: array<vec4<f32>, 128>;
+var<workgroup> kq: array<f32, 128>;
+var<workgroup> delta: vec4<f32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let lane = lid3.x;
+    let tile = wid.x % p.dv_tiles;
+    let bh = wid.x / p.dv_tiles;
+    let batch_index = bh / p.heads;
+    let head = bh % p.heads;
+    let dv4 = p.dv / 4u;
+    let state_index = ((batch_index * p.heads + head) * p.dk + lane) * dv4 + tile;
+    var state = initial_state[state_index];
+
+    let packed_q = p.q_heads * p.dk;
+    let packed_k = p.k_heads * p.dk;
+    let packed_v4 = p.heads * dv4;
+    for (var t = 0u; t < p.length; t++) {
+        let bt = batch_index * p.length + t;
+        let k_head = head * p.k_heads / p.heads;
+        let q_head = head * p.q_heads / p.heads;
+        let kval = key[bt * packed_k + k_head * p.dk + lane];
+        let qval = query[bt * packed_q + q_head * p.dk + lane];
+        let gate_index = select(bt * p.heads * p.dk + head * p.dk + lane,
+                                bt * p.heads + head, p.decay_broadcast != 0u);
+        state *= exp(decay[gate_index]);
+        retrieved[lane] = state * kval;
+        pre_output[lane] = state * qval;
+        kq[lane] = kval * qval;
+        workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                retrieved[lane] += retrieved[lane + stride];
+                pre_output[lane] += pre_output[lane + stride];
+                kq[lane] += kq[lane + stride];
+            }
+            workgroupBarrier();
+        }
+        if (lane == 0u) {
+            let b = beta[bt * p.heads + head];
+            let value_index = bt * packed_v4 + head * dv4 + tile;
+            delta = b * (value[value_index] - retrieved[0]);
+            output[value_index] = (pre_output[0] + delta * kq[0]) * p.scale;
+        }
+        workgroupBarrier();
+        state += kval * delta;
+        workgroupBarrier();
+    }
+    present_state[state_index] = state;
+}
+)WGSL";
+
 static void opLinearAttention(OpContext& ex, const OnnxGraphNode& node,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     if (in.size() < 6 || out.size() < 2 || !in[0] || !in[1] || !in[2] ||
@@ -279,8 +353,14 @@ static void opLinearAttention(OpContext& ex, const OnnxGraphNode& node,
              decay.shape.back() == static_cast<int64_t>(heads), 0, 0};
     auto param = ex.getParamBuffer(sizeof(params));
     ex.getGpu()->writeBuffer(param, &params, sizeof(params));
-    auto& pipeline = ex.GetPipeline("linear_attention_gated_delta_f32",
-                                    kLinearAttentionGatedDelta, 9);
+    // Decode is consistently faster across NVIDIA, AMD, and Intel.  Keep
+    // multi-token prefill on the established scalar path: its sequential loop
+    // sees no benefit and showed a small portable regression in A/B testing.
+    const bool useVec4 = length == 1 && dv % 4 == 0 && dk == 128;
+    auto& pipeline = ex.GetPipeline(useVec4 ? "linear_attention_gated_delta_vec4" :
+                                              "linear_attention_gated_delta_f32",
+                                    useVec4 ? kLinearAttentionGatedDeltaVec4 :
+                                              kLinearAttentionGatedDelta, 9);
     auto group = ex.MakeBindGroup(pipeline, {
         {0, q.buffer}, {1, k.buffer}, {2, v.buffer}, {3, state.buffer},
         {4, decay.buffer}, {5, beta.buffer}, {6, out[0]->buffer},
