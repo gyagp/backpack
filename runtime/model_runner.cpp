@@ -2365,6 +2365,45 @@ void ModelRunner::buildDecodePipeline() {
     auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
     const CompiledPipeline* plQ4Decode = weightsAreNativeQ4
         ? &getKernel("matmul_q4_decode") : nullptr;
+    static const char* Q4_PREQUANT_DOWN_WGSL = R"(
+requires packed_4x8_integer_dot_product;
+enable subgroups;
+@group(0) @binding(0)var<storage,read>XQ:array<u32>;
+@group(0) @binding(1)var<storage,read>XS:array<f32>;
+@group(0) @binding(2)var<storage,read>B:array<u32>;
+@group(0) @binding(3)var<storage,read>S:array<u32>;
+@group(0) @binding(4)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(5)var<storage,read>P:array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id)wid:vec3<u32>,
+        @builtin(local_invocation_id)lid:vec3<u32>){
+ let N=P[1];let K=P[2];let warp=lid.x/32u;let lane=lid.x&31u;
+ let row=wid.x*8u+warp;let nblocks=K/32u;let words=K/8u;
+ var acc=0.0;
+ if(row<N){
+  for(var g=0u;g<K/256u;g++){
+   let xb=lane/4u;let xq0=XQ[g*64u+lane*2u];let xq1=XQ[g*64u+lane*2u+1u];
+   let qw=B[row*words+g*32u+lane];
+   let b0=qw&255u;let b1=(qw>>8u)&255u;let b2=(qw>>16u)&255u;let b3=qw>>24u;
+   let w0=(u32(b0&15u)-8u)&255u;let w1=(u32(b0>>4u)-8u)&255u;
+   let w2=(u32(b1&15u)-8u)&255u;let w3=(u32(b1>>4u)-8u)&255u;
+   let w4=(u32(b2&15u)-8u)&255u;let w5=(u32(b2>>4u)-8u)&255u;
+   let w6=(u32(b3&15u)-8u)&255u;let w7=(u32(b3>>4u)-8u)&255u;
+   let wq0=w0|(w1<<8u)|(w2<<16u)|(w3<<24u);
+   let wq1=w4|(w5<<8u)|(w6<<16u)|(w7<<24u);
+   let wb=g*8u+xb;let si=row*nblocks+wb;let sp=unpack2x16float(S[si/2u]);
+   let ws=select(sp.x,sp.y,(si&1u)!=0u);
+   acc+=f32(dot4I8Packed(xq0,wq0)+dot4I8Packed(xq1,wq1))*XS[wb]*ws;
+  }
+ }
+ let sum=subgroupAdd(acc);if(lane==0u&&row<N){Y[row]=sum;}
+}
+)";
+    const bool useNativeQ4PrequantDown = weightsAreNativeQ4 && isNvidiaAdapter &&
+        !std::getenv("BP_Q4_DISABLE_PREQUANT_DOWN");
+    const CompiledPipeline* plQ4PrequantDown = useNativeQ4PrequantDown
+        ? &gpu->getOrCreatePipeline("q4_prequant_down", std::string(Q4_PREQUANT_DOWN_WGSL), 6)
+        : nullptr;
     uint32_t Q4_DECODE_TILE_N = 32;
     int q4Cols = std::getenv("BP_Q4_COLS") ? std::atoi(std::getenv("BP_Q4_COLS")) : 1;
     if (weightsAreNativeQ4 && (q4Cols >= 1 && q4Cols <= 3)) {
@@ -4246,11 +4285,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 // removes the device (DXGI_ERROR_DEVICE_REMOVED).
                 if (weightsAreNativeQ4 && plQ4Decode) {
                     auto p = makeQ4Params("p_q4_down_" + std::to_string(i), plIM, cfg.nEmbd);
-                    auto bgDn = makeBG(*plQ4Decode, {
-                        {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
-                        {3, projOutBuf}, {4, p}});
-                    allDecodeDispatches.push_back({plQ4Decode->pipeline, bgDn,
-                        (cfg.nEmbd + Q4_DECODE_TILE_N - 1) / Q4_DECODE_TILE_N, 1, 1, L+"q4_down_sw"});
+                    if (plQ4PrequantDown) {
+                        auto qp = makeQ8Params("p_q4_down_quant_" + std::to_string(i), plIM, 0);
+                        auto& plQuant = getKernel("q8_quantize_dp4a");
+                        auto bgQuant = makeBG(plQuant, {
+                            {0, siluMulOutBuf}, {1, kqActQ8Buf},
+                            {2, kqActScaleBuf}, {3, qp}});
+                        allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
+                            (plIM + 255) / 256, 1, 1, L+"q4_down_quant"});
+                        auto bgDn = makeBG(*plQ4PrequantDown, {
+                            {0, kqActQ8Buf}, {1, kqActScaleBuf},
+                            {2, lw.dnW}, {3, lw.dnS}, {4, projOutBuf}, {5, p}});
+                        allDecodeDispatches.push_back({plQ4PrequantDown->pipeline, bgDn,
+                            (cfg.nEmbd + 7) / 8, 1, 1, L+"q4_down_sw"});
+                    } else {
+                        auto bgDn = makeBG(*plQ4Decode, {
+                            {0, siluMulOutBuf}, {1, lw.dnW}, {2, lw.dnS},
+                            {3, projOutBuf}, {4, p}});
+                        allDecodeDispatches.push_back({plQ4Decode->pipeline, bgDn,
+                            (cfg.nEmbd + Q4_DECODE_TILE_N - 1) / Q4_DECODE_TILE_N, 1, 1, L+"q4_down_sw"});
+                    }
                 } else {
                     auto dnMatmulP = makeQ8Params("p_dn_sw_" + std::to_string(i), plIM, cfg.nEmbd);
                     auto bgDn = makeBG(plQ8Matmul, {
