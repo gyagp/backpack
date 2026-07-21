@@ -1866,6 +1866,17 @@ TEST(q4k_matmul_reference) {
     auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
 }
 
+TEST(q4k_matmul_dp4a_reference) {
+    auto wgsl=loadWgsl("quant_kq","q4k_matmul_dp4a");if(wgsl.empty())return{false,"cannot load kernel"};
+    const int N=8,K=512,NB=K/256;Rng rng(0x44D4);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*144);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}
+    auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),xq(K),bias(N),exp(N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);
+    for(int b=0;b<K/32;b++){float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[b*32+j]));float s=amax/127.0f;for(int j=0;j<32;j++){int q=s==0?0:std::max(-127,std::min(127,(int)std::round(x[b*32+j]/s)));xq[b*32+j]=q*s;}}
+    for(int n=0;n<N;n++){bias[n]=.01f*n;exp[n]=bias[n];for(int k=0;k<K;k++)exp[n]+=xq[k]*dq[n*K+k];}
+    auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,pk.nBlocks,pk.rowStrideWords,0});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),exp.data(),N,2e-3f,2e-3f);
+}
+
 TEST(q4k_matmul_128_reference) {
  auto wgsl=loadWgsl("quant_kq","q4k_matmul_128");if(wgsl.empty())return{false,"cannot load kernel"};const int N=7,K=512,NB=2;Rng rng(5555);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*144);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);for(int n=0;n<N;n++){bias[n]=.01f*n;exp[n]=bias[n];for(int k=0;k<K;k++)exp[n]+=x[k]*dq[n*K+k];}auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,pk.nBlocks,pk.rowStrideWords,0});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,ceilDiv(N,4),1,by,N*4,5);return assertClose((const float*)r.data(),exp.data(),N,2e-4f,2e-4f);
 }

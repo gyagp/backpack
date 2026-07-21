@@ -2327,10 +2327,13 @@ void ModelRunner::buildDecodePipeline() {
     // overrides so cross-device experiments can compare either path.
     const bool useQ4KDecode256 = std::getenv("BP_Q4K_DECODE_256") ||
         (isNvidiaAdapter && !std::getenv("BP_Q4K_DECODE_128"));
+    const bool useQ4KDp4a = isNvidiaAdapter &&
+        !std::getenv("BP_Q4K_DISABLE_DP4A");
     auto kqPipelineFor = [&](GGUFType type) -> const CompiledPipeline* {
         switch (type) {
-            case GGUF_TYPE_Q4_K: return &getKernel(
-                useQ4KDecode256 ? "q4k_matmul" : "q4k_matmul_128");
+            case GGUF_TYPE_Q4_K: return &getKernel(useQ4KDp4a
+                ? "q4k_matmul_dp4a"
+                : useQ4KDecode256 ? "q4k_matmul" : "q4k_matmul_128");
             case GGUF_TYPE_Q5_K: return &getKernel("q5k_matmul");
             case GGUF_TYPE_Q6_K: return &getKernel("q6k_matmul");
             default: return nullptr;
