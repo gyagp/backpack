@@ -4816,8 +4816,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (!isKQ && !gemmaSerial) {
         initPrefillResources();
     } else if (gemmaSerial) {
-        if (cfg.arch == "gemma4" && weightsAreNativeQ4 &&
-            gpu->backendType == WGPUBackendType_Vulkan) {
+        const bool intelAdapter = gpu->adapterName.find("Intel") != std::string::npos;
+        if (cfg.arch == "gemma4" && !weightsUseNativeKQ && gpu->supportsSubgroups &&
+            !intelAdapter) {
             initGemmaPrefillResources();
         } else {
             fprintf(stderr, "  Prefill: skipped (Gemma sandwich/shared-KV, using serial decode)\n");
@@ -4901,12 +4902,16 @@ void ModelRunner::initGemmaPrefillResources() {
     // Force compilation at load so unsupported shader features fail before
     // the first prompt rather than midway through inference.
     (void)getKernel("matmul_q4_batched");
+    (void)getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
     (void)getKernel("q4_gather_batched");
     (void)getKernel("gemma_sandwich_attn_batched");
     (void)getKernel("gemma_norm_add_batched");
     (void)getKernel("gelu_mul_batched");
     (void)getKernel("ple_gelu_mul_batched");
     (void)getKernel("ple_combine_batched");
+    for (const auto& pl : cfg.perLayer)
+        if (pl.headDim) (void)getKernelHD(gpu->backendType == WGPUBackendType_D3D12
+            ? "causal_attn" : "flash_attn_vulkan", pl.headDim);
     gemmaPf.ready = true;
     fprintf(stderr, "  Gemma batched prefill: enabled (chunk=%u)\n", C);
 }
@@ -6418,13 +6423,36 @@ int32_t ModelRunner::prefillGemmaBatched(
 
         auto& q4Gather = getKernel("q4_gather_batched");
         float embScale = cfg.embeddingScale > 0 ? cfg.embeddingScale : 1.0f;
-        memcpy(&scaleBits, &embScale, 4);
-        auto embP = mkP("gpf_emb_p", {M, cfg.nEmbd, cfg.nVocab, scaleBits});
-        add(q4Gather, {{0,lmHeadQ8W},{1,lmHeadQ8S},{2,gemmaPf.tokens},
-                       {3,gemmaPf.x},{4,embP}},
-            (M * cfg.nEmbd + 255) / 256, 1, "gpf_embed");
+        if (weightsAreNativeQ4) {
+            memcpy(&scaleBits, &embScale, 4);
+            auto embP = mkP("gpf_emb_p", {M, cfg.nEmbd, cfg.nVocab, scaleBits});
+            add(q4Gather, {{0,lmHeadQ8W},{1,lmHeadQ8S},{2,gemmaPf.tokens},
+                           {3,gemmaPf.x},{4,embP}},
+                (M * cfg.nEmbd + 255) / 256, 1, "gpf_embed");
+        } else {
+            std::vector<float> embeddings((size_t)M * cfg.nEmbd);
+            for (uint32_t r = 0; r < M; r++) {
+                const float* src = embeddingCPU.data() + (size_t)tokens[r] * cfg.nEmbd;
+                float* dst = embeddings.data() + (size_t)r * cfg.nEmbd;
+                for (uint32_t j = 0; j < cfg.nEmbd; j++) dst[j] = src[j] * embScale;
+            }
+            gpu->writeBuffer(gemmaPf.x, embeddings.data(), embeddings.size() * sizeof(float));
+        }
 
         auto& q4mm = getKernel("matmul_q4_batched");
+        auto& q8mm = getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
+        auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
+                      uint32_t K, uint32_t N, const std::string& name) {
+            auto p = mkP(name + "_p", {M,N,K});
+            if (weightsAreNativeQ4) {
+                add(q4mm, {{0,x},{1,w},{2,s},{3,y},{4,p}},
+                    (N+31)/32,(M+3)/4,name);
+            } else {
+                auto q8p = mkP(name + "_q8p", {K,N,M});
+                add(q8mm, {{0,x},{1,w},{2,s},{3,zeroBiasQKV},{4,y},{5,q8p}},
+                    (M+(useDP4A?3u:7u))/(useDP4A?4u:8u),(N+31)/32,name);
+            }
+        };
         if (cfg.pleSize > 0 && pleGpuPreprocess) {
             uint32_t totalPle = cfg.pleSize * cfg.nLayer;
             float ps = sqrtf((float)cfg.pleSize); memcpy(&scaleBits, &ps, 4);
@@ -6433,14 +6461,28 @@ int32_t ModelRunner::prefillGemmaBatched(
                            {3,gemmaPf.pleSignal},{4,pg}},
                 (M*totalPle+255)/256,1,"gpf_ple_gather");
             auto pm = mkP("gpf_ple_model_p", {M,totalPle,cfg.nEmbd});
-            add(q4mm, {{0,gemmaPf.x},{1,pleModelProjW},{2,pleModelProjS},
-                       {3,gemmaPf.pleRaw},{4,pm}},
-                (totalPle+31)/32,(M+3)/4,"gpf_ple_model");
+            mm(gemmaPf.x,pleModelProjW,pleModelProjS,gemmaPf.pleRaw,
+               cfg.nEmbd,totalPle,"gpf_ple_model");
             auto pc = mkP("gpf_ple_combine_p", {M,cfg.pleSize,cfg.nLayer,eb});
             auto& combine = getKernel("ple_combine_batched");
             add(combine, {{0,gemmaPf.pleRaw},{1,pleProjNormW},
                           {2,gemmaPf.pleSignal},{3,pc}},
                 M,cfg.nLayer,"gpf_ple_combine");
+        } else if (cfg.pleSize > 0 && !pleEmbCPU.empty()) {
+            const uint32_t pleDim=cfg.pleSize,totalPle=pleDim*cfg.nLayer;
+            const float pleScale=sqrtf((float)pleDim),invSqrt2=0.70710678f;
+            std::vector<float> signal((size_t)M*totalPle),proj((size_t)M*totalPle);
+            std::vector<uint32_t> jobs(M*cfg.nLayer);std::iota(jobs.begin(),jobs.end(),0u);
+            std::for_each(std::execution::par,jobs.begin(),jobs.end(),[&](uint32_t job){
+                uint32_t r=job/cfg.nLayer,li=job%cfg.nLayer;float* out=signal.data()+(size_t)r*totalPle+li*pleDim;
+                const float* tok=pleEmbCPU.data()+(size_t)tokens[r]*totalPle+li*pleDim;
+                const float* emb=embeddingCPU.data()+(size_t)tokens[r]*cfg.nEmbd;
+                float* pr=proj.data()+(size_t)r*totalPle+li*pleDim;
+                for(uint32_t d=0;d<pleDim;d++){const float* w=pleModelProjCPU.data()+(size_t)(li*pleDim+d)*cfg.nEmbd;float acc=0;for(uint32_t k=0;k<cfg.nEmbd;k++)acc+=w[k]*emb[k];pr[d]=acc;}
+                float ss=0;for(uint32_t d=0;d<pleDim;d++)ss+=pr[d]*pr[d];float rms=1.0f/sqrtf(ss/(float)pleDim+cfg.rmsNormEps);
+                for(uint32_t d=0;d<pleDim;d++)out[d]=(pr[d]*rms*(d<pleProjNormCPU.size()?pleProjNormCPU[d]:1.0f)+tok[d]*pleScale)*invSqrt2;
+            });
+            gpu->writeBuffer(gemmaPf.pleSignal,signal.data(),signal.size()*sizeof(float));
         }
 
         uint32_t cacheLen = kvCache[0].len;
@@ -6460,9 +6502,8 @@ int32_t ModelRunner::prefillGemmaBatched(
             bool qonly = lw.qOnly;
             uint32_t qkvN = qonly ? qdim : qdim + 2u*kvdim;
             auto qp=mkP("gpf_qkv_"+std::to_string(li),{M,qkvN,cfg.nEmbd});
-            add(q4mm,{{0,gemmaPf.norm},{1,qonly?lw.qOnlyW:lw.qkvW},
-                      {2,qonly?lw.qOnlyS:lw.qkvS},{3,gemmaPf.qkv},{4,qp}},
-                (qkvN+31)/32,(M+3)/4,"gpf_qkv");
+            mm(gemmaPf.norm,qonly?lw.qOnlyW:lw.qkvW,qonly?lw.qOnlyS:lw.qkvS,
+               gemmaPf.qkv,cfg.nEmbd,qkvN,"gpf_qkv");
 
             bool swa = li<cfg.layerAttnTypes.size() &&
                        cfg.layerAttnTypes[li]==AttnLayerType::SlidingWindow;
@@ -6486,47 +6527,40 @@ int32_t ModelRunner::prefillGemmaBatched(
             memcpy(&asb,&ascale,4);memcpy(&nib,&ni,4);
             auto ap=mkP("gpf_attn_"+std::to_string(li),
                 {kvdim,cfg.nHead/cfg.nKvHeads,total,cacheLen,M,asb,nib,kvStart},true);
-            auto& attn=getKernelHD("flash_attn_vulkan",hd);
+            const bool mmaAttn=gpu->backendType!=WGPUBackendType_D3D12&&gpu->supportsSubgroupMatrix;
+            auto& attn=getKernelHD(mmaAttn?"flash_attn_vulkan":"causal_attn",hd);
             add(attn,{{0,gemmaPf.qrot},{1,kvCache[cacheLayer].K},
                       {2,kvCache[cacheLayer].V},{3,gemmaPf.attn},{4,ap}},
-                cfg.nHead,(M+15)/16,"gpf_attn");
+                cfg.nHead,(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),"gpf_attn");
 
             auto op=mkP("gpf_o_"+std::to_string(li),{M,cfg.nEmbd,qdim});
-            add(q4mm,{{0,gemmaPf.attn},{1,lw.oW},{2,lw.oS},
-                      {3,gemmaPf.proj},{4,op}},
-                (cfg.nEmbd+31)/32,(M+3)/4,"gpf_oproj");
+            mm(gemmaPf.attn,lw.oW,lw.oS,gemmaPf.proj,qdim,cfg.nEmbd,"gpf_oproj");
             auto sp=mkP("gpf_sand_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
             add(sandwich,{{0,gemmaPf.x},{1,gemmaPf.proj},{2,lw.postNorm},
                           {3,lw.ffnNorm},{4,gemmaPf.norm},{5,gemmaPf.rstd},{6,sp}},
                 M,1,"gpf_sandwich");
 
             auto gp=mkP("gpf_gu_"+std::to_string(li),{M,2u*im,cfg.nEmbd});
-            add(q4mm,{{0,gemmaPf.norm},{1,lw.guW},{2,lw.guS},
-                      {3,gemmaPf.gateup},{4,gp}},
-                (2u*im+31)/32,(M+3)/4,"gpf_gateup");
+            mm(gemmaPf.norm,lw.guW,lw.guS,gemmaPf.gateup,cfg.nEmbd,2u*im,"gpf_gateup");
             auto gap=mkP("gpf_gelu_"+std::to_string(li),{M,im});
             add(geluMul,{{0,gemmaPf.gateup},{1,gemmaPf.act},{2,gap}},
                 (M*im+255)/256,1,"gpf_gelu");
             auto dp=mkP("gpf_down_"+std::to_string(li),{M,cfg.nEmbd,im});
-            add(q4mm,{{0,gemmaPf.act},{1,lw.dnW},{2,lw.dnS},
-                      {3,gemmaPf.proj},{4,dp}},
-                (cfg.nEmbd+31)/32,(M+3)/4,"gpf_down");
+            mm(gemmaPf.act,lw.dnW,lw.dnS,gemmaPf.proj,im,cfg.nEmbd,"gpf_down");
             auto np=mkP("gpf_ffn_add_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
             add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.proj},{2,lw.postFfwNorm},
                          {3,gemmaPf.rstd},{4,np}},M,1,"gpf_ffn_add");
 
-            if(cfg.pleSize>0&&pleGpuPreprocess&&lw.pleInpGateW.handle){
+            if(cfg.pleSize>0&&(pleGpuPreprocess||!pleEmbCPU.empty())&&lw.pleInpGateW.handle){
                 auto p1=mkP("gpf_pg_"+std::to_string(li),{M,cfg.pleSize,cfg.nEmbd});
-                add(q4mm,{{0,gemmaPf.x},{1,lw.pleInpGateW},{2,lw.pleInpGateS},
-                          {3,gemmaPf.pleGate},{4,p1}},
-                    (cfg.pleSize+31)/32,(M+3)/4,"gpf_ple_gate");
+                mm(gemmaPf.x,lw.pleInpGateW,lw.pleInpGateS,gemmaPf.pleGate,
+                   cfg.nEmbd,cfg.pleSize,"gpf_ple_gate");
                 auto p2=mkP("gpf_pm_"+std::to_string(li),{M,cfg.pleSize,li,cfg.nLayer});
                 add(pleMul,{{0,gemmaPf.pleGate},{1,gemmaPf.pleSignal},{2,p2}},
                     (M*cfg.pleSize+255)/256,1,"gpf_ple_mul");
                 auto p3=mkP("gpf_pp_"+std::to_string(li),{M,cfg.nEmbd,cfg.pleSize});
-                add(q4mm,{{0,gemmaPf.pleGate},{1,lw.pleProjW},{2,lw.pleProjS},
-                          {3,gemmaPf.pleOut},{4,p3}},
-                    (cfg.nEmbd+31)/32,(M+3)/4,"gpf_ple_proj");
+                mm(gemmaPf.pleGate,lw.pleProjW,lw.pleProjS,gemmaPf.pleOut,
+                   cfg.pleSize,cfg.nEmbd,"gpf_ple_proj");
                 auto p4=mkP("gpf_pa_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
                 add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.pleOut},{2,lw.plePostNorm},
                              {3,gemmaPf.rstd},{4,p4}},M,1,"gpf_ple_add");
@@ -6545,11 +6579,18 @@ int32_t ModelRunner::prefillGemmaBatched(
                      {3,gemmaPf.rstd},{4,fp}},M,1,"gpf_final_rms");
             GPUBuffer lastNorm=gemmaPf.norm;
             lastNorm.offset=(uint64_t)(M-1)*cfg.nEmbd*4; lastNorm.size=cfg.nEmbd*4;
-            auto lp=mkP("gpf_lm",{0,cfg.nVocab,cfg.nEmbd,0});
-            auto& lm=getKernel("matmul_q4_decode");
-            add(lm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
-                    {3,logitsBuf},{4,lp}},
-                (cfg.nVocab+31)/32,1,"gpf_lm");
+            if (weightsAreNativeQ4) {
+                auto lp=mkP("gpf_lm",{0,cfg.nVocab,cfg.nEmbd,0});
+                auto& lm=getKernel("matmul_q4_decode");
+                add(lm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
+                        {3,logitsBuf},{4,lp}},
+                    (cfg.nVocab+31)/32,1,"gpf_lm");
+            } else {
+                auto lp=mkP("gpf_lm_q8",{cfg.nEmbd,cfg.nVocab,1});
+                add(q8mm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
+                          {3,zeroBiasV},{4,logitsBuf},{5,lp}},
+                    1,(cfg.nVocab+31)/32,"gpf_lm");
+            }
             if(softcapPipeline&&softcapBG){
                 ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"logit_softcap"});
             }

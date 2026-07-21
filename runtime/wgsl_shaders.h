@@ -191,7 +191,7 @@ struct AttnParams {
     T_prefill: u32,
     scale_bits: u32,
     neg_inf_bits: u32,
-    pad1: u32,
+    kv_start: u32,
 };
 @group(0) @binding(4) var<uniform> params: AttnParams;
 
@@ -244,7 +244,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let max_causal = min(cache_offset + q_block * QUERIES_PER_WG + QUERIES_PER_WG, T_total);
 
     for (var t = 0u; t < max_causal; t = t + 1u) {
-        let causal_valid = q_valid && t <= q_abs_pos;
+        let causal_valid = q_valid && t >= params.kv_start && t <= q_abs_pos;
 
         let k_base = t * kv_stride + kv_off;
         let k_off = k_base + lane * HD_PER_THREAD;
