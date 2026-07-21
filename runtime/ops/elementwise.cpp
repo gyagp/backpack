@@ -352,7 +352,11 @@ static void dispatchBinaryOp(OpContext& ex, const OnnxGraphNode& node,
         {0, A->buffer}, {1, B->buffer}, {2, outputs[0]->buffer}, {3, params}});
     // Each thread handles 2 elements
     uint32_t numWorkgroups = (uint32_t)(((N + 1) / 2 + 255) / 256);
-    ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
+    if (ex.getGpu()->adapterName.find("Intel") != std::string::npos)
+        ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
+    else
+        ex.QueueDispatch(pl.pipeline, bg, numWorkgroups, 1, 1,
+                         node.opType.c_str());
 }
 
 // ─── Unary elementwise dispatch ──────────────────────────────────────────────
@@ -385,7 +389,11 @@ static void dispatchUnaryOp(OpContext& ex, const OnnxGraphNode& node,
         {0, A->buffer}, {1, outputs[0]->buffer}, {2, params}});
     // Each thread handles 2 elements
     uint32_t numWorkgroups = (uint32_t)(((N + 1) / 2 + 255) / 256);
-    ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
+    if (ex.getGpu()->adapterName.find("Intel") != std::string::npos)
+        ex.SubmitAsync({{pl.pipeline, bg, numWorkgroups, 1, 1, node.opType}});
+    else
+        ex.QueueDispatch(pl.pipeline, bg, numWorkgroups, 1, 1,
+                         node.opType.c_str());
 }
 
 // ─── Op Registrations ────────────────────────────────────────────────────────
