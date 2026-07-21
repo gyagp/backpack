@@ -61,6 +61,20 @@ struct ExecutionContext {
     struct PendingCopy { GPUBuffer src; uint64_t srcOff; GPUBuffer dst; uint64_t dstOff; uint64_t size; };
     std::vector<PendingCopy> pendingCopies_;
 
+    struct PendingQ4Pair {
+        bool valid = false;
+        std::string inputName;
+        GPUBuffer x, w, scales, y, params;
+        uint32_t n = 0, k = 0;
+        Dispatch fallback;
+    } pendingQ4Pair_;
+
+    void FlushPendingQ4Pair() {
+        if (!pendingQ4Pair_.valid) return;
+        pendingDispatches_.push_back(std::move(pendingQ4Pair_.fallback));
+        pendingQ4Pair_ = {};
+    }
+
     /// Flush pending dispatches+copies into a command encoder and submit.
     void flushToEncoder();
 

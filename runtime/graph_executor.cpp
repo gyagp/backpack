@@ -1199,6 +1199,13 @@ void GraphExecutor::Execute(
         size_t ni = execOrder[ei];
         auto& node = graph_.nodes[ni];
 
+        const bool completesQ4Pair = ctx.pendingQ4Pair_.valid &&
+            node.opType == "MatMulNBits" &&
+            node.name.find("/mlp/gate_proj/MatMul_Q4") != std::string::npos &&
+            !node.inputs.empty() && node.inputs[0] == ctx.pendingQ4Pair_.inputName;
+        if (ctx.pendingQ4Pair_.valid && !completesQ4Pair)
+            ctx.FlushPendingQ4Pair();
+
         // Insert every output before resolving input pointers: insertion may
         // rehash tensorStore_.  Node names themselves are stable graph data,
         // so copying them into two temporary string vectors is unnecessary.
@@ -1483,6 +1490,8 @@ void GraphExecutor::Execute(
             skipped++;
         }
     }
+
+    ctx.FlushPendingQ4Pair();
 
     // Copy outputs
     for (auto& [name, tensor] : outputs) {

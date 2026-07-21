@@ -486,6 +486,57 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         auto bg = ex.MakeBindGroup(pl, {
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
+
+        const bool isUpProjection = n.name.find("/mlp/up_proj/MatMul_Q4") != std::string::npos;
+        const bool isGateProjection = n.name.find("/mlp/gate_proj/MatMul_Q4") != std::string::npos;
+        auto& pendingPair = ex.exec.pendingQ4Pair_;
+        if (useTwoColumnDecode && isGateProjection && pendingPair.valid &&
+            pendingPair.inputName == n.inputs[0] && pendingPair.n == N && pendingPair.k == K &&
+            pendingPair.x.handle == X->buffer.handle) {
+            const bool pairOneColumn =
+                ex.getGpu()->adapterName.find("Intel") == std::string::npos;
+            auto& pairPl = ex.GetPipelineT(pairOneColumn ? "matmul_q4_decode_pair_1col" :
+                                                           "matmul_q4_decode_pair_2col", 8,
+                [pairOneColumn]() {
+                    std::string source(WGSL_MATMUL_Q4_DECODE_PAIR);
+                    const std::string from = "COLS_PER_WARP: u32 = 2u";
+                    if (pairOneColumn) {
+                        if (auto pos = source.find(from); pos != std::string::npos)
+                            source.replace(pos, from.size(), "COLS_PER_WARP: u32 = 1u");
+                    }
+                    return source;
+                });
+            auto pairBg = ex.MakeBindGroup(pairPl, {
+                {0, X->buffer}, {1, pendingPair.w}, {2, pendingPair.scales},
+                {3, pendingPair.y}, {4, paramBuf}, {5, W->buffer},
+                {6, S->buffer}, {7, out[0]->buffer}});
+            ex.QueueDispatch(pairPl.pipeline, pairBg,
+                pairOneColumn ? (N + 7) / 8 : (N + 15) / 16,
+                1, 1, pairOneColumn ? "matmul_q4_pair_1col" : "matmul_q4_pair_2col");
+            pendingPair = {};
+            return;
+        }
+        if (useTwoColumnDecode && isUpProjection) {
+            pendingPair.valid = true;
+            pendingPair.inputName = n.inputs[0];
+            pendingPair.x = X->buffer;
+            pendingPair.w = W->buffer;
+            pendingPair.scales = S->buffer;
+            pendingPair.y = out[0]->buffer;
+            pendingPair.params = paramBuf;
+            pendingPair.n = N;
+            pendingPair.k = K;
+            pendingPair.fallback = {pl.pipeline, bg,
+                useOneColumnDecode ? (N + 7) / 8 : (N + 15) / 16,
+                1, 1, useOneColumnDecode ? "matmul_q4_decode_1col" :
+                                           "matmul_q4_decode_2col", {}};
+            if (ex.exec.fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing) {
+                pendingPair.fallback.capturedBindings =
+                    std::move(ex.exec.lastCapturedBindings_);
+                ex.exec.lastCapturedBindings_.clear();
+            }
+            return;
+        }
         ex.QueueDispatch(pl.pipeline, bg,
             usePackedPrefill ? (N + 31) / 32
                 : useWidePrefill ? (N + 127) / 128
