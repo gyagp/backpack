@@ -67,11 +67,11 @@ inline std::string applyChatTemplate(const std::string& message,
     // Empty <think></think> block disables thinking mode.
     if (arch.find("qwen3") != std::string::npos ||
         arch.find("qwen2") != std::string::npos)
-        // Match ORT GenAI's Qwen 3.5 processor prefix. Disable thinking for
-        // deterministic conformance and benchmark prompts.
-        return "You are a helpful AI assistant."
-               "<|im_start|>user\n" + message + "<|im_end|>\n"
-               "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+          // Match ORT GenAI model_chat: its system-only Jinja application
+          // falls back to plain system text, then the user turn uses ChatML.
+          return "You are a helpful AI assistant."
+                 "<|im_start|>user\n" + message + "<|im_end|>\n"
+                 "<|im_start|>assistant\n<think>\n\n</think>\n\n";
     // Phi-3/Phi-4-mini: uses <|user|>/<|end|>/<|assistant|> tokens
     if (arch.find("phi3") != std::string::npos ||
         arch.find("phi4") != std::string::npos)
@@ -92,6 +92,11 @@ inline std::string applyChatTemplate(const std::string& message,
                "<start_of_turn>model\n";
     return "<|im_start|>user\n" + message +
            "<|im_end|>\n<|im_start|>assistant\n";
+}
+
+inline std::string applyQwenUserTemplate(const std::string& message) {
+    return "<|im_start|>user\n" + message + "<|im_end|>\n"
+           "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
 // ─── fp16 conversion ────────────────────────────────────────────────────────

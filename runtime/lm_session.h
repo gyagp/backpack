@@ -101,7 +101,8 @@ public:
     /// Generate text from a string prompt. Handles tokenize, prefill, decode.
     std::string Generate(const std::string& prompt, int maxTokens,
                          const SamplingParams& sampling = {},
-                         StreamCallback onToken = nullptr);
+                         StreamCallback onToken = nullptr,
+                         bool resetSession = true);
 
     // ─── Low-level Stepping ─────────────────────────────────────────────
 

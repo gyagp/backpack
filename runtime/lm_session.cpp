@@ -225,6 +225,7 @@ struct GenericOnnxState {
     bool fastDecodeEnabled = false;
     bool fastDecodeCaptured = false;
     bool prefillDone = false;
+    bool benchWarmupDone = false;
     bool decodePlanInitialized = false;
     int decodeWarmupRemaining = 0;
     bool nlkWritten = false;
@@ -508,11 +509,18 @@ struct GenericOnnxState {
         // Large fully-dynamic Qwen batches currently exceed the reliable
         // shape/arena envelope on D3D12. Preserve state across bounded batches;
         // this still reduces a 128-token prompt from 128 graph executions to 2.
-        constexpr uint32_t kPrefillChunk = 64;
-        if (arch == "qwen3_5_text" && T > kPrefillChunk) {
+        // The exported Qwen 3.5 recurrent graph is not sequence-parallel:
+        // Conv and GatedDeltaNet carry state from token t to t+1. Executing
+        // M>1 as independent rows corrupts that recurrence. ORT GenAI updates
+        // these states in token order, so use single-token chunks until the
+        // graph executor has a fused causal recurrent scan.
+        uint32_t qwenPrefillChunk = 1;
+        if (const char* value = std::getenv("BP_QWEN_PREFILL_CHUNK"))
+            qwenPrefillChunk = std::max(1, atoi(value));
+        if (arch == "qwen3_5_text" && T > qwenPrefillChunk) {
             int32_t result = -1;
-            for (uint32_t offset = 0; offset < T; offset += kPrefillChunk) {
-                const uint32_t count = std::min(kPrefillChunk, T - offset);
+            for (uint32_t offset = 0; offset < T; offset += qwenPrefillChunk) {
+                const uint32_t count = std::min(qwenPrefillChunk, T - offset);
                 result = RunPrefillBatch(tokenIds + offset, count);
             }
             return result;
@@ -1489,10 +1497,11 @@ int32_t LmSession::GetEosTokenId() const {
 
 std::string LmSession::Generate(const std::string& prompt, int maxTokens,
                                  const SamplingParams& sampling,
-                                 StreamCallback onToken) {
+                                 StreamCallback onToken,
+                                 bool resetSession) {
     if (!impl_) return {};
 
-    Reset();
+    if (resetSession) Reset();
     auto tokens = Tokenize(prompt);
     if (tokens.empty()) return {};
 
@@ -1700,11 +1709,22 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         int totalNeeded = promptLen + 3 + genTokens;
         if (totalNeeded > (int)gen->maxSeqLen) return result;
 
-        gen->ResetCaches();
+        std::vector<int32_t> prefillTokens(promptLen, 1);
+        // Match ORT GenAI's reused-generator benchmark semantics: compile the
+        // shape-specific pipelines and materialize the tensor plan before the
+        // timed sample. Otherwise the first prompt reports shader compilation
+        // as inference time and understates steady-state prefill by several x.
+        if (!gen->benchWarmupDone) {
+            gen->ResetCaches();
+            (void)gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
+            gen->ResetCaches();
+            gen->benchWarmupDone = true;
+        } else {
+            gen->ResetCaches();
+        }
         int32_t tok = 1;
 
         // Prefill
-        std::vector<int32_t> prefillTokens(promptLen, 1);
         auto pfStart = std::chrono::steady_clock::now();
         tok = gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
         auto pfEnd = std::chrono::steady_clock::now();

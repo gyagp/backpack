@@ -201,8 +201,21 @@ int main(int argc, char* argv[]) {
     // 4. Generate
     std::string finalPrompt;
     bool chat = !chatMessage.empty();
+    bool qwenOnnxChat = false;
     if (chat) {
-        finalPrompt = app::applyChatTemplate(chatMessage, cfg.arch);
+        qwenOnnxChat = cfg.format == "onnx_generic" &&
+            cfg.arch.find("qwen3") != std::string::npos;
+        if (qwenOnnxChat) {
+            // ORT GenAI advances Qwen's recurrent state with the system turn
+            // before appending the user ChatML turn. Preserve that ordering.
+            session.Reset();
+            auto systemTokens = session.Tokenize("You are a helpful AI assistant.");
+            if (!systemTokens.empty())
+                (void)session.Prefill(systemTokens.data(), (uint32_t)systemTokens.size());
+            finalPrompt = app::applyQwenUserTemplate(chatMessage);
+        } else {
+            finalPrompt = app::applyChatTemplate(chatMessage, cfg.arch);
+        }
         fprintf(stderr, "Chat: %s\n", chatMessage.c_str());
     } else {
         finalPrompt = prompt;
@@ -231,7 +244,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s", text.c_str()); fflush(stderr);
             tokenCount++;
             return true;
-        });
+        }, !qwenOnnxChat);
 
     auto genMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - genStart).count();
