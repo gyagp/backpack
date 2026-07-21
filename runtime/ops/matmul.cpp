@@ -440,12 +440,17 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             ex.getGpu()->supportsSubgroups;
         const bool useTwoColumnDecode = usePackedDecode &&
             (K == 2048u || K == 6144u);
+        const bool useOneColumnDecode = useTwoColumnDecode &&
+            ex.getGpu()->adapterName.find("Intel") == std::string::npos;
         auto& pl = useTwoColumnDecode
-            ? ex.GetPipelineT("matmul_q4_decode_2col", 5, []() {
+            ? ex.GetPipelineT(useOneColumnDecode ? "matmul_q4_decode_1col" :
+                                               "matmul_q4_decode_2col", 5,
+              [useOneColumnDecode]() {
                 std::string source(WGSL_MATMUL_Q4_DECODE);
                 const std::string from = "COLS_PER_WARP: u32 = 4u";
                 if (auto pos = source.find(from); pos != std::string::npos)
-                    source.replace(pos, from.size(), "COLS_PER_WARP: u32 = 2u");
+                    source.replace(pos, from.size(), useOneColumnDecode ?
+                        "COLS_PER_WARP: u32 = 1u" : "COLS_PER_WARP: u32 = 2u");
                 return source;
             })
             : usePackedDecode
@@ -457,9 +462,11 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
             {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pl.pipeline, bg,
-            useTwoColumnDecode ? (N + 15) / 16
+            useOneColumnDecode ? (N + 7) / 8
+                : useTwoColumnDecode ? (N + 15) / 16
                 : usePackedDecode ? (N + 31) / 32 : (N + 255) / 256,
-            (uint32_t)M, 1, useTwoColumnDecode ? "matmul_q4_decode_2col"
+            (uint32_t)M, 1, useOneColumnDecode ? "matmul_q4_decode_1col"
+                : useTwoColumnDecode ? "matmul_q4_decode_2col"
                 : usePackedDecode ? "matmul_q4_decode" : "matmul_q4");
     }
 }
