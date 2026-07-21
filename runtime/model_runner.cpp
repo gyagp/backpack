@@ -18,6 +18,20 @@
 
 namespace {
 
+std::string deltaNetValueMajorSource(const char* source) {
+    std::string result(source);
+    auto replace = [&](const std::string& from, const std::string& to) {
+        size_t pos = 0;
+        while ((pos = result.find(from, pos)) != std::string::npos) {
+            result.replace(pos, from.size(), to);
+            pos += to.size();
+        }
+    };
+    replace("ki * dv + vi", "vi * dk + ki");
+    replace("ki*dv+vi", "vi*dk+ki");
+    return result;
+}
+
 const WGPULimits& effectiveLimits(const GPUContext& gpu) {
     return gpu.deviceLimits.maxComputeInvocationsPerWorkgroup != 0
         ? gpu.deviceLimits
@@ -3382,8 +3396,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             }
             }
             {
-                auto& plDelta = (qwen35VulkanDecode || qwen35SubgroupSuite)
-                    ? getKernel("delta_net_decode_x2") : getKernel("delta_net_decode");
+                const bool valueMajorState = isNvidiaAdapter &&
+                    cfg.ssmTimeStepRank == 32u &&
+                    (qwen35VulkanDecode || qwen35SubgroupSuite);
+                const auto& plDelta = valueMajorState
+                    ? gpu->getOrCreatePipeline("delta_net_decode_x2_value_major",
+                        deltaNetValueMajorSource(WGSL_DELTA_NET_DECODE_X2), 8)
+                    : (qwen35VulkanDecode || qwen35SubgroupSuite)
+                        ? getKernel("delta_net_decode_x2") : getKernel("delta_net_decode");
                 auto p = mkP32("p_ssm_delta_L"+std::to_string(i),
                                {cfg.ssmTimeStepRank, cfg.ssmGroupCount, cfg.ssmStateSize, headV});
                 auto bg = makeBG(plDelta, {
@@ -6402,7 +6422,11 @@ int32_t ModelRunner::prefillQwen35Batched(
         auto&bagKernel=getKernel("qwen35_alpha_beta_gate_batched");
         auto&convKernel=getKernel("qwen35_conv_scan_silu");
         auto&splitSsmKernel=getKernel("qwen35_split_qkv_l2_batched");
-        auto&deltaKernel=getKernel("delta_net_scan_x2");
+        const auto&deltaKernel=gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+            cfg.ssmTimeStepRank==32u
+            ? gpu->getOrCreatePipeline("delta_net_scan_x2_value_major",
+                deltaNetValueMajorSource(WGSL_DELTA_NET_SCAN_X2),8)
+            : getKernel("delta_net_scan_x2");
         auto&normGateKernel=getKernel("qwen35_norm_gated_batched");
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},(M+3)/4,(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
