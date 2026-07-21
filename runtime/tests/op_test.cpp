@@ -1588,6 +1588,39 @@ TEST(gqa_decode_with_cache) {
     }
 }
 
+TEST(rotary_embedding_partial_dimension) {
+    constexpr int heads = 2, headDim = 8, rotaryDim = 4;
+    std::vector<float> x(heads * headDim);
+    std::iota(x.begin(), x.end(), 1.0f);
+    const float c0 = cosf(0.3f), s0 = sinf(0.3f);
+    const float c1 = cosf(0.7f), s1 = sinf(0.7f);
+    std::vector<float> cosCache = {c0, c1};
+    std::vector<float> sinCache = {s0, s1};
+    auto expected = x;
+    for (int h = 0; h < heads; ++h) {
+        const int base = h * headDim;
+        expected[base + 0] = x[base + 0] * c0 - x[base + 2] * s0;
+        expected[base + 1] = x[base + 1] * c1 - x[base + 3] * s1;
+        expected[base + 2] = x[base + 0] * s0 + x[base + 2] * c0;
+        expected[base + 3] = x[base + 1] * s1 + x[base + 3] * c1;
+    }
+
+    auto model = buildOnnxModel(
+        {{"RotaryEmbedding", {"X", "position_ids", "cos_cache", "sin_cache"}, {"Y"},
+          {{"num_heads", AttrDef::INT, heads},
+           {"rotary_embedding_dim", AttrDef::INT, rotaryDim},
+           {"interleaved", AttrDef::INT, 0}}}},
+        {{"X", ONNX_FLOAT, {1, heads, 1, headDim}}},
+        {{"Y", ONNX_FLOAT, {1, heads, 1, headDim}}},
+        {makeInitI64("position_ids", {1, 1}, {0}),
+         makeInitF32("cos_cache", {1, rotaryDim / 2}, cosCache),
+         makeInitF32("sin_cache", {1, rotaryDim / 2}, sinCache)});
+
+    auto outputs = runOnnxModel(gpu, model,
+        {{"X", makeInputF32("X", {1, heads, 1, headDim}, x)}}, {"Y"});
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 1e-4f);
+}
+
 // ── GPU Concat and Slice ────────────────────────────────────────────────────
 
 TEST(concat_f32_axis2) {
@@ -2006,6 +2039,7 @@ int main(int argc, char** argv) {
     // GQA
     RUN(gqa_decode_no_cache);
     RUN(gqa_decode_with_cache);
+    RUN(rotary_embedding_partial_dimension);
 
     // GPU concat/slice
     RUN(concat_f32_axis2);

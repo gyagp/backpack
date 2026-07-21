@@ -597,6 +597,8 @@ static void opRotaryEmbedding(OpContext& ex, const OnnxGraphNode& n,
     int64_t interleaved = n.GetInt("interleaved", 0);
     int64_t total = tensorNel(X);
     int64_t head_dim = X->shape.back();
+    int64_t rotary_dim = n.GetInt("rotary_embedding_dim", head_dim);
+    rotary_dim = std::min(rotary_dim, head_dim);
 
     // Compute seq_len from X shape for position auto-increment
     // X shape: [batch, heads, seq_len, head_dim] for 4D
@@ -651,10 +653,68 @@ static void opRotaryEmbedding(OpContext& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(32);
     ex.getGpu()->writeBuffer(paramBuf, params, 32);
 
-    auto& pl = ex.GetPipelineT("rotary_embedding", 6, []() { return instantiateTemplate(WGSL_ROTARY_EMBEDDING_T, TensorDtype::Float32); });
-    auto bg = ex.MakeBindGroup(pl, {
-        {0, X->buffer}, {1, posIdsBuf}, {2, CosCache->buffer},
-        {3, SinCache->buffer}, {4, out[0]->buffer}, {5, paramBuf}});
+    static const char* kPartialRotary = R"WGSL(
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> CosCache: array<f32>;
+@group(0) @binding(2) var<storage, read> SinCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> params: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let total = params[0]; let head_dim = params[1]; let rotary_dim = params[2];
+  let seq_len = params[3]; let heads = params[4]; let interleaved = params[5];
+  let idx = gid.x;
+  if (idx >= total) { return; }
+  let d = idx % head_dim;
+  if (d >= rotary_dim) { Y[idx] = X[idx]; return; }
+  let half = rotary_dim / 2u;
+  let vector_idx = idx / head_dim;
+  let seq_idx = vector_idx % seq_len;
+  let batch_idx = vector_idx / (seq_len * heads);
+  let cache_base = (batch_idx * seq_len + seq_idx) * half;
+  let head_base = idx - d;
+  if (interleaved != 0u) {
+    let pair = d / 2u; let c = CosCache[cache_base + pair]; let s = SinCache[cache_base + pair];
+    if ((d & 1u) == 0u) {
+      Y[idx] = X[idx] * c - X[head_base + d + 1u] * s;
+    } else {
+      Y[idx] = X[head_base + d - 1u] * s + X[idx] * c;
+    }
+  } else {
+    let pair = d % half; let c = CosCache[cache_base + pair]; let s = SinCache[cache_base + pair];
+    if (d < half) {
+      Y[idx] = X[idx] * c - X[head_base + pair + half] * s;
+    } else {
+      Y[idx] = X[head_base + pair] * s + X[idx] * c;
+    }
+  }
+}
+)WGSL";
+    // Qwen mRoPE pre-gathers one cache row per batch/sequence position and
+    // rotates only rotary_embedding_dim channels of a wider head. The generic
+    // ONNX kernel expects a full absolute-position cache and a full-head
+    // rotation, so keep this specialization narrowly scoped to that export.
+    const int64_t batch = X->shape.empty() ? 1 : X->shape[0];
+    const bool preGatheredCache = CosCache->shape.size() == 2 &&
+        CosCache->shape[0] == batch * seqLen &&
+        CosCache->shape[1] == rotary_dim / 2;
+    const bool partialRotary = rotary_dim > 0 && rotary_dim < head_dim &&
+        rotary_dim % 2 == 0 && preGatheredCache;
+    const int64_t heads = n.GetInt("num_heads", X->shape.size() >= 2 ? X->shape[1] : 1);
+    uint32_t partialParams[8] = {(uint32_t)total, (uint32_t)head_dim,
+        (uint32_t)rotary_dim, (uint32_t)seqLen, (uint32_t)heads,
+        (uint32_t)interleaved, 0, 0};
+    if (partialRotary) ex.getGpu()->writeBuffer(paramBuf, partialParams, 32);
+    auto& pl = partialRotary
+        ? ex.GetPipeline("rotary_embedding_partial_mrope", kPartialRotary, 5)
+        : ex.GetPipelineT("rotary_embedding", 6, []() {
+            return instantiateTemplate(WGSL_ROTARY_EMBEDDING_T, TensorDtype::Float32);
+          });
+    auto bg = partialRotary
+        ? ex.MakeBindGroup(pl, {{0, X->buffer}, {1, CosCache->buffer},
+                                {2, SinCache->buffer}, {3, out[0]->buffer}, {4, paramBuf}})
+        : ex.MakeBindGroup(pl, {{0, X->buffer}, {1, posIdsBuf}, {2, CosCache->buffer},
+                                {3, SinCache->buffer}, {4, out[0]->buffer}, {5, paramBuf}});
 
     ex.QueueDispatch(pl.pipeline, bg,
         (uint32_t)((total + 255) / 256), 1, 1, "rope");
