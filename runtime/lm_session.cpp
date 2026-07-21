@@ -1172,10 +1172,14 @@ struct StandardState {
         if (!ok) return false;
 
         if (format == "onnx") {
-            if (!onnxTokenizer.load(resolved)) {
-                auto parent = fs::path(resolved).parent_path().string();
-                if (!onnxTokenizer.load(parent)) return false;
-            }
+            // Split GenAI models resolve to their decoder subdirectory while
+            // tokenizer.json remains at the package root.  Select the existing
+            // tokenizer directory before loading so a valid package does not
+            // emit a misleading "Failed to open" diagnostic.
+            fs::path tokenizerDir(resolved);
+            if (!fs::exists(tokenizerDir / "tokenizer.json"))
+                tokenizerDir = tokenizerDir.parent_path();
+            if (!onnxTokenizer.load(tokenizerDir.string())) return false;
         } else {
             if (!ggufTokenizer.load(runner.gguf)) return false;
         }
