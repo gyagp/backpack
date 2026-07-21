@@ -16,7 +16,7 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL,
+  id TEXT PRIMARY KEY, task_number INTEGER UNIQUE, title TEXT NOT NULL, kind TEXT NOT NULL,
   state TEXT NOT NULL, hypothesis TEXT NOT NULL, origin_json TEXT NOT NULL,
   base_sha TEXT, candidate_sha TEXT, manifest_json TEXT NOT NULL,
   device_policy_json TEXT NOT NULL, decision_policy_json TEXT NOT NULL,
@@ -128,6 +128,16 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
         with self._db:
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(tasks)")}
+            if "task_number" not in columns:
+                self._db.execute("ALTER TABLE tasks ADD COLUMN task_number INTEGER")
+            unnumbered = self._db.execute(
+                "SELECT id FROM tasks WHERE task_number IS NULL ORDER BY created_at,id"
+            ).fetchall()
+            next_number = self._db.execute("SELECT COALESCE(MAX(task_number),0)+1 FROM tasks").fetchone()[0]
+            for offset, row in enumerate(unnumbered):
+                self._db.execute("UPDATE tasks SET task_number=? WHERE id=?", (next_number + offset, row[0]))
+            self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS tasks_number_idx ON tasks(task_number)")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
 
@@ -166,18 +176,19 @@ class Store:
             manifest = {**manifest, "atomic_experiment": True,
                         "experiment_branch": manifest.get("experiment_branch") or f"experiment/{task_id}-{slug}"}
         initial_state = "blocked" if kind == "optimization" and self.has_conformance_gaps() else "proposed"
-        values = (
-            task_id, require(data.get("title"), "title"), data.get("kind", "optimization"),
-            initial_state, require(data.get("hypothesis"), "hypothesis"),
-            json_text(data.get("origin") or {"type": "human"}), data.get("base_sha"),
-            data.get("candidate_sha"), json_text(manifest), json_text(device_policy),
-            json_text(data.get("decision_policy") or {}), now, now,
-        )
         with self._lock, self._db:
+            task_number = self._db.execute("SELECT COALESCE(MAX(task_number),0)+1 FROM tasks").fetchone()[0]
+            values = (
+                task_id, task_number, require(data.get("title"), "title"), data.get("kind", "optimization"),
+                initial_state, require(data.get("hypothesis"), "hypothesis"),
+                json_text(data.get("origin") or {"type": "human"}), data.get("base_sha"),
+                data.get("candidate_sha"), json_text(manifest), json_text(device_policy),
+                json_text(data.get("decision_policy") or {}), now, now,
+            )
             self._db.execute("""INSERT INTO tasks(
-              id,title,kind,state,hypothesis,origin_json,base_sha,candidate_sha,
+              id,task_number,title,kind,state,hypothesis,origin_json,base_sha,candidate_sha,
               manifest_json,device_policy_json,decision_policy_json,created_at,updated_at
-              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", values)
+              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values)
             self.audit("task", task_id, "created", actor, {"title": data["title"], "state": initial_state,
                                                              "reason": "conformance-first gate" if initial_state == "blocked" else ""})
         return self.get_task(task_id)  # type: ignore[return-value]

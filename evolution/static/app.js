@@ -1,138 +1,2321 @@
-const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path,options={}){const r=await fetch(path,{headers:{'Content-Type':'application/json','X-Evolution-Actor':'dashboard'},...options});const v=await r.json();if(!r.ok)throw Error(v.error||r.statusText);return v}
-function statusLabel(v){return ({not_applicable:'Not tested',pending:'Pending',unknown:'Unknown'}[v]||v||'—')}
-function badge(v){return `<span class="badge ${esc(v)}">${esc(statusLabel(v))}</span>`}function num(v){return v==null?'—':Number(v).toFixed(2)}
-function shortDate(v){if(!v)return '—';const d=new Date(v);return Number.isNaN(d.valueOf())?String(v).slice(0,10):d.toISOString().slice(0,10)}
-async function refresh(){const [status,tasks,decisions,machines,matrix,history,activity,dismissedTodos,regressions,studies,observations]=await Promise.all([api('/api/status'),api('/api/tasks'),api('/api/decisions?status=pending'),api('/api/machines'),api('/api/models/matrix'),api('/api/history'),api('/api/activity'),api('/api/todos/dismissed'),api('/api/regressions/confirmed'),api('/api/studies'),api('/api/observations')]);
- const states=status.tasks||{};$('#stats').innerHTML=[['Cared models',status.cared_models||0],['Active tasks',Object.entries(states).filter(([k])=>!['integrated','rejected','failed','reverted'].includes(k)).reduce((n,[,v])=>n+v,0)],['Pending decisions',status.pending_decisions],['Configured devices',machines.length]].map(([l,v])=>`<div class="stat"><b>${v}</b><span>${l}</span></div>`).join('');
- $('#nav-task-count').textContent=tasks.length||'';$('#nav-device-count').textContent=machines.length||'';
- const enriched=activity.tasks||activity.active_tasks||[],terminal=new Set(['integrated','rejected','failed','reverted']),pending=enriched.filter(t=>!terminal.has(t.state)&&!(t.runs||[]).some(r=>r.status==='running'));$('#task-count').textContent=`${pending.length} pending`;$('#tasks').innerHTML=pending.length?pending.map(t=>{const p=t.activity||{percent:progress(t.state),elapsed_seconds:(Date.now()-Date.parse(t.created_at))/1000,basis:'lifecycle'},assignments=(t.runs||[]).map(r=>`${r.machine_name}: ${r.status}`).join(' · '),reason=failureReason(t);return `<div class="row"><div><strong>${esc(t.title)}</strong><div class="meta">Created ${esc(t.created_at?new Date(t.created_at).toLocaleString():'not recorded')} · Start not yet assigned · ${formatDuration(p.elapsed_seconds)} queued</div><div class="meter"><i style="width:${p.percent}%"></i></div><div class="meta">${p.percent}% toward goal${assignments?` · ${esc(assignments)}`:''}</div>${reason?`<div class="task-failure"><strong>Failure reason:</strong> ${esc(reason)}</div>`:''}</div><div>${renderImpactBadge(classifyHistoryImpact(null))} ${badge(t.state)} ${t.aggregate_verdict?badge(t.aggregate_verdict):''}<button class="secondary detail" data-id="${esc(t.id)}">View</button></div></div>`}).join(''):'<div class="empty">No pending tasks.</div>';
- const todoHistory=[...history,...regressions.map(r=>({id:r.id,title:`Confirmed ${r.framework}/${r.backend} regression`,gains:{[r.metric]:r.delta_percent},commit_sha:r.revision,created_at:'confirmed by two measurements'}))];renderTodos(enriched,decisions,todoHistory,dismissedTodos);
- renderMatrix(matrix);renderPerformanceAnalysis();renderPerformanceTrend(observations);renderDoneTasks(history,enriched,machines);renderDigest(history);renderStudies(studies,tasks);renderStudyFeedback(studies,tasks,history);renderDevices(machines);renderActivity(activity);$('#active-work').innerHTML=renderDeviceTaskGroups(activity);updateTaskTabs(enriched);document.querySelectorAll('.activity-toggle').forEach(b=>b.onclick=()=>toggleDeviceActivity(b));document.querySelectorAll('.detail').forEach(b=>b.onclick=()=>showTask(b.dataset.id));}
-function progress(s){return ({proposed:5,triaged:12,implementing:25,candidate_ready:38,validating:55,evaluating:68,debating:75,awaiting_human:80,ready_to_merge:88,integrating:94,integrated:100,observing:100,rejected:100,failed:100,reverted:100,blocked:50}[s]||0)}
-function formatDuration(seconds){seconds=Math.max(0,Math.floor(Number(seconds)||0));if(seconds<60)return `${seconds}s`;if(seconds<3600)return `${Math.floor(seconds/60)}m ${seconds%60}s`;if(seconds<86400)return `${Math.floor(seconds/3600)}h ${Math.floor(seconds%3600/60)}m`;return `${Math.floor(seconds/86400)}d ${Math.floor(seconds%86400/3600)}h`}
-async function showTask(id){const t=await api('/api/tasks/'+encodeURIComponent(id));const evals=t.evaluations||[];$('#detail').innerHTML=`<h2>${esc(t.title)}</h2><p>${esc(t.hypothesis)}</p><p>${badge(t.state)} ${t.aggregate_verdict?badge(t.aggregate_verdict):''} <span class="meta">base ${esc(t.base_sha||'unset')} → candidate ${esc(t.candidate_sha||'unset')}</span></p><h3>Device evidence</h3>${evals.length?`<table class="matrix"><tr><th>Machine</th><th>Metric</th><th>Base</th><th>Candidate</th><th>Delta</th><th>Verdict</th></tr>${evals.map(e=>`<tr><td>${esc(e.machine_id)}</td><td>${esc(e.metric)}</td><td>${num(e.base_median)}</td><td>${num(e.candidate_median)}</td><td>${num(e.delta_percent)}%</td><td>${badge(e.verdict)}</td></tr>`).join('')}</table>`:'<div class="empty">No evaluated evidence.</div>'}<h3>Audit trail</h3><pre>${esc((t.audit||[]).map(a=>`${a.created_at}  ${a.event_type}  ${a.actor}`).join('\n')||'No events')}</pre>`;$('#detail-dialog').showModal()}
-function expectedRuntimes(model){const formats=new Set(Object.keys(model.files||{}));return [{format:'gguf',framework:'backpack',backend:'webgpu',artifact:formats.has('gguf')},{format:'ort',framework:'backpack',backend:'webgpu',artifact:formats.has('ort')},{format:'gguf',framework:'llamacpp',backend:'vulkan',artifact:formats.has('gguf')},{format:'ort',framework:'ort',backend:'webgpu',artifact:formats.has('ort')}]}
-function frameworkName(v){return ({backpack:'Backpack',llamacpp:'llama.cpp',ort:'ORT'}[v]||v)}
-function performanceCommand(r){const modelPath=r.model.files?.[r.format]?.path||'<model-path>',q=s=>`"${String(s).replaceAll('"','\\"')}"`;if(r.framework==='llamacpp')return `cd /d D:\\workspace\\project\\agents\\webgfx-agents\\ai-test\nnode scripts\\perf-test-llamacpp.js --llamacpp-backend vulkan --model ${q(modelPath)} -pl 128 -gl 128 -r 5 --ngl 99\n\nllama-bench records prompt processing (pp128) and token generation (tg128) separately. The collector maps plTs to prefill_tok_s and decode_tok_s.`;if(r.framework==='ort'){const qwen=r.model.id==='qwen3.5-2b'||r.model.id==='qwen3.5-4b',capture=qwen?'0':'1',note=qwen?'Temporary Qwen 3.5 exception: graph capture is disabled; results are marked graph_capture=false.':'Graph capture is the ORT WebGPU default; --reuse_generator is required.';return `Set model.decoder.session_options.provider_options[].webgpu.enableGraphCapture to "${capture}" in:\n${modelPath}\\genai_config.json\n\ncd /d D:\\backup\\x64\\ort\\20260720-ort-da90494371-genai-87047e6d77\nmodel_benchmark.exe -i ${q(modelPath)} -l 128 -g 128 -r 5 --reuse_generator\n\n${note} Timeout: 60 seconds per prompt length.`}const format=r.format==='ort'?'onnx':'gguf';return `cd /d D:\\workspace\\project\\backpack\ngitignore\\runtime\\build\\backpack_llm.exe --model ${q(modelPath)} --format ${format} --benchmark --bench-prompt-len 128 --bench-gen-tokens 64\n\nThis bounded command measures the Status row directly and avoids the expensive 128-to-4096 sweep. Timeout: 240 seconds.`}
-function showPerformanceCommand(button){$('#detail').innerHTML=`<h2>Performance collection command</h2><p>${esc(button.dataset.title)}</p><pre class="command-detail">${esc(button.dataset.command)}</pre><p class="muted">Run on ${esc(button.dataset.device)}. Prefill and decode are stored as separate metrics for this exact framework/backend combination.</p>`;$('#detail-dialog').showModal()}
-let validationRows=[],trendObservations=[];
-let activeStatusModel='';
-function applyStatusModelFilter(){document.querySelectorAll('.status-model-tab').forEach(button=>button.classList.toggle('active',button.dataset.model===activeStatusModel));renderValidationRows();renderPerformanceTrend(trendObservations)}
-function renderStatusModelTabs(){const models=[...new Map(validationRows.map(r=>[r.model.id,r.model])).values()];if(!models.some(model=>model.id===activeStatusModel))activeStatusModel=models[0]?.id||'';$('#status-model-tabs').innerHTML=models.map(model=>`<button type="button" class="status-model-tab" role="tab" data-model="${esc(model.id)}">${esc(model.name)}</button>`).join('');document.querySelectorAll('.status-model-tab').forEach(button=>button.onclick=()=>{activeStatusModel=button.dataset.model;applyStatusModelFilter()});document.querySelectorAll('.status-model-tab').forEach(button=>button.classList.toggle('active',button.dataset.model===activeStatusModel))}
-function renderMatrix(matrix){validationRows=[];for(const row of matrix.models||[]){for(const cell of row.cells){const seen=new Set;for(const spec of expectedRuntimes(row.model)){const matches=(cell.results||[]).filter(x=>x.framework===spec.framework&&x.format===spec.format&&x.backend===spec.backend),result=matches.find(x=>x.conformance==='pass'||x.conformance==='fail')||matches[0],metricsResult=matches.find(x=>x.performance_validated&&Object.keys(x.metrics||{}).length)||result,conformance=result?.conformance||'pending',combined=result&&metricsResult&&result!==metricsResult?{...result,metrics:metricsResult.metrics,revision:metricsResult.revision,created_at:metricsResult.created_at}:result;validationRows.push({model:row.model,machine:cell.machine,conformance,conformant:conformance==='pass',...spec,result:combined});seen.add(`${spec.framework}/${spec.format}/${spec.backend}`)}for(const result of cell.results||[]){if(result.framework==='backpack'&&result.backend==='vulkan')continue;const key=`${result.framework}/${result.format}/${result.backend}`;if(!seen.has(key))validationRows.push({model:row.model,machine:cell.machine,conformance:result.conformance,conformant:result.conformance==='pass',artifact:true,format:result.format,framework:result.framework,backend:result.backend,result})}}}renderStatusModelTabs();renderValidationRows()}
-function comparisonStatusRows(){const groups=new Map;for(const row of validationRows.filter(r=>r.model.id===activeStatusModel)){const key=`${row.model.id}/${row.machine.id}`;if(!groups.has(key))groups.set(key,{model:row.model,machine:row.machine,rows:[]});groups.get(key).rows.push(row)}const pairs=[];for(const group of groups.values()){const find=(framework,format)=>group.rows.find(r=>r.framework===framework&&r.format===format);pairs.push({...group,format:'ort',label:'ORT WebGPU',backpack:find('backpack','ort'),reference:find('ort','ort')});pairs.push({...group,format:'gguf',label:'llama.cpp Vulkan',backpack:find('backpack','gguf'),reference:find('llamacpp','gguf')})}return pairs}
-function statusPerf(row,key){const value=row?.result?.metrics?.[key];if(value!=null)return `<strong>${num(value)}</strong>`;return '<span class="muted">pending</span>'}
-function backpackPerfCell(backpack,reference,key){const value=Number(backpack?.result?.metrics?.[key]),baseline=Number(reference?.result?.metrics?.[key]);if(!Number.isFinite(value))return '<td><span class="muted">pending</span></td>';if(!Number.isFinite(baseline)||baseline===0)return `<td><strong>${num(value)}</strong><div class="meta">no comparison</div></td>`;const delta=(value/baseline-1)*100,tone=delta>0?'perf-better':delta<0?'perf-worse':'perf-equal';return `<td class="${tone}"><strong>${num(value)}</strong><div class="perf-delta">${delta>0?'+':''}${num(delta)}%</div></td>`}
-function statusInstanceName(runtime,backend,format){const runtimeName=runtime==='llamacpp'?'llama.cpp':runtime==='ort'?'ORT':'Backpack',backendName=backend==='vulkan'?'Vulkan':'WebGPU',formatName=format==='ort'?'ONNX':String(format||'').toUpperCase();return `${runtimeName}/${backendName}/${formatName}`}
-function statusRevision(row){return `${esc(row?.result?.revision||'—')}<div class="meta">${esc(shortDate(row?.result?.created_at))}</div>`}
-function statusCommand(row,label){if(!row)return '<span class="muted">—</span>';const title=`${row.machine.name} · ${row.model.name} · ${label}`;return `<button class="secondary row-command" data-device="${esc(row.machine.name)}" data-title="${esc(title)}" data-command="${esc(performanceCommand(row))}">${esc(label)}</button>`}
-function renderValidationRows(){const query=($('#validation-search')?.value||'').trim().toLowerCase(),sort=$('#validation-sort')?.value||'device',direction=$('#validation-direction')?.dataset.direction||'asc',keys={device:r=>r.machine.name,framework:r=>r.label,backend:r=>`${r.backpack?.backend||''}/${r.reference?.backend||''}`,conformance:r=>`${r.backpack?.conformance||'pending'}/${r.reference?.conformance||'pending'}`};let rows=comparisonStatusRows().filter(r=>!query||[r.machine.name,r.machine.fingerprint?.gpu,r.model.name,r.format,r.label,'Backpack',r.backpack?.backend,r.reference?.backend,r.backpack?.conformance,r.reference?.conformance,r.backpack?.result?.revision,r.reference?.result?.revision].some(v=>String(v||'').toLowerCase().includes(query)));rows.sort((a,b)=>String(keys[sort](a)).localeCompare(String(keys[sort](b)))||a.machine.name.localeCompare(b.machine.name)||a.format.localeCompare(b.format));if(direction==='desc')rows.reverse();const selected=validationRows.find(r=>r.model.id===activeStatusModel)?.model;$('#validation-count').textContent=`${rows.length} comparison rows${selected?` · ${selected.name}`:''}`;renderStatusChart(rows);$('#model-matrix').innerHTML=rows.length?`<table class="status-table status-comparison"><thead><tr><th rowspan="2">Device</th><th colspan="6" class="instance-group">Instance A</th><th colspan="6" class="instance-group reference-group">Instance B</th></tr><tr><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS</th><th>Decode TPS</th><th>Revision / Date</th><th>Command</th><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS</th><th>Decode TPS</th><th>Revision / Date</th><th>Command</th></tr></thead><tbody>${rows.map((r,i)=>{const p=rows[i-1],n=rows[i+1],newGroup=!p||p.machine.id!==r.machine.id,endGroup=!n||n.machine.id!==r.machine.id,b=r.backpack,c=r.reference,captureOff=c?.framework==='ort'&&c.result?.metrics?.graph_capture===false;return `<tr data-model="${esc(r.model.name)}" class="${newGroup?'status-group':''} ${endGroup?'status-group-end':''}"><td><strong>${esc(r.machine.name)}</strong><div class="meta">${esc(r.machine.fingerprint?.gpu||'unknown GPU')}</div></td><td class="runtime-instance"><strong>${esc(statusInstanceName('backpack',b?.backend||'webgpu',r.format))}</strong></td><td>${badge(b?.conformance||'pending')}</td>${backpackPerfCell(b,c,'prefill_tok_s')}${backpackPerfCell(b,c,'decode_tok_s')}<td class="runtime-revision backpack-revision">${statusRevision(b)}</td><td>${statusCommand(b,'Backpack')}</td><td class="runtime-instance reference-instance"><strong>${esc(statusInstanceName(c?.framework||(r.format==='ort'?'ort':'llamacpp'),c?.backend||(r.format==='ort'?'webgpu':'vulkan'),r.format))}</strong>${captureOff?'<span class="badge stale graph-capture-off">Graph capture off</span>':''}</td><td>${badge(c?.conformance||'pending')}</td><td>${statusPerf(c,'prefill_tok_s')}</td><td>${statusPerf(c,'decode_tok_s')}</td><td class="runtime-revision reference-revision">${statusRevision(c)}</td><td>${statusCommand(c,r.format==='ort'?'ORT':'llama.cpp')}</td></tr>`}).join('')}</tbody></table>`:'<div class="empty">No comparison results match this search.</div>';document.querySelectorAll('.row-command').forEach(b=>b.onclick=()=>showPerformanceCommand(b))}
-function renderStatusChart(rows){const el=$('#status-chart');if(!el)return;const samples=rows.flatMap(r=>[{name:'Backpack',row:r.backpack,device:r.machine.name,format:r.format},{name:r.label,row:r.reference,device:r.machine.name,format:r.format}]).filter(x=>x.row?.result?.metrics),metrics=['prefill_tok_s','decode_tok_s'];el.innerHTML=samples.length?`<div class="status-chart-grid">${metrics.map(metric=>{const values=samples.map(x=>Number(x.row.result.metrics?.[metric])).filter(Number.isFinite),max=Math.max(1,...values);return `<section class="status-chart-panel"><header><strong>${metric==='prefill_tok_s'?'Prefill TPS':'Decode TPS'}</strong><span>higher is better</span></header>${samples.map(x=>{const value=Number(x.row.result.metrics?.[metric]);return `<div class="status-chart-row"><span>${esc(x.device)} · ${esc(x.format.toUpperCase())} · ${esc(x.name)}</span><div><i class="${x.name==='Backpack'?'backpack':'reference'}" style="width:${Number.isFinite(value)?Math.max(1,value/max*100):0}%"></i></div><b>${Number.isFinite(value)?num(value):'—'}</b></div>`}).join('')}</section>`}).join('')}</div>`:'<div class="empty compact">Performance charts will appear as measurements arrive.</div>'}
-async function showObservationHistory(button){const p=new URLSearchParams({model_id:button.dataset.model,machine_id:button.dataset.machine,framework:button.dataset.framework,format:button.dataset.format,backend:button.dataset.backend}),items=await api('/api/observations?'+p);$('#detail').innerHTML=`<h2>${esc(button.dataset.title)}</h2><p class="muted">Complete measurement history for this exact combination.</p>${items.length?`${historyChart(items)}<table class="matrix"><thead><tr><th>Time</th><th>Revision</th><th>Conformance</th><th>Prefill</th><th>Decode</th></tr></thead><tbody>${items.map(x=>`<tr><td>${esc(x.created_at)}</td><td class="mono">${esc(x.revision||'—')}</td><td>${badge(x.conformance)}</td><td>${num(x.metrics?.prefill_tok_s)}</td><td>${num(x.metrics?.decode_tok_s)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No history recorded for this combination.</div>'}`;$('#detail-dialog').showModal()}
-function historyChart(records){const rows=[...records].reverse().filter(x=>x.metrics?.prefill_tok_s!=null||x.metrics?.decode_tok_s!=null);if(!rows.length)return '<div class="empty compact">No performance samples to chart.</div>';const W=760,H=230,pad=34,values=rows.flatMap(x=>[x.metrics?.prefill_tok_s,x.metrics?.decode_tok_s]).filter(Number.isFinite),max=Math.max(...values,1),x=i=>pad+(rows.length===1?(W-2*pad)/2:i*(W-2*pad)/(rows.length-1)),y=v=>H-pad-Number(v)/max*(H-2*pad),line=key=>rows.map((r,i)=>r.metrics?.[key]==null?'':`${x(i)},${y(r.metrics[key])}`).filter(Boolean).join(' '),points=key=>rows.map((r,i)=>r.metrics?.[key]==null?'':`<circle cx="${x(i)}" cy="${y(r.metrics[key])}" r="3"><title>${esc(r.created_at)} · ${num(r.metrics[key])} tok/s</title></circle>`).join('');return `<div class="history-chart"><div class="chart-legend"><span class="prefill">Prefill</span><span class="decode">Decode</span><span>0–${num(max)} tok/s</span></div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Performance trend"><line class="axis" x1="${pad}" y1="${H-pad}" x2="${W-pad}" y2="${H-pad}"/><line class="axis" x1="${pad}" y1="${pad}" x2="${pad}" y2="${H-pad}"/><polyline class="prefill-line" points="${line('prefill_tok_s')}"/><g class="prefill-points">${points('prefill_tok_s')}</g><polyline class="decode-line" points="${line('decode_tok_s')}"/><g class="decode-points">${points('decode_tok_s')}</g></svg></div>`}
-function classifyHistoryImpact(value){if(value==null)return{key:'unquantified',name:'Measured outcome',rank:7,value:null};if(value>=20)return{key:'transformative',name:'Transformative improvement',rank:0,value};if(value>=5)return{key:'strong',name:'Strong improvement',rank:1,value};if(value>=1)return{key:'measured_gain',name:'Measured improvement',rank:2,value};if(value>-1)return{key:'noise',name:'Within measurement noise',rank:3,value};if(value>-5)return{key:'measured_regression',name:'Measured regression',rank:4,value};if(value>-20)return{key:'serious_regression',name:'Serious regression',rank:5,value};return{key:'critical_regression',name:'Critical regression',rank:6,value}}
-function historyGroupImpact(records){const values=records.flatMap(r=>(r.device_impacts||[]).map(d=>d.impact?.value)).filter(Number.isFinite);const value=values.some(x=>x<=-5)?Math.min(...values):values.length?values.reduce((a,b)=>a+b,0)/values.length:null;return classifyHistoryImpact(value)}
-function renderImpactBadge(impact){return `<span class="history-impact-badge ${esc(impact?.key||'unquantified')}">${esc(impact?.name||'Measured outcome')}${impact?.value==null?'':` · ${impact.value>=0?'+':''}${num(impact.value)}%`}</span>`}
-function historyTpsRows(record){const before=record.before||{},after=record.after||{},keys=[...new Set([...Object.keys(before),...Object.keys(after)])].filter(key=>/(tps|tok_s|tokens_per_second|throughput)/i.test(key)&&!/percent/i.test(key));return keys.map(key=>{const base=Number(before[key]),candidate=Number(after[key]),delta=Number.isFinite(base)&&base!==0&&Number.isFinite(candidate)?(candidate/base-1)*100:null,explicit=(record.evidence||[]).map(x=>x?.device).filter(Boolean),device=explicit.length===1?explicit[0]:/webgfx[_-]?104|nvidia/i.test(key)?'webgfx-104':/webgfx[_-]?103|amd/i.test(key)?'webgfx-103':/webgfx[_-]?31|intel/i.test(key)?'webgfx-31':'Fleet / record';return {device,metric:key.replaceAll('_',' '),base:Number.isFinite(base)?base:null,candidate:Number.isFinite(candidate)?candidate:null,delta}})}
-function taskTiming(task,finishedAt){const runs=task?.runs||[],starts=runs.map(r=>r.started_at).filter(Boolean),start=starts.sort()[0]||task?.created_at,end=runs.map(r=>r.updated_at).filter(Boolean).sort().at(-1)||finishedAt,duration=start&&end?(Date.parse(end)-Date.parse(start))/1000:null;return{start,duration}}
-function renderDoneTasks(items,tasks=[],machines=[]){const taskById=new Map(tasks.map(t=>[t.id,t])),groups=new Map;for(const h of items){const key=`${h.task_id||h.title}|${h.commit_sha||''}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(h)}const cards=[...groups.values()].map(records=>({records,impact:historyGroupImpact(records)})),sections=new Map;for(const card of cards){if(!sections.has(card.impact.key))sections.set(card.impact.key,{impact:card.impact,cards:[]});sections.get(card.impact.key).cards.push(card)}const renderCard=({records,impact})=>{const first=records[0],task=taskById.get(first.task_id),timing=taskTiming(task,first.created_at),deviceRows=records.flatMap(record=>(record.device_impacts||[]).map(device=>({...device,record}))),tpsRows=records.flatMap(record=>historyTpsRows(record).map(row=>({...row,revision:record.commit_sha||'uncommitted'})));return `<article class="history-group"><header><div><strong>${esc(task?.title||first.title)}</strong><div class="meta">Started ${esc(timing.start?new Date(timing.start).toLocaleString():'not recorded')} · Duration ${timing.duration==null?'not recorded':formatDuration(timing.duration)} · ${esc(first.commit_sha||'uncommitted')}</div></div>${renderImpactBadge(impact)}</header><p>${esc(first.summary)}</p>${tpsRows.length?`<h3>Recorded TPS evidence</h3><div class="table-wrap"><table class="history-tps-table"><thead><tr><th>Device</th><th>Metric</th><th>Baseline TPS</th><th>Candidate TPS</th><th>Change</th><th>Revision</th></tr></thead><tbody>${tpsRows.map(row=>`<tr><td>${esc(row.device)}</td><td>${esc(row.metric)}</td><td>${row.base==null?'—':num(row.base)}</td><td>${row.candidate==null?'—':num(row.candidate)}</td><td class="${row.delta==null?'':row.delta<0?'impact-negative':'impact-positive'}">${row.delta==null?'—':`${row.delta>=0?'+':''}${num(row.delta)}%`}</td><td class="mono">${esc(row.revision)}</td></tr>`).join('')}</tbody></table></div>`:''}${deviceRows.length?`<h3>Device impact</h3><div class="table-wrap"><table class="history-impact-table"><thead><tr><th>Device</th><th>GPU</th><th>Prefill TPS</th><th>Decode TPS</th><th>Impact</th><th>Measured deltas</th></tr></thead><tbody>${deviceRows.map(row=>{const metrics=row.metrics||{},deltas=(row.deltas||[]).map(delta=>`${delta.metric.split(' / ').pop().replaceAll('_',' ')}: ${delta.percent>=0?'+':''}${num(delta.percent)}%`).join(' · ');return `<tr><td><strong>${esc(row.device)}</strong></td><td>${esc(row.gpu||machines.find(m=>m.id===row.machine_id)?.fingerprint?.gpu||'—')}</td><td>${metrics.prefill_tok_s==null?'—':num(metrics.prefill_tok_s)}</td><td>${metrics.decode_tok_s==null?'—':num(metrics.decode_tok_s)}</td><td>${renderImpactBadge(row.impact)}</td><td class="${row.impact?.value<0?'impact-negative':'impact-positive'}">${esc(deltas||'Measured baseline')}</td></tr>`}).join('')}</tbody></table></div>`:''}${task?`<button class="history-task-link detail" data-id="${esc(task.id)}">View task details</button>`:''}</article>`};const measuredIds=new Set(items.map(x=>x.task_id).filter(Boolean)),terminal=new Set(['integrated','rejected','failed','reverted']),unmeasured=tasks.filter(t=>terminal.has(t.state)&&!measuredIds.has(t.id));const ordered=[...sections.values()].sort((a,b)=>a.impact.rank-b.impact.rank),measured=ordered.map(section=>`<section class="history-tier history-tier-${esc(section.impact.key)}"><div class="history-tier-heading"><div><h2>${esc(section.impact.name)}</h2><p>${section.cards.length} completed task${section.cards.length===1?'':'s'}</p></div><span>${section.cards.length}</span></div><div class="history-tier-cards">${section.cards.map(renderCard).join('')}</div></section>`).join(''),plain=unmeasured.map(t=>{const timing=taskTiming(t,t.updated_at);return `<article class="terminal-task"><div><strong>${esc(t.title)}</strong><div class="meta">Started ${esc(timing.start?new Date(timing.start).toLocaleString():'not recorded')} · Duration ${timing.duration==null?'not recorded':formatDuration(timing.duration)} · ${esc(t.id)}</div><p>${esc(t.verdict_reason||t.hypothesis||'Task completed without measured performance evidence.')}</p></div><div>${renderImpactBadge(classifyHistoryImpact(null))} ${badge(t.state)} <button class="secondary detail" data-id="${esc(t.id)}">View</button></div></article>`}).join('');$('#done-tasks').innerHTML=measured+plain||'<div class="empty">No tasks have been completed yet.</div>';const total=cards.length+unmeasured.length;$('#done-count').textContent=`${total} done`;$('#done-tab-count').textContent=total||''}
-function historyDailyDigest(items){const days=new Map;for(const item of items){const day=String(item.created_at||'').slice(0,10)||'Unknown date',key=`${item.title}|${item.commit_sha||''}`;if(!days.has(day))days.set(day,new Map);days.get(day).set(key,item)}return [...days.entries()].sort((a,b)=>b[0].localeCompare(a[0])).map(([day,records])=>{const entries=[...records.values()],major=entries.filter(item=>item.impact?.rank<=1||item.impact?.rank>=5);return `<article class="daily-digest"><header><div><h2>${esc(day)}</h2><span class="meta">${entries.length} recorded milestone${entries.length===1?'':'s'}</span></div><strong>${major.length} major</strong></header>${major.length?`<section><h3>Major improvements and regressions</h3>${major.map(item=>`<div class="digest-major"><div><strong>${esc(item.title)}</strong><span class="meta mono">${esc(item.commit_sha||'uncommitted')}</span></div>${renderImpactBadge(item.impact)}</div>`).join('')}</section>`:'<div class="empty compact">No major performance movement recorded.</div>'}<section><h3>Key findings</h3><ul>${entries.slice(0,8).map(item=>`<li><strong>${esc(item.title)}</strong> — ${esc(item.summary)}</li>`).join('')}</ul></section></article>`}).join('')||'<div class="empty">No daily progress has been recorded yet.</div>'}
-function digestItems(items){const groups=new Map,normalize=text=>String(text||'').replace(/Qwen 3\.5 (?:2B|4B)/gi,'Qwen 3.5').replace(/\s+/g,' ').trim();for(const item of items){const day=shortDate(item.created_at),title=normalize(item.title),key=`${day}|${title.toLowerCase()}`;if(!groups.has(key))groups.set(key,{...item,title,summary:normalize(item.summary),digestModels:new Set});const group=groups.get(key);if(item.model_id)group.digestModels.add(item.model_id)}return [...groups.values()].map(item=>{const models=[...item.digestModels].map(id=>id.replace('qwen3.5-','').toUpperCase());delete item.digestModels;return{...item,summary:`${item.summary}${models.length>1?` Affected models: ${models.join(', ')}.`:''}`}})}
-function digestImpactName(impact){return({transformative:'Breakthrough improvement',strong:'Major improvement',measured_gain:'Incremental improvement',noise:'No material change',measured_regression:'Minor regression',serious_regression:'Major regression',critical_regression:'Severe regression',unquantified:'Impact not quantified'}[impact?.key]||impact?.name||'Measured result')}
-function digestCalendar(items){if(!items.length)return'<div class="empty">No daily progress has been recorded yet.</div>';const byDay=new Map;for(const item of items){const day=shortDate(item.created_at);if(!byDay.has(day))byDay.set(day,[]);byDay.get(day).push(item)}const latest=new Date(Math.max(Date.now(),...items.map(x=>Date.parse(x.created_at)||0))),end=new Date(Date.UTC(latest.getUTCFullYear(),latest.getUTCMonth(),latest.getUTCDate())),start=new Date(end);start.setUTCDate(start.getUTCDate()-364-start.getUTCDay());const cells=[],months=new Map;let week=0,lastMonth='';for(let cursor=new Date(start);cursor<=end;cursor.setUTCDate(cursor.getUTCDate()+1)){const key=cursor.toISOString().slice(0,10),entries=byDay.get(key)||[],month=cursor.toLocaleDateString(undefined,{month:'short',timeZone:'UTC'});if(cursor.getUTCDay()===0&&month!==lastMonth){months.set(week,month);lastMonth=month}const negative=entries.some(x=>['measured_regression','serious_regression','critical_regression'].includes(x.impact?.key)),major=entries.some(x=>['transformative','critical_regression','serious_regression'].includes(x.impact?.key)),level=!entries.length?0:major?4:Math.min(3,entries.length),tone=negative?'regression':'gain',details=entries.map(x=>`${x.title} — ${x.impact?.name||'Measured result'}`).join('\n');cells.push(`<button type="button" class="digest-square ${entries.length?`${tone} level-${level}`:''}" title="${esc(`${key}: ${entries.length} item${entries.length===1?'':'s'}${details?`\n${details}`:''}`)}" aria-label="${esc(`${key}, ${entries.length} progress items`)}"></button>`);if(cursor.getUTCDay()===6)week++}return`<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w,label])=>`<span style="left:${w*15}px">${esc(label)}</span>`).join('')}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join('')}</div></div><div class="digest-heatmap-footer"><span class="digest-regression-key">Regression</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`}
-function renderDigest(items){const digest=digestItems(items).map(item=>({...item,impact:{...item.impact,name:digestImpactName(item.impact)}}));$('#digest').innerHTML=digestCalendar(digest);const days=new Set(items.map(item=>shortDate(item.created_at)));$('#digest-count').textContent=`${days.size} day${days.size===1?'':'s'}`}
-let activeTaskTab='active';
-function updateTaskTabs(tasks){const running=tasks.filter(t=>(t.runs||[]).some(r=>r.status==='running')).length,terminal=new Set(['integrated','rejected','failed','reverted']),pending=tasks.filter(t=>!terminal.has(t.state)&&!(t.runs||[]).some(r=>r.status==='running')).length;$('#active-tab-count').textContent=running||'';$('#pending-tab-count').textContent=pending||'';const select=key=>{activeTaskTab=key;document.querySelectorAll('[data-task-tab]').forEach(button=>button.classList.toggle('active',button.dataset.taskTab===key));document.querySelectorAll('[data-task-panel]').forEach(panel=>panel.hidden=panel.dataset.taskPanel!==key)};document.querySelectorAll('[data-task-tab]').forEach(button=>button.onclick=()=>select(button.dataset.taskTab));select(activeTaskTab)}
-function renderStudies(studies,tasks){const taskById=new Map(tasks.map(t=>[t.id,t]));$('#nav-study-count').textContent=studies.length||'';$('#study-count').textContent=`${studies.filter(s=>s.status==='completed').length} completed · ${studies.length} total`;$('#studies').innerHTML=studies.length?studies.map(study=>{const generated=(study.generated_tasks||[]).map(id=>taskById.get(id)||{id,title:'Generated task'});return `<article class="study-card"><header><div><div class="study-project">${esc(study.source)}</div><h2>${esc(study.title)}</h2><div class="meta mono">${esc(study.revision||'revision unavailable')} · ${esc(study.completed_at||study.created_at||'not completed')}</div></div>${badge(study.status)}</header><p>${esc(study.summary||'')}</p><div class="study-columns"><section><h3>Studied scope</h3>${study.scope?.length?`<ul>${study.scope.map(x=>`<li class="mono">${esc(x)}</li>`).join('')}</ul>`:'<div class="empty compact">No source scope recorded.</div>'}</section><section><h3>Detailed findings</h3>${study.findings?.length?`<ul>${study.findings.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:'<div class="empty compact">No findings recorded.</div>'}</section></div><details><summary>References (${study.references?.length||0})</summary>${study.references?.length?`<ul>${study.references.map(x=>`<li class="mono">${esc(x)}</li>`).join('')}</ul>`:'<div class="empty compact">No references recorded.</div>'}</details><section class="study-tasks"><h3>Potential Tasks</h3>${generated.length?generated.map(t=>`<button class="study-task-link secondary detail" data-id="${esc(t.id)}"><span>${esc(t.title)}</span><span class="mono">${esc(t.id)}</span></button>`).join(''):'<div class="empty compact">No tasks generated from this study.</div>'}</section></article>`}).join(''):'<div class="empty">No upstream studies have been recorded.</div>'}
-function renderActivity(a){const total=(a.fleet||[]).length,blocked=(a.blocked_tasks||[]).length,active=(a.tasks||a.active_tasks||[]).filter(t=>(t.runs||[]).some(r=>r.status==='running')).length;const cards=[{label:'Control plane',value:'Active',detail:'SSE and API responding',state:'ok'},{label:'Devices',value:`${total} configured`,detail:(a.fleet||[]).map(x=>x.name).join(' · '),state:'ok'},{label:'Tasks',value:`${active} running`,detail:blocked?`${blocked} need attention`:'No blocked decisions',state:blocked?'warn':'ok'},{label:'Automation',value:'Monitoring',detail:'Refresh every 15 seconds',state:'ok'}];$('#activity-strip').innerHTML=cards.map(c=>`<div class="health-card ${c.state==='ok'?'':c.state}"><i class="health-icon"></i><div><strong>${esc(c.value)}</strong><div class="meta">${esc(c.label)} · ${esc(c.detail)}</div></div></div>`).join('');$('#activity-task-count').textContent=`${active} running`;$('#last-refresh').textContent=`${(a.events||[]).length} events · updated ${new Date(a.server_time).toLocaleTimeString()}`;$('#activity-feed').innerHTML=(a.events||[]).length?(a.events||[]).map(e=>`<details class="activity-log"><summary><time>${new Date(e.created_at).toLocaleTimeString()}</time><span><strong>${esc(eventLabel(e))}</strong><span class="meta">${esc(e.actor)} · ${esc(e.entity_type)} ${esc(e.entity_id)}</span></span></summary><div class="activity-log-detail"><dl><dt>Timestamp</dt><dd class="mono">${esc(e.created_at)}</dd><dt>Event</dt><dd class="mono">${esc(e.event_type)}</dd><dt>Actor</dt><dd>${esc(e.actor)}</dd><dt>Entity</dt><dd class="mono">${esc(e.entity_type)} / ${esc(e.entity_id)}</dd></dl><div class="meta">Payload</div><pre>${esc(JSON.stringify(e.payload||{},null,2))}</pre></div></details>`).join(''):'<div class="empty">No activity recorded.</div>'}
-function renderDeviceTaskGroups(a){const tasks=a.tasks||a.active_tasks||[];return (a.fleet||[]).map(device=>{const applicable=tasks.filter(t=>(t.runs||[]).some(r=>r.machine_id===device.id&&r.status==='running')),blockers=tasks.flatMap(t=>(t.runs||[]).filter(r=>r.machine_id===device.id&&['blocked','failed'].includes(r.status)).map(r=>({task:t,run:r}))).slice(0,3),paused=!!device.activity_paused,empty=paused?'<div class="empty compact">Tasks are stopped by the operator.</div>':blockers.length?`<div class="device-blockers"><strong>Blocked</strong>${blockers.map(x=>`<div><span>${esc(x.task.title)}</span><span class="meta">${esc(x.run.error||x.task.verdict_reason||x.run.phase||'Requires intervention')}</span></div>`).join('')}</div>`:'<div class="empty compact">No runnable task; scheduler is waiting for new goal work.</div>';return `<section class="device-task-group"><header><div><strong>${esc(device.name)}</strong><span class="meta">${esc(device.gpu)} · ${paused?'tasks stopped':applicable.length?'working':'waiting'}</span></div><div>${badge(paused?'paused':applicable.length?'running':'blocked')} <button class="secondary activity-toggle" data-id="${esc(device.id)}" data-action="${paused?'resume':'pause'}">${paused?'Resume tasks':'Stop tasks'}</button></div></header>${applicable.length?applicable.map(t=>renderDeviceTask(t,device)).join(''):empty}</section>`}).join('')}
-function failureReason(t){const failed=(t.runs||[]).find(r=>r.status==='failed'&&r.error);return failed?.error||t.verdict_reason||''}
-function renderTodos(tasks,decisions,history,dismissed=[]){const taskById=new Map(tasks.map(t=>[t.id,t])),items=[],hidden=new Set(dismissed);for(const d of decisions)items.push({id:`decision:${d.id}`,title:taskById.get(d.task_id)?.title||d.task_id,reason:d.question,meta:`${d.task_id}${d.recommendation?` · recommends ${d.recommendation}`:''}`,status:'awaiting_human'});for(const t of tasks.filter(t=>t.state==='awaiting_human'&&!decisions.some(d=>d.task_id===t.id)))items.push({id:`task:${t.id}`,title:t.title,reason:t.verdict_reason||'Human review is required before this task can continue.',meta:t.id,status:'awaiting_human'});for(const t of tasks)for(const run of (t.runs||[]).filter(r=>r.status==='failed'))items.push({id:`run:${run.id}`,title:t.title,reason:run.error||'The device run failed without a recorded reason.',meta:`${run.machine_name} · ${run.id}`,status:'failed'});for(const h of history)for(const [metric,gain] of Object.entries(h.gains||{}))if(Number(gain)<0)items.push({id:`regression:${h.id}:${metric}`,title:`Regression: ${h.title}`,reason:`${metric} regressed by ${Math.abs(Number(gain)).toFixed(2)}%.`,meta:h.commit_sha||h.created_at,status:'regression'});const visible=items.filter(x=>!hidden.has(x.id));$('#nav-todo-count').textContent=visible.length||'';$('#todo-count').textContent=visible.length?`${visible.length} require attention`:'All clear';$('#todos').innerHTML=visible.length?visible.map(item=>`<div class="todo-item"><label class="todo-select"><input type="checkbox" value="${esc(item.id)}"><span></span></label><div class="todo-content"><strong>${esc(item.title)}</strong><div class="todo-reason">${esc(item.reason)}</div><div class="meta">${esc(item.meta)}</div></div>${badge(item.status)}<button class="secondary delete-todo" data-id="${esc(item.id)}">Delete</button></div>`).join(''):'<div class="empty">Nothing currently requires human intervention.</div>';const bulk=$('#delete-selected-todos'),checks=[...document.querySelectorAll('.todo-select input')];checks.forEach(c=>c.onchange=()=>bulk.disabled=!checks.some(x=>x.checked));bulk.disabled=true;bulk.onclick=()=>dismissTodos(checks.filter(x=>x.checked).map(x=>x.value));document.querySelectorAll('.delete-todo').forEach(b=>b.onclick=()=>dismissTodos([b.dataset.id]))}
-function renderStudyFeedback(studies,tasks,history){const taskById=new Map(tasks.map(t=>[t.id,t])),historyByTask=new Map;for(const item of history)if(item.task_id&&!historyByTask.has(item.task_id))historyByTask.set(item.task_id,item);const latestBySource=new Map;for(const study of studies){const checked=study.completed_at||study.started_at||study.created_at;if(!latestBySource.has(study.source)||String(checked)>String(latestBySource.get(study.source)))latestBySource.set(study.source,checked)}document.querySelectorAll('.study-card').forEach((card,index)=>{const study=studies[index];if(!study)return;card.querySelector('.study-project')?.insertAdjacentHTML('afterend',`<div class="study-check">Latest checked · ${esc(shortDate(latestBySource.get(study.source)))}</div>`);let completed=0,measured=0,gains=0;card.querySelectorAll('.study-task-link').forEach(button=>{const task=taskById.get(button.dataset.id),outcome=historyByTask.get(button.dataset.id);if(['integrated','rejected','failed','reverted'].includes(task?.state))completed++;if(outcome){measured++;if((outcome.impact?.value||0)>0)gains++}button.insertAdjacentHTML('beforeend',`<span class="study-task-outcome">${task?badge(task.state):''}${outcome?renderImpactBadge(outcome.impact):'<span class="meta">Impact pending</span>'}</span>`)});const columns=card.querySelector('.study-columns');columns?.insertAdjacentHTML('beforebegin',`<div class="study-feedback-summary"><strong>Experiment feedback</strong> · ${completed} completed · ${measured} measured · ${gains} positive gain${gains===1?'':'s'}</div>`)})}
-async function dismissTodos(ids){if(!ids.length)return;await api('/api/todos/dismiss',{method:'POST',body:JSON.stringify({ids})});await refresh()}
-function renderDeviceTask(t,device){const p=t.activity||{},run=(t.runs||[]).find(r=>r.machine_id===device.id),result=run?.result||{},model=t.origin?.model_id||t.manifest?.models?.join(', ')||'general',deviceStep=(p.devices||[]).find(d=>d.name===device.name),steps=p.steps||[],runProgress=run?.progress??0,displayProgress=run?.status==='running'||run?.status==='completed'?runProgress:(p.percent||0),elapsed=run?.started_at?run.elapsed_seconds:p.elapsed_seconds,started=run?.started_at?new Date(run.started_at).toLocaleString():'Not started',updated=run?.updated_at?new Date(run.updated_at).toLocaleTimeString():'—',argv=result.argv||t.manifest?.argv||[],stdout=result.stdout_tail||'',stderr=result.stderr_tail||'',output=[stdout,stderr].filter(Boolean).join('\n').trim();return `<details class="device-task" open><summary><div><strong>${esc(t.title)}</strong><div class="meta">${esc(model)} · ${esc(t.kind)} · started ${esc(started)} · ${formatDuration(elapsed)} elapsed</div></div><div>${badge(run?.status||'unassigned')} ${badge(deviceStep?.status||p.phase||'pending')}</div></summary><div class="device-task-detail"><div class="task-content"><strong>Work content</strong><p>${esc(t.hypothesis||t.title)}</p></div><div class="task-progress-line"><span>Run phase: <strong>${esc(run?.phase||p.phase||t.state)}</strong></span><span>${displayProgress}% · updated ${esc(updated)}</span></div><div class="meter"><i style="width:${displayProgress}%"></i></div><div class="task-progress-line"><span>${esc(p.basis||'lifecycle')}</span><span>${p.evaluated??0}/${p.total??0} evidence complete</span></div><div class="step-list">${steps.map(s=>`<div class="task-step"><i class="status-dot ${s.status==='pass'||s.status==='complete'?'online':s.status==='fail'?'offline':'stale'}"></i><span>${esc(s.name)}</span>${badge(s.status)}</div>`).join('')||'<span class="muted">No detailed steps reported.</span>'}</div>${argv.length?`<details class="task-command"><summary>Command</summary><pre>${esc(argv.map(x=>/\s/.test(x)?`"${x}"`:x).join(' '))}</pre></details>`:''}<details class="task-live-output" ${run?.status==='running'?'open':''}><summary>Latest device output <span class="meta">refreshed ${esc(updated)}</span></summary><pre>${esc(output||'No output has been reported yet.')}</pre></details>${run?.error?`<pre class="run-error">${esc(run.error)}</pre>`:''}${run&&Object.keys(result).length&&!result.live?`<details><summary>Run result</summary><pre>${esc(JSON.stringify(result,null,2))}</pre></details>`:''}<div class="meta mono">Task ${esc(t.id)} · Run ${esc(run?.id||'not materialized')}</div></div></details>`}
-function eventLabel(e){return ({created:'Task created',transition:'Task state changed',observation_added:'Conformance/performance observation received',registered:'Device enrolled',configured:'Device configured',configuration_updated:'Device configuration updated',catalog_updated:'Model catalog refreshed',evaluated:'Evidence evaluated',evidence_added:'Experiment evidence received',publishing:'Milestone publication started',active:'Milestone activated',failed:'Operation failed'}[e.event_type]||e.event_type.replaceAll('_',' '))}
-function effectiveStatus(m){if(m.status!=='online')return m.status;const age=Date.now()-Date.parse(m.last_seen_at);return age>180000?'stale':'online'}
-function age(value){if(!value)return 'never';const sec=Math.max(0,(Date.now()-Date.parse(value))/1000);if(sec<90)return `${Math.floor(sec)}s ago`;if(sec<5400)return `${Math.floor(sec/60)}m ago`;if(sec<172800)return `${Math.floor(sec/3600)}h ago`;return `${Math.floor(sec/86400)}d ago`}
-function renderDevices(items){const el=$('#device-table');if(!el)return;el.innerHTML=items.length?`<table class="matrix device-table"><thead><tr><th>Name</th><th>Address</th><th>OS</th><th>CPU / RAM</th><th>GPU</th><th>Driver / backend</th><th>Actions</th></tr></thead><tbody>${items.map(m=>{const f=m.fingerprint||{},l=m.labels||{};return `<tr><td><div class="device-name">${esc(m.name)}</div><div class="meta">${esc([f.manufacturer,f.system_model].filter(Boolean).join(' ')||'')}</div></td><td class="mono">${esc(l.address||'—')}</td><td>${esc(f.os||'—')}<div class="meta">${esc(f.os_version||'')}</div></td><td>${esc(f.cpu||'—')}<div class="meta">${f.cpu_cores?`${esc(f.cpu_cores)} logical cores · `:''}${f.memory_mb?num(f.memory_mb/1024)+' GB RAM':'—'}</div></td><td><div class="device-gpu">${esc(f.gpu||'—')}</div><div class="meta">${esc(f.gpu_vendor||'unknown vendor')}</div></td><td class="mono">${esc(f.driver||'—')}<div class="meta">${esc(f.backend||'—')}</div></td><td><div class="device-actions"><button class="secondary reprovision" data-name="${esc(m.name)}" data-address="${esc(l.address||'')}">Re-provision</button></div></td></tr>`}).join('')}</tbody></table>`:'<div class="empty">No devices configured.</div>';document.querySelectorAll('.reprovision').forEach(b=>b.onclick=()=>openProvision(b.dataset.name,b.dataset.address));enableColumnResize(el.querySelector('table'),'backpack-device-column-widths');}
-function enableColumnResize(table,storageKey){if(!table)return;const headers=[...table.querySelectorAll('thead th')],saved=JSON.parse(localStorage.getItem(storageKey)||'null'),widths=Array.isArray(saved)&&saved.length===headers.length?saved:headers.map(h=>Math.max(110,Math.round(h.getBoundingClientRect().width)));const group=document.createElement('colgroup');widths.forEach(width=>{const col=document.createElement('col');col.style.width=`${width}px`;group.appendChild(col)});table.prepend(group);table.style.width=`${widths.reduce((sum,width)=>sum+width,0)}px`;headers.forEach((header,index)=>{const handle=document.createElement('span');handle.className='column-resizer';header.appendChild(handle);handle.onpointerdown=event=>{event.preventDefault();handle.setPointerCapture(event.pointerId);const startX=event.clientX,startWidth=widths[index];handle.onpointermove=move=>{widths[index]=Math.max(80,startWidth+move.clientX-startX);group.children[index].style.width=`${widths[index]}px`;table.style.width=`${widths.reduce((sum,width)=>sum+width,0)}px`};handle.onpointerup=()=>{localStorage.setItem(storageKey,JSON.stringify(widths));handle.onpointermove=null;handle.onpointerup=null}}})}
-async function toggleDeviceActivity(button){button.disabled=true;try{await api(`/api/machines/${encodeURIComponent(button.dataset.id)}/activity`,{method:'POST',body:JSON.stringify({action:button.dataset.action})});await refresh()}catch(error){alert(error.message)}finally{button.disabled=false}}
-const bootstrap=name=>`Invoke-WebRequest http://${location.hostname}:8787/api/bootstrap.ps1 -OutFile $env:TEMP\\bootstrap-backpack.ps1\npowershell -ExecutionPolicy Bypass -File $env:TEMP\\bootstrap-backpack.ps1`;
-async function copyEnrollment(button,name){await navigator.clipboard.writeText(bootstrap(name));const old=button.textContent;button.textContent='Copied';button.classList.add('copy-ok');setTimeout(()=>{button.textContent=old;button.classList.remove('copy-ok')},1400)}
-function openProvision(name='',address=''){const form=$('#provision-form');form.reset();form.elements.name.value=name;form.elements.address.value=address;$('#provision-title').textContent=name?'Re-provision device':'Provision device';$('#submit-provision').textContent=name?'Re-provision':'Provision';$('#provision-result').classList.add('hidden');$('#provision-steps').classList.add('hidden');$('#provision-steps').innerHTML='';$('#provision-dialog').showModal()}
-$('#new-task').onclick=()=>$('#task-dialog').showModal();$('#cancel-task').onclick=()=>$('#task-dialog').close();$('#task-form').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await api('/api/tasks',{method:'POST',body:JSON.stringify({title:f.get('title'),hypothesis:f.get('hypothesis'),kind:f.get('kind'),manifest:{metrics:['decode_tok_s']},device_policy:{required:[]}})});e.target.reset();$('#task-dialog').close();refresh()}catch(x){alert(x.message)}};
-const tabPaths={status:'tasks',evolution:'evolution',todo:'human-intervention',validation:'status',analysis:'performance-analysis',digest:'digest',devices:'devices'},pathTabs=Object.fromEntries(Object.entries(tabPaths).map(([tab,path])=>[path,tab]));pathTabs.history='digest';
-function tabFromUrl(url=new URL(location.href)){const path=url.pathname.replace(/^\/+|\/+$/g,'');return pathTabs[path]||url.searchParams.get('view')||url.hash.replace(/^#/,'')||'validation'}
-function navigate(name,updateUrl=true){if(!$('#'+name+'-tab'))name='status';document.querySelectorAll('.sidebar-item').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));document.querySelectorAll('.tab-page').forEach(x=>x.classList.add('hidden'));$('#'+name+'-tab').classList.remove('hidden');if(updateUrl){const url=new URL('/'+tabPaths[name],location.origin);history.pushState({view:name},'',url)}document.title=`${document.querySelector(`.sidebar-item[data-tab="${name}"] span:nth-child(2)`)?.textContent||'Backpack'} · Backpack`}
-document.querySelectorAll('.sidebar-item').forEach(b=>b.onclick=()=>navigate(b.dataset.tab));window.addEventListener('popstate',()=>navigate(tabFromUrl(),false));const initialUrl=new URL(location.href),initialTab=tabFromUrl(initialUrl),canonicalUrl=new URL('/'+tabPaths[$('#'+initialTab+'-tab')?initialTab:'status'],location.origin);history.replaceState({view:initialTab},'',canonicalUrl);navigate(initialTab,false);
-$('#provision-device').onclick=()=>openProvision();$('#cancel-provision').onclick=()=>$('#provision-dialog').close();$('#provision-form').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.currentTarget),vendor=f.get('vendor'),steps=$('#provision-steps'),submit=$('#submit-provision');steps.classList.remove('hidden');steps.innerHTML='<div class="provision-step done">✓ Device configuration validated</div><div class="provision-step ready">⏳ Connecting through WinRM…</div><div class="provision-step waiting">○ Installing task worker</div><div class="provision-step waiting">○ Synchronizing cared models</div>';submit.disabled=true;try{await api('/api/machines/provision',{method:'POST',body:JSON.stringify({name:f.get('name'),address:f.get('address'),fingerprint:vendor?{gpu_vendor:vendor}:{}})});steps.innerHTML='<div class="provision-step done">✓ WinRM connected</div><div class="provision-step done">✓ Task worker installed</div><div class="provision-step done">✓ Cared models synchronized</div>';$('#provision-result').classList.remove('hidden');submit.textContent='Provisioned';await refresh()}catch(x){steps.innerHTML+=`<div class="provision-step" style="color:var(--red)">✕ ${esc(x.message)}</div>`}finally{submit.disabled=false}};
-$('#validation-search').oninput=renderValidationRows;$('#validation-sort').onchange=renderValidationRows;$('#validation-direction').onclick=e=>{const b=e.currentTarget,next=b.dataset.direction==='asc'?'desc':'asc';b.dataset.direction=next;b.textContent=next==='asc'?'Ascending ↑':'Descending ↓';renderValidationRows()};
-let analysisState={metric:'decode_tok_s',model:'all',prompt:'all',x:'model',series:'source'},analysisSources=[];
-const analysisSourceFields=[['framework','Framework'],['backend','Backend'],['machineId','Device'],['modelId','Model'],['format','Format'],['revision','Revision / Date']];
-function analysisSourceValue(r,field){return field==='machineId'?r.machine.id:field==='modelId'?r.model.id:field==='revision'?`${r.result.revision||'unknown'}|${r.result.created_at||''}`:r[field]}
-function analysisSourceLabel(r,field,value){if(field==='framework')return frameworkName(value);if(field==='machineId')return r.machine.name;if(field==='modelId')return r.model.name;if(field==='revision'){const [revision,date]=value.split('|');return `${revision} · ${shortDate(date)}`}return field==='format'?String(value).toUpperCase():value}
-function analysisSourceKey(source){return analysisSourceFields.map(([field])=>source[field]||'').join('\u001f')}
-function analysisSourceFromRow(row){return Object.fromEntries(analysisSourceFields.map(([field])=>[field,analysisSourceValue(row,field)]))}
-function saveAnalysisSources(){localStorage.setItem('backpack-performance-analysis-sources',JSON.stringify(analysisSources))}
-function loadAnalysisSources(measured){if(analysisSources.length)return;try{analysisSources=JSON.parse(localStorage.getItem('backpack-performance-analysis-sources')||'[]')}catch{analysisSources=[]}const available=new Set(measured.map(r=>analysisSourceKey(analysisSourceFromRow(r))));analysisSources=analysisSources.filter(source=>available.has(analysisSourceKey(source)));if(!analysisSources.length)analysisSources=measured.slice(0,Math.min(4,measured.length)).map(analysisSourceFromRow)}
-function analysisSourceOptions(measured,source,field){const fieldIndex=analysisSourceFields.findIndex(([name])=>name===field),candidates=measured.filter(row=>analysisSourceFields.slice(0,fieldIndex).every(([name])=>!source[name]||analysisSourceValue(row,name)===source[name])),values=new Map;for(const row of candidates){const value=analysisSourceValue(row,field);if(!values.has(value))values.set(value,analysisSourceLabel(row,field,value))}return [...values].map(([value,label])=>`<option value="${esc(value)}"${source[field]===value?' selected':''}>${esc(label)}</option>`).join('')}
-function normalizeAnalysisSource(measured,source,changedField){const changedIndex=analysisSourceFields.findIndex(([field])=>field===changedField);for(let i=changedIndex+1;i<analysisSourceFields.length;i++)delete source[analysisSourceFields[i][0]];const match=measured.find(row=>analysisSourceFields.every(([field],i)=>i<=changedIndex?analysisSourceValue(row,field)===source[field]:true));if(match)for(let i=changedIndex+1;i<analysisSourceFields.length;i++){const field=analysisSourceFields[i][0];source[field]=analysisSourceValue(match,field)}}
-function analysisFactor(r,key){if(key==='device')return r.machine.name;if(key==='model')return r.model.name;if(key==='runtime')return frameworkName(r.framework);if(key==='revision')return `${r.result.revision||'unknown'} · ${shortDate(r.result.created_at)}`;return `${frameworkName(r.framework)} / ${r.backend}`}
-function renderPerformanceAnalysis(){const el=$('#performance-analysis');if(!el)return;const measured=validationRows.filter(r=>r.result&&((r.result.metrics||{}).prefill_tok_s!=null||(r.result.metrics||{}).decode_tok_s!=null)),models=[...new Set(measured.map(r=>r.model.name))].sort(),prompts=[...new Set(measured.map(r=>String(r.result.metrics?.prompt_tokens||r.result.metrics?.generation_tokens||128)))].sort((a,b)=>Number(a)-Number(b));$('#analysis-count').textContent=`${measured.length} measurements`;if(!measured.length){el.innerHTML='<div class="empty">No performance measurements are available yet.</div>';return}el.innerHTML=`<div class="analysis-source"><div class="analysis-section-title">Data Sources</div><div class="analysis-combos">${measured.map((r,i)=>`<label class="analysis-combo"><input type="checkbox" data-analysis-source="${i}" checked><i style="--combo-color:hsl(${i*47%360} 65% 50%)"></i><span><strong>${esc(r.machine.name)} · ${esc(frameworkName(r.framework))}</strong><small>${esc(r.backend)} · ${esc(r.result.revision||'unknown')} · ${esc(shortDate(r.result.created_at))}</small></span></label>`).join('')}</div></div><div class="analysis-controls"><label>Metric<select id="analysis-metric"><option value="decode_tok_s">Token Generation (tok/s)</option><option value="prefill_tok_s">Prompt Processing (tok/s)</option></select></label><label>Prompt length<select id="analysis-prompt"><option value="all">All</option>${prompts.map(x=>`<option>${esc(x)}</option>`).join('')}</select></label><label>Model<select id="analysis-model"><option value="all">All models</option>${models.map(x=>`<option>${esc(x)}</option>`).join('')}</select></label><label>X-axis<select id="analysis-x"><option value="model">Model</option><option value="device">Device</option><option value="runtime">Runtime</option><option value="revision">Revision / Date</option></select></label><label>Series<select id="analysis-series"><option value="source">Runtime / Backend</option><option value="device">Device</option><option value="model">Model</option><option value="revision">Revision / Date</option></select></label><label class="analysis-check"><input id="analysis-zero" type="checkbox" checked> Begin at zero</label></div><div id="analysis-chart"></div><div id="analysis-table"></div>`;$('#analysis-metric').value=analysisState.metric;$('#analysis-prompt').value=analysisState.prompt;$('#analysis-model').value=analysisState.model;$('#analysis-x').value=analysisState.x;$('#analysis-series').value=analysisState.series;const update=()=>{analysisState={metric:$('#analysis-metric').value,prompt:$('#analysis-prompt').value,model:$('#analysis-model').value,x:$('#analysis-x').value,series:$('#analysis-series').value};renderAnalysisChart(measured)};el.querySelectorAll('select,input').forEach(x=>x.onchange=update);update()}
-function renderAnalysisChart(allRows){const enabled=new Set([...document.querySelectorAll('[data-analysis-source]')].filter(x=>x.checked).map(x=>Number(x.dataset.analysisSource))),metric=analysisState.metric,rows=allRows.filter((r,i)=>enabled.has(i)&&(analysisState.model==='all'||r.model.name===analysisState.model)&&(analysisState.prompt==='all'||String(r.result.metrics?.prompt_tokens||r.result.metrics?.generation_tokens||128)===analysisState.prompt)).map(r=>({...r,value:Number(r.result.metrics?.[metric])})).filter(r=>Number.isFinite(r.value)),max=Math.max(1,...rows.map(r=>r.value)),beginZero=$('#analysis-zero').checked,min=beginZero?0:Math.min(...rows.map(r=>r.value))*0.95,span=Math.max(max-min,1),groups=new Map;for(const r of rows){const x=analysisFactor(r,analysisState.x),series=analysisFactor(r,analysisState.series);if(!groups.has(x))groups.set(x,[]);groups.get(x).push({...r,series})}$('#analysis-chart').innerHTML=rows.length?`<section class="analysis-chart-card"><header><strong>${metric==='prefill_tok_s'?'Prompt Processing':'Token Generation'}</strong><span>tokens/sec · ${rows.length} samples</span></header><div class="analysis-bars">${[...groups].map(([x,items])=>`<div class="analysis-bar-group"><div class="analysis-x-label">${esc(x)}</div><div>${items.map((r,i)=>`<div class="analysis-bar-row"><span title="${esc(r.series)}">${esc(r.series)}</span><div class="analysis-bar-track"><i style="width:${Math.max(1,(r.value-min)/span*100)}%;--bar-color:hsl(${(i*67+31)%360} 65% 48%)"></i></div><b>${num(r.value)}</b></div>`).join('')}</div></div>`).join('')}</div></section>`:'<div class="empty">No data for the current selection.</div>';const best=rows.length?Math.max(...rows.map(r=>r.value)):0;$('#analysis-table').innerHTML=rows.length?`<div class="analysis-section-title">Data Table</div><div class="table-wrap analysis-data-wrap"><table class="analysis-data"><thead><tr><th>Device</th><th>Model</th><th>Runtime</th><th>Backend</th><th>Revision / Date</th><th>${metric==='prefill_tok_s'?'Prefill':'Decode'}</th><th>Δ vs best</th><th>Trend</th></tr></thead><tbody>${rows.sort((a,b)=>b.value-a.value).map(r=>`<tr><td>${esc(r.machine.name)}</td><td>${esc(r.model.name)}</td><td>${esc(frameworkName(r.framework))}</td><td class="mono">${esc(r.backend)}</td><td class="mono">${esc(r.result.revision||'—')}<div class="meta">${esc(shortDate(r.result.created_at))}</div></td><td><strong>${num(r.value)} tok/s</strong></td><td class="${r.value===best?'impact-positive':'impact-negative'}">${r.value===best?'best':`${num((r.value-best)/best*100)}%`}</td><td><button class="secondary analysis-trend" data-model="${esc(r.model.id)}" data-machine="${esc(r.machine.id)}" data-framework="${esc(r.framework)}" data-format="${esc(r.format)}" data-backend="${esc(r.backend)}" data-title="${esc(`${r.machine.name} · ${r.model.name} · ${frameworkName(r.framework)} ${r.backend}`)}">View trend</button></td></tr>`).join('')}</tbody></table></div>`:'';document.querySelectorAll('.analysis-trend').forEach(b=>b.onclick=()=>showObservationHistory(b))}
-function renderPerformanceAnalysis(){
- const el=$('#performance-analysis');if(!el)return;
- const measured=validationRows.filter(r=>r.result&&((r.result.metrics||{}).prefill_tok_s!=null||(r.result.metrics||{}).decode_tok_s!=null)),models=[...new Set(measured.map(r=>r.model.name))].sort(),prompts=[...new Set(measured.map(r=>String(r.result.metrics?.prompt_tokens||r.result.metrics?.generation_tokens||128)))].sort((a,b)=>Number(a)-Number(b));
- $('#analysis-count').textContent=`${measured.length} measurements`;if(!measured.length){el.innerHTML='<div class="empty">No performance measurements are available yet.</div>';return}loadAnalysisSources(measured);
- el.innerHTML=`<div class="analysis-source"><div class="analysis-section-title">Data Sources</div><div class="analysis-source-head">Choose exact measured instances by framework, backend, device, model, format, and revision.</div><div class="analysis-source-rows">${analysisSources.map((source,i)=>`<div class="analysis-source-row"><i style="--combo-color:hsl(${i*47%360} 65% 50%)">${i+1}</i>${analysisSourceFields.map(([field,label])=>`<label><span>${label}</span><select data-source-index="${i}" data-source-field="${field}">${analysisSourceOptions(measured,source,field)}</select></label>`).join('')}<button type="button" class="analysis-source-remove" data-source-remove="${i}" title="Remove data source">×</button></div>`).join('')}</div><button type="button" class="analysis-source-add" id="analysis-source-add">＋ Add data source</button></div><div class="analysis-controls"><label>Metric<select id="analysis-metric"><option value="decode_tok_s">Token Generation (TPS)</option><option value="prefill_tok_s">Prompt Processing (TPS)</option></select></label><label>Prompt length<select id="analysis-prompt"><option value="all">All</option>${prompts.map(x=>`<option>${esc(x)}</option>`).join('')}</select></label><label>Model<select id="analysis-model"><option value="all">All models</option>${models.map(x=>`<option>${esc(x)}</option>`).join('')}</select></label><label>X-axis<select id="analysis-x"><option value="model">Model</option><option value="device">Device</option><option value="runtime">Runtime</option><option value="revision">Revision / Date</option></select></label><label>Series<select id="analysis-series"><option value="source">Runtime / Backend</option><option value="device">Device</option><option value="model">Model</option><option value="revision">Revision / Date</option></select></label><label class="analysis-check"><input id="analysis-zero" type="checkbox" checked> Begin at zero</label></div><div id="analysis-chart"></div><div id="analysis-table"></div>`;
- $('#analysis-metric').value=analysisState.metric;$('#analysis-prompt').value=analysisState.prompt;$('#analysis-model').value=analysisState.model;$('#analysis-x').value=analysisState.x;$('#analysis-series').value=analysisState.series;
- const update=()=>{analysisState={metric:$('#analysis-metric').value,prompt:$('#analysis-prompt').value,model:$('#analysis-model').value,x:$('#analysis-x').value,series:$('#analysis-series').value};renderAnalysisChart(measured)};el.querySelectorAll('.analysis-controls select,.analysis-controls input').forEach(x=>x.onchange=update);
- el.querySelectorAll('[data-source-field]').forEach(select=>select.onchange=()=>{const source=analysisSources[Number(select.dataset.sourceIndex)];source[select.dataset.sourceField]=select.value;normalizeAnalysisSource(measured,source,select.dataset.sourceField);saveAnalysisSources();renderPerformanceAnalysis()});el.querySelectorAll('[data-source-remove]').forEach(button=>button.onclick=()=>{analysisSources.splice(Number(button.dataset.sourceRemove),1);saveAnalysisSources();renderPerformanceAnalysis()});
- $('#analysis-source-add').onclick=()=>{const used=new Set(analysisSources.map(analysisSourceKey)),row=measured.find(r=>!used.has(analysisSourceKey(analysisSourceFromRow(r))))||measured[0];analysisSources.push(analysisSourceFromRow(row));saveAnalysisSources();renderPerformanceAnalysis()};update()
+const $ = (s) => document.querySelector(s);
+const esc = (s) =>
+  String(s ?? "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
+async function api(path, options = {}) {
+  const r = await fetch(path, {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Evolution-Actor": "dashboard",
+    },
+    ...options,
+  });
+  const v = await r.json();
+  if (!r.ok) throw Error(v.error || r.statusText);
+  return v;
 }
-function renderAnalysisChart(allRows){
- const enabled=new Set(analysisSources.map(analysisSourceKey)),metric=analysisState.metric,rows=allRows.filter(r=>enabled.has(analysisSourceKey(analysisSourceFromRow(r)))&&(analysisState.model==='all'||r.model.name===analysisState.model)&&(analysisState.prompt==='all'||String(r.result.metrics?.prompt_tokens||r.result.metrics?.generation_tokens||128)===analysisState.prompt)).map(r=>({...r,value:Number(r.result.metrics?.[metric])})).filter(r=>Number.isFinite(r.value)),max=Math.max(1,...rows.map(r=>r.value)),beginZero=$('#analysis-zero').checked,min=beginZero?0:Math.min(...rows.map(r=>r.value))*0.95,span=Math.max(max-min,1),groups=new Map;
- for(const r of rows){const x=analysisFactor(r,analysisState.x),series=analysisFactor(r,analysisState.series);if(!groups.has(x))groups.set(x,[]);groups.get(x).push({...r,series})}
- $('#analysis-chart').innerHTML=rows.length?`<section class="analysis-chart-card"><header><strong>${metric==='prefill_tok_s'?'Prompt Processing':'Token Generation'}</strong><span>TPS · ${rows.length} selected sources</span></header><div class="analysis-bars">${[...groups].map(([x,items])=>`<div class="analysis-bar-group"><div class="analysis-x-label">${esc(x)}</div><div>${items.map((r,i)=>`<div class="analysis-bar-row"><span title="${esc(r.series)}">${esc(r.series)}</span><div class="analysis-bar-track"><i style="width:${Math.max(1,(r.value-min)/span*100)}%;--bar-color:hsl(${(i*67+31)%360} 65% 48%)"></i></div><b>${num(r.value)}</b></div>`).join('')}</div></div>`).join('')}</div></section>`:'<div class="empty">Add or adjust a data source to chart its performance.</div>';
- const best=rows.length?Math.max(...rows.map(r=>r.value)):0;$('#analysis-table').innerHTML=rows.length?`<div class="analysis-section-title">Data Table</div><div class="table-wrap analysis-data-wrap"><table class="analysis-data"><thead><tr><th>Device</th><th>Model</th><th>Framework</th><th>Backend</th><th>Format</th><th>Revision / Date</th><th>${metric==='prefill_tok_s'?'Prefill TPS':'Decode TPS'}</th><th>Δ vs best</th><th>Trend</th></tr></thead><tbody>${rows.sort((a,b)=>b.value-a.value).map(r=>`<tr><td>${esc(r.machine.name)}</td><td>${esc(r.model.name)}</td><td>${esc(frameworkName(r.framework))}</td><td class="mono">${esc(r.backend)}</td><td>${esc(r.format.toUpperCase())}</td><td class="mono">${esc(r.result.revision||'—')}<div class="meta">${esc(shortDate(r.result.created_at))}</div></td><td><strong>${num(r.value)}</strong></td><td class="${r.value===best?'impact-positive':'impact-negative'}">${r.value===best?'best':`${num((r.value-best)/best*100)}%`}</td><td><button class="secondary analysis-trend" data-model="${esc(r.model.id)}" data-machine="${esc(r.machine.id)}" data-framework="${esc(r.framework)}" data-format="${esc(r.format)}" data-backend="${esc(r.backend)}" data-title="${esc(`${r.machine.name} · ${r.model.name} · ${frameworkName(r.framework)} ${r.backend}`)}">View trend</button></td></tr>`).join('')}</tbody></table></div>`:'';document.querySelectorAll('.analysis-trend').forEach(b=>b.onclick=()=>showObservationHistory(b))
+function statusLabel(v) {
+  return (
+    { not_applicable: "Not tested", pending: "Pending", unknown: "Unknown" }[
+      v
+    ] ||
+    v ||
+    "—"
+  );
 }
-let trendState={metric:'decode_tok_s',model:'',device:'all',runtime:'all'};
-function renderPerformanceTrend(observations){const el=$('#performance-trend');if(!el)return;const modelMap=new Map(validationRows.map(r=>[r.model.id,r.model.name])),machineMap=new Map(validationRows.map(r=>[r.machine.id,r.machine.name])),measured=observations.filter(x=>x.metrics?.prefill_tok_s!=null||x.metrics?.decode_tok_s!=null),models=[...new Set(measured.map(x=>x.model_id))].filter(x=>modelMap.has(x)),devices=[...new Set(measured.map(x=>x.machine_id))].filter(x=>machineMap.has(x));if(!trendState.model||!models.includes(trendState.model))trendState.model=models[0]||'';el.innerHTML=measured.length?`<div class="trend-controls"><label>Metric<select id="trend-metric"><option value="decode_tok_s">Decode TPS</option><option value="prefill_tok_s">Prefill TPS</option></select></label><label>Model<select id="trend-model">${models.map(id=>`<option value="${esc(id)}">${esc(modelMap.get(id))}</option>`).join('')}</select></label><label>Device<select id="trend-device"><option value="all">All devices</option>${devices.map(id=>`<option value="${esc(id)}">${esc(machineMap.get(id))}</option>`).join('')}</select></label><label>Runtime<select id="trend-runtime"><option value="all">All runtimes</option><option value="backpack/ort">Backpack ORT</option><option value="ort/ort">ORT WebGPU</option><option value="backpack/gguf">Backpack GGUF</option><option value="llamacpp/gguf">llama.cpp Vulkan</option></select></label></div><div id="trend-chart"></div><div id="trend-latest"></div>`:'<div class="empty">No historical performance measurements are available.</div>';if(!measured.length)return;$('#trend-metric').value=trendState.metric;$('#trend-model').value=trendState.model;$('#trend-device').value=trendState.device;$('#trend-runtime').value=trendState.runtime;const update=()=>{trendState={metric:$('#trend-metric').value,model:$('#trend-model').value,device:$('#trend-device').value,runtime:$('#trend-runtime').value};renderTrendChart(measured,modelMap,machineMap)};el.querySelectorAll('select').forEach(x=>x.onchange=update);update()}
-function renderTrendChart(observations,modelMap,machineMap){const rows=observations.filter(x=>x.model_id===trendState.model&&(trendState.device==='all'||x.machine_id===trendState.device)&&(trendState.runtime==='all'||`${x.framework}/${x.format}`===trendState.runtime)).map(x=>({...x,value:Number(x.metrics?.[trendState.metric]),time:Date.parse(x.created_at)})).filter(x=>Number.isFinite(x.value)&&Number.isFinite(x.time)).sort((a,b)=>a.time-b.time),groups=new Map;for(const row of rows){const key=`${row.machine_id}|${row.framework}|${row.format}|${row.backend}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row)}$('#trend-count').textContent=`${rows.length} samples`;if(!rows.length){$('#trend-chart').innerHTML='<div class="empty">No samples match these filters.</div>';$('#trend-latest').innerHTML='';return}const W=1100,H=420,padL=68,padR=24,padT=30,padB=62,minT=Math.min(...rows.map(x=>x.time)),maxT=Math.max(...rows.map(x=>x.time)),maxV=Math.max(1,...rows.map(x=>x.value)),x=t=>padL+(maxT===minT?(W-padL-padR)/2:(t-minT)/(maxT-minT)*(W-padL-padR)),y=v=>H-padB-v/maxV*(H-padT-padB),colors=['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#65a30d','#db2777'],series=[...groups.entries()];$('#trend-chart').innerHTML=`<section class="trend-chart-card"><div class="trend-legend">${series.map(([key,data],i)=>`<span><i style="background:${colors[i%colors.length]}"></i>${esc(machineMap.get(data[0].machine_id))} · ${esc(frameworkName(data[0].framework))} ${esc(data[0].format.toUpperCase())}</span>`).join('')}</div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Performance over revisions"><line class="axis" x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}"/><line class="axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}"/>${[0,.25,.5,.75,1].map(f=>`<g><line class="grid" x1="${padL}" y1="${y(maxV*f)}" x2="${W-padR}" y2="${y(maxV*f)}"/><text x="${padL-10}" y="${y(maxV*f)+4}" text-anchor="end">${num(maxV*f)}</text></g>`).join('')}${series.map(([key,data],i)=>`<polyline style="stroke:${colors[i%colors.length]}" points="${data.map(r=>`${x(r.time)},${y(r.value)}`).join(' ')}"/>${data.map(r=>`<circle style="fill:${colors[i%colors.length]}" cx="${x(r.time)}" cy="${y(r.value)}" r="4"><title>${esc(machineMap.get(r.machine_id))} · ${esc(r.revision||'unknown')} · ${esc(r.created_at)} · ${num(r.value)} TPS</title></circle>`).join('')}`).join('')}<text class="axis-title" x="${(padL+W-padR)/2}" y="${H-14}" text-anchor="middle">Revision date</text><text class="axis-title" transform="translate(17 ${(padT+H-padB)/2}) rotate(-90)" text-anchor="middle">${trendState.metric==='decode_tok_s'?'Decode TPS':'Prefill TPS'}</text></svg></section>`;const latest=series.map(([,data])=>data[data.length-1]).sort((a,b)=>b.value-a.value);$('#trend-latest').innerHTML=`<div class="trend-latest-grid">${latest.map((r,i)=>{const previous=groups.get(`${r.machine_id}|${r.framework}|${r.format}|${r.backend}`).slice(-2)[0],delta=previous&&previous!==r?(r.value/previous.value-1)*100:null;return `<article><span>${esc(machineMap.get(r.machine_id))} · ${esc(frameworkName(r.framework))} ${esc(r.format.toUpperCase())}</span><strong>${num(r.value)} TPS</strong><small>${esc(r.revision||'unknown')} · ${esc(shortDate(r.created_at))}${delta==null?'':` · ${delta>=0?'+':''}${num(delta)}%`}</small></article>`}).join('')}</div>`}
-let statusTrendState={devices:[],runtimes:[],metrics:['decode_tok_s']};
-function statusTrendRuntime(row){return `${row.framework}/${row.format}/${row.backend}`}
-function statusTrendRuntimeLabel(key){const [framework,format,backend]=key.split('/');return `${frameworkName(framework)} · ${format.toUpperCase()} · ${backend}`}
-function compatiblePerformanceRevision(a,b){const clean=value=>String(value||'').toLowerCase().replace(/-(reuse[-_]generator)$/,'').replace(/-(?:19|20)\d{6}$/,'').replace(/-+$/,'');a=clean(a);b=clean(b);return !!a&&!!b&&(a===b||a.startsWith(b+'-')||b.startsWith(a+'-'))}
-function validPerformanceObservations(items){const groups=new Map;for(const item of items){const key=`${item.model_id}|${item.machine_id}|${item.framework}|${item.format}|${item.backend}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item)}return items.filter(item=>{if(item.metrics?.prefill_tok_s==null&&item.metrics?.decode_tok_s==null)return false;if(item.conformance==='pass')return true;const key=`${item.model_id}|${item.machine_id}|${item.framework}|${item.format}|${item.backend}`;return groups.get(key).some(candidate=>candidate.conformance==='pass'&&compatiblePerformanceRevision(item.revision,candidate.revision))})}
-function renderPerformanceTrend(observations){
- trendObservations=observations||trendObservations;const el=$('#performance-trend');if(!el)return;
- const machineMap=new Map(validationRows.map(r=>[r.machine.id,r.machine.name])),measured=validPerformanceObservations(trendObservations).filter(x=>x.model_id===activeStatusModel),devices=[...new Set(measured.map(x=>x.machine_id))].filter(x=>machineMap.has(x)),runtimes=[...new Set(measured.map(statusTrendRuntime))];
- statusTrendState.devices=[...devices];statusTrendState.runtimes=statusTrendState.runtimes.filter(x=>runtimes.includes(x));if(!statusTrendState.runtimes.length)statusTrendState.runtimes=[...runtimes];if(!statusTrendState.metrics.length)statusTrendState.metrics=['decode_tok_s'];if(statusTrendState.metrics.length>1)statusTrendState.metrics=[statusTrendState.metrics.at(-1)];
- if(!measured.length){el.innerHTML='<div class="empty compact">Performance trends will appear after measurements are recorded for this model.</div>';$('#trend-count').textContent='0 samples';return}
- const checks=(kind,items,label)=>`<fieldset><legend>${label}</legend><div class="trend-checks">${items.map(([value,text])=>`<label><input type="checkbox" data-trend-kind="${kind}" value="${esc(value)}"${statusTrendState[kind].includes(value)?' checked':''}><span>${esc(text)}</span></label>`).join('')}</div></fieldset>`;
- el.innerHTML=`<div class="trend-controls multi status-trend-filters">${checks('runtimes',runtimes.map(key=>[key,statusTrendRuntimeLabel(key)]),'Runtimes')}${checks('metrics',[['prefill_tok_s','Prefill TPS'],['decode_tok_s','Decode TPS']],'Metrics')}</div><div id="trend-chart"></div><div id="trend-latest"></div>`;
- el.querySelectorAll('[data-trend-kind]').forEach(box=>box.onchange=()=>{const kind=box.dataset.trendKind;if(kind==='metrics'){el.querySelectorAll('[data-trend-kind="metrics"]').forEach(other=>other.checked=other===box);box.checked=true}statusTrendState[kind]=[...el.querySelectorAll(`[data-trend-kind="${kind}"]:checked`)].map(x=>x.value);renderStatusTrendChart(measured,machineMap)});renderStatusTrendChart(measured,machineMap)
+function badge(v) {
+  return `<span class="badge ${esc(v)}">${esc(statusLabel(v))}</span>`;
 }
-function renderStatusTrendChart(observations,machineMap){
- const rawRows=observations.filter(x=>statusTrendState.devices.includes(x.machine_id)&&statusTrendState.runtimes.includes(statusTrendRuntime(x))).flatMap(x=>statusTrendState.metrics.map(metric=>({...x,metric,value:Number(x.metrics?.[metric]),time:Date.parse(x.created_at)}))).filter(x=>Number.isFinite(x.value)&&Number.isFinite(x.time)).sort((a,b)=>a.time-b.time),daily=new Map;for(const row of rawRows){const day=new Date(row.time).toISOString().slice(0,10),key=`${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${day}`;daily.set(key,{...row,sample_time:row.time,time:Date.parse(`${day}T00:00:00Z`)})}const rows=[...daily.values()].sort((a,b)=>a.time-b.time),groups=new Map;
- for(const row of rows){const key=`${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row)}$('#trend-count').textContent=`${rows.length} samples · ${groups.size} series`;if(!rows.length){$('#trend-chart').innerHTML='<div class="empty compact">Select at least one device, runtime, and metric with recorded data.</div>';$('#trend-latest').innerHTML='';return}
- const W=1100,H=390,padL=68,padR=24,padT=26,padB=58,colors=['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#65a30d','#db2777','#0f766e','#be123c'],series=[...groups.entries()],seriesLabel=data=>`${statusTrendRuntimeLabel(statusTrendRuntime(data[0]))} · ${data[0].metric==='prefill_tok_s'?'Prefill':'Decode'}`,deviceIds=[...new Set(rows.map(row=>row.machine_id))];
- const deviceChart=deviceId=>{const deviceRows=rows.filter(row=>row.machine_id===deviceId),deviceSeries=series.filter(([,data])=>data[0].machine_id===deviceId),minT=Math.min(...deviceRows.map(row=>row.time)),maxT=Math.max(...deviceRows.map(row=>row.time)),maxV=Math.max(1,...deviceRows.map(row=>row.value)),x=t=>padL+(maxT===minT?(W-padL-padR)/2:(t-minT)/(maxT-minT)*(W-padL-padR)),y=v=>H-padB-v/maxV*(H-padT-padB);return `<section class="trend-chart-card"><h3>${esc(machineMap.get(deviceId))}</h3><div class="trend-legend">${deviceSeries.map(([,data],i)=>`<span><i style="background:${colors[i%colors.length]}"></i>${esc(seriesLabel(data))}</span>`).join('')}</div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Performance improvement trend for ${esc(machineMap.get(deviceId))}"><line class="axis" x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}"/><line class="axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}"/>${[0,.25,.5,.75,1].map(f=>`<g><line class="grid" x1="${padL}" y1="${y(maxV*f)}" x2="${W-padR}" y2="${y(maxV*f)}"/><text x="${padL-10}" y="${y(maxV*f)+4}" text-anchor="end">${num(maxV*f)}</text></g>`).join('')}${deviceSeries.map(([,data],i)=>`<polyline style="stroke:${colors[i%colors.length]}" points="${data.map(r=>`${x(r.time)},${y(r.value)}`).join(' ')}"/>${data.map(r=>`<circle style="fill:${colors[i%colors.length]}" cx="${x(r.time)}" cy="${y(r.value)}" r="4"><title>${esc(seriesLabel(data))} · ${esc(shortDate(r.created_at))} · ${esc(r.revision||'unknown')} · ${num(r.value)} TPS</title></circle>`).join('')}`).join('')}<text class="axis-title" x="${(padL+W-padR)/2}" y="${H-12}" text-anchor="middle">Date</text><text class="axis-title" transform="translate(17 ${(padT+H-padB)/2}) rotate(-90)" text-anchor="middle">TPS</text></svg></section>`};$('#trend-chart').innerHTML=`<div class="status-device-trends">${deviceIds.map(deviceChart).join('')}</div>`;
- const latest=series.map(([,data])=>({first:data[0],last:data[data.length-1],label:`${machineMap.get(data[0].machine_id)} · ${seriesLabel(data)}`})).sort((a,b)=>b.last.value-a.last.value);$('#trend-latest').innerHTML=`<div class="trend-latest-grid">${latest.map(item=>{const gain=item.first===item.last?null:(item.last.value/item.first.value-1)*100;return `<article><span>${esc(item.label)}</span><strong>${num(item.last.value)} TPS</strong><small>${esc(item.last.revision||'unknown')} · ${esc(shortDate(item.last.created_at))}${gain==null?' · baseline':` · ${gain>=0?'+':''}${num(gain)}% since first`}</small></article>`}).join('')}</div>`
+function num(v) {
+  return v == null ? "—" : Number(v).toFixed(2);
 }
-function trendRuntimeTime(row){
- const explicit=row.framework==='ort'?[row.metrics?.ort_date,row.metrics?.ort_genai_date,row.conformance_details?.ort_date,row.conformance_details?.ort_genai_date]:[],revisionDates=String(row.revision||'').match(/(?:19|20)\d{6}/g)||[],values=[...explicit,...revisionDates].filter(Boolean).map(value=>{const text=String(value).replace(/[^0-9]/g,'').slice(0,8);return text.length===8?Date.parse(`${text.slice(0,4)}-${text.slice(4,6)}-${text.slice(6,8)}T00:00:00Z`):Date.parse(value)}).filter(Number.isFinite);return values.length?Math.max(...values):Date.parse(row.created_at)
+function shortDate(v) {
+  if (!v) return "—";
+  const d = new Date(v);
+  return Number.isNaN(d.valueOf())
+    ? String(v).slice(0, 10)
+    : d.toISOString().slice(0, 10);
 }
-function renderStatusTrendChart(observations,machineMap){
- const raw=observations.filter(row=>statusTrendState.devices.includes(row.machine_id)&&statusTrendState.runtimes.includes(statusTrendRuntime(row))).flatMap(row=>statusTrendState.metrics.map(metric=>({...row,metric,value:Number(row.metrics?.[metric]),sampleTime:Date.parse(row.created_at),time:trendRuntimeTime(row)}))).filter(row=>Number.isFinite(row.value)&&Number.isFinite(row.time)&&Number.isFinite(row.sampleTime)).sort((a,b)=>a.sampleTime-b.sampleTime),daily=new Map;
- for(const row of raw){const day=new Date(row.time).toISOString().slice(0,10),key=`${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${day}`;daily.set(key,{...row,time:Date.parse(`${day}T00:00:00Z`)})}
- const rows=[...daily.values()].sort((a,b)=>a.time-b.time),groups=new Map;for(const row of rows){const key=`${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}`;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row)}
- $('#trend-count').textContent=`${rows.length} daily points · ${groups.size} series`;if(!rows.length){$('#trend-chart').innerHTML='<div class="empty compact">Select at least one device, runtime, and metric with recorded data.</div>';$('#trend-latest').innerHTML='';return}
- const W=1100,H=410,L=68,R=24,T=28,B=76,colors=['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#65a30d','#db2777','#0f766e','#be123c'],allSeries=[...groups.values()],label=data=>`${statusTrendRuntimeLabel(statusTrendRuntime(data[0]))} · ${data[0].metric==='prefill_tok_s'?'Prefill':'Decode'}`;
- const chart=deviceId=>{const deviceRows=rows.filter(row=>row.machine_id===deviceId),series=allSeries.filter(data=>data[0].machine_id===deviceId),dates=[...new Set(deviceRows.map(row=>row.time))].sort((a,b)=>a-b),minT=Math.min(...dates),maxT=Math.max(...dates),maxV=Math.max(1,...deviceRows.map(row=>row.value)),x=time=>L+(maxT===minT?(W-L-R)/2:(time-minT)/(maxT-minT)*(W-L-R)),y=value=>H-B-value/maxV*(H-T-B),guides=dates.map(time=>`<g><line class="date-grid" x1="${x(time)}" y1="${T}" x2="${x(time)}" y2="${H-B}"/><text class="date-label" x="${x(time)}" y="${H-B+20}" text-anchor="middle">${shortDate(new Date(time).toISOString())}</text></g>`).join('');return `<section class="trend-chart-card"><h3>${esc(machineMap.get(deviceId))}</h3><div class="trend-legend">${series.map((data,i)=>`<span><i style="background:${colors[i%colors.length]}"></i>${esc(label(data))}</span>`).join('')}</div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Daily performance trend for ${esc(machineMap.get(deviceId))}"><line class="axis" x1="${L}" y1="${H-B}" x2="${W-R}" y2="${H-B}"/><line class="axis" x1="${L}" y1="${T}" x2="${L}" y2="${H-B}"/>${guides}${[0,.25,.5,.75,1].map(f=>`<g><line class="grid" x1="${L}" y1="${y(maxV*f)}" x2="${W-R}" y2="${y(maxV*f)}"/><text x="${L-10}" y="${y(maxV*f)+4}" text-anchor="end">${num(maxV*f)}</text></g>`).join('')}${series.map((data,i)=>`<polyline style="stroke:${colors[i%colors.length]}" points="${data.map(row=>`${x(row.time)},${y(row.value)}`).join(' ')}"/>${data.map(row=>`<circle style="fill:${colors[i%colors.length]}" cx="${x(row.time)}" cy="${y(row.value)}" r="4"><title>${esc(label(data))} · ${esc(shortDate(new Date(row.time).toISOString()))} · ${esc(row.revision||'unknown')} · ${num(row.value)} TPS</title></circle>`).join('')}`).join('')}<text class="axis-title" x="${(L+W-R)/2}" y="${H-12}" text-anchor="middle">Runtime date</text><text class="axis-title" transform="translate(17 ${(T+H-B)/2}) rotate(-90)" text-anchor="middle">TPS</text></svg></section>`};
- const deviceIds=[...new Set(rows.map(row=>row.machine_id))];$('#trend-chart').innerHTML=`<div class="status-device-trends">${deviceIds.map(chart).join('')}</div>`;const latest=allSeries.map(data=>({first:data[0],last:data[data.length-1],label:`${machineMap.get(data[0].machine_id)} · ${label(data)}`})).sort((a,b)=>b.last.value-a.last.value);$('#trend-latest').innerHTML=`<div class="trend-latest-grid">${latest.map(item=>{const gain=item.first===item.last?null:(item.last.value/item.first.value-1)*100;return `<article><span>${esc(item.label)}</span><strong>${num(item.last.value)} TPS</strong><small>${esc(item.last.revision||'unknown')} · ${esc(shortDate(new Date(item.last.time).toISOString()))}${gain==null?' · baseline':` · ${gain>=0?'+':''}${num(gain)}% since first`}</small></article>`}).join('')}</div>`
+function taskLabel(t) {
+  return t?.task_number ? `#${t.task_number}` : "#—";
 }
-new MutationObserver(renderStatusModelTabs).observe($('#model-matrix'),{childList:true});
-const events=new EventSource('/api/events');events.onopen=()=>{$('#connection').textContent='live';$('#connection').className='pill online'};events.onerror=()=>{$('#connection').textContent='reconnecting';$('#connection').className='pill blocked'};['task-created','task-updated','task-evaluated','evidence-added','observation-added','history-added','machine-updated','decision-resolved','run-updated'].forEach(n=>events.addEventListener(n,refresh));refresh().catch(e=>alert(e.message));
-setInterval(()=>{if(!document.hidden)refresh().catch(()=>{})},15000);
+function taskSource(t) {
+  const o = t?.origin || {},
+    type = o.type || "human";
+  if (o.source) return o.source;
+  if (type === "learning-study") return o.study_source || "Evolution";
+  return (
+    {
+      "continuous-learning": "Evolution",
+      automatic: "Automation",
+      scheduled: "Scheduled automation",
+      human: "Manual",
+    }[type] || type.replaceAll("-", " ")
+  );
+}
+function taskResult(t, run = null) {
+  if (run?.status === "failed") return run.error || "Run failed";
+  if (run?.status === "completed")
+    return run.result?.summary || run.result?.verdict || "Run completed";
+  if (run?.status === "running")
+    return `${run.phase || "running"} · ${run.progress ?? 0}%`;
+  if (t?.aggregate_verdict)
+    return `${t.aggregate_verdict}${t.verdict_reason ? `: ${t.verdict_reason}` : ""}`;
+  return t?.verdict_reason || t?.state || "pending";
+}
+async function refresh() {
+  const [
+    status,
+    tasks,
+    decisions,
+    machines,
+    matrix,
+    history,
+    activity,
+    dismissedTodos,
+    regressions,
+    studies,
+    observations,
+  ] = await Promise.all([
+    api("/api/status"),
+    api("/api/tasks"),
+    api("/api/decisions?status=pending"),
+    api("/api/machines"),
+    api("/api/models/matrix"),
+    api("/api/history"),
+    api("/api/activity"),
+    api("/api/todos/dismissed"),
+    api("/api/regressions/confirmed"),
+    api("/api/studies"),
+    api("/api/observations"),
+  ]);
+  const states = status.tasks || {};
+  $("#stats").innerHTML = [
+    ["Cared models", status.cared_models || 0],
+    [
+      "Active tasks",
+      Object.entries(states)
+        .filter(
+          ([k]) =>
+            !["integrated", "rejected", "failed", "reverted"].includes(k),
+        )
+        .reduce((n, [, v]) => n + v, 0),
+    ],
+    ["Pending decisions", status.pending_decisions],
+    ["Configured devices", machines.length],
+  ]
+    .map(([l, v]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`)
+    .join("");
+  $("#nav-task-count").textContent = tasks.length || "";
+  $("#nav-device-count").textContent = machines.length || "";
+  const enriched = activity.tasks || activity.active_tasks || [],
+    terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
+    pending = enriched.filter(
+      (t) =>
+        !terminal.has(t.state) &&
+        !(t.runs || []).some((r) => r.status === "running"),
+    );
+  $("#task-count").textContent = `${pending.length} pending`;
+  $("#tasks").innerHTML = pending.length
+    ? pending
+        .map((t) => {
+          const p = t.activity || {
+              percent: progress(t.state),
+              elapsed_seconds: (Date.now() - Date.parse(t.created_at)) / 1000,
+              basis: "lifecycle",
+            },
+            assignments = (t.runs || [])
+              .map((r) => `${r.machine_name}: ${r.status}`)
+              .join(" · "),
+            reason = failureReason(t);
+          return `<div class="row"><div><strong>${esc(t.title)}</strong><div class="meta">Created ${esc(t.created_at ? new Date(t.created_at).toLocaleString() : "not recorded")} · Start not yet assigned · ${formatDuration(p.elapsed_seconds)} queued</div><div class="meter"><i style="width:${p.percent}%"></i></div><div class="meta">${p.percent}% toward goal${assignments ? ` · ${esc(assignments)}` : ""}</div>${reason ? `<div class="task-failure"><strong>Failure reason:</strong> ${esc(reason)}</div>` : ""}</div><div>${renderImpactBadge(classifyHistoryImpact(null))} ${badge(t.state)} ${t.aggregate_verdict ? badge(t.aggregate_verdict) : ""}<button class="secondary detail" data-id="${esc(t.id)}">View</button></div></div>`;
+        })
+        .join("")
+    : '<div class="empty">No pending tasks.</div>';
+  const todoHistory = [
+    ...history,
+    ...regressions.map((r) => ({
+      id: r.id,
+      title: `Confirmed ${r.framework}/${r.backend} regression`,
+      gains: { [r.metric]: r.delta_percent },
+      commit_sha: r.revision,
+      created_at: "confirmed by two measurements",
+    })),
+  ];
+  renderTodos(enriched, decisions, todoHistory, dismissedTodos);
+  renderMatrix(matrix);
+  renderPerformanceAnalysis();
+  renderPerformanceTrend(observations);
+  renderDoneTasks(history, enriched, machines);
+  renderDigest(history);
+  renderStudies(studies, tasks);
+  renderStudyFeedback(studies, tasks, history);
+  renderDevices(machines);
+  renderActivity(activity);
+  $("#active-work").innerHTML = renderDeviceTaskGroups(activity);
+  updateTaskTabs(enriched);
+  document
+    .querySelectorAll(".activity-toggle")
+    .forEach((b) => (b.onclick = () => toggleDeviceActivity(b)));
+  document
+    .querySelectorAll(".detail")
+    .forEach((b) => (b.onclick = () => showTask(b.dataset.id)));
+  const taskById = new Map(enriched.map((task) => [task.id, task]));
+  document.querySelectorAll(".detail[data-id]").forEach((button) => {
+    const task = taskById.get(button.dataset.id);
+    const container = button.closest(".row, .device-task, .history-group, .terminal-task, .study-task-link");
+    const title = container?.querySelector("strong");
+    if (!task || !title || title.dataset.taskDecorated) return;
+    title.dataset.taskDecorated = "true";
+    title.textContent = `${taskLabel(task)} · ${title.textContent}`;
+    const meta = document.createElement("div");
+    meta.className = "meta task-origin-result";
+    const run = (task.runs || []).find((item) => item.status === "running");
+    meta.textContent = `Source: ${taskSource(task)} · Result: ${taskResult(task, run)}`;
+    title.insertAdjacentElement("afterend", meta);
+  });
+}
+function progress(s) {
+  return (
+    {
+      proposed: 5,
+      triaged: 12,
+      implementing: 25,
+      candidate_ready: 38,
+      validating: 55,
+      evaluating: 68,
+      debating: 75,
+      awaiting_human: 80,
+      ready_to_merge: 88,
+      integrating: 94,
+      integrated: 100,
+      observing: 100,
+      rejected: 100,
+      failed: 100,
+      reverted: 100,
+      blocked: 50,
+    }[s] || 0
+  );
+}
+function formatDuration(seconds) {
+  seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  if (seconds < 86400)
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
+}
+async function showTask(id) {
+  const t = await api("/api/tasks/" + encodeURIComponent(id));
+  const evals = t.evaluations || [];
+  $("#detail").innerHTML =
+    `<h2>${esc(t.title)}</h2><p>${esc(t.hypothesis)}</p><p>${badge(t.state)} ${t.aggregate_verdict ? badge(t.aggregate_verdict) : ""} <span class="meta">base ${esc(t.base_sha || "unset")} → candidate ${esc(t.candidate_sha || "unset")}</span></p><h3>Device evidence</h3>${evals.length ? `<table class="matrix"><tr><th>Machine</th><th>Metric</th><th>Base</th><th>Candidate</th><th>Delta</th><th>Verdict</th></tr>${evals.map((e) => `<tr><td>${esc(e.machine_id)}</td><td>${esc(e.metric)}</td><td>${num(e.base_median)}</td><td>${num(e.candidate_median)}</td><td>${num(e.delta_percent)}%</td><td>${badge(e.verdict)}</td></tr>`).join("")}</table>` : '<div class="empty">No evaluated evidence.</div>'}<h3>Audit trail</h3><pre>${esc((t.audit || []).map((a) => `${a.created_at}  ${a.event_type}  ${a.actor}`).join("\n") || "No events")}</pre>`;
+  $("#detail").insertAdjacentHTML(
+    "afterbegin",
+    `<div class="meta">${esc(taskLabel(t))} · Source: ${esc(taskSource(t))} · Result: ${esc(taskResult(t))} · Internal ID: ${esc(t.id)}</div>`,
+  );
+  $("#detail-dialog").showModal();
+}
+function expectedRuntimes(model) {
+  const formats = new Set(Object.keys(model.files || {}));
+  return [
+    {
+      format: "gguf",
+      framework: "backpack",
+      backend: "webgpu",
+      artifact: formats.has("gguf"),
+    },
+    {
+      format: "ort",
+      framework: "backpack",
+      backend: "webgpu",
+      artifact: formats.has("ort"),
+    },
+    {
+      format: "gguf",
+      framework: "llamacpp",
+      backend: "vulkan",
+      artifact: formats.has("gguf"),
+    },
+    {
+      format: "ort",
+      framework: "ort",
+      backend: "webgpu",
+      artifact: formats.has("ort"),
+    },
+  ];
+}
+function frameworkName(v) {
+  return { backpack: "Backpack", llamacpp: "llama.cpp", ort: "ORT" }[v] || v;
+}
+function performanceCommand(r) {
+  const modelPath = r.model.files?.[r.format]?.path || "<model-path>",
+    q = (s) => `"${String(s).replaceAll('"', '\\"')}"`;
+  if (r.framework === "llamacpp")
+    return `cd /d D:\\workspace\\project\\agents\\webgfx-agents\\ai-test\nnode scripts\\perf-test-llamacpp.js --llamacpp-backend vulkan --model ${q(modelPath)} -pl 128 -gl 128 -r 5 --ngl 99\n\nllama-bench records prompt processing (pp128) and token generation (tg128) separately. The collector maps plTs to prefill_tok_s and decode_tok_s.`;
+  if (r.framework === "ort") {
+    const qwen = r.model.id === "qwen3.5-2b" || r.model.id === "qwen3.5-4b",
+      capture = qwen ? "0" : "1",
+      note = qwen
+        ? "Temporary Qwen 3.5 exception: graph capture is disabled; results are marked graph_capture=false."
+        : "Graph capture is the ORT WebGPU default; --reuse_generator is required.";
+    return `Set model.decoder.session_options.provider_options[].webgpu.enableGraphCapture to "${capture}" in:\n${modelPath}\\genai_config.json\n\ncd /d D:\\backup\\x64\\ort\\20260720-ort-da90494371-genai-87047e6d77\nmodel_benchmark.exe -i ${q(modelPath)} -l 128 -g 128 -r 5 --reuse_generator\n\n${note} Timeout: 60 seconds per prompt length.`;
+  }
+  const format = r.format === "ort" ? "onnx" : "gguf";
+  return `cd /d D:\\workspace\\project\\backpack\ngitignore\\runtime\\build\\backpack_llm.exe --model ${q(modelPath)} --format ${format} --benchmark --bench-prompt-len 128 --bench-gen-tokens 64\n\nThis bounded command measures the Status row directly and avoids the expensive 128-to-4096 sweep. Timeout: 240 seconds.`;
+}
+function showPerformanceCommand(button) {
+  $("#detail").innerHTML =
+    `<h2>Performance collection command</h2><p>${esc(button.dataset.title)}</p><pre class="command-detail">${esc(button.dataset.command)}</pre><p class="muted">Run on ${esc(button.dataset.device)}. Prefill and decode are stored as separate metrics for this exact framework/backend combination.</p>`;
+  $("#detail-dialog").showModal();
+}
+let validationRows = [],
+  trendObservations = [];
+let activeStatusModel = "";
+function applyStatusModelFilter() {
+  document
+    .querySelectorAll(".status-model-tab")
+    .forEach((button) =>
+      button.classList.toggle(
+        "active",
+        button.dataset.model === activeStatusModel,
+      ),
+    );
+  renderValidationRows();
+  renderPerformanceTrend(trendObservations);
+}
+function renderStatusModelTabs() {
+  const models = [
+    ...new Map(validationRows.map((r) => [r.model.id, r.model])).values(),
+  ];
+  if (!models.some((model) => model.id === activeStatusModel))
+    activeStatusModel = models[0]?.id || "";
+  $("#status-model-tabs").innerHTML = models
+    .map(
+      (model) =>
+        `<button type="button" class="status-model-tab" role="tab" data-model="${esc(model.id)}">${esc(model.name)}</button>`,
+    )
+    .join("");
+  document.querySelectorAll(".status-model-tab").forEach(
+    (button) =>
+      (button.onclick = () => {
+        activeStatusModel = button.dataset.model;
+        applyStatusModelFilter();
+      }),
+  );
+  document
+    .querySelectorAll(".status-model-tab")
+    .forEach((button) =>
+      button.classList.toggle(
+        "active",
+        button.dataset.model === activeStatusModel,
+      ),
+    );
+}
+function renderMatrix(matrix) {
+  validationRows = [];
+  for (const row of matrix.models || []) {
+    for (const cell of row.cells) {
+      const seen = new Set();
+      for (const spec of expectedRuntimes(row.model)) {
+        const matches = (cell.results || []).filter(
+            (x) =>
+              x.framework === spec.framework &&
+              x.format === spec.format &&
+              x.backend === spec.backend,
+          ),
+          result =
+            matches.find(
+              (x) => x.conformance === "pass" || x.conformance === "fail",
+            ) || matches[0],
+          metricsResult =
+            matches.find(
+              (x) =>
+                x.performance_validated && Object.keys(x.metrics || {}).length,
+            ) || result,
+          conformance = result?.conformance || "pending",
+          combined =
+            result && metricsResult && result !== metricsResult
+              ? {
+                  ...result,
+                  metrics: metricsResult.metrics,
+                  revision: metricsResult.revision,
+                  created_at: metricsResult.created_at,
+                }
+              : result;
+        validationRows.push({
+          model: row.model,
+          machine: cell.machine,
+          conformance,
+          conformant: conformance === "pass",
+          ...spec,
+          result: combined,
+        });
+        seen.add(`${spec.framework}/${spec.format}/${spec.backend}`);
+      }
+      for (const result of cell.results || []) {
+        if (result.framework === "backpack" && result.backend === "vulkan")
+          continue;
+        const key = `${result.framework}/${result.format}/${result.backend}`;
+        if (!seen.has(key))
+          validationRows.push({
+            model: row.model,
+            machine: cell.machine,
+            conformance: result.conformance,
+            conformant: result.conformance === "pass",
+            artifact: true,
+            format: result.format,
+            framework: result.framework,
+            backend: result.backend,
+            result,
+          });
+      }
+    }
+  }
+  renderStatusModelTabs();
+  renderValidationRows();
+}
+function comparisonStatusRows() {
+  const groups = new Map();
+  for (const row of validationRows.filter(
+    (r) => r.model.id === activeStatusModel,
+  )) {
+    const key = `${row.model.id}/${row.machine.id}`;
+    if (!groups.has(key))
+      groups.set(key, { model: row.model, machine: row.machine, rows: [] });
+    groups.get(key).rows.push(row);
+  }
+  const pairs = [];
+  for (const group of groups.values()) {
+    const find = (framework, format) =>
+      group.rows.find((r) => r.framework === framework && r.format === format);
+    pairs.push({
+      ...group,
+      format: "ort",
+      label: "ORT WebGPU",
+      backpack: find("backpack", "ort"),
+      reference: find("ort", "ort"),
+    });
+    pairs.push({
+      ...group,
+      format: "gguf",
+      label: "llama.cpp Vulkan",
+      backpack: find("backpack", "gguf"),
+      reference: find("llamacpp", "gguf"),
+    });
+  }
+  return pairs;
+}
+function statusPerf(row, key) {
+  const value = row?.result?.metrics?.[key];
+  if (value != null) return `<strong>${num(value)}</strong>`;
+  return '<span class="muted">pending</span>';
+}
+function backpackPerfCell(backpack, reference, key) {
+  const value = Number(backpack?.result?.metrics?.[key]),
+    baseline = Number(reference?.result?.metrics?.[key]);
+  if (!Number.isFinite(value))
+    return '<td><span class="muted">pending</span></td>';
+  if (!Number.isFinite(baseline) || baseline === 0)
+    return `<td><strong>${num(value)}</strong><div class="meta">no comparison</div></td>`;
+  const delta = (value / baseline - 1) * 100,
+    tone = delta > 0 ? "perf-better" : delta < 0 ? "perf-worse" : "perf-equal";
+  return `<td class="${tone}"><strong>${num(value)}</strong><div class="perf-delta">${delta > 0 ? "+" : ""}${num(delta)}%</div></td>`;
+}
+function statusInstanceName(runtime, backend, format) {
+  const runtimeName =
+      runtime === "llamacpp"
+        ? "llama.cpp"
+        : runtime === "ort"
+          ? "ORT"
+          : "Backpack",
+    backendName = backend === "vulkan" ? "Vulkan" : "WebGPU",
+    formatName = format === "ort" ? "ONNX" : String(format || "").toUpperCase();
+  return `${runtimeName}/${backendName}/${formatName}`;
+}
+function statusRevision(row) {
+  return `${esc(row?.result?.revision || "—")}<div class="meta">${esc(shortDate(row?.result?.created_at))}</div>`;
+}
+function statusCommand(row, label) {
+  if (!row) return '<span class="muted">—</span>';
+  const title = `${row.machine.name} · ${row.model.name} · ${label}`;
+  return `<button class="secondary row-command" data-device="${esc(row.machine.name)}" data-title="${esc(title)}" data-command="${esc(performanceCommand(row))}">${esc(label)}</button>`;
+}
+function renderValidationRows() {
+  const query = ($("#validation-search")?.value || "").trim().toLowerCase(),
+    sort = $("#validation-sort")?.value || "device",
+    direction = $("#validation-direction")?.dataset.direction || "asc",
+    keys = {
+      device: (r) => r.machine.name,
+      framework: (r) => r.label,
+      backend: (r) =>
+        `${r.backpack?.backend || ""}/${r.reference?.backend || ""}`,
+      conformance: (r) =>
+        `${r.backpack?.conformance || "pending"}/${r.reference?.conformance || "pending"}`,
+    };
+  let rows = comparisonStatusRows().filter(
+    (r) =>
+      !query ||
+      [
+        r.machine.name,
+        r.machine.fingerprint?.gpu,
+        r.model.name,
+        r.format,
+        r.label,
+        "Backpack",
+        r.backpack?.backend,
+        r.reference?.backend,
+        r.backpack?.conformance,
+        r.reference?.conformance,
+        r.backpack?.result?.revision,
+        r.reference?.result?.revision,
+      ].some((v) =>
+        String(v || "")
+          .toLowerCase()
+          .includes(query),
+      ),
+  );
+  rows.sort(
+    (a, b) =>
+      String(keys[sort](a)).localeCompare(String(keys[sort](b))) ||
+      a.machine.name.localeCompare(b.machine.name) ||
+      a.format.localeCompare(b.format),
+  );
+  if (direction === "desc") rows.reverse();
+  const selected = validationRows.find(
+    (r) => r.model.id === activeStatusModel,
+  )?.model;
+  $("#validation-count").textContent =
+    `${rows.length} comparison rows${selected ? ` · ${selected.name}` : ""}`;
+  renderStatusChart(rows);
+  $("#model-matrix").innerHTML = rows.length
+    ? `<table class="status-table status-comparison"><thead><tr><th rowspan="2">Device</th><th colspan="6" class="instance-group">Instance A</th><th colspan="6" class="instance-group reference-group">Instance B</th></tr><tr><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS</th><th>Decode TPS</th><th>Revision / Date</th><th>Command</th><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS</th><th>Decode TPS</th><th>Revision / Date</th><th>Command</th></tr></thead><tbody>${rows
+        .map((r, i) => {
+          const p = rows[i - 1],
+            n = rows[i + 1],
+            newGroup = !p || p.machine.id !== r.machine.id,
+            endGroup = !n || n.machine.id !== r.machine.id,
+            b = r.backpack,
+            c = r.reference,
+            captureOff =
+              c?.framework === "ort" &&
+              c.result?.metrics?.graph_capture === false;
+          return `<tr data-model="${esc(r.model.name)}" class="${newGroup ? "status-group" : ""} ${endGroup ? "status-group-end" : ""}"><td><strong>${esc(r.machine.name)}</strong><div class="meta">${esc(r.machine.fingerprint?.gpu || "unknown GPU")}</div></td><td class="runtime-instance"><strong>${esc(statusInstanceName("backpack", b?.backend || "webgpu", r.format))}</strong></td><td>${badge(b?.conformance || "pending")}</td>${backpackPerfCell(b, c, "prefill_tok_s")}${backpackPerfCell(b, c, "decode_tok_s")}<td class="runtime-revision backpack-revision">${statusRevision(b)}</td><td>${statusCommand(b, "Backpack")}</td><td class="runtime-instance reference-instance"><strong>${esc(statusInstanceName(c?.framework || (r.format === "ort" ? "ort" : "llamacpp"), c?.backend || (r.format === "ort" ? "webgpu" : "vulkan"), r.format))}</strong>${captureOff ? '<span class="badge stale graph-capture-off">Graph capture off</span>' : ""}</td><td>${badge(c?.conformance || "pending")}</td><td>${statusPerf(c, "prefill_tok_s")}</td><td>${statusPerf(c, "decode_tok_s")}</td><td class="runtime-revision reference-revision">${statusRevision(c)}</td><td>${statusCommand(c, r.format === "ort" ? "ORT" : "llama.cpp")}</td></tr>`;
+        })
+        .join("")}</tbody></table>`
+    : '<div class="empty">No comparison results match this search.</div>';
+  document
+    .querySelectorAll(".row-command")
+    .forEach((b) => (b.onclick = () => showPerformanceCommand(b)));
+}
+function renderStatusChart(rows) {
+  const el = $("#status-chart");
+  if (!el) return;
+  const samples = rows
+      .flatMap((r) => [
+        {
+          name: "Backpack",
+          row: r.backpack,
+          device: r.machine.name,
+          format: r.format,
+        },
+        {
+          name: r.label,
+          row: r.reference,
+          device: r.machine.name,
+          format: r.format,
+        },
+      ])
+      .filter((x) => x.row?.result?.metrics),
+    metrics = ["prefill_tok_s", "decode_tok_s"];
+  el.innerHTML = samples.length
+    ? `<div class="status-chart-grid">${metrics
+        .map((metric) => {
+          const values = samples
+              .map((x) => Number(x.row.result.metrics?.[metric]))
+              .filter(Number.isFinite),
+            max = Math.max(1, ...values);
+          return `<section class="status-chart-panel"><header><strong>${metric === "prefill_tok_s" ? "Prefill TPS" : "Decode TPS"}</strong><span>higher is better</span></header>${samples
+            .map((x) => {
+              const value = Number(x.row.result.metrics?.[metric]);
+              return `<div class="status-chart-row"><span>${esc(x.device)} · ${esc(x.format.toUpperCase())} · ${esc(x.name)}</span><div><i class="${x.name === "Backpack" ? "backpack" : "reference"}" style="width:${Number.isFinite(value) ? Math.max(1, (value / max) * 100) : 0}%"></i></div><b>${Number.isFinite(value) ? num(value) : "—"}</b></div>`;
+            })
+            .join("")}</section>`;
+        })
+        .join("")}</div>`
+    : '<div class="empty compact">Performance charts will appear as measurements arrive.</div>';
+}
+async function showObservationHistory(button) {
+  const p = new URLSearchParams({
+      model_id: button.dataset.model,
+      machine_id: button.dataset.machine,
+      framework: button.dataset.framework,
+      format: button.dataset.format,
+      backend: button.dataset.backend,
+    }),
+    items = await api("/api/observations?" + p);
+  $("#detail").innerHTML =
+    `<h2>${esc(button.dataset.title)}</h2><p class="muted">Complete measurement history for this exact combination.</p>${items.length ? `${historyChart(items)}<table class="matrix"><thead><tr><th>Time</th><th>Revision</th><th>Conformance</th><th>Prefill</th><th>Decode</th></tr></thead><tbody>${items.map((x) => `<tr><td>${esc(x.created_at)}</td><td class="mono">${esc(x.revision || "—")}</td><td>${badge(x.conformance)}</td><td>${num(x.metrics?.prefill_tok_s)}</td><td>${num(x.metrics?.decode_tok_s)}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">No history recorded for this combination.</div>'}`;
+  $("#detail-dialog").showModal();
+}
+function historyChart(records) {
+  const rows = [...records]
+    .reverse()
+    .filter(
+      (x) =>
+        x.metrics?.prefill_tok_s != null || x.metrics?.decode_tok_s != null,
+    );
+  if (!rows.length)
+    return '<div class="empty compact">No performance samples to chart.</div>';
+  const W = 760,
+    H = 230,
+    pad = 34,
+    values = rows
+      .flatMap((x) => [x.metrics?.prefill_tok_s, x.metrics?.decode_tok_s])
+      .filter(Number.isFinite),
+    max = Math.max(...values, 1),
+    x = (i) =>
+      pad +
+      (rows.length === 1
+        ? (W - 2 * pad) / 2
+        : (i * (W - 2 * pad)) / (rows.length - 1)),
+    y = (v) => H - pad - (Number(v) / max) * (H - 2 * pad),
+    line = (key) =>
+      rows
+        .map((r, i) =>
+          r.metrics?.[key] == null ? "" : `${x(i)},${y(r.metrics[key])}`,
+        )
+        .filter(Boolean)
+        .join(" "),
+    points = (key) =>
+      rows
+        .map((r, i) =>
+          r.metrics?.[key] == null
+            ? ""
+            : `<circle cx="${x(i)}" cy="${y(r.metrics[key])}" r="3"><title>${esc(r.created_at)} · ${num(r.metrics[key])} tok/s</title></circle>`,
+        )
+        .join("");
+  return `<div class="history-chart"><div class="chart-legend"><span class="prefill">Prefill</span><span class="decode">Decode</span><span>0–${num(max)} tok/s</span></div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Performance trend"><line class="axis" x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${H - pad}"/><line class="axis" x1="${pad}" y1="${pad}" x2="${pad}" y2="${H - pad}"/><polyline class="prefill-line" points="${line("prefill_tok_s")}"/><g class="prefill-points">${points("prefill_tok_s")}</g><polyline class="decode-line" points="${line("decode_tok_s")}"/><g class="decode-points">${points("decode_tok_s")}</g></svg></div>`;
+}
+function classifyHistoryImpact(value) {
+  if (value == null)
+    return {
+      key: "unquantified",
+      name: "Measured outcome",
+      rank: 7,
+      value: null,
+    };
+  if (value >= 20)
+    return {
+      key: "transformative",
+      name: "Transformative improvement",
+      rank: 0,
+      value,
+    };
+  if (value >= 5)
+    return { key: "strong", name: "Strong improvement", rank: 1, value };
+  if (value >= 1)
+    return {
+      key: "measured_gain",
+      name: "Measured improvement",
+      rank: 2,
+      value,
+    };
+  if (value > -1)
+    return { key: "noise", name: "Within measurement noise", rank: 3, value };
+  if (value > -5)
+    return {
+      key: "measured_regression",
+      name: "Measured regression",
+      rank: 4,
+      value,
+    };
+  if (value > -20)
+    return {
+      key: "serious_regression",
+      name: "Serious regression",
+      rank: 5,
+      value,
+    };
+  return {
+    key: "critical_regression",
+    name: "Critical regression",
+    rank: 6,
+    value,
+  };
+}
+function historyGroupImpact(records) {
+  const values = records
+    .flatMap((r) => (r.device_impacts || []).map((d) => d.impact?.value))
+    .filter(Number.isFinite);
+  const value = values.some((x) => x <= -5)
+    ? Math.min(...values)
+    : values.length
+      ? values.reduce((a, b) => a + b, 0) / values.length
+      : null;
+  return classifyHistoryImpact(value);
+}
+function renderImpactBadge(impact) {
+  return `<span class="history-impact-badge ${esc(impact?.key || "unquantified")}">${esc(impact?.name || "Measured outcome")}${impact?.value == null ? "" : ` · ${impact.value >= 0 ? "+" : ""}${num(impact.value)}%`}</span>`;
+}
+function historyTpsRows(record) {
+  const before = record.before || {},
+    after = record.after || {},
+    keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(
+      (key) =>
+        /(tps|tok_s|tokens_per_second|throughput)/i.test(key) &&
+        !/percent/i.test(key),
+    );
+  return keys.map((key) => {
+    const base = Number(before[key]),
+      candidate = Number(after[key]),
+      delta =
+        Number.isFinite(base) && base !== 0 && Number.isFinite(candidate)
+          ? (candidate / base - 1) * 100
+          : null,
+      explicit = (record.evidence || []).map((x) => x?.device).filter(Boolean),
+      device =
+        explicit.length === 1
+          ? explicit[0]
+          : /webgfx[_-]?104|nvidia/i.test(key)
+            ? "webgfx-104"
+            : /webgfx[_-]?103|amd/i.test(key)
+              ? "webgfx-103"
+              : /webgfx[_-]?31|intel/i.test(key)
+                ? "webgfx-31"
+                : "Fleet / record";
+    return {
+      device,
+      metric: key.replaceAll("_", " "),
+      base: Number.isFinite(base) ? base : null,
+      candidate: Number.isFinite(candidate) ? candidate : null,
+      delta,
+    };
+  });
+}
+function taskTiming(task, finishedAt) {
+  const runs = task?.runs || [],
+    starts = runs.map((r) => r.started_at).filter(Boolean),
+    start = starts.sort()[0] || task?.created_at,
+    end =
+      runs
+        .map((r) => r.updated_at)
+        .filter(Boolean)
+        .sort()
+        .at(-1) || finishedAt,
+    duration =
+      start && end ? (Date.parse(end) - Date.parse(start)) / 1000 : null;
+  return { start, duration };
+}
+function renderDoneTasks(items, tasks = [], machines = []) {
+  const taskById = new Map(tasks.map((t) => [t.id, t])),
+    groups = new Map();
+  for (const h of items) {
+    const key = `${h.task_id || h.title}|${h.commit_sha || ""}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(h);
+  }
+  const cards = [...groups.values()].map((records) => ({
+      records,
+      impact: historyGroupImpact(records),
+    })),
+    sections = new Map();
+  for (const card of cards) {
+    if (!sections.has(card.impact.key))
+      sections.set(card.impact.key, { impact: card.impact, cards: [] });
+    sections.get(card.impact.key).cards.push(card);
+  }
+  const renderCard = ({ records, impact }) => {
+    const first = records[0],
+      task = taskById.get(first.task_id),
+      timing = taskTiming(task, first.created_at),
+      deviceRows = records.flatMap((record) =>
+        (record.device_impacts || []).map((device) => ({ ...device, record })),
+      ),
+      tpsRows = records.flatMap((record) =>
+        historyTpsRows(record).map((row) => ({
+          ...row,
+          revision: record.commit_sha || "uncommitted",
+        })),
+      );
+    return `<article class="history-group"><header><div><strong>${esc(task?.title || first.title)}</strong><div class="meta">Started ${esc(timing.start ? new Date(timing.start).toLocaleString() : "not recorded")} · Duration ${timing.duration == null ? "not recorded" : formatDuration(timing.duration)} · ${esc(first.commit_sha || "uncommitted")}</div></div>${renderImpactBadge(impact)}</header><p>${esc(first.summary)}</p>${tpsRows.length ? `<h3>Recorded TPS evidence</h3><div class="table-wrap"><table class="history-tps-table"><thead><tr><th>Device</th><th>Metric</th><th>Baseline TPS</th><th>Candidate TPS</th><th>Change</th><th>Revision</th></tr></thead><tbody>${tpsRows.map((row) => `<tr><td>${esc(row.device)}</td><td>${esc(row.metric)}</td><td>${row.base == null ? "—" : num(row.base)}</td><td>${row.candidate == null ? "—" : num(row.candidate)}</td><td class="${row.delta == null ? "" : row.delta < 0 ? "impact-negative" : "impact-positive"}">${row.delta == null ? "—" : `${row.delta >= 0 ? "+" : ""}${num(row.delta)}%`}</td><td class="mono">${esc(row.revision)}</td></tr>`).join("")}</tbody></table></div>` : ""}${
+      deviceRows.length
+        ? `<h3>Device impact</h3><div class="table-wrap"><table class="history-impact-table"><thead><tr><th>Device</th><th>GPU</th><th>Prefill TPS</th><th>Decode TPS</th><th>Impact</th><th>Measured deltas</th></tr></thead><tbody>${deviceRows
+            .map((row) => {
+              const metrics = row.metrics || {},
+                deltas = (row.deltas || [])
+                  .map(
+                    (delta) =>
+                      `${delta.metric.split(" / ").pop().replaceAll("_", " ")}: ${delta.percent >= 0 ? "+" : ""}${num(delta.percent)}%`,
+                  )
+                  .join(" · ");
+              return `<tr><td><strong>${esc(row.device)}</strong></td><td>${esc(row.gpu || machines.find((m) => m.id === row.machine_id)?.fingerprint?.gpu || "—")}</td><td>${metrics.prefill_tok_s == null ? "—" : num(metrics.prefill_tok_s)}</td><td>${metrics.decode_tok_s == null ? "—" : num(metrics.decode_tok_s)}</td><td>${renderImpactBadge(row.impact)}</td><td class="${row.impact?.value < 0 ? "impact-negative" : "impact-positive"}">${esc(deltas || "Measured baseline")}</td></tr>`;
+            })
+            .join("")}</tbody></table></div>`
+        : ""
+    }${task ? `<button class="history-task-link detail" data-id="${esc(task.id)}">View task details</button>` : ""}</article>`;
+  };
+  const measuredIds = new Set(items.map((x) => x.task_id).filter(Boolean)),
+    terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
+    unmeasured = tasks.filter(
+      (t) => terminal.has(t.state) && !measuredIds.has(t.id),
+    );
+  const ordered = [...sections.values()].sort(
+      (a, b) => a.impact.rank - b.impact.rank,
+    ),
+    measured = ordered
+      .map(
+        (section) =>
+          `<section class="history-tier history-tier-${esc(section.impact.key)}"><div class="history-tier-heading"><div><h2>${esc(section.impact.name)}</h2><p>${section.cards.length} completed task${section.cards.length === 1 ? "" : "s"}</p></div><span>${section.cards.length}</span></div><div class="history-tier-cards">${section.cards.map(renderCard).join("")}</div></section>`,
+      )
+      .join(""),
+    plain = unmeasured
+      .map((t) => {
+        const timing = taskTiming(t, t.updated_at);
+        return `<article class="terminal-task"><div><strong>${esc(t.title)}</strong><div class="meta">Started ${esc(timing.start ? new Date(timing.start).toLocaleString() : "not recorded")} · Duration ${timing.duration == null ? "not recorded" : formatDuration(timing.duration)} · ${esc(t.id)}</div><p>${esc(t.verdict_reason || t.hypothesis || "Task completed without measured performance evidence.")}</p></div><div>${renderImpactBadge(classifyHistoryImpact(null))} ${badge(t.state)} <button class="secondary detail" data-id="${esc(t.id)}">View</button></div></article>`;
+      })
+      .join("");
+  $("#done-tasks").innerHTML =
+    measured + plain ||
+    '<div class="empty">No tasks have been completed yet.</div>';
+  const total = cards.length + unmeasured.length;
+  $("#done-count").textContent = `${total} done`;
+  $("#done-tab-count").textContent = total || "";
+}
+function historyDailyDigest(items) {
+  const days = new Map();
+  for (const item of items) {
+    const day = String(item.created_at || "").slice(0, 10) || "Unknown date",
+      key = `${item.title}|${item.commit_sha || ""}`;
+    if (!days.has(day)) days.set(day, new Map());
+    days.get(day).set(key, item);
+  }
+  return (
+    [...days.entries()]
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([day, records]) => {
+        const entries = [...records.values()],
+          major = entries.filter(
+            (item) => item.impact?.rank <= 1 || item.impact?.rank >= 5,
+          );
+        return `<article class="daily-digest"><header><div><h2>${esc(day)}</h2><span class="meta">${entries.length} recorded milestone${entries.length === 1 ? "" : "s"}</span></div><strong>${major.length} major</strong></header>${major.length ? `<section><h3>Major improvements and regressions</h3>${major.map((item) => `<div class="digest-major"><div><strong>${esc(item.title)}</strong><span class="meta mono">${esc(item.commit_sha || "uncommitted")}</span></div>${renderImpactBadge(item.impact)}</div>`).join("")}</section>` : '<div class="empty compact">No major performance movement recorded.</div>'}<section><h3>Key findings</h3><ul>${entries
+          .slice(0, 8)
+          .map(
+            (item) =>
+              `<li><strong>${esc(item.title)}</strong> — ${esc(item.summary)}</li>`,
+          )
+          .join("")}</ul></section></article>`;
+      })
+      .join("") ||
+    '<div class="empty">No daily progress has been recorded yet.</div>'
+  );
+}
+function digestItems(items) {
+  const groups = new Map(),
+    normalize = (text) =>
+      String(text || "")
+        .replace(/Qwen 3\.5 (?:2B|4B)/gi, "Qwen 3.5")
+        .replace(/\s+/g, " ")
+        .trim();
+  for (const item of items) {
+    const day = shortDate(item.created_at),
+      title = normalize(item.title),
+      key = `${day}|${title.toLowerCase()}`;
+    if (!groups.has(key))
+      groups.set(key, {
+        ...item,
+        title,
+        summary: normalize(item.summary),
+        digestModels: new Set(),
+      });
+    const group = groups.get(key);
+    if (item.model_id) group.digestModels.add(item.model_id);
+  }
+  return [...groups.values()].map((item) => {
+    const models = [...item.digestModels].map((id) =>
+      id.replace("qwen3.5-", "").toUpperCase(),
+    );
+    delete item.digestModels;
+    return {
+      ...item,
+      summary: `${item.summary}${models.length > 1 ? ` Affected models: ${models.join(", ")}.` : ""}`,
+    };
+  });
+}
+function digestImpactName(impact) {
+  return (
+    {
+      transformative: "Breakthrough improvement",
+      strong: "Major improvement",
+      measured_gain: "Incremental improvement",
+      noise: "No material change",
+      measured_regression: "Minor regression",
+      serious_regression: "Major regression",
+      critical_regression: "Severe regression",
+      unquantified: "Impact not quantified",
+    }[impact?.key] ||
+    impact?.name ||
+    "Measured result"
+  );
+}
+function digestCalendar(items) {
+  if (!items.length)
+    return '<div class="empty">No daily progress has been recorded yet.</div>';
+  const byDay = new Map();
+  for (const item of items) {
+    const day = shortDate(item.created_at);
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push(item);
+  }
+  const latest = new Date(
+      Math.max(Date.now(), ...items.map((x) => Date.parse(x.created_at) || 0)),
+    ),
+    end = new Date(
+      Date.UTC(
+        latest.getUTCFullYear(),
+        latest.getUTCMonth(),
+        latest.getUTCDate(),
+      ),
+    ),
+    start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 364 - start.getUTCDay());
+  const cells = [],
+    months = new Map();
+  let week = 0,
+    lastMonth = "";
+  for (
+    let cursor = new Date(start);
+    cursor <= end;
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  ) {
+    const key = cursor.toISOString().slice(0, 10),
+      entries = byDay.get(key) || [],
+      month = cursor.toLocaleDateString(undefined, {
+        month: "short",
+        timeZone: "UTC",
+      });
+    if (cursor.getUTCDay() === 0 && month !== lastMonth) {
+      months.set(week, month);
+      lastMonth = month;
+    }
+    const negative = entries.some((x) =>
+        [
+          "measured_regression",
+          "serious_regression",
+          "critical_regression",
+        ].includes(x.impact?.key),
+      ),
+      major = entries.some((x) =>
+        [
+          "transformative",
+          "critical_regression",
+          "serious_regression",
+        ].includes(x.impact?.key),
+      ),
+      level = !entries.length ? 0 : major ? 4 : Math.min(3, entries.length),
+      tone = negative ? "regression" : "gain",
+      details = entries
+        .map((x) => `${x.title} — ${x.impact?.name || "Measured result"}`)
+        .join("\n");
+    cells.push(
+      `<button type="button" class="digest-square ${entries.length ? `${tone} level-${level}` : ""}" data-date="${esc(key)}" title="${esc(`${key}: ${entries.length} item${entries.length === 1 ? "" : "s"}${details ? `\n${details}` : ""}`)}" aria-label="${esc(`${key}, ${entries.length} progress items`)}"></button>`,
+    );
+    if (cursor.getUTCDay() === 6) week++;
+  }
+  return `<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w, label]) => `<span style="left:${w * 15}px">${esc(label)}</span>`).join("")}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join("")}</div></div><div class="digest-heatmap-footer"><span class="digest-regression-key">Regression</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`;
+}
+function renderDigest(items) {
+  const digest = digestItems(items).map((item) => ({
+    ...item,
+    impact: { ...item.impact, name: digestImpactName(item.impact) },
+  }));
+  $("#digest").innerHTML = `${digestCalendar(digest)}<div id="digest-day-detail" class="digest-day-detail empty compact">Select a date to see its detailed findings.</div>`;
+  document.querySelectorAll(".digest-square").forEach((button) => {
+    button.onclick = () => {
+      document.querySelectorAll(".digest-square").forEach((square) =>
+        square.classList.toggle("selected", square === button),
+      );
+      const selected = digest.filter(
+        (item) => shortDate(item.created_at) === button.dataset.date,
+      );
+      const detail = $("#digest-day-detail");
+      detail.className = "digest-day-detail";
+      detail.innerHTML = selected.length
+        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><strong>${esc(item.title)}</strong>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
+        : `<h2>${esc(button.dataset.date)}</h2><div class="empty compact">No progress was recorded on this date.</div>`;
+    };
+  });
+  const days = new Set(items.map((item) => shortDate(item.created_at)));
+  $("#digest-count").textContent =
+    `${days.size} day${days.size === 1 ? "" : "s"}`;
+}
+let activeTaskTab = "active";
+function updateTaskTabs(tasks) {
+  const running = tasks.filter((t) =>
+      (t.runs || []).some((r) => r.status === "running"),
+    ).length,
+    terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
+    pending = tasks.filter(
+      (t) =>
+        !terminal.has(t.state) &&
+        !(t.runs || []).some((r) => r.status === "running"),
+    ).length;
+  $("#active-tab-count").textContent = running || "";
+  $("#pending-tab-count").textContent = pending || "";
+  const select = (key) => {
+    activeTaskTab = key;
+    document
+      .querySelectorAll("[data-task-tab]")
+      .forEach((button) =>
+        button.classList.toggle("active", button.dataset.taskTab === key),
+      );
+    document
+      .querySelectorAll("[data-task-panel]")
+      .forEach((panel) => (panel.hidden = panel.dataset.taskPanel !== key));
+  };
+  document
+    .querySelectorAll("[data-task-tab]")
+    .forEach(
+      (button) => (button.onclick = () => select(button.dataset.taskTab)),
+    );
+  select(activeTaskTab);
+}
+function renderStudies(studies, tasks) {
+  const taskById = new Map(tasks.map((t) => [t.id, t]));
+  $("#nav-study-count").textContent = studies.length || "";
+  $("#study-count").textContent =
+    `${studies.filter((s) => s.status === "completed").length} completed · ${studies.length} total`;
+  $("#studies").innerHTML = studies.length
+    ? studies
+        .map((study) => {
+          const generated = (study.generated_tasks || []).map(
+            (id) => taskById.get(id) || { id, title: "Generated task" },
+          );
+          return `<article class="study-card"><header><div><div class="study-project">${esc(study.source)}</div><h2>${esc(study.title)}</h2><div class="meta mono">${esc(study.revision || "revision unavailable")} · ${esc(study.completed_at || study.created_at || "not completed")}</div></div>${badge(study.status)}</header><p>${esc(study.summary || "")}</p><div class="study-columns"><section><h3>Studied scope</h3>${study.scope?.length ? `<ul>${study.scope.map((x) => `<li class="mono">${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No source scope recorded.</div>'}</section><section><h3>Detailed findings</h3>${study.findings?.length ? `<ul>${study.findings.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No findings recorded.</div>'}</section></div><details><summary>References (${study.references?.length || 0})</summary>${study.references?.length ? `<ul>${study.references.map((x) => `<li class="mono">${esc(x)}</li>`).join("")}</ul>` : '<div class="empty compact">No references recorded.</div>'}</details><section class="study-tasks"><h3>Potential Tasks</h3>${generated.length ? generated.map((t) => `<button class="study-task-link secondary detail" data-id="${esc(t.id)}"><span>${esc(t.title)}</span><span class="mono">${esc(t.id)}</span></button>`).join("") : '<div class="empty compact">No tasks generated from this study.</div>'}</section></article>`;
+        })
+        .join("")
+    : '<div class="empty">No upstream studies have been recorded.</div>';
+}
+function renderActivity(a) {
+  const total = (a.fleet || []).length,
+    blocked = (a.blocked_tasks || []).length,
+    active = (a.tasks || a.active_tasks || []).filter((t) =>
+      (t.runs || []).some((r) => r.status === "running"),
+    ).length;
+  const cards = [
+    {
+      label: "Control plane",
+      value: "Active",
+      detail: "SSE and API responding",
+      state: "ok",
+    },
+    {
+      label: "Devices",
+      value: `${total} configured`,
+      detail: (a.fleet || []).map((x) => x.name).join(" · "),
+      state: "ok",
+    },
+    {
+      label: "Tasks",
+      value: `${active} running`,
+      detail: blocked ? `${blocked} need attention` : "No blocked decisions",
+      state: blocked ? "warn" : "ok",
+    },
+    {
+      label: "Automation",
+      value: "Monitoring",
+      detail: "Refresh every 15 seconds",
+      state: "ok",
+    },
+  ];
+  $("#activity-strip").innerHTML = cards
+    .map(
+      (c) =>
+        `<div class="health-card ${c.state === "ok" ? "" : c.state}"><i class="health-icon"></i><div><strong>${esc(c.value)}</strong><div class="meta">${esc(c.label)} · ${esc(c.detail)}</div></div></div>`,
+    )
+    .join("");
+  $("#activity-task-count").textContent = `${active} running`;
+  $("#last-refresh").textContent =
+    `${(a.events || []).length} events · updated ${new Date(a.server_time).toLocaleTimeString()}`;
+  $("#activity-feed").innerHTML = (a.events || []).length
+    ? (a.events || [])
+        .map(
+          (e) =>
+            `<details class="activity-log"><summary><time>${new Date(e.created_at).toLocaleTimeString()}</time><span><strong>${esc(eventLabel(e))}</strong><span class="meta">${esc(e.actor)} · ${esc(e.entity_type)} ${esc(e.entity_id)}</span></span></summary><div class="activity-log-detail"><dl><dt>Timestamp</dt><dd class="mono">${esc(e.created_at)}</dd><dt>Event</dt><dd class="mono">${esc(e.event_type)}</dd><dt>Actor</dt><dd>${esc(e.actor)}</dd><dt>Entity</dt><dd class="mono">${esc(e.entity_type)} / ${esc(e.entity_id)}</dd></dl><div class="meta">Payload</div><pre>${esc(JSON.stringify(e.payload || {}, null, 2))}</pre></div></details>`,
+        )
+        .join("")
+    : '<div class="empty">No activity recorded.</div>';
+}
+function renderDeviceTaskGroups(a) {
+  const tasks = a.tasks || a.active_tasks || [];
+  return (a.fleet || [])
+    .map((device) => {
+      const applicable = tasks.filter((t) =>
+          (t.runs || []).some(
+            (r) => r.machine_id === device.id && r.status === "running",
+          ),
+        ),
+        blockers = tasks
+          .flatMap((t) =>
+            (t.runs || [])
+              .filter(
+                (r) =>
+                  r.machine_id === device.id &&
+                  ["blocked", "failed"].includes(r.status),
+              )
+              .map((r) => ({ task: t, run: r })),
+          )
+          .slice(0, 3),
+        paused = !!device.activity_paused,
+        empty = paused
+          ? '<div class="empty compact">Tasks are stopped by the operator.</div>'
+          : blockers.length
+            ? `<div class="device-blockers"><strong>Blocked</strong>${blockers.map((x) => `<div><span>${esc(x.task.title)}</span><span class="meta">${esc(x.run.error || x.task.verdict_reason || x.run.phase || "Requires intervention")}</span></div>`).join("")}</div>`
+            : '<div class="empty compact">No runnable task; scheduler is waiting for new goal work.</div>';
+      return `<section class="device-task-group"><header><div><strong>${esc(device.name)}</strong><span class="meta">${esc(device.gpu)} · ${paused ? "tasks stopped" : applicable.length ? "working" : "waiting"}</span></div><div>${badge(paused ? "paused" : applicable.length ? "running" : "blocked")} <button class="secondary activity-toggle" data-id="${esc(device.id)}" data-action="${paused ? "resume" : "pause"}">${paused ? "Resume tasks" : "Stop tasks"}</button></div></header>${applicable.length ? applicable.map((t) => renderDeviceTask(t, device)).join("") : empty}</section>`;
+    })
+    .join("");
+}
+function failureReason(t) {
+  const failed = (t.runs || []).find((r) => r.status === "failed" && r.error);
+  return failed?.error || t.verdict_reason || "";
+}
+function renderTodos(tasks, decisions, history, dismissed = []) {
+  const taskById = new Map(tasks.map((t) => [t.id, t])),
+    items = [],
+    hidden = new Set(dismissed);
+  for (const d of decisions)
+    items.push({
+      id: `decision:${d.id}`,
+      title: taskById.get(d.task_id)?.title || d.task_id,
+      reason: d.question,
+      meta: `${d.task_id}${d.recommendation ? ` · recommends ${d.recommendation}` : ""}`,
+      status: "awaiting_human",
+    });
+  for (const t of tasks.filter(
+    (t) =>
+      t.state === "awaiting_human" &&
+      !decisions.some((d) => d.task_id === t.id),
+  ))
+    items.push({
+      id: `task:${t.id}`,
+      title: t.title,
+      reason:
+        t.verdict_reason ||
+        "Human review is required before this task can continue.",
+      meta: t.id,
+      status: "awaiting_human",
+    });
+  for (const t of tasks)
+    for (const run of (t.runs || []).filter((r) => r.status === "failed"))
+      items.push({
+        id: `run:${run.id}`,
+        title: t.title,
+        reason: run.error || "The device run failed without a recorded reason.",
+        meta: `${run.machine_name} · ${run.id}`,
+        status: "failed",
+      });
+  for (const h of history)
+    for (const [metric, gain] of Object.entries(h.gains || {}))
+      if (Number(gain) < 0)
+        items.push({
+          id: `regression:${h.id}:${metric}`,
+          title: `Regression: ${h.title}`,
+          reason: `${metric} regressed by ${Math.abs(Number(gain)).toFixed(2)}%.`,
+          meta: h.commit_sha || h.created_at,
+          status: "regression",
+        });
+  const visible = items.filter((x) => !hidden.has(x.id));
+  $("#nav-todo-count").textContent = visible.length || "";
+  $("#todo-count").textContent = visible.length
+    ? `${visible.length} require attention`
+    : "All clear";
+  $("#todos").innerHTML = visible.length
+    ? visible
+        .map(
+          (item) =>
+            `<div class="todo-item"><label class="todo-select"><input type="checkbox" value="${esc(item.id)}"><span></span></label><div class="todo-content"><strong>${esc(item.title)}</strong><div class="todo-reason">${esc(item.reason)}</div><div class="meta">${esc(item.meta)}</div></div>${badge(item.status)}<button class="secondary delete-todo" data-id="${esc(item.id)}">Delete</button></div>`,
+        )
+        .join("")
+    : '<div class="empty">Nothing currently requires human intervention.</div>';
+  const bulk = $("#delete-selected-todos"),
+    checks = [...document.querySelectorAll(".todo-select input")];
+  checks.forEach(
+    (c) =>
+      (c.onchange = () => (bulk.disabled = !checks.some((x) => x.checked))),
+  );
+  bulk.disabled = true;
+  bulk.onclick = () =>
+    dismissTodos(checks.filter((x) => x.checked).map((x) => x.value));
+  document
+    .querySelectorAll(".delete-todo")
+    .forEach((b) => (b.onclick = () => dismissTodos([b.dataset.id])));
+}
+function renderStudyFeedback(studies, tasks, history) {
+  const taskById = new Map(tasks.map((t) => [t.id, t])),
+    historyByTask = new Map();
+  for (const item of history)
+    if (item.task_id && !historyByTask.has(item.task_id))
+      historyByTask.set(item.task_id, item);
+  const latestBySource = new Map();
+  for (const study of studies) {
+    const checked = study.completed_at || study.started_at || study.created_at;
+    if (
+      !latestBySource.has(study.source) ||
+      String(checked) > String(latestBySource.get(study.source))
+    )
+      latestBySource.set(study.source, checked);
+  }
+  document.querySelectorAll(".study-card").forEach((card, index) => {
+    const study = studies[index];
+    if (!study) return;
+    card
+      .querySelector(".study-project")
+      ?.insertAdjacentHTML(
+        "afterend",
+        `<div class="study-check">Latest checked · ${esc(shortDate(latestBySource.get(study.source)))}</div>`,
+      );
+    let completed = 0,
+      measured = 0,
+      gains = 0;
+    card.querySelectorAll(".study-task-link").forEach((button) => {
+      const task = taskById.get(button.dataset.id),
+        outcome = historyByTask.get(button.dataset.id);
+      if (
+        ["integrated", "rejected", "failed", "reverted"].includes(task?.state)
+      )
+        completed++;
+      if (outcome) {
+        measured++;
+        if ((outcome.impact?.value || 0) > 0) gains++;
+      }
+      button.insertAdjacentHTML(
+        "beforeend",
+        `<span class="study-task-outcome">${task ? badge(task.state) : ""}${outcome ? renderImpactBadge(outcome.impact) : '<span class="meta">Impact pending</span>'}</span>`,
+      );
+    });
+    const columns = card.querySelector(".study-columns");
+    columns?.insertAdjacentHTML(
+      "beforebegin",
+      `<div class="study-feedback-summary"><strong>Experiment feedback</strong> · ${completed} completed · ${measured} measured · ${gains} positive gain${gains === 1 ? "" : "s"}</div>`,
+    );
+  });
+}
+async function dismissTodos(ids) {
+  if (!ids.length) return;
+  await api("/api/todos/dismiss", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+  await refresh();
+}
+function renderDeviceTask(t, device) {
+  const p = t.activity || {},
+    run = (t.runs || []).find((r) => r.machine_id === device.id),
+    result = run?.result || {},
+    model = t.origin?.model_id || t.manifest?.models?.join(", ") || "general",
+    deviceStep = (p.devices || []).find((d) => d.name === device.name),
+    steps = p.steps || [],
+    runProgress = run?.progress ?? 0,
+    displayProgress =
+      run?.status === "running" || run?.status === "completed"
+        ? runProgress
+        : p.percent || 0,
+    elapsed = run?.started_at ? run.elapsed_seconds : p.elapsed_seconds,
+    started = run?.started_at
+      ? new Date(run.started_at).toLocaleString()
+      : "Not started",
+    updated = run?.updated_at
+      ? new Date(run.updated_at).toLocaleTimeString()
+      : "—",
+    argv = result.argv || t.manifest?.argv || [],
+    stdout = result.stdout_tail || "",
+    stderr = result.stderr_tail || "",
+    output = [stdout, stderr].filter(Boolean).join("\n").trim();
+  return `<details class="device-task" open><summary><div><strong>${esc(t.title)}</strong><div class="meta">${esc(model)} · ${esc(t.kind)} · started ${esc(started)} · ${formatDuration(elapsed)} elapsed</div></div><div>${badge(run?.status || "unassigned")} ${badge(deviceStep?.status || p.phase || "pending")}</div></summary><div class="device-task-detail"><div class="task-content"><strong>Work content</strong><p>${esc(t.hypothesis || t.title)}</p></div><div class="task-progress-line"><span>Run phase: <strong>${esc(run?.phase || p.phase || t.state)}</strong></span><span>${displayProgress}% · updated ${esc(updated)}</span></div><div class="meter"><i style="width:${displayProgress}%"></i></div><div class="task-progress-line"><span>${esc(p.basis || "lifecycle")}</span><span>${p.evaluated ?? 0}/${p.total ?? 0} evidence complete</span></div><div class="step-list">${steps.map((s) => `<div class="task-step"><i class="status-dot ${s.status === "pass" || s.status === "complete" ? "online" : s.status === "fail" ? "offline" : "stale"}"></i><span>${esc(s.name)}</span>${badge(s.status)}</div>`).join("") || '<span class="muted">No detailed steps reported.</span>'}</div>${argv.length ? `<details class="task-command"><summary>Command</summary><pre>${esc(argv.map((x) => (/\s/.test(x) ? `"${x}"` : x)).join(" "))}</pre></details>` : ""}<details class="task-live-output" ${run?.status === "running" ? "open" : ""}><summary>Latest device output <span class="meta">refreshed ${esc(updated)}</span></summary><pre>${esc(output || "No output has been reported yet.")}</pre></details>${run?.error ? `<pre class="run-error">${esc(run.error)}</pre>` : ""}${run && Object.keys(result).length && !result.live ? `<details><summary>Run result</summary><pre>${esc(JSON.stringify(result, null, 2))}</pre></details>` : ""}<div class="meta mono">Task ${esc(t.id)} · Run ${esc(run?.id || "not materialized")}</div></div></details>`;
+}
+function eventLabel(e) {
+  return (
+    {
+      created: "Task created",
+      transition: "Task state changed",
+      observation_added: "Conformance/performance observation received",
+      registered: "Device enrolled",
+      configured: "Device configured",
+      configuration_updated: "Device configuration updated",
+      catalog_updated: "Model catalog refreshed",
+      evaluated: "Evidence evaluated",
+      evidence_added: "Experiment evidence received",
+      publishing: "Milestone publication started",
+      active: "Milestone activated",
+      failed: "Operation failed",
+    }[e.event_type] || e.event_type.replaceAll("_", " ")
+  );
+}
+function effectiveStatus(m) {
+  if (m.status !== "online") return m.status;
+  const age = Date.now() - Date.parse(m.last_seen_at);
+  return age > 180000 ? "stale" : "online";
+}
+function age(value) {
+  if (!value) return "never";
+  const sec = Math.max(0, (Date.now() - Date.parse(value)) / 1000);
+  if (sec < 90) return `${Math.floor(sec)}s ago`;
+  if (sec < 5400) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 172800) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+function renderDevices(items) {
+  const el = $("#device-table");
+  if (!el) return;
+  el.innerHTML = items.length
+    ? `<table class="matrix device-table"><thead><tr><th>Name</th><th>Address</th><th>OS</th><th>CPU / RAM</th><th>GPU</th><th>Driver / backend</th><th>Actions</th></tr></thead><tbody>${items
+        .map((m) => {
+          const f = m.fingerprint || {},
+            l = m.labels || {};
+          return `<tr><td><div class="device-name">${esc(m.name)}</div><div class="meta">${esc([f.manufacturer, f.system_model].filter(Boolean).join(" ") || "")}</div></td><td class="mono">${esc(l.address || "—")}</td><td>${esc(f.os || "—")}<div class="meta">${esc(f.os_version || "")}</div></td><td>${esc(f.cpu || "—")}<div class="meta">${f.cpu_cores ? `${esc(f.cpu_cores)} logical cores · ` : ""}${f.memory_mb ? num(f.memory_mb / 1024) + " GB RAM" : "—"}</div></td><td><div class="device-gpu">${esc(f.gpu || "—")}</div><div class="meta">${esc(f.gpu_vendor || "unknown vendor")}</div></td><td class="mono">${esc(f.driver || "—")}<div class="meta">${esc(f.backend || "—")}</div></td><td><div class="device-actions"><button class="secondary reprovision" data-name="${esc(m.name)}" data-address="${esc(l.address || "")}">Re-provision</button></div></td></tr>`;
+        })
+        .join("")}</tbody></table>`
+    : '<div class="empty">No devices configured.</div>';
+  document
+    .querySelectorAll(".reprovision")
+    .forEach(
+      (b) =>
+        (b.onclick = () => openProvision(b.dataset.name, b.dataset.address)),
+    );
+  enableColumnResize(
+    el.querySelector("table"),
+    "backpack-device-column-widths",
+  );
+}
+function enableColumnResize(table, storageKey) {
+  if (!table) return;
+  const headers = [...table.querySelectorAll("thead th")],
+    saved = JSON.parse(localStorage.getItem(storageKey) || "null"),
+    widths =
+      Array.isArray(saved) && saved.length === headers.length
+        ? saved
+        : headers.map((h) =>
+            Math.max(110, Math.round(h.getBoundingClientRect().width)),
+          );
+  const group = document.createElement("colgroup");
+  widths.forEach((width) => {
+    const col = document.createElement("col");
+    col.style.width = `${width}px`;
+    group.appendChild(col);
+  });
+  table.prepend(group);
+  table.style.width = `${widths.reduce((sum, width) => sum + width, 0)}px`;
+  headers.forEach((header, index) => {
+    const handle = document.createElement("span");
+    handle.className = "column-resizer";
+    header.appendChild(handle);
+    handle.onpointerdown = (event) => {
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      const startX = event.clientX,
+        startWidth = widths[index];
+      handle.onpointermove = (move) => {
+        widths[index] = Math.max(80, startWidth + move.clientX - startX);
+        group.children[index].style.width = `${widths[index]}px`;
+        table.style.width = `${widths.reduce((sum, width) => sum + width, 0)}px`;
+      };
+      handle.onpointerup = () => {
+        localStorage.setItem(storageKey, JSON.stringify(widths));
+        handle.onpointermove = null;
+        handle.onpointerup = null;
+      };
+    };
+  });
+}
+async function toggleDeviceActivity(button) {
+  button.disabled = true;
+  try {
+    await api(
+      `/api/machines/${encodeURIComponent(button.dataset.id)}/activity`,
+      {
+        method: "POST",
+        body: JSON.stringify({ action: button.dataset.action }),
+      },
+    );
+    await refresh();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+const bootstrap = (name) =>
+  `Invoke-WebRequest http://${location.hostname}:8787/api/bootstrap.ps1 -OutFile $env:TEMP\\bootstrap-backpack.ps1\npowershell -ExecutionPolicy Bypass -File $env:TEMP\\bootstrap-backpack.ps1`;
+async function copyEnrollment(button, name) {
+  await navigator.clipboard.writeText(bootstrap(name));
+  const old = button.textContent;
+  button.textContent = "Copied";
+  button.classList.add("copy-ok");
+  setTimeout(() => {
+    button.textContent = old;
+    button.classList.remove("copy-ok");
+  }, 1400);
+}
+function openProvision(name = "", address = "") {
+  const form = $("#provision-form");
+  form.reset();
+  form.elements.name.value = name;
+  form.elements.address.value = address;
+  $("#provision-title").textContent = name
+    ? "Re-provision device"
+    : "Provision device";
+  $("#submit-provision").textContent = name ? "Re-provision" : "Provision";
+  $("#provision-result").classList.add("hidden");
+  $("#provision-steps").classList.add("hidden");
+  $("#provision-steps").innerHTML = "";
+  $("#provision-dialog").showModal();
+}
+$("#new-task").onclick = () => $("#task-dialog").showModal();
+$("#cancel-task").onclick = () => $("#task-dialog").close();
+$("#task-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    await api("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        title: f.get("title"),
+        hypothesis: f.get("hypothesis"),
+        kind: f.get("kind"),
+        manifest: { metrics: ["decode_tok_s"] },
+        device_policy: { required: [] },
+      }),
+    });
+    e.target.reset();
+    $("#task-dialog").close();
+    refresh();
+  } catch (x) {
+    alert(x.message);
+  }
+};
+const tabPaths = {
+    status: "tasks",
+    evolution: "evolution",
+    todo: "human-intervention",
+    validation: "status",
+    analysis: "performance-analysis",
+    digest: "digest",
+    devices: "devices",
+  },
+  pathTabs = Object.fromEntries(
+    Object.entries(tabPaths).map(([tab, path]) => [path, tab]),
+  );
+pathTabs.history = "digest";
+function tabFromUrl(url = new URL(location.href)) {
+  const path = url.pathname.replace(/^\/+|\/+$/g, "");
+  return (
+    pathTabs[path] ||
+    url.searchParams.get("view") ||
+    url.hash.replace(/^#/, "") ||
+    "validation"
+  );
+}
+function navigate(name, updateUrl = true) {
+  if (!$("#" + name + "-tab")) name = "status";
+  document
+    .querySelectorAll(".sidebar-item")
+    .forEach((x) => x.classList.toggle("active", x.dataset.tab === name));
+  document
+    .querySelectorAll(".tab-page")
+    .forEach((x) => x.classList.add("hidden"));
+  $("#" + name + "-tab").classList.remove("hidden");
+  if (updateUrl) {
+    const url = new URL("/" + tabPaths[name], location.origin);
+    history.pushState({ view: name }, "", url);
+  }
+  document.title = `${document.querySelector(`.sidebar-item[data-tab="${name}"] span:nth-child(2)`)?.textContent || "Backpack"} · Backpack`;
+}
+document
+  .querySelectorAll(".sidebar-item")
+  .forEach((b) => (b.onclick = () => navigate(b.dataset.tab)));
+window.addEventListener("popstate", () => navigate(tabFromUrl(), false));
+const initialUrl = new URL(location.href),
+  initialTab = tabFromUrl(initialUrl),
+  canonicalUrl = new URL(
+    "/" + tabPaths[$("#" + initialTab + "-tab") ? initialTab : "status"],
+    location.origin,
+  );
+history.replaceState({ view: initialTab }, "", canonicalUrl);
+navigate(initialTab, false);
+$("#provision-device").onclick = () => openProvision();
+$("#cancel-provision").onclick = () => $("#provision-dialog").close();
+$("#provision-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.currentTarget),
+    vendor = f.get("vendor"),
+    steps = $("#provision-steps"),
+    submit = $("#submit-provision");
+  steps.classList.remove("hidden");
+  steps.innerHTML =
+    '<div class="provision-step done">✓ Device configuration validated</div><div class="provision-step ready">⏳ Connecting through WinRM…</div><div class="provision-step waiting">○ Installing task worker</div><div class="provision-step waiting">○ Synchronizing cared models</div>';
+  submit.disabled = true;
+  try {
+    await api("/api/machines/provision", {
+      method: "POST",
+      body: JSON.stringify({
+        name: f.get("name"),
+        address: f.get("address"),
+        fingerprint: vendor ? { gpu_vendor: vendor } : {},
+      }),
+    });
+    steps.innerHTML =
+      '<div class="provision-step done">✓ WinRM connected</div><div class="provision-step done">✓ Task worker installed</div><div class="provision-step done">✓ Cared models synchronized</div>';
+    $("#provision-result").classList.remove("hidden");
+    submit.textContent = "Provisioned";
+    await refresh();
+  } catch (x) {
+    steps.innerHTML += `<div class="provision-step" style="color:var(--red)">✕ ${esc(x.message)}</div>`;
+  } finally {
+    submit.disabled = false;
+  }
+};
+$("#validation-search").oninput = renderValidationRows;
+$("#validation-sort").onchange = renderValidationRows;
+$("#validation-direction").onclick = (e) => {
+  const b = e.currentTarget,
+    next = b.dataset.direction === "asc" ? "desc" : "asc";
+  b.dataset.direction = next;
+  b.textContent = next === "asc" ? "Ascending ↑" : "Descending ↓";
+  renderValidationRows();
+};
+let analysisState = {
+    metric: "decode_tok_s",
+    model: "all",
+    prompt: "all",
+    x: "model",
+    series: "source",
+  },
+  analysisSources = [];
+const analysisSourceFields = [
+  ["framework", "Framework"],
+  ["backend", "Backend"],
+  ["machineId", "Device"],
+  ["modelId", "Model"],
+  ["format", "Format"],
+  ["revision", "Revision / Date"],
+];
+function analysisSourceValue(r, field) {
+  return field === "machineId"
+    ? r.machine.id
+    : field === "modelId"
+      ? r.model.id
+      : field === "revision"
+        ? `${r.result.revision || "unknown"}|${r.result.created_at || ""}`
+        : r[field];
+}
+function analysisSourceLabel(r, field, value) {
+  if (field === "framework") return frameworkName(value);
+  if (field === "machineId") return r.machine.name;
+  if (field === "modelId") return r.model.name;
+  if (field === "revision") {
+    const [revision, date] = value.split("|");
+    return `${revision} · ${shortDate(date)}`;
+  }
+  return field === "format" ? String(value).toUpperCase() : value;
+}
+function analysisSourceKey(source) {
+  return analysisSourceFields
+    .map(([field]) => source[field] || "")
+    .join("\u001f");
+}
+function analysisSourceFromRow(row) {
+  return Object.fromEntries(
+    analysisSourceFields.map(([field]) => [
+      field,
+      analysisSourceValue(row, field),
+    ]),
+  );
+}
+function saveAnalysisSources() {
+  localStorage.setItem(
+    "backpack-performance-analysis-sources",
+    JSON.stringify(analysisSources),
+  );
+}
+function loadAnalysisSources(measured) {
+  if (analysisSources.length) return;
+  try {
+    analysisSources = JSON.parse(
+      localStorage.getItem("backpack-performance-analysis-sources") || "[]",
+    );
+  } catch {
+    analysisSources = [];
+  }
+  const available = new Set(
+    measured.map((r) => analysisSourceKey(analysisSourceFromRow(r))),
+  );
+  analysisSources = analysisSources.filter((source) =>
+    available.has(analysisSourceKey(source)),
+  );
+  if (!analysisSources.length)
+    analysisSources = measured
+      .slice(0, Math.min(4, measured.length))
+      .map(analysisSourceFromRow);
+}
+function analysisSourceOptions(measured, source, field) {
+  const fieldIndex = analysisSourceFields.findIndex(([name]) => name === field),
+    candidates = measured.filter((row) =>
+      analysisSourceFields
+        .slice(0, fieldIndex)
+        .every(
+          ([name]) =>
+            !source[name] || analysisSourceValue(row, name) === source[name],
+        ),
+    ),
+    values = new Map();
+  for (const row of candidates) {
+    const value = analysisSourceValue(row, field);
+    if (!values.has(value))
+      values.set(value, analysisSourceLabel(row, field, value));
+  }
+  return [...values]
+    .map(
+      ([value, label]) =>
+        `<option value="${esc(value)}"${source[field] === value ? " selected" : ""}>${esc(label)}</option>`,
+    )
+    .join("");
+}
+function normalizeAnalysisSource(measured, source, changedField) {
+  const changedIndex = analysisSourceFields.findIndex(
+    ([field]) => field === changedField,
+  );
+  for (let i = changedIndex + 1; i < analysisSourceFields.length; i++)
+    delete source[analysisSourceFields[i][0]];
+  const match = measured.find((row) =>
+    analysisSourceFields.every(([field], i) =>
+      i <= changedIndex
+        ? analysisSourceValue(row, field) === source[field]
+        : true,
+    ),
+  );
+  if (match)
+    for (let i = changedIndex + 1; i < analysisSourceFields.length; i++) {
+      const field = analysisSourceFields[i][0];
+      source[field] = analysisSourceValue(match, field);
+    }
+}
+function analysisFactor(r, key) {
+  if (key === "device") return r.machine.name;
+  if (key === "model") return r.model.name;
+  if (key === "runtime") return frameworkName(r.framework);
+  if (key === "revision")
+    return `${r.result.revision || "unknown"} · ${shortDate(r.result.created_at)}`;
+  return `${frameworkName(r.framework)} / ${r.backend}`;
+}
+function renderPerformanceAnalysis() {
+  const el = $("#performance-analysis");
+  if (!el) return;
+  const measured = validationRows.filter(
+      (r) =>
+        r.result &&
+        ((r.result.metrics || {}).prefill_tok_s != null ||
+          (r.result.metrics || {}).decode_tok_s != null),
+    ),
+    models = [...new Set(measured.map((r) => r.model.name))].sort(),
+    prompts = [
+      ...new Set(
+        measured.map((r) =>
+          String(
+            r.result.metrics?.prompt_tokens ||
+              r.result.metrics?.generation_tokens ||
+              128,
+          ),
+        ),
+      ),
+    ].sort((a, b) => Number(a) - Number(b));
+  $("#analysis-count").textContent = `${measured.length} measurements`;
+  if (!measured.length) {
+    el.innerHTML =
+      '<div class="empty">No performance measurements are available yet.</div>';
+    return;
+  }
+  el.innerHTML = `<div class="analysis-source"><div class="analysis-section-title">Data Sources</div><div class="analysis-combos">${measured.map((r, i) => `<label class="analysis-combo"><input type="checkbox" data-analysis-source="${i}" checked><i style="--combo-color:hsl(${(i * 47) % 360} 65% 50%)"></i><span><strong>${esc(r.machine.name)} · ${esc(frameworkName(r.framework))}</strong><small>${esc(r.backend)} · ${esc(r.result.revision || "unknown")} · ${esc(shortDate(r.result.created_at))}</small></span></label>`).join("")}</div></div><div class="analysis-controls"><label>Metric<select id="analysis-metric"><option value="decode_tok_s">Token Generation (tok/s)</option><option value="prefill_tok_s">Prompt Processing (tok/s)</option></select></label><label>Prompt length<select id="analysis-prompt"><option value="all">All</option>${prompts.map((x) => `<option>${esc(x)}</option>`).join("")}</select></label><label>Model<select id="analysis-model"><option value="all">All models</option>${models.map((x) => `<option>${esc(x)}</option>`).join("")}</select></label><label>X-axis<select id="analysis-x"><option value="model">Model</option><option value="device">Device</option><option value="runtime">Runtime</option><option value="revision">Revision / Date</option></select></label><label>Series<select id="analysis-series"><option value="source">Runtime / Backend</option><option value="device">Device</option><option value="model">Model</option><option value="revision">Revision / Date</option></select></label><label class="analysis-check"><input id="analysis-zero" type="checkbox" checked> Begin at zero</label></div><div id="analysis-chart"></div><div id="analysis-table"></div>`;
+  $("#analysis-metric").value = analysisState.metric;
+  $("#analysis-prompt").value = analysisState.prompt;
+  $("#analysis-model").value = analysisState.model;
+  $("#analysis-x").value = analysisState.x;
+  $("#analysis-series").value = analysisState.series;
+  const update = () => {
+    analysisState = {
+      metric: $("#analysis-metric").value,
+      prompt: $("#analysis-prompt").value,
+      model: $("#analysis-model").value,
+      x: $("#analysis-x").value,
+      series: $("#analysis-series").value,
+    };
+    renderAnalysisChart(measured);
+  };
+  el.querySelectorAll("select,input").forEach((x) => (x.onchange = update));
+  update();
+}
+function renderAnalysisChart(allRows) {
+  const enabled = new Set(
+      [...document.querySelectorAll("[data-analysis-source]")]
+        .filter((x) => x.checked)
+        .map((x) => Number(x.dataset.analysisSource)),
+    ),
+    metric = analysisState.metric,
+    rows = allRows
+      .filter(
+        (r, i) =>
+          enabled.has(i) &&
+          (analysisState.model === "all" ||
+            r.model.name === analysisState.model) &&
+          (analysisState.prompt === "all" ||
+            String(
+              r.result.metrics?.prompt_tokens ||
+                r.result.metrics?.generation_tokens ||
+                128,
+            ) === analysisState.prompt),
+      )
+      .map((r) => ({ ...r, value: Number(r.result.metrics?.[metric]) }))
+      .filter((r) => Number.isFinite(r.value)),
+    max = Math.max(1, ...rows.map((r) => r.value)),
+    beginZero = $("#analysis-zero").checked,
+    min = beginZero ? 0 : Math.min(...rows.map((r) => r.value)) * 0.95,
+    span = Math.max(max - min, 1),
+    groups = new Map();
+  for (const r of rows) {
+    const x = analysisFactor(r, analysisState.x),
+      series = analysisFactor(r, analysisState.series);
+    if (!groups.has(x)) groups.set(x, []);
+    groups.get(x).push({ ...r, series });
+  }
+  $("#analysis-chart").innerHTML = rows.length
+    ? `<section class="analysis-chart-card"><header><strong>${metric === "prefill_tok_s" ? "Prompt Processing" : "Token Generation"}</strong><span>tokens/sec · ${rows.length} samples</span></header><div class="analysis-bars">${[...groups].map(([x, items]) => `<div class="analysis-bar-group"><div class="analysis-x-label">${esc(x)}</div><div>${items.map((r, i) => `<div class="analysis-bar-row"><span title="${esc(r.series)}">${esc(r.series)}</span><div class="analysis-bar-track"><i style="width:${Math.max(1, ((r.value - min) / span) * 100)}%;--bar-color:hsl(${(i * 67 + 31) % 360} 65% 48%)"></i></div><b>${num(r.value)}</b></div>`).join("")}</div></div>`).join("")}</div></section>`
+    : '<div class="empty">No data for the current selection.</div>';
+  const best = rows.length ? Math.max(...rows.map((r) => r.value)) : 0;
+  $("#analysis-table").innerHTML = rows.length
+    ? `<div class="analysis-section-title">Data Table</div><div class="table-wrap analysis-data-wrap"><table class="analysis-data"><thead><tr><th>Device</th><th>Model</th><th>Runtime</th><th>Backend</th><th>Revision / Date</th><th>${metric === "prefill_tok_s" ? "Prefill" : "Decode"}</th><th>Δ vs best</th><th>Trend</th></tr></thead><tbody>${rows
+        .sort((a, b) => b.value - a.value)
+        .map(
+          (r) =>
+            `<tr><td>${esc(r.machine.name)}</td><td>${esc(r.model.name)}</td><td>${esc(frameworkName(r.framework))}</td><td class="mono">${esc(r.backend)}</td><td class="mono">${esc(r.result.revision || "—")}<div class="meta">${esc(shortDate(r.result.created_at))}</div></td><td><strong>${num(r.value)} tok/s</strong></td><td class="${r.value === best ? "impact-positive" : "impact-negative"}">${r.value === best ? "best" : `${num(((r.value - best) / best) * 100)}%`}</td><td><button class="secondary analysis-trend" data-model="${esc(r.model.id)}" data-machine="${esc(r.machine.id)}" data-framework="${esc(r.framework)}" data-format="${esc(r.format)}" data-backend="${esc(r.backend)}" data-title="${esc(`${r.machine.name} · ${r.model.name} · ${frameworkName(r.framework)} ${r.backend}`)}">View trend</button></td></tr>`,
+        )
+        .join("")}</tbody></table></div>`
+    : "";
+  document
+    .querySelectorAll(".analysis-trend")
+    .forEach((b) => (b.onclick = () => showObservationHistory(b)));
+}
+function renderPerformanceAnalysis() {
+  const el = $("#performance-analysis");
+  if (!el) return;
+  const measured = validationRows.filter(
+      (r) =>
+        r.result &&
+        ((r.result.metrics || {}).prefill_tok_s != null ||
+          (r.result.metrics || {}).decode_tok_s != null),
+    ),
+    models = [...new Set(measured.map((r) => r.model.name))].sort(),
+    prompts = [
+      ...new Set(
+        measured.map((r) =>
+          String(
+            r.result.metrics?.prompt_tokens ||
+              r.result.metrics?.generation_tokens ||
+              128,
+          ),
+        ),
+      ),
+    ].sort((a, b) => Number(a) - Number(b));
+  $("#analysis-count").textContent = `${measured.length} measurements`;
+  if (!measured.length) {
+    el.innerHTML =
+      '<div class="empty">No performance measurements are available yet.</div>';
+    return;
+  }
+  loadAnalysisSources(measured);
+  el.innerHTML = `<div class="analysis-source"><div class="analysis-section-title">Data Sources</div><div class="analysis-source-head">Choose exact measured instances by framework, backend, device, model, format, and revision.</div><div class="analysis-source-rows">${analysisSources.map((source, i) => `<div class="analysis-source-row"><i style="--combo-color:hsl(${(i * 47) % 360} 65% 50%)">${i + 1}</i>${analysisSourceFields.map(([field, label]) => `<label><span>${label}</span><select data-source-index="${i}" data-source-field="${field}">${analysisSourceOptions(measured, source, field)}</select></label>`).join("")}<button type="button" class="analysis-source-remove" data-source-remove="${i}" title="Remove data source">×</button></div>`).join("")}</div><button type="button" class="analysis-source-add" id="analysis-source-add">＋ Add data source</button></div><div class="analysis-controls"><label>Metric<select id="analysis-metric"><option value="decode_tok_s">Token Generation (TPS)</option><option value="prefill_tok_s">Prompt Processing (TPS)</option></select></label><label>Prompt length<select id="analysis-prompt"><option value="all">All</option>${prompts.map((x) => `<option>${esc(x)}</option>`).join("")}</select></label><label>Model<select id="analysis-model"><option value="all">All models</option>${models.map((x) => `<option>${esc(x)}</option>`).join("")}</select></label><label>X-axis<select id="analysis-x"><option value="model">Model</option><option value="device">Device</option><option value="runtime">Runtime</option><option value="revision">Revision / Date</option></select></label><label>Series<select id="analysis-series"><option value="source">Runtime / Backend</option><option value="device">Device</option><option value="model">Model</option><option value="revision">Revision / Date</option></select></label><label class="analysis-check"><input id="analysis-zero" type="checkbox" checked> Begin at zero</label></div><div id="analysis-chart"></div><div id="analysis-table"></div>`;
+  $("#analysis-metric").value = analysisState.metric;
+  $("#analysis-prompt").value = analysisState.prompt;
+  $("#analysis-model").value = analysisState.model;
+  $("#analysis-x").value = analysisState.x;
+  $("#analysis-series").value = analysisState.series;
+  const update = () => {
+    analysisState = {
+      metric: $("#analysis-metric").value,
+      prompt: $("#analysis-prompt").value,
+      model: $("#analysis-model").value,
+      x: $("#analysis-x").value,
+      series: $("#analysis-series").value,
+    };
+    renderAnalysisChart(measured);
+  };
+  el.querySelectorAll(
+    ".analysis-controls select,.analysis-controls input",
+  ).forEach((x) => (x.onchange = update));
+  el.querySelectorAll("[data-source-field]").forEach(
+    (select) =>
+      (select.onchange = () => {
+        const source = analysisSources[Number(select.dataset.sourceIndex)];
+        source[select.dataset.sourceField] = select.value;
+        normalizeAnalysisSource(measured, source, select.dataset.sourceField);
+        saveAnalysisSources();
+        renderPerformanceAnalysis();
+      }),
+  );
+  el.querySelectorAll("[data-source-remove]").forEach(
+    (button) =>
+      (button.onclick = () => {
+        analysisSources.splice(Number(button.dataset.sourceRemove), 1);
+        saveAnalysisSources();
+        renderPerformanceAnalysis();
+      }),
+  );
+  $("#analysis-source-add").onclick = () => {
+    const used = new Set(analysisSources.map(analysisSourceKey)),
+      row =
+        measured.find(
+          (r) => !used.has(analysisSourceKey(analysisSourceFromRow(r))),
+        ) || measured[0];
+    analysisSources.push(analysisSourceFromRow(row));
+    saveAnalysisSources();
+    renderPerformanceAnalysis();
+  };
+  update();
+}
+function renderAnalysisChart(allRows) {
+  const enabled = new Set(analysisSources.map(analysisSourceKey)),
+    metric = analysisState.metric,
+    rows = allRows
+      .filter(
+        (r) =>
+          enabled.has(analysisSourceKey(analysisSourceFromRow(r))) &&
+          (analysisState.model === "all" ||
+            r.model.name === analysisState.model) &&
+          (analysisState.prompt === "all" ||
+            String(
+              r.result.metrics?.prompt_tokens ||
+                r.result.metrics?.generation_tokens ||
+                128,
+            ) === analysisState.prompt),
+      )
+      .map((r) => ({ ...r, value: Number(r.result.metrics?.[metric]) }))
+      .filter((r) => Number.isFinite(r.value)),
+    max = Math.max(1, ...rows.map((r) => r.value)),
+    beginZero = $("#analysis-zero").checked,
+    min = beginZero ? 0 : Math.min(...rows.map((r) => r.value)) * 0.95,
+    span = Math.max(max - min, 1),
+    groups = new Map();
+  for (const r of rows) {
+    const x = analysisFactor(r, analysisState.x),
+      series = analysisFactor(r, analysisState.series);
+    if (!groups.has(x)) groups.set(x, []);
+    groups.get(x).push({ ...r, series });
+  }
+  $("#analysis-chart").innerHTML = rows.length
+    ? `<section class="analysis-chart-card"><header><strong>${metric === "prefill_tok_s" ? "Prompt Processing" : "Token Generation"}</strong><span>TPS · ${rows.length} selected sources</span></header><div class="analysis-bars">${[...groups].map(([x, items]) => `<div class="analysis-bar-group"><div class="analysis-x-label">${esc(x)}</div><div>${items.map((r, i) => `<div class="analysis-bar-row"><span title="${esc(r.series)}">${esc(r.series)}</span><div class="analysis-bar-track"><i style="width:${Math.max(1, ((r.value - min) / span) * 100)}%;--bar-color:hsl(${(i * 67 + 31) % 360} 65% 48%)"></i></div><b>${num(r.value)}</b></div>`).join("")}</div></div>`).join("")}</div></section>`
+    : '<div class="empty">Add or adjust a data source to chart its performance.</div>';
+  const best = rows.length ? Math.max(...rows.map((r) => r.value)) : 0;
+  $("#analysis-table").innerHTML = rows.length
+    ? `<div class="analysis-section-title">Data Table</div><div class="table-wrap analysis-data-wrap"><table class="analysis-data"><thead><tr><th>Device</th><th>Model</th><th>Framework</th><th>Backend</th><th>Format</th><th>Revision / Date</th><th>${metric === "prefill_tok_s" ? "Prefill TPS" : "Decode TPS"}</th><th>Δ vs best</th><th>Trend</th></tr></thead><tbody>${rows
+        .sort((a, b) => b.value - a.value)
+        .map(
+          (r) =>
+            `<tr><td>${esc(r.machine.name)}</td><td>${esc(r.model.name)}</td><td>${esc(frameworkName(r.framework))}</td><td class="mono">${esc(r.backend)}</td><td>${esc(r.format.toUpperCase())}</td><td class="mono">${esc(r.result.revision || "—")}<div class="meta">${esc(shortDate(r.result.created_at))}</div></td><td><strong>${num(r.value)}</strong></td><td class="${r.value === best ? "impact-positive" : "impact-negative"}">${r.value === best ? "best" : `${num(((r.value - best) / best) * 100)}%`}</td><td><button class="secondary analysis-trend" data-model="${esc(r.model.id)}" data-machine="${esc(r.machine.id)}" data-framework="${esc(r.framework)}" data-format="${esc(r.format)}" data-backend="${esc(r.backend)}" data-title="${esc(`${r.machine.name} · ${r.model.name} · ${frameworkName(r.framework)} ${r.backend}`)}">View trend</button></td></tr>`,
+        )
+        .join("")}</tbody></table></div>`
+    : "";
+  document
+    .querySelectorAll(".analysis-trend")
+    .forEach((b) => (b.onclick = () => showObservationHistory(b)));
+}
+let trendState = {
+  metric: "decode_tok_s",
+  model: "",
+  device: "all",
+  runtime: "all",
+};
+function renderPerformanceTrend(observations) {
+  const el = $("#performance-trend");
+  if (!el) return;
+  const modelMap = new Map(
+      validationRows.map((r) => [r.model.id, r.model.name]),
+    ),
+    machineMap = new Map(
+      validationRows.map((r) => [r.machine.id, r.machine.name]),
+    ),
+    measured = observations.filter(
+      (x) =>
+        x.metrics?.prefill_tok_s != null || x.metrics?.decode_tok_s != null,
+    ),
+    models = [...new Set(measured.map((x) => x.model_id))].filter((x) =>
+      modelMap.has(x),
+    ),
+    devices = [...new Set(measured.map((x) => x.machine_id))].filter((x) =>
+      machineMap.has(x),
+    );
+  if (!trendState.model || !models.includes(trendState.model))
+    trendState.model = models[0] || "";
+  el.innerHTML = measured.length
+    ? `<div class="trend-controls"><label>Metric<select id="trend-metric"><option value="decode_tok_s">Decode TPS</option><option value="prefill_tok_s">Prefill TPS</option></select></label><label>Model<select id="trend-model">${models.map((id) => `<option value="${esc(id)}">${esc(modelMap.get(id))}</option>`).join("")}</select></label><label>Device<select id="trend-device"><option value="all">All devices</option>${devices.map((id) => `<option value="${esc(id)}">${esc(machineMap.get(id))}</option>`).join("")}</select></label><label>Runtime<select id="trend-runtime"><option value="all">All runtimes</option><option value="backpack/ort">Backpack ORT</option><option value="ort/ort">ORT WebGPU</option><option value="backpack/gguf">Backpack GGUF</option><option value="llamacpp/gguf">llama.cpp Vulkan</option></select></label></div><div id="trend-chart"></div><div id="trend-latest"></div>`
+    : '<div class="empty">No historical performance measurements are available.</div>';
+  if (!measured.length) return;
+  $("#trend-metric").value = trendState.metric;
+  $("#trend-model").value = trendState.model;
+  $("#trend-device").value = trendState.device;
+  $("#trend-runtime").value = trendState.runtime;
+  const update = () => {
+    trendState = {
+      metric: $("#trend-metric").value,
+      model: $("#trend-model").value,
+      device: $("#trend-device").value,
+      runtime: $("#trend-runtime").value,
+    };
+    renderTrendChart(measured, modelMap, machineMap);
+  };
+  el.querySelectorAll("select").forEach((x) => (x.onchange = update));
+  update();
+}
+function renderTrendChart(observations, modelMap, machineMap) {
+  const rows = observations
+      .filter(
+        (x) =>
+          x.model_id === trendState.model &&
+          (trendState.device === "all" || x.machine_id === trendState.device) &&
+          (trendState.runtime === "all" ||
+            `${x.framework}/${x.format}` === trendState.runtime),
+      )
+      .map((x) => ({
+        ...x,
+        value: Number(x.metrics?.[trendState.metric]),
+        time: Date.parse(x.created_at),
+      }))
+      .filter((x) => Number.isFinite(x.value) && Number.isFinite(x.time))
+      .sort((a, b) => a.time - b.time),
+    groups = new Map();
+  for (const row of rows) {
+    const key = `${row.machine_id}|${row.framework}|${row.format}|${row.backend}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  $("#trend-count").textContent = `${rows.length} samples`;
+  if (!rows.length) {
+    $("#trend-chart").innerHTML =
+      '<div class="empty">No samples match these filters.</div>';
+    $("#trend-latest").innerHTML = "";
+    return;
+  }
+  const W = 1100,
+    H = 420,
+    padL = 68,
+    padR = 24,
+    padT = 30,
+    padB = 62,
+    minT = Math.min(...rows.map((x) => x.time)),
+    maxT = Math.max(...rows.map((x) => x.time)),
+    maxV = Math.max(1, ...rows.map((x) => x.value)),
+    x = (t) =>
+      padL +
+      (maxT === minT
+        ? (W - padL - padR) / 2
+        : ((t - minT) / (maxT - minT)) * (W - padL - padR)),
+    y = (v) => H - padB - (v / maxV) * (H - padT - padB),
+    colors = [
+      "#4f46e5",
+      "#059669",
+      "#d97706",
+      "#dc2626",
+      "#0891b2",
+      "#7c3aed",
+      "#65a30d",
+      "#db2777",
+    ],
+    series = [...groups.entries()];
+  $("#trend-chart").innerHTML =
+    `<section class="trend-chart-card"><div class="trend-legend">${series.map(([key, data], i) => `<span><i style="background:${colors[i % colors.length]}"></i>${esc(machineMap.get(data[0].machine_id))} · ${esc(frameworkName(data[0].framework))} ${esc(data[0].format.toUpperCase())}</span>`).join("")}</div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Performance over revisions"><line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}"/><line class="axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${H - padB}"/>${[0, 0.25, 0.5, 0.75, 1].map((f) => `<g><line class="grid" x1="${padL}" y1="${y(maxV * f)}" x2="${W - padR}" y2="${y(maxV * f)}"/><text x="${padL - 10}" y="${y(maxV * f) + 4}" text-anchor="end">${num(maxV * f)}</text></g>`).join("")}${series.map(([key, data], i) => `<polyline style="stroke:${colors[i % colors.length]}" points="${data.map((r) => `${x(r.time)},${y(r.value)}`).join(" ")}"/>${data.map((r) => `<circle style="fill:${colors[i % colors.length]}" cx="${x(r.time)}" cy="${y(r.value)}" r="4"><title>${esc(machineMap.get(r.machine_id))} · ${esc(r.revision || "unknown")} · ${esc(r.created_at)} · ${num(r.value)} TPS</title></circle>`).join("")}`).join("")}<text class="axis-title" x="${(padL + W - padR) / 2}" y="${H - 14}" text-anchor="middle">Revision date</text><text class="axis-title" transform="translate(17 ${(padT + H - padB) / 2}) rotate(-90)" text-anchor="middle">${trendState.metric === "decode_tok_s" ? "Decode TPS" : "Prefill TPS"}</text></svg></section>`;
+  const latest = series
+    .map(([, data]) => data[data.length - 1])
+    .sort((a, b) => b.value - a.value);
+  $("#trend-latest").innerHTML = `<div class="trend-latest-grid">${latest
+    .map((r, i) => {
+      const previous = groups
+          .get(`${r.machine_id}|${r.framework}|${r.format}|${r.backend}`)
+          .slice(-2)[0],
+        delta =
+          previous && previous !== r
+            ? (r.value / previous.value - 1) * 100
+            : null;
+      return `<article><span>${esc(machineMap.get(r.machine_id))} · ${esc(frameworkName(r.framework))} ${esc(r.format.toUpperCase())}</span><strong>${num(r.value)} TPS</strong><small>${esc(r.revision || "unknown")} · ${esc(shortDate(r.created_at))}${delta == null ? "" : ` · ${delta >= 0 ? "+" : ""}${num(delta)}%`}</small></article>`;
+    })
+    .join("")}</div>`;
+}
+let statusTrendState = { devices: [], runtimes: [], metrics: ["decode_tok_s"] };
+function statusTrendRuntime(row) {
+  return `${row.framework}/${row.format}/${row.backend}`;
+}
+function statusTrendRuntimeLabel(key) {
+  const [framework, format, backend] = key.split("/");
+  return `${frameworkName(framework)} · ${format.toUpperCase()} · ${backend}`;
+}
+function compatiblePerformanceRevision(a, b) {
+  const clean = (value) =>
+    String(value || "")
+      .toLowerCase()
+      .replace(/-(reuse[-_]generator)$/, "")
+      .replace(/-(?:19|20)\d{6}$/, "")
+      .replace(/-+$/, "");
+  a = clean(a);
+  b = clean(b);
+  return (
+    !!a && !!b && (a === b || a.startsWith(b + "-") || b.startsWith(a + "-"))
+  );
+}
+function validPerformanceObservations(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const key = `${item.model_id}|${item.machine_id}|${item.framework}|${item.format}|${item.backend}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  return items.filter((item) => {
+    if (
+      item.metrics?.prefill_tok_s == null &&
+      item.metrics?.decode_tok_s == null
+    )
+      return false;
+    if (item.conformance === "pass") return true;
+    const key = `${item.model_id}|${item.machine_id}|${item.framework}|${item.format}|${item.backend}`;
+    return groups
+      .get(key)
+      .some(
+        (candidate) =>
+          candidate.conformance === "pass" &&
+          compatiblePerformanceRevision(item.revision, candidate.revision),
+      );
+  });
+}
+function renderPerformanceTrend(observations) {
+  trendObservations = observations || trendObservations;
+  const el = $("#performance-trend");
+  if (!el) return;
+  const machineMap = new Map(
+      validationRows.map((r) => [r.machine.id, r.machine.name]),
+    ),
+    measured = validPerformanceObservations(trendObservations).filter(
+      (x) => x.model_id === activeStatusModel,
+    ),
+    devices = [...new Set(measured.map((x) => x.machine_id))].filter((x) =>
+      machineMap.has(x),
+    ),
+    runtimes = [...new Set(measured.map(statusTrendRuntime))];
+  statusTrendState.devices = [...devices];
+  statusTrendState.runtimes = statusTrendState.runtimes.filter((x) =>
+    runtimes.includes(x),
+  );
+  if (!statusTrendState.runtimes.length)
+    statusTrendState.runtimes = [...runtimes];
+  if (!statusTrendState.metrics.length)
+    statusTrendState.metrics = ["decode_tok_s"];
+  if (statusTrendState.metrics.length > 1)
+    statusTrendState.metrics = [statusTrendState.metrics.at(-1)];
+  if (!measured.length) {
+    el.innerHTML =
+      '<div class="empty compact">Performance trends will appear after measurements are recorded for this model.</div>';
+    $("#trend-count").textContent = "0 samples";
+    return;
+  }
+  const checks = (kind, items, label) =>
+    `<fieldset><legend>${label}</legend><div class="trend-checks">${items.map(([value, text]) => `<label><input type="checkbox" data-trend-kind="${kind}" value="${esc(value)}"${statusTrendState[kind].includes(value) ? " checked" : ""}><span>${esc(text)}</span></label>`).join("")}</div></fieldset>`;
+  el.innerHTML = `<div class="trend-controls multi status-trend-filters">${checks(
+    "runtimes",
+    runtimes.map((key) => [key, statusTrendRuntimeLabel(key)]),
+    "Runtimes",
+  )}${checks(
+    "metrics",
+    [
+      ["prefill_tok_s", "Prefill TPS"],
+      ["decode_tok_s", "Decode TPS"],
+    ],
+    "Metrics",
+  )}</div><div id="trend-chart"></div><div id="trend-latest"></div>`;
+  el.querySelectorAll("[data-trend-kind]").forEach(
+    (box) =>
+      (box.onchange = () => {
+        const kind = box.dataset.trendKind;
+        if (kind === "metrics") {
+          el.querySelectorAll('[data-trend-kind="metrics"]').forEach(
+            (other) => (other.checked = other === box),
+          );
+          box.checked = true;
+        }
+        statusTrendState[kind] = [
+          ...el.querySelectorAll(`[data-trend-kind="${kind}"]:checked`),
+        ].map((x) => x.value);
+        renderStatusTrendChart(measured, machineMap);
+      }),
+  );
+  renderStatusTrendChart(measured, machineMap);
+}
+function renderStatusTrendChart(observations, machineMap) {
+  const rawRows = observations
+      .filter(
+        (x) =>
+          statusTrendState.devices.includes(x.machine_id) &&
+          statusTrendState.runtimes.includes(statusTrendRuntime(x)),
+      )
+      .flatMap((x) =>
+        statusTrendState.metrics.map((metric) => ({
+          ...x,
+          metric,
+          value: Number(x.metrics?.[metric]),
+          time: Date.parse(x.created_at),
+        })),
+      )
+      .filter((x) => Number.isFinite(x.value) && Number.isFinite(x.time))
+      .sort((a, b) => a.time - b.time),
+    daily = new Map();
+  for (const row of rawRows) {
+    const day = new Date(row.time).toISOString().slice(0, 10),
+      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${day}`;
+    daily.set(key, {
+      ...row,
+      sample_time: row.time,
+      time: Date.parse(`${day}T00:00:00Z`),
+    });
+  }
+  const rows = [...daily.values()].sort((a, b) => a.time - b.time),
+    groups = new Map();
+  for (const row of rows) {
+    const key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  $("#trend-count").textContent =
+    `${rows.length} samples · ${groups.size} series`;
+  if (!rows.length) {
+    $("#trend-chart").innerHTML =
+      '<div class="empty compact">Select at least one device, runtime, and metric with recorded data.</div>';
+    $("#trend-latest").innerHTML = "";
+    return;
+  }
+  const W = 1100,
+    H = 390,
+    padL = 68,
+    padR = 24,
+    padT = 26,
+    padB = 58,
+    colors = [
+      "#4f46e5",
+      "#059669",
+      "#d97706",
+      "#dc2626",
+      "#0891b2",
+      "#7c3aed",
+      "#65a30d",
+      "#db2777",
+      "#0f766e",
+      "#be123c",
+    ],
+    series = [...groups.entries()],
+    seriesLabel = (data) =>
+      `${statusTrendRuntimeLabel(statusTrendRuntime(data[0]))} · ${data[0].metric === "prefill_tok_s" ? "Prefill" : "Decode"}`,
+    deviceIds = [...new Set(rows.map((row) => row.machine_id))];
+  const deviceChart = (deviceId) => {
+    const deviceRows = rows.filter((row) => row.machine_id === deviceId),
+      deviceSeries = series.filter(
+        ([, data]) => data[0].machine_id === deviceId,
+      ),
+      minT = Math.min(...deviceRows.map((row) => row.time)),
+      maxT = Math.max(...deviceRows.map((row) => row.time)),
+      maxV = Math.max(1, ...deviceRows.map((row) => row.value)),
+      x = (t) =>
+        padL +
+        (maxT === minT
+          ? (W - padL - padR) / 2
+          : ((t - minT) / (maxT - minT)) * (W - padL - padR)),
+      y = (v) => H - padB - (v / maxV) * (H - padT - padB);
+    return `<section class="trend-chart-card"><h3>${esc(machineMap.get(deviceId))}</h3><div class="trend-legend">${deviceSeries.map(([, data], i) => `<span><i style="background:${colors[i % colors.length]}"></i>${esc(seriesLabel(data))}</span>`).join("")}</div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Performance improvement trend for ${esc(machineMap.get(deviceId))}"><line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}"/><line class="axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${H - padB}"/>${[0, 0.25, 0.5, 0.75, 1].map((f) => `<g><line class="grid" x1="${padL}" y1="${y(maxV * f)}" x2="${W - padR}" y2="${y(maxV * f)}"/><text x="${padL - 10}" y="${y(maxV * f) + 4}" text-anchor="end">${num(maxV * f)}</text></g>`).join("")}${deviceSeries.map(([, data], i) => `<polyline style="stroke:${colors[i % colors.length]}" points="${data.map((r) => `${x(r.time)},${y(r.value)}`).join(" ")}"/>${data.map((r) => `<circle style="fill:${colors[i % colors.length]}" cx="${x(r.time)}" cy="${y(r.value)}" r="4"><title>${esc(seriesLabel(data))} · ${esc(shortDate(r.created_at))} · ${esc(r.revision || "unknown")} · ${num(r.value)} TPS</title></circle>`).join("")}`).join("")}<text class="axis-title" x="${(padL + W - padR) / 2}" y="${H - 12}" text-anchor="middle">Date</text><text class="axis-title" transform="translate(17 ${(padT + H - padB) / 2}) rotate(-90)" text-anchor="middle">TPS</text></svg></section>`;
+  };
+  $("#trend-chart").innerHTML =
+    `<div class="status-device-trends">${deviceIds.map(deviceChart).join("")}</div>`;
+  const latest = series
+    .map(([, data]) => ({
+      first: data[0],
+      last: data[data.length - 1],
+      label: `${machineMap.get(data[0].machine_id)} · ${seriesLabel(data)}`,
+    }))
+    .sort((a, b) => b.last.value - a.last.value);
+  $("#trend-latest").innerHTML = `<div class="trend-latest-grid">${latest
+    .map((item) => {
+      const gain =
+        item.first === item.last
+          ? null
+          : (item.last.value / item.first.value - 1) * 100;
+      return `<article><span>${esc(item.label)}</span><strong>${num(item.last.value)} TPS</strong><small>${esc(item.last.revision || "unknown")} · ${esc(shortDate(item.last.created_at))}${gain == null ? " · baseline" : ` · ${gain >= 0 ? "+" : ""}${num(gain)}% since first`}</small></article>`;
+    })
+    .join("")}</div>`;
+}
+function trendRuntimeTime(row) {
+  const explicit =
+      row.framework === "ort"
+        ? [
+            row.metrics?.ort_date,
+            row.metrics?.ort_genai_date,
+            row.conformance_details?.ort_date,
+            row.conformance_details?.ort_genai_date,
+          ]
+        : [],
+    revisionDates = String(row.revision || "").match(/(?:19|20)\d{6}/g) || [],
+    values = [...explicit, ...revisionDates]
+      .filter(Boolean)
+      .map((value) => {
+        const text = String(value)
+          .replace(/[^0-9]/g, "")
+          .slice(0, 8);
+        return text.length === 8
+          ? Date.parse(
+              `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}T00:00:00Z`,
+            )
+          : Date.parse(value);
+      })
+      .filter(Number.isFinite);
+  return values.length ? Math.max(...values) : Date.parse(row.created_at);
+}
+function renderStatusTrendChart(observations, machineMap) {
+  const raw = observations
+      .filter(
+        (row) =>
+          statusTrendState.devices.includes(row.machine_id) &&
+          statusTrendState.runtimes.includes(statusTrendRuntime(row)),
+      )
+      .flatMap((row) =>
+        statusTrendState.metrics.map((metric) => ({
+          ...row,
+          metric,
+          value: Number(row.metrics?.[metric]),
+          sampleTime: Date.parse(row.created_at),
+          time: trendRuntimeTime(row),
+        })),
+      )
+      .filter(
+        (row) =>
+          Number.isFinite(row.value) &&
+          Number.isFinite(row.time) &&
+          Number.isFinite(row.sampleTime),
+      )
+      .sort((a, b) => a.sampleTime - b.sampleTime),
+    daily = new Map();
+  for (const row of raw) {
+    const day = new Date(row.time).toISOString().slice(0, 10),
+      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${day}`;
+    daily.set(key, { ...row, time: Date.parse(`${day}T00:00:00Z`) });
+  }
+  const rows = [...daily.values()].sort((a, b) => a.time - b.time),
+    groups = new Map();
+  for (const row of rows) {
+    const key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  $("#trend-count").textContent =
+    `${rows.length} daily points · ${groups.size} series`;
+  if (!rows.length) {
+    $("#trend-chart").innerHTML =
+      '<div class="empty compact">Select at least one device, runtime, and metric with recorded data.</div>';
+    $("#trend-latest").innerHTML = "";
+    return;
+  }
+  const W = 1100,
+    H = 410,
+    L = 68,
+    R = 24,
+    T = 28,
+    B = 76,
+    colors = [
+      "#4f46e5",
+      "#059669",
+      "#d97706",
+      "#dc2626",
+      "#0891b2",
+      "#7c3aed",
+      "#65a30d",
+      "#db2777",
+      "#0f766e",
+      "#be123c",
+    ],
+    allSeries = [...groups.values()],
+    label = (data) =>
+      `${statusTrendRuntimeLabel(statusTrendRuntime(data[0]))} · ${data[0].metric === "prefill_tok_s" ? "Prefill" : "Decode"}`;
+  const chart = (deviceId) => {
+    const deviceRows = rows.filter((row) => row.machine_id === deviceId),
+      series = allSeries.filter((data) => data[0].machine_id === deviceId),
+      dates = [...new Set(deviceRows.map((row) => row.time))].sort(
+        (a, b) => a - b,
+      ),
+      minT = Math.min(...dates),
+      maxT = Math.max(...dates),
+      maxV = Math.max(1, ...deviceRows.map((row) => row.value)),
+      x = (time) =>
+        L +
+        (maxT === minT
+          ? (W - L - R) / 2
+          : ((time - minT) / (maxT - minT)) * (W - L - R)),
+      y = (value) => H - B - (value / maxV) * (H - T - B),
+      guides = dates
+        .map(
+          (time) =>
+            `<g><line class="date-grid" x1="${x(time)}" y1="${T}" x2="${x(time)}" y2="${H - B}"/><text class="date-label" x="${x(time)}" y="${H - B + 20}" text-anchor="middle">${shortDate(new Date(time).toISOString())}</text></g>`,
+        )
+        .join("");
+    return `<section class="trend-chart-card"><h3>${esc(machineMap.get(deviceId))}</h3><div class="trend-legend">${series.map((data, i) => `<span><i style="background:${colors[i % colors.length]}"></i>${esc(label(data))}</span>`).join("")}</div><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Daily performance trend for ${esc(machineMap.get(deviceId))}"><line class="axis" x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}"/><line class="axis" x1="${L}" y1="${T}" x2="${L}" y2="${H - B}"/>${guides}${[0, 0.25, 0.5, 0.75, 1].map((f) => `<g><line class="grid" x1="${L}" y1="${y(maxV * f)}" x2="${W - R}" y2="${y(maxV * f)}"/><text x="${L - 10}" y="${y(maxV * f) + 4}" text-anchor="end">${num(maxV * f)}</text></g>`).join("")}${series.map((data, i) => `<polyline style="stroke:${colors[i % colors.length]}" points="${data.map((row) => `${x(row.time)},${y(row.value)}`).join(" ")}"/>${data.map((row) => `<circle style="fill:${colors[i % colors.length]}" cx="${x(row.time)}" cy="${y(row.value)}" r="4"><title>${esc(label(data))} · ${esc(shortDate(new Date(row.time).toISOString()))} · ${esc(row.revision || "unknown")} · ${num(row.value)} TPS</title></circle>`).join("")}`).join("")}<text class="axis-title" x="${(L + W - R) / 2}" y="${H - 12}" text-anchor="middle">Runtime date</text><text class="axis-title" transform="translate(17 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">TPS</text></svg></section>`;
+  };
+  const deviceIds = [...new Set(rows.map((row) => row.machine_id))];
+  $("#trend-chart").innerHTML =
+    `<div class="status-device-trends">${deviceIds.map(chart).join("")}</div>`;
+  const latest = allSeries
+    .map((data) => ({
+      first: data[0],
+      last: data[data.length - 1],
+      label: `${machineMap.get(data[0].machine_id)} · ${label(data)}`,
+    }))
+    .sort((a, b) => b.last.value - a.last.value);
+  $("#trend-latest").innerHTML = `<div class="trend-latest-grid">${latest
+    .map((item) => {
+      const gain =
+        item.first === item.last
+          ? null
+          : (item.last.value / item.first.value - 1) * 100;
+      return `<article><span>${esc(item.label)}</span><strong>${num(item.last.value)} TPS</strong><small>${esc(item.last.revision || "unknown")} · ${esc(shortDate(new Date(item.last.time).toISOString()))}${gain == null ? " · baseline" : ` · ${gain >= 0 ? "+" : ""}${num(gain)}% since first`}</small></article>`;
+    })
+    .join("")}</div>`;
+}
+new MutationObserver(renderStatusModelTabs).observe($("#model-matrix"), {
+  childList: true,
+});
+const events = new EventSource("/api/events");
+events.onopen = () => {
+  $("#connection").textContent = "live";
+  $("#connection").className = "pill online";
+};
+events.onerror = () => {
+  $("#connection").textContent = "reconnecting";
+  $("#connection").className = "pill blocked";
+};
+[
+  "task-created",
+  "task-updated",
+  "task-evaluated",
+  "evidence-added",
+  "observation-added",
+  "history-added",
+  "machine-updated",
+  "decision-resolved",
+  "run-updated",
+].forEach((n) => events.addEventListener(n, refresh));
+refresh().catch((e) => alert(e.message));
+setInterval(() => {
+  if (!document.hidden) refresh().catch(() => {});
+}, 15000);

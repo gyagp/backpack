@@ -23,6 +23,7 @@ class FrameworkTest(unittest.TestCase):
             "device_policy": {"required": [{"selector": {"gpu_vendor": "nvidia"}, "count": 1}]},
             "decision_policy": {"thresholds": {"positive_percent": 2, "negative_percent": -2, "max_cv_percent": 5}},
         })
+        self.assertEqual(1, self.task["task_number"])
 
     def tearDown(self) -> None:
         self.store.close()
