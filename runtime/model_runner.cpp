@@ -2314,17 +2314,23 @@ void ModelRunner::buildDecodePipeline() {
     if (useKQ && kqKernelName) {
         plKQ = &getKernel(kqKernelName);
     }
+    // The 256-thread Q4_K kernel processes eight output rows per workgroup.
+    // It is consistently faster on NVIDIA decode (the 128-thread/four-row
+    // variant remains the portable default for AMD and Intel).  Keep explicit
+    // overrides so cross-device experiments can compare either path.
+    const bool useQ4KDecode256 = std::getenv("BP_Q4K_DECODE_256") ||
+        (isNvidiaAdapter && !std::getenv("BP_Q4K_DECODE_128"));
     auto kqPipelineFor = [&](GGUFType type) -> const CompiledPipeline* {
         switch (type) {
             case GGUF_TYPE_Q4_K: return &getKernel(
-                std::getenv("BP_Q4K_DECODE_256") ? "q4k_matmul" : "q4k_matmul_128");
+                useQ4KDecode256 ? "q4k_matmul" : "q4k_matmul_128");
             case GGUF_TYPE_Q5_K: return &getKernel("q5k_matmul");
             case GGUF_TYPE_Q6_K: return &getKernel("q6k_matmul");
             default: return nullptr;
         }
     };
-    auto kqTileFor = [](GGUFType type) {
-        return type == GGUF_TYPE_Q4_K && !std::getenv("BP_Q4K_DECODE_256") ? 4u : 8u;
+    auto kqTileFor = [&](GGUFType type) {
+        return type == GGUF_TYPE_Q4_K && !useQ4KDecode256 ? 4u : 8u;
     };
 
     const bool subgroupMatrixKernelReady =
