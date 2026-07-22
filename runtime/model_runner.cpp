@@ -6684,10 +6684,16 @@ int32_t ModelRunner::prefillQwen35Batched(
             (gpu->adapterName.find("NVIDIA")!=std::string::npos&&cfg.ssmTimeStepRank==32u)||
             (gpu->adapterName.find("AMD")!=std::string::npos&&
              (cfg.ssmTimeStepRank==16u||cfg.ssmTimeStepRank==32u));
+        // Intel rank-32 (Qwen 4B) loses occupancy with two resident state
+        // columns per lane; retain x2 there while rank-16 and other vendors
+        // benefit or remain neutral.
+        const bool intelRank32=gpu->adapterName.find("Intel")!=std::string::npos&&
+            cfg.ssmTimeStepRank==32u;
+        const bool deltaX4=!intelRank32&&std::getenv("BP_QWEN_DISABLE_DELTA_X4")==nullptr;
         const auto&deltaKernel=valueMajorPrefill
-            ? gpu->getOrCreatePipeline("delta_net_scan_x2_value_major",
-                deltaNetValueMajorSource(WGSL_DELTA_NET_SCAN_X2),8)
-            : getKernel("delta_net_scan_x2");
+            ? gpu->getOrCreatePipeline(deltaX4?"delta_net_scan_x4_value_major":"delta_net_scan_x2_value_major",
+                deltaNetValueMajorSource(deltaX4?WGSL_DELTA_NET_SCAN_X4:WGSL_DELTA_NET_SCAN_X2),8)
+            : getKernel(deltaX4?"delta_net_scan_x4":"delta_net_scan_x2");
         auto&normGateKernel=getKernel("qwen35_norm_gated_batched");
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},(M+3)/4,(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
@@ -6746,7 +6752,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
                 add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
                 auto dp=mkp(L+"delta_p",{R,cfg.ssmGroupCount,cfg.ssmStateSize,DV,M});
-                add(deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,(DV+1)/2,1,L+"delta");
+                add(deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,(DV+(deltaX4?3u:1u))/(deltaX4?4u:2u),1,L+"delta");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u delta built\n",li);fflush(stderr);}
                 auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
                 add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,M,1,L+"normgate");

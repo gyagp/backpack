@@ -1573,6 +1573,15 @@ TEST(delta_net_scan_x2) {
     return assertClose((const float*)result.data(),expected.data(),T*NV*DV,3e-4f,3e-4f);
 }
 
+TEST(delta_net_scan_x4) {
+    std::string wgsl=WGSL_DELTA_NET_SCAN_X4;const int T=3,NV=1,NK=1,DK=128,DV=5;Rng rng(655);
+    auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV),beta=rng.randnVec(T*NV),gate=rng.randnVec(T*NV),state=rng.randnVec(NV*DK*DV);
+    for(float&b:beta)b=1.0f/(1.0f+std::exp(-b));for(float&g:gate)g=-std::abs(g)*.1f;auto ref=state;std::vector<float>expected(T*NV*DV);float qs=1/std::sqrt(float(DK));
+    for(int t=0;t<T;t++)for(int vi=0;vi<DV;vi++){float gh=std::exp(gate[t]),pred=0;for(int d=0;d<DK;d++)pred+=gh*ref[d*DV+vi]*k[t*DK+d];float delta=(v[t*DV+vi]-pred)*beta[t],out=0;for(int d=0;d<DK;d++){float sn=gh*ref[d*DV+vi]+k[t*DK+d]*delta;ref[d*DV+vi]=sn;out+=sn*q[t*DK+d]*qs;}expected[t*DV+vi]=out;}
+    auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size()),bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size()),bg=makeBuffer(gpu,"G",gate.data(),gate.size()),bs=makeBuffer(gpu,"S",state.data(),state.size()),by=makeBuffer(gpu,"Y",nullptr,T*NV*DV),p=makeParams(gpu,"P",{NV,NK,DK,DV,T});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},NV,ceilDiv(DV,4),1,by,T*NV*DV*4,8);return assertClose((const float*)result.data(),expected.data(),expected.size(),3e-4f,3e-4f);
+}
+
 TEST(qwen35_split_qkv_l2_batched) {
     auto wgsl=loadWgsl("ssm","qwen35_split_qkv_l2_batched");if(wgsl.empty())return{false,"cannot load kernel"};
     const int T=2,NK=1,NV=1,DK=128,DV=128,C=2*NK*DK+NV*DV;Rng rng(991);auto in=rng.randnVec(T*C);
