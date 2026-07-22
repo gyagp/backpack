@@ -430,6 +430,80 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
                 (N + 127) / 128, ((uint32_t)M + 7) / 8, 1, "matmul_q4_zp_wide");
         }
     } else {
+        const bool useOrtDp4aPrefill = M >= 64 &&
+            (X->dtype == TensorDtype::Float16 || X->dtype == TensorDtype::Float32) &&
+            (K % 128u) == 0u && (N % 64u) == 0u &&
+            ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
+            ex.getGpu()->supportsSubgroups &&
+            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+            !std::getenv("BP_QWEN_Q4_DISABLE_ORT_PREFILL");
+        if (useOrtDp4aPrefill) {
+            GpuTensor xq = ex.AllocTensor({M, (int64_t)K / 4}, TensorDtype::Int32);
+            GpuTensor xs = ex.AllocTensor({M, (int64_t)K / 128}, TensorDtype::Float16);
+            uint32_t qCount = (uint32_t)M * K / 4u;
+            auto qp = ex.getParamBuffer(16);
+            uint32_t qParams[4] = {qCount, 0, 0, 0};
+            ex.getGpu()->writeBuffer(qp, qParams, sizeof(qParams));
+            const bool ortF32 = X->dtype == TensorDtype::Float32;
+            auto& qpl = ex.GetPipelineT(ortF32 ? "ort_dp4a_quantize_exact_f32" :
+                                                  "ort_dp4a_quantize_exact_f16", 4,
+                [ortF32]() {
+                    std::string source(WGSL_ORT_DP4A_QUANTIZE_EXACT);
+                    if (ortF32) {
+                        const std::string from = "input_a: array<vec4<f16>>";
+                        if (auto p = source.find(from); p != std::string::npos)
+                            source.replace(p, from.size(), "input_a: array<vec4<f32>>");
+                        const std::string alias = "alias input_a_element_t = f16;";
+                        if (auto p = source.find(alias); p != std::string::npos)
+                            source.replace(p, alias.size(), "alias input_a_element_t = f32;");
+                        const std::string value = "alias input_a_value_t = vec4<f16>;";
+                        if (auto p = source.find(value); p != std::string::npos)
+                            source.replace(p, value.size(), "alias input_a_value_t = vec4<f32>;");
+                        const std::string store = "=scale/127;";
+                        for (auto p = source.find(store); p != std::string::npos;
+                             p = source.find(store, p + 16))
+                            source.replace(p, store.size(), "=f16(scale/127);");
+                    }
+                    return source;
+                });
+            auto qbg = ex.MakeBindGroup(qpl, {
+                {0, X->buffer}, {1, xq.buffer}, {2, xs.buffer}, {3, qp}});
+            ex.QueueDispatch(qpl.pipeline, qbg, (qCount + 63u) / 64u, 1, 1,
+                "ort_dp4a_quantize_exact");
+
+            uint32_t mt = ((uint32_t)M + 63u) / 64u;
+            uint32_t nt = (N + 63u) / 64u;
+            uint32_t mp[10] = {1u, (uint32_t)M, N, K, K / 8u, K / 16u,
+                               mt, nt, 0u, 0u};
+            auto mb = ex.getParamBuffer(sizeof(mp));
+            ex.getGpu()->writeBuffer(mb, mp, sizeof(mp));
+            auto& mpl = ex.GetPipelineT(ortF32 ? "ort_dp4a_matmul_exact_f32" :
+                                                  "ort_dp4a_matmul_exact_f16", 6,
+                [ortF32]() {
+                    std::string source(WGSL_ORT_DP4A_MATMUL_EXACT);
+                    if (ortF32) {
+                        const std::string out = "output: array<vec4<f16>>";
+                        if (auto p = source.find(out); p != std::string::npos)
+                            source.replace(p, out.size(), "output: array<vec4<f32>>");
+                        const std::string alias = "alias output_element_t = f16;";
+                        if (auto p = source.find(alias); p != std::string::npos)
+                            source.replace(p, alias.size(), "alias output_element_t = f32;");
+                        const std::string sa = "scale_A[row] = scales_a[batch*uniforms.M*(uniforms.K/128) + a_global*(uniforms.K/128) + kidx_v/8];";
+                        if (auto p = source.find(sa); p != std::string::npos)
+                            source.replace(p, sa.size(), "scale_A[row] = f32(scales_a[batch*uniforms.M*(uniforms.K/128) + a_global*(uniforms.K/128) + kidx_v/8]);");
+                        const std::string sb = "scale_B[row] = scales_b[b_scale_offset + b_global*(uniforms.K/32) + block_idx];";
+                        if (auto p = source.find(sb); p != std::string::npos)
+                            source.replace(p, sb.size(), "scale_B[row] = f32(scales_b[b_scale_offset + b_global*(uniforms.K/32) + block_idx]);");
+                    }
+                    return source;
+                });
+            auto mbg = ex.MakeBindGroup(mpl, {
+                {0, xq.buffer}, {1, xs.buffer}, {2, W->buffer}, {3, S->buffer},
+                {4, out[0]->buffer}, {5, mb}});
+            ex.QueueDispatch(mpl.pipeline, mbg, mt * nt, 1, 1,
+                "ort_dp4a_matmul_exact");
+            return;
+        }
         // The portable no-zero-point Q4 shader is an f32 kernel. Some Qwen
         // projections feed it fp16 tensors; interpreting those bytes as f32
         // also made the shader write past an fp16-sized output allocation.
