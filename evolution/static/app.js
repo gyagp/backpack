@@ -1019,6 +1019,11 @@ function renderDigest(items, tasks = []) {
   const digest = digestItems(items).map((item) => ({
     ...item,
     impact: { ...item.impact, name: digestImpactName(item.impact) },
+    rejectedRegression: [
+      "measured_regression",
+      "serious_regression",
+      "critical_regression",
+    ].includes(item.impact?.key),
     task_labels: (item.task_ids || []).map((id) =>
       taskById.has(id) ? taskLabel(taskById.get(id)) : id,
     ),
@@ -1036,7 +1041,7 @@ function renderDigest(items, tasks = []) {
       const detail = $("#digest-day-detail");
       detail.className = "digest-day-detail";
       detail.innerHTML = selected.length
-        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
+        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header>${item.rejectedRegression ? '<div class="digest-disposition rejected">Rejected experiment · not merged</div>' : ""}<p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
         : `<h2>${esc(button.dataset.date)}</h2><div class="empty compact">No progress was recorded on this date.</div>`;
     };
   });

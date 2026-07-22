@@ -244,6 +244,26 @@ class FrameworkTest(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.store.transition_task(optimization["id"], "implementing", "test")
 
+    def test_regressed_optimization_cannot_advance_to_merge(self) -> None:
+        task = self.store.create_task({
+            "title": "Regressed candidate", "kind": "optimization",
+            "hypothesis": "The candidate might be faster",
+            "manifest": {"metrics": ["decode_tok_s"]},
+            "device_policy": {"required": [self.machine["id"]]},
+        })
+        with self.store._db:
+            self.store._db.execute(
+                "UPDATE tasks SET state='evaluating',aggregate_verdict='accept' WHERE id=?",
+                (task["id"],),
+            )
+            self.store._db.execute(
+                "INSERT INTO evaluations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("eval-regression", task["id"], self.machine["id"], "decode_tok_s",
+                 "negative", 100.0, 70.0, -30.0, "{}", "2026-07-22T00:00:00+00:00"),
+            )
+        with self.assertRaisesRegex(DomainError, "regressed or inconclusive"):
+            self.store.transition_task(task["id"], "ready_to_merge", "test")
+
     def test_passing_conformance_schedules_missing_performance(self) -> None:
         self.store.upsert_model({"id": "perf-model", "name": "Perf", "files": {"gguf": {}}})
         self.store.add_observation({"model_id": "perf-model", "machine_id": self.machine["id"],

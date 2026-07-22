@@ -265,6 +265,12 @@ class Store:
             raise DomainError("task not found")
         if task["kind"] == "optimization" and target in {"implementing", "candidate_ready", "validating", "evaluating"} and self.has_conformance_gaps():
             raise DomainError("optimization is blocked until every cared model/device passes Backpack conformance")
+        if task["kind"] == "optimization" and target in {"ready_to_merge", "integrating", "integrated"}:
+            evaluations = self._all("SELECT verdict FROM evaluations WHERE task_id=?", (task_id,))
+            if task.get("aggregate_verdict") != "accept" or not evaluations:
+                raise DomainError("only an accepted optimization with required-device evidence can be merged")
+            if any(row["verdict"] in {"negative", "inconclusive"} for row in evaluations):
+                raise DomainError("optimization has regressed or inconclusive required-device evidence")
         validate_transition(task["state"], target)
         with self._lock, self._db:
             self._db.execute("UPDATE tasks SET state=?,updated_at=? WHERE id=?", (target, utc_now(), task_id))
