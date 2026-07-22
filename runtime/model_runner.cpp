@@ -609,6 +609,17 @@ static void uploadQ8Weight(GPUContext& gpu, const std::string& name,
                         std::min(CHUNK, sSize - off), off);
 }
 
+static GPUBuffer uploadBytes(GPUContext& gpu, const std::string& name,
+                             const std::vector<uint8_t>& data) {
+    if (data.empty()) return {};
+    auto out = gpu.createBuffer(name, std::max<size_t>(4, data.size()));
+    constexpr uint64_t CHUNK = 64ull * 1024 * 1024;
+    for (uint64_t off = 0; off < data.size(); off += CHUNK)
+        gpu.writeBuffer(out, data.data() + off,
+                        std::min<uint64_t>(CHUNK, data.size() - off), off);
+    return out;
+}
+
 static Q8Repacked repackQ4_0Native(const void* rawData, uint32_t N, uint32_t K) {
     Q8Repacked out;
     out.N = N; out.K = K;
@@ -1023,6 +1034,12 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         }
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
+        if (ld.gateupQ4.N > 0) {
+            const auto p = "L" + std::to_string(i) + ".gu_q4";
+            lw.guQ4W = uploadBytes(*gpu, p + ".w", ld.gateupQ4.weights);
+            lw.guQ4S = uploadBytes(*gpu, p + ".s", ld.gateupQ4.scales);
+            lw.guQ4Z = uploadBytes(*gpu, p + ".z", ld.gateupQ4.zeroPoints);
+        }
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", ld.down, lw.dnW, lw.dnS);
         if (ld.pleInputGate.N > 0)
             uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_gate",
@@ -5233,6 +5250,7 @@ void ModelRunner::initGemmaPrefillResources() {
     // Force compilation at load so unsupported shader features fail before
     // the first prompt rather than midway through inference.
     (void)getKernel("matmul_q4_batched");
+    (void)getKernel("matmul_q4_zp_batched_dp4a");
     (void)getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
     (void)getKernel("q4_gather_batched");
     (void)getKernel("gemma_sandwich_attn_batched");
@@ -6797,6 +6815,7 @@ int32_t ModelRunner::prefillGemmaBatched(
         }
 
         auto& q4mm = getKernel("matmul_q4_batched");
+        auto& q4zp = getKernel("matmul_q4_zp_batched_dp4a");
         auto& q8mm = getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
         auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
                       uint32_t K, uint32_t N, const std::string& name) {
@@ -6909,7 +6928,14 @@ int32_t ModelRunner::prefillGemmaBatched(
                 M,1,"gpf_sandwich");
 
             auto gp=mkP("gpf_gu_"+std::to_string(li),{M,2u*im,cfg.nEmbd});
-            mm(gemmaPf.norm,lw.guW,lw.guS,gemmaPf.gateup,cfg.nEmbd,2u*im,"gpf_gateup");
+            if (lw.guQ4W.handle && !std::getenv("BP_GEMMA_Q8_GATEUP")) {
+                add(q4zp, {{0,gemmaPf.norm},{1,lw.guQ4W},{2,lw.guQ4S},
+                           {3,gemmaPf.gateup},{4,gp},{5,lw.guQ4Z}},
+                    (2u*im+31)/32,(M+3)/4,"gpf_gateup_q4");
+            } else {
+                mm(gemmaPf.norm,lw.guW,lw.guS,gemmaPf.gateup,
+                   cfg.nEmbd,2u*im,"gpf_gateup");
+            }
             auto gap=mkP("gpf_gelu_"+std::to_string(li),{M,im});
             add(geluMul,{{0,gemmaPf.gateup},{1,gemmaPf.act},{2,gap}},
                 (M*im+255)/256,1,"gpf_gelu");

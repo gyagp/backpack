@@ -19,6 +19,10 @@
 
 /// Result of loading an ONNX model — all data needed to build the GPU pipeline.
 struct OnnxLoadResult {
+    struct PackedQ4 {
+        std::vector<uint8_t> weights, scales, zeroPoints;
+        uint32_t N = 0, K = 0;
+    };
     ModelConfig cfg;
 
     /// Partial RoPE: rotary_dim may be < head_dim (e.g. Phi-4).
@@ -31,6 +35,7 @@ struct OnnxLoadResult {
         Q8Repacked qOnly;       // Q-only projection for shared-KV layers
         Q8Repacked o;           // output projection
         Q8Repacked gateup;      // fused gate + up projection
+        PackedQ4 gateupQ4;      // original ONNX Q4G32 payload for prefill
         Q8Repacked down;        // down projection
         Q8Repacked pleInputGate;
         Q8Repacked pleProjection;

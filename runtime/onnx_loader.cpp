@@ -944,6 +944,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
 
     // Maps from backpack weight name → Q8Repacked
     std::unordered_map<std::string, Q8Repacked> q8Weights;
+    std::unordered_map<std::string, OnnxLoadResult::PackedQ4> q4Weights;
     // Maps from backpack norm name → float vector
     std::unordered_map<std::string, std::vector<float>> normWeights;
 
@@ -1107,6 +1108,20 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                 q8Weights[mapping.backpackName] = dequantQ4ToQ8(
                     wTensor.rawData, sTensor.rawData, zeroPoints,
                     N, K, blockSize, nGroups, blockHalf);
+                if (cfg.arch == "gemma4" &&
+                    (mapping.backpackName.find("mlp.gate_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("mlp.up_proj.weight") != std::string::npos)) {
+                    OnnxLoadResult::PackedQ4 packed;
+                    packed.N = N; packed.K = K;
+                    packed.weights.assign(wTensor.rawData,
+                        wTensor.rawData + (size_t)N * nGroups * blockHalf);
+                    packed.scales.assign(sTensor.rawData,
+                        sTensor.rawData + (size_t)N * nGroups * 2u);
+                    const size_t zpBytes = ((size_t)N * nGroups + 1u) / 2u;
+                    if (zeroPoints) packed.zeroPoints.assign(zeroPoints, zeroPoints + zpBytes);
+                    else packed.zeroPoints.assign(zpBytes, 0x88u);
+                    q4Weights[mapping.backpackName] = std::move(packed);
+                }
             } else if (bits == 8) {
                 q8Weights[mapping.backpackName] = dequantQ8ToQ8(
                     wTensor.rawData, sTensor.rawData,
@@ -1428,6 +1443,19 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             q8Weights.erase(gateKey);
             q8Weights.erase(upKey);
         }
+        if (q4Weights.count(gateKey) && q4Weights.count(upKey)) {
+            auto& g = q4Weights[gateKey]; auto& u = q4Weights[upKey];
+            OnnxLoadResult::PackedQ4 fused;
+            fused.N = g.N + u.N; fused.K = g.K;
+            fused.weights = std::move(g.weights);
+            fused.weights.insert(fused.weights.end(), u.weights.begin(), u.weights.end());
+            fused.scales = std::move(g.scales);
+            fused.scales.insert(fused.scales.end(), u.scales.begin(), u.scales.end());
+            fused.zeroPoints = std::move(g.zeroPoints);
+            fused.zeroPoints.insert(fused.zeroPoints.end(), u.zeroPoints.begin(), u.zeroPoints.end());
+            q4Weights[guKey] = std::move(fused);
+            q4Weights.erase(gateKey); q4Weights.erase(upKey);
+        }
     }
 
     // ─── 6. Organize into per-layer structure ────────────────────────────
@@ -1457,6 +1485,9 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             moveQ8(pfx + "self_attn.q_proj.weight", ld.qOnly);
         moveQ8(pfx + "self_attn.o_proj.weight", ld.o);
         moveQ8(pfx + "mlp.gate_up_proj.weight", ld.gateup);
+        if (auto it = q4Weights.find(pfx + "mlp.gate_up_proj.weight"); it != q4Weights.end()) {
+            ld.gateupQ4 = std::move(it->second); q4Weights.erase(it);
+        }
         moveQ8(pfx + "mlp.down_proj.weight", ld.down);
         moveQ8(pfx + "ple_input_gate.weight", ld.pleInputGate);
         moveQ8(pfx + "ple_projection.weight", ld.pleProjection);
