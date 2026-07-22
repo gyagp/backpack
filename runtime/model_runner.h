@@ -515,6 +515,7 @@ private:
         GPUBuffer tokens, x, norm, proj, gateup, act, rstd;
         GPUBuffer qkv, z, beta, gate, conv, sq, sk, sv, sy, snorm;
         GPUBuffer qj, aq, ag, ak, av, qrot, attn, aout;
+        GPUBuffer kqActQ8, kqActScale;
         GPUBuffer paramArena;
     } qwen35Pf;
 };

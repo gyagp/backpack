@@ -1976,6 +1976,21 @@ void LmSession::PrintProfileReport(const std::string& htmlPath) {
         if (!st->runner.profiler)
             return;
 
+        if (std::getenv("BP_PROFILE_PREFILL")) {
+            constexpr uint32_t kProfileTokens = 64;
+            st->Reset();
+            st->runner.profiler->nextIndex = 0;
+            st->runner.profiler->entries.clear();
+            std::vector<int32_t> tokens(kProfileTokens, 1);
+            auto pt0 = std::chrono::steady_clock::now();
+            (void)st->runner.prefillBatched(tokens.data(), kProfileTokens, 0);
+            auto pt1 = std::chrono::steady_clock::now();
+            double profMs = std::chrono::duration<double, std::milli>(pt1 - pt0).count();
+            st->runner.printProfileReport(0, kProfileTokens, profMs, 0.0, htmlPath);
+            st->Reset();
+            return;
+        }
+
         st->Reset();
         std::vector<float> logits;
         int32_t tok = 0;

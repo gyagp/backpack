@@ -1890,6 +1890,17 @@ TEST(q4k_matmul_prequant_dp4a_reference) {
     auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bb},{4,by},{5,p}},1,ceilDiv(N,8),1,by,N*4,6);return assertClose((const float*)r.data(),exp.data(),N,2e-3f,2e-3f);
 }
 
+TEST(q4k_matmul_prequant_batched_dp4a_reference) {
+    std::string q=WGSL_Q8_QUANTIZE_BATCHED_DP4A,mm=WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A;
+    const int M=9,N=17,K=512,NB=K/256;Rng rng(0x44B8);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*144);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}
+    auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),xq(M*K),bias(N),exp(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);
+    for(int m=0;m<M;m++)for(int b=0;b<K/32;b++){float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[m*K+b*32+j]));float s=amax/127.0f;for(int j=0;j<32;j++){int v=s==0?0:std::max(-127,std::min(127,(int)std::round(x[m*K+b*32+j]/s)));xq[m*K+b*32+j]=v*s;}}
+    for(int n=0;n<N;n++)bias[n]=.01f*n;for(int m=0;m<M;m++)for(int n=0;n<N;n++){exp[m*N+n]=bias[n];for(int k=0;k<K;k++)exp[m*N+n]+=xq[m*K+k]*dq[n*K+k];}
+    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bs=makeBuffer(gpu,"XS",nullptr,M*K/32),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M,pk.nBlocks,pk.rowStrideWords});
+    dispatchAndReadback(gpu,q,{{0,bx},{1,bq},{2,bs},{3,p}},K/256,M,1,bq,M*K,4);auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bb},{4,by},{5,p}},ceilDiv(M,8),ceilDiv(N,8),1,by,M*N*4,6);return assertClose((const float*)r.data(),exp.data(),M*N,2e-3f,2e-3f);
+}
+
 TEST(q4k_matmul_128_reference) {
  auto wgsl=loadWgsl("quant_kq","q4k_matmul_128");if(wgsl.empty())return{false,"cannot load kernel"};const int N=7,K=512,NB=2;Rng rng(5555);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*144);for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),bias(N),exp(N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);for(int n=0;n<N;n++){bias[n]=.01f*n;exp[n]=bias[n];for(int k=0;k<K;k++)exp[n]+=x[k]*dq[n*K+k];}auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,pk.nBlocks,pk.rowStrideWords,0});auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,ceilDiv(N,4),1,by,N*4,5);return assertClose((const float*)r.data(),exp.data(),N,2e-4f,2e-4f);
 }

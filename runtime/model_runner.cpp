@@ -5220,11 +5220,16 @@ void ModelRunner::initQwen35PrefillResources() {
     qwen35Pf.ag=mk("qpf_ag",(uint64_t)C*qdim);qwen35Pf.ak=mk("qpf_ak",(uint64_t)C*kvdim);
     qwen35Pf.av=mk("qpf_av",(uint64_t)C*kvdim);qwen35Pf.qrot=mk("qpf_qrot",(uint64_t)C*qdim);
     qwen35Pf.attn=mk("qpf_attn",(uint64_t)C*qdim);qwen35Pf.aout=mk("qpf_aout",(uint64_t)C*qdim);
+    const uint64_t maxK=std::max<uint64_t>({E,im,2u*qdim,cfg.ssmInnerSize});
+    qwen35Pf.kqActQ8=gpu->createBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
+    qwen35Pf.kqActScale=mk("qpf_kq_act_scales",(uint64_t)C*((maxK+31u)/32u));
     qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",128u*1024u,
         BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
     (void)getKernel("q4k_matmul_batched4");
     (void)getKernel("q4k_matmul_batched8");
+    (void)getKernel("q8_quantize_batched_dp4a");
+    (void)getKernel("q4k_matmul_prequant_batched_dp4a");
     if(gpu->adapterName.find("AMD")!=std::string::npos)
         (void)gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",
             q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5);
@@ -6639,10 +6644,14 @@ std::vector<float> ModelRunner::prefillFinish(int32_t tokenId, uint32_t posOffse
 int32_t ModelRunner::prefillQwen35Batched(
         const int32_t* tokenIds,uint32_t T,uint32_t posOffset){
     if(!qwen35Pf.ready||T==0)return -1;
+    using QwenPrefillClock=std::chrono::steady_clock;
+    const bool profileCpu=std::getenv("BP_PROFILE_CPU")!=nullptr;
+    double buildMs=0.0,submitMs=0.0,cleanupMs=0.0;
     const bool traceQpf=std::getenv("BP_PROFILE_QWEN_PREFILL")!=nullptr;
     if(traceQpf){fprintf(stderr,"[qwen-prefill] enter T=%u\n",T);fflush(stderr);}
     int32_t result=-1;uint32_t done=0;
     while(done<T){
+        auto buildStart=QwenPrefillClock::now();
         uint32_t M=std::min(qwen35Pf.capacity,T-done),E=cfg.nEmbd;
         std::vector<int32_t> toks(M);for(uint32_t i=0;i<M;i++){int32_t v=tokenIds[done+i];toks[i]=(v>=0&&(uint32_t)v<cfg.nVocab)?v:0;}
         gpu->writeBuffer(qwen35Pf.tokens,toks.data(),M*4);
@@ -6692,8 +6701,16 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool useIntelFourRows=cfg.nEmbd>2048&&
             gpu->adapterName.find("Intel")!=std::string::npos&&
             (!intelRowsEnv||std::strcmp(intelRowsEnv,"8")!=0);
+        const bool packedQ4Prefill=std::getenv("BP_Q4K_DISABLE_PACKED_PREFILL")==nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
-            if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
+            if(t==GGUF_TYPE_Q4_K&&packedQ4Prefill){
+                auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
+                auto&quant=getKernel("q8_quantize_batched_dp4a");
+                add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
+                auto&kp=getKernel("q4k_matmul_prequant_batched_dp4a");
+                add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
+            }
+            else if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos&&!useIntelFourRows){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
             else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
@@ -6775,16 +6792,36 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(softcapPipeline&&softcapBG)ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"softcap"});
             ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
             gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
-            auto bytes=gpu->submitAndReadback(ds,argmaxResultBuf,4,true);memcpy(&result,bytes.data(),4);
+            auto buildEnd=QwenPrefillClock::now();
+            auto bytes=(profiler&&profiler->enabled())
+                ?gpu->submitAndReadbackProfiled(ds,argmaxResultBuf,4,*profiler)
+                :gpu->submitAndReadback(ds,argmaxResultBuf,4,true);
+            auto submitEnd=QwenPrefillClock::now();
+            buildMs+=std::chrono::duration<double,std::milli>(buildEnd-buildStart).count();
+            submitMs+=std::chrono::duration<double,std::milli>(submitEnd-buildEnd).count();
+            memcpy(&result,bytes.data(),4);
         }else{
             gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
             // Scratch buffers, parameter-arena slots, and bind groups are
             // reused by the next chunk. Wait once per chunk (rather than once
             // per layer) so none of them are overwritten while still in use.
-            (void)gpu->submitAndReadback(ds,qwen35Pf.x,4,true);
+            auto buildEnd=QwenPrefillClock::now();
+            if(profiler&&profiler->enabled())
+                (void)gpu->submitAndReadbackProfiled(ds,qwen35Pf.x,4,*profiler);
+            else
+                (void)gpu->submitAndReadback(ds,qwen35Pf.x,4,true);
+            auto submitEnd=QwenPrefillClock::now();
+            buildMs+=std::chrono::duration<double,std::milli>(buildEnd-buildStart).count();
+            submitMs+=std::chrono::duration<double,std::milli>(submitEnd-buildEnd).count();
         }
-        for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=M;for(auto bg:bgs)if(bg)wgpuBindGroupRelease(bg);done+=M;
-    }return result;
+        for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=M;
+        auto cleanupStart=QwenPrefillClock::now();
+        for(auto bg:bgs)if(bg)wgpuBindGroupRelease(bg);
+        cleanupMs+=std::chrono::duration<double,std::milli>(QwenPrefillClock::now()-cleanupStart).count();
+        done+=M;
+    }
+    if(profileCpu)fprintf(stderr,"[qwen-prefill-cpu] T=%u build=%.2fms submit/wait=%.2fms cleanup=%.2fms\n",T,buildMs,submitMs,cleanupMs);
+    return result;
 }
 
 int32_t ModelRunner::prefillGemmaBatched(
