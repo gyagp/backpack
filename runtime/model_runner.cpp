@@ -32,6 +32,26 @@ std::string deltaNetValueMajorSource(const char* source) {
     return result;
 }
 
+std::string q4kBatched8PortableSource(const char* source) {
+    // The fast kernel maps one output column to each logical 32-lane group.
+    // subgroupAdd combines two columns on AMD wave64, so reduce each logical
+    // group explicitly while retaining eight-row Q4_K weight reuse.
+    std::string result(source);
+    const std::string subgroupEnable = "enable subgroups;\n";
+    if (auto pos = result.find(subgroupEnable); pos != std::string::npos)
+        result.erase(pos, subgroupEnable.size());
+
+    const std::string subgroupReduction =
+        " for(var m=0u;m<8u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}";
+    const std::string portableReduction =
+        " for(var m=0u;m<8u;m++){sx[m*256u+tid]=acc[m];}workgroupBarrier();"
+        " for(var off=16u;off>0u;off=off/2u){if(lane<off){for(var m=0u;m<8u;m++){sx[m*256u+tid]+=sx[m*256u+tid+off];}}workgroupBarrier();}"
+        " if(lane==0u&&col<N){for(var m=0u;m<8u;m++){if(m0+m<M){Y[(m0+m)*N+col]=sx[m*256u+warp*32u]+B[col];}}}";
+    if (auto pos = result.find(subgroupReduction); pos != std::string::npos)
+        result.replace(pos, subgroupReduction.size(), portableReduction);
+    return result;
+}
+
 const WGPULimits& effectiveLimits(const GPUContext& gpu) {
     return gpu.deviceLimits.maxComputeInvocationsPerWorkgroup != 0
         ? gpu.deviceLimits
@@ -5138,6 +5158,9 @@ void ModelRunner::initQwen35PrefillResources() {
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
     (void)getKernel("q4k_matmul_batched4");
     (void)getKernel("q4k_matmul_batched8");
+    if(gpu->adapterName.find("AMD")!=std::string::npos)
+        (void)gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",
+            q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5);
     (void)getKernel("q5k_matmul_batched4");
     (void)getKernel("q6k_matmul_batched4");
     (void)getKernel("qwen35_conv_scan_silu");(void)getKernel("qwen35_split_qkv_l2_batched");
@@ -6584,8 +6607,16 @@ int32_t ModelRunner::prefillQwen35Batched(
         auto&normGateKernel=getKernel("qwen35_norm_gated_batched");
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},(M+3)/4,(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
+        const char* portableEnv=std::getenv("BP_Q4K_PREFILL_PORTABLE");
+        // The override keeps an exact same-binary baseline for A/B validation.
+        const bool useAmdPortableQ4=gpu->adapterName.find("AMD")!=std::string::npos&&
+            (!portableEnv||std::strcmp(portableEnv,"0")!=0);
+        const CompiledPipeline* amdPortableQ4=useAmdPortableQ4
+            ?&gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5)
+            :nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
-            if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
+            if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
+            else if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
             else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
         for(uint32_t li=0;li<cfg.nLayer;li++){
