@@ -17,7 +17,7 @@ $name = $env:COMPUTERNAME.ToLowerInvariant()
 & $python "$InstallDir\agent.py" --server $Server --name $name sync-models --models-dir $ModelsDir
 $watchScript = @"
 `$ErrorActionPreference = 'Continue'
-& '$python' '$InstallDir\agent.py' --server '$Server' --name '$name' --label 'role=required' watch --repo '$Repo' --worktrees '$Repo\gitignore\evolution\worktrees' *>> '$InstallDir\watch.log'
+& '$python' '$InstallDir\agent.py' --server '$Server' --name '$name' --label 'role=required' watch --repo '$Repo' --worktrees '$Repo\gitignore\evolution\worktrees' --interval 10 *>> '$InstallDir\watch.log'
 "@
 [IO.File]::WriteAllText("$InstallDir\watch.ps1", $watchScript)
 if (Get-ScheduledTask -TaskName backpack-evolution-agent -ErrorAction SilentlyContinue) {
