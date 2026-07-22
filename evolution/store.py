@@ -994,6 +994,55 @@ class Store:
                 if runs and all(run["status"] == "completed"
                                 and run.get("result", {}).get("exit_code") == 0 for run in runs):
                     reason = "All assigned operational runs completed successfully"
+            elif task["kind"] == "optimization":
+                # Older experiments sometimes published their accepted commit and
+                # fleet measurements before the task lifecycle was transitioned.
+                # Treat that linked history as authoritative only when it names a
+                # commit, reports a measured gain, and explicitly proves passing
+                # conformance on every required device.
+                history = self._all(
+                    "SELECT * FROM optimization_history WHERE task_id=? ORDER BY created_at",
+                    (task["id"],),
+                )
+                required = set()
+                for item in task.get("device_policy", {}).get("required", []):
+                    if isinstance(item, str):
+                        machine = next((m for m in self.list_machines()
+                                        if m["id"] == item or m["name"] == item), None)
+                        if machine:
+                            required.add(machine["name"])
+                covered = set()
+                accepted_commit = False
+                for record in history:
+                    performance_deltas: list[float] = []
+
+                    def collect_performance_deltas(value: Any, path: str = "") -> None:
+                        if not isinstance(value, dict):
+                            return
+                        for key, child in value.items():
+                            child_path = f"{path}.{key}".lower()
+                            if isinstance(child, (int, float)) and "percent" in child_path and any(
+                                    name in child_path for name in
+                                    ("decode", "prefill", "throughput", "latency")):
+                                performance_deltas.append(float(child))
+                            elif isinstance(child, dict):
+                                collect_performance_deltas(child, child_path)
+
+                    collect_performance_deltas(record.get("gains", {}))
+                    negative_limit = float(task.get("decision_policy", {}).get(
+                        "negative_percent", -2.0))
+                    accepted_commit = accepted_commit or bool(
+                        record.get("commit_sha") and performance_deltas
+                        and min(performance_deltas) >= negative_limit
+                        and max(performance_deltas) > 0)
+                    for evidence in record.get("evidence", []):
+                        if not isinstance(evidence, dict) or evidence.get("conformance") != "pass":
+                            continue
+                        covered.update(str(name) for name in evidence.get("devices", []))
+                        if evidence.get("device"):
+                            covered.add(str(evidence["device"]))
+                if accepted_commit and required and required <= covered:
+                    reason = "Linked accepted history has a measured commit and passing conformance on every required device"
             if reason:
                 closed.append((task["id"], reason))
         if not closed:

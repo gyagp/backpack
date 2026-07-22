@@ -180,6 +180,42 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("integrated", closed["state"])
         self.assertEqual("accepted", closed["aggregate_verdict"])
 
+    def test_cross_device_optimization_history_closes_stale_task(self) -> None:
+        second = self.store.register_machine({"name": "gpu-2"})
+        task = self.store.create_task({
+            "title": "Fuse measured graph operations", "kind": "optimization",
+            "hypothesis": "Fewer dispatches improve decode throughput",
+            "device_policy": {"required": [self.machine["name"], second["name"]]},
+        }, "test")
+        self.store.add_history({
+            "task_id": task["id"], "title": "Measured fusion",
+            "summary": "Passed conformance and improved decode on both devices",
+            "commit_sha": "abc123", "gains": {"decode_percent": 2.5},
+            "evidence": [{"kind": "cross-device", "conformance": "pass",
+                          "devices": [self.machine["name"], second["name"]]}],
+        }, "test")
+
+        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        closed = self.store.get_task(task["id"])
+        self.assertEqual("integrated", closed["state"])
+        self.assertEqual("accepted", closed["aggregate_verdict"])
+
+    def test_regressed_history_does_not_close_optimization(self) -> None:
+        task = self.store.create_task({
+            "title": "Regressed fusion", "kind": "optimization",
+            "hypothesis": "This candidate should remain rejected",
+            "device_policy": {"required": [self.machine["name"]]},
+        }, "test")
+        self.store.add_history({
+            "task_id": task["id"], "title": "Regressed measurement",
+            "summary": "Conformance passed but decode regressed",
+            "commit_sha": "bad123", "gains": {"decode_percent": -8.0},
+            "evidence": [{"conformance": "pass", "devices": [self.machine["name"]]}],
+        }, "test")
+
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
+        self.assertEqual("proposed", self.store.get_task(task["id"])["state"])
+
     def test_history_keeps_detailed_gain(self) -> None:
         item = self.store.add_history({
             "title": "Fused projection", "summary": "Removed two dispatches",
