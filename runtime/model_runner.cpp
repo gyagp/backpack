@@ -52,6 +52,20 @@ std::string q4kBatched8PortableSource(const char* source) {
     return result;
 }
 
+std::string kqGlobalActivationSource(const char* source) {
+    std::string result(source);
+    auto replace=[&](const std::string&from,const std::string&to){auto p=result.find(from);if(p==std::string::npos){fprintf(stderr,"K-quant source transform failed\n");std::abort();}result.replace(p,from.size(),to);};
+    replace("var<workgroup>sxq:array<u32,512>;var<workgroup>sxs:array<f32,64>;var<workgroup>sxsum:array<f32,256>;\n","");
+    replace("  let lm=tid/32u;let ll=tid&31u;let lr=row0+lm;let lq=lm*64u+ll*2u;\n  if(lr<M){let qb=lr*qStride+b*64u+ll*2u;sxq[lq]=XQ[qb];sxq[lq+1u]=XQ[qb+1u];}else{sxq[lq]=0u;sxq[lq+1u]=0u;}\n  if(tid<64u){let sm=tid/8u;let ss=tid&7u;let sr=row0+sm;if(sr<M){sxs[tid]=XS[sr*sStride+b*8u+ss];}else{sxs[tid]=0.0;}}\n  workgroupBarrier();let sa0=sxq[lq];let sa1=sxq[lq+1u];sxsum[tid]=f32(dot4I8Packed(sa0,0x01010101u)+dot4I8Packed(sa1,0x01010101u));workgroupBarrier();\n  if(col<N){",
+            "  if(col<N){");
+    replace("   let aq0=sxq[m*64u+lane*2u];let aq1=sxq[m*64u+lane*2u+1u];let asum=sxsum[m*32u+lane];",
+            "   let qb=row*qStride+b*64u+lane*2u;let aq0=XQ[qb];let aq1=XQ[qb+1u];\n   let asum=dot4I8Packed(aq0,0x01010101u)+dot4I8Packed(aq1,0x01010101u);");
+    replace("   acc[m]+=sxs[m*8u+sb]*(dm.x*f32(sc)*f32(dot)-dm.y*f32(mn)*asum);",
+            "   acc[m]+=XS[row*sStride+b*8u+sb]*(dm.x*f32(sc)*f32(dot)-dm.y*f32(mn)*f32(asum));");
+    replace(" }workgroupBarrier();}"," }}");
+    return result;
+}
+
 std::string q4ZpBatchedRows8Source() {
     std::string result=getEmbeddedKernels().at("matmul_q4_zp_batched_dp4a").source;
     auto replace=[&](const std::string& from,const std::string& to){
@@ -5231,6 +5245,8 @@ void ModelRunner::initQwen35PrefillResources() {
     (void)getKernel("q8_quantize_batched_dp4a");
     (void)getKernel("q4k_matmul_prequant_batched_dp4a");
     (void)getKernel("q5k_matmul_prequant_batched_dp4a");
+    (void)gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6);
+    (void)gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6);
     if(gpu->adapterName.find("AMD")!=std::string::npos)
         (void)gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",
             q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5);
@@ -6710,19 +6726,23 @@ int32_t ModelRunner::prefillQwen35Batched(
             (!intelRowsEnv||std::strcmp(intelRowsEnv,"8")!=0);
         const bool packedQ4Prefill=std::getenv("BP_Q4K_DISABLE_PACKED_PREFILL")==nullptr;
         const bool packedQ5Prefill=std::getenv("BP_Q5K_DISABLE_PACKED_PREFILL")==nullptr;
+        const bool sharedKq=gpu->adapterName.find("Intel")==std::string::npos&&
+            std::getenv("BP_QWEN_DISABLE_SHARED_KQ")==nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
             if(t==GGUF_TYPE_Q4_K&&packedQ4Prefill){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
-                auto&kp=getKernel("q4k_matmul_prequant_batched_dp4a");
+                const auto&kp=sharedKq?getKernel("q4k_matmul_prequant_batched_dp4a"):
+                    gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6);
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q5_K&&packedQ5Prefill){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
-                auto&kp=getKernel("q5k_matmul_prequant_batched_dp4a");
+                const auto&kp=sharedKq?getKernel("q5k_matmul_prequant_batched_dp4a"):
+                    gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6);
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
