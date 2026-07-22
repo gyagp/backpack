@@ -1139,8 +1139,6 @@ function renderActivity(a) {
         `<div class="health-card ${c.state === "ok" ? "" : c.state}"><i class="health-icon"></i><div><strong>${esc(c.value)}</strong><div class="meta">${esc(c.label)} · ${esc(c.detail)}</div></div></div>`,
     )
     .join("");
-  const activityTaskCount = $("#activity-task-count");
-  if (activityTaskCount) activityTaskCount.textContent = `${active} running`;
   $("#last-refresh").textContent =
     `${(a.events || []).length} events · updated ${new Date(a.server_time).toLocaleTimeString()}`;
   $("#activity-feed").innerHTML = (a.events || []).length
