@@ -1858,6 +1858,17 @@ TEST(q5k_matmul_reference) {
     auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
 }
 
+TEST(q5k_matmul_prequant_batched_dp4a_reference) {
+    std::string q=WGSL_Q8_QUANTIZE_BATCHED_DP4A,mm=WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A;
+    const int M=9,N=17,K=512,NB=K/256;Rng rng(0x55B8);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*176);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*176;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<176;j++)p[j]=uint8_t(n*37+b*11+j*13+7);}
+    auto pk=pack_q5k(raw.data(),N,K);std::vector<float>dq(N*K),xq(M*K),bias(N),exp(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q5_K);
+    for(int m=0;m<M;m++)for(int b=0;b<K/32;b++){float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[m*K+b*32+j]));float s=amax/127.0f;for(int j=0;j<32;j++){int v=s==0?0:std::max(-127,std::min(127,(int)std::round(x[m*K+b*32+j]/s)));xq[m*K+b*32+j]=v*s;}}
+    for(int n=0;n<N;n++)bias[n]=.01f*n;for(int m=0;m<M;m++)for(int n=0;n<N;n++){exp[m*N+n]=bias[n];for(int k=0;k<K;k++)exp[m*N+n]+=xq[m*K+k]*dq[n*K+k];}
+    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bs=makeBuffer(gpu,"XS",nullptr,M*K/32),bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,M*N),p=makeParams(gpu,"P",{K,N,M,pk.nBlocks,pk.rowStrideWords});
+    dispatchAndReadback(gpu,q,{{0,bx},{1,bq},{2,bs},{3,p}},K/256,M,1,bq,M*K,4);auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bb},{4,by},{5,p}},ceilDiv(M,8),ceilDiv(N,8),1,by,M*N*4,6);return assertClose((const float*)r.data(),exp.data(),M*N,3e-3f,3e-3f);
+}
+
 TEST(q4k_matmul_reference) {
     auto wgsl=loadWgsl("quant_kq","q4k_matmul");if(wgsl.empty())return{false,"cannot load kernel"};
     const int N=8,K=256;Rng rng(4343);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*144);

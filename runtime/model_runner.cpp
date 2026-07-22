@@ -5230,6 +5230,7 @@ void ModelRunner::initQwen35PrefillResources() {
     (void)getKernel("q4k_matmul_batched8");
     (void)getKernel("q8_quantize_batched_dp4a");
     (void)getKernel("q4k_matmul_prequant_batched_dp4a");
+    (void)getKernel("q5k_matmul_prequant_batched_dp4a");
     if(gpu->adapterName.find("AMD")!=std::string::npos)
         (void)gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",
             q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5);
@@ -6702,12 +6703,20 @@ int32_t ModelRunner::prefillQwen35Batched(
             gpu->adapterName.find("Intel")!=std::string::npos&&
             (!intelRowsEnv||std::strcmp(intelRowsEnv,"8")!=0);
         const bool packedQ4Prefill=std::getenv("BP_Q4K_DISABLE_PACKED_PREFILL")==nullptr;
+        const bool packedQ5Prefill=std::getenv("BP_Q5K_DISABLE_PACKED_PREFILL")==nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
             if(t==GGUF_TYPE_Q4_K&&packedQ4Prefill){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
                 auto&kp=getKernel("q4k_matmul_prequant_batched_dp4a");
+                add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
+            }
+            else if(t==GGUF_TYPE_Q5_K&&packedQ5Prefill){
+                auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
+                auto&quant=getKernel("q8_quantize_batched_dp4a");
+                add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
+                auto&kp=getKernel("q5k_matmul_prequant_batched_dp4a");
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
