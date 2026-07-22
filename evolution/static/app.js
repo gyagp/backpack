@@ -987,22 +987,14 @@ function digestCalendar(items) {
       months.set(week, month);
       lastMonth = month;
     }
-    const negative = entries.some((x) =>
-        [
-          "measured_regression",
-          "serious_regression",
-          "critical_regression",
-        ].includes(x.impact?.key),
-      ),
-      major = entries.some((x) =>
+    const major = entries.some((x) =>
         [
           "transformative",
-          "critical_regression",
-          "serious_regression",
+          "strong",
         ].includes(x.impact?.key),
       ),
       level = !entries.length ? 0 : major ? 4 : Math.min(3, entries.length),
-      tone = negative ? "regression" : "gain",
+      tone = "gain",
       details = entries
         .map((x) => `${(x.task_labels || []).join(", ") || "#—"} ${x.title} — ${x.impact?.name || "Measured result"}`)
         .join("\n");
@@ -1011,19 +1003,29 @@ function digestCalendar(items) {
     );
     if (cursor.getUTCDay() === 6) week++;
   }
-  return `<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w, label]) => `<span style="left:${w * 15}px">${esc(label)}</span>`).join("")}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join("")}</div></div><div class="digest-heatmap-footer"><span class="digest-regression-key">Regression</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`;
+  return `<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w, label]) => `<span style="left:${w * 15}px">${esc(label)}</span>`).join("")}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join("")}</div></div><div class="digest-heatmap-footer"><span>Accepted progress only</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`;
 }
 let selectedDigestDate = null;
+function roughDailyGain(items) {
+  const values = items
+    .map((item) => Number(item.impact?.value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (!values.length) return null;
+  return (values.reduce((factor, value) => factor * (1 + value / 100), 1) - 1) * 100;
+}
 function renderDigest(items, tasks = []) {
   const taskById = new Map(tasks.map((task) => [task.id, task]));
-  const digest = digestItems(items).map((item) => ({
+  const acceptedItems = items.filter((item) => {
+    if (["measured_regression", "serious_regression", "critical_regression"].includes(item.impact?.key))
+      return false;
+    const task = taskById.get(item.task_id);
+    if (!task) return true;
+    return ["integrated", "observing"].includes(task.state) &&
+      ["accept", "accepted"].includes(task.aggregate_verdict);
+  });
+  const digest = digestItems(acceptedItems).map((item) => ({
     ...item,
     impact: { ...item.impact, name: digestImpactName(item.impact) },
-    rejectedRegression: [
-      "measured_regression",
-      "serious_regression",
-      "critical_regression",
-    ].includes(item.impact?.key),
     task_labels: (item.task_ids || []).map((id) =>
       taskById.has(id) ? taskLabel(taskById.get(id)) : id,
     ),
@@ -1037,11 +1039,11 @@ function renderDigest(items, tasks = []) {
       );
       const selected = digest.filter(
         (item) => shortDate(item.created_at) === button.dataset.date,
-      );
+      ), roughGain = roughDailyGain(selected);
       const detail = $("#digest-day-detail");
       detail.className = "digest-day-detail";
       detail.innerHTML = selected.length
-        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header>${item.rejectedRegression ? '<div class="digest-disposition rejected">Rejected experiment · not merged</div>' : ""}<p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
+        ? `<div class="digest-day-heading"><h2>${esc(button.dataset.date)}</h2><div><strong>${roughGain == null ? "No quantified gain" : `≈ ${roughGain >= 0 ? "+" : ""}${num(roughGain)}%`}</strong><span>rough overall gain</span></div></div>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
         : `<h2>${esc(button.dataset.date)}</h2><div class="empty compact">No progress was recorded on this date.</div>`;
     };
   });
@@ -1056,7 +1058,7 @@ function renderDigest(items, tasks = []) {
       .find((button) => button.dataset.date === defaultDay);
     defaultButton?.click();
   }
-  const days = new Set(items.map((item) => shortDate(item.created_at)));
+  const days = new Set(acceptedItems.map((item) => shortDate(item.created_at)));
   $("#digest-count").textContent =
     `${days.size} day${days.size === 1 ? "" : "s"}`;
 }
