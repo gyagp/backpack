@@ -52,6 +52,32 @@ std::string q4kBatched8PortableSource(const char* source) {
     return result;
 }
 
+const char* gemmaPleAsymGatherBatchedSource() {
+    return R"WGSL(
+@group(0) @binding(0) var<storage, read> B: array<u32>;
+@group(0) @binding(1) var<storage, read> S: array<u32>;
+@group(0) @binding(2) var<storage, read> Z: array<u32>;
+@group(0) @binding(3) var<storage, read> Token: array<i32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(5) var<storage, read> P: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let M=P[0]; let K=P[1]; let V=P[2]; let D=P[3]; let flat=gid.x;
+    if(flat>=M*K){return;} let r=flat/K; let i=flat-r*K;
+    let token=u32(max(Token[r],0)); let layer=i/D; let col=i-layer*D;
+    let packedRow=layer*V+token; let byteIndex=packedRow*(D/2u)+col/2u;
+    let word=B[byteIndex/4u];
+    let qv=i32((word>>(((byteIndex&3u)*8u+(col&1u)*4u)))&15u);
+    let block=packedRow*(D/32u)+col/32u; let zpByteIndex=block/2u;
+    let zpWord=Z[zpByteIndex/4u]; let zpByte=(zpWord>>((zpByteIndex&3u)*8u))&255u;
+    let zp=i32(select(zpByte&15u,zpByte>>4u,(block&1u)==1u));
+    let sp=unpack2x16float(S[block/2u]);
+    let scale=select(sp.x,sp.y,(block&1u)!=0u);
+    Y[flat]=f32(qv-zp)*scale*bitcast<f32>(P[4]);
+}
+)WGSL";
+}
+
 const WGPULimits& effectiveLimits(const GPUContext& gpu) {
     return gpu.deviceLimits.maxComputeInvocationsPerWorkgroup != 0
         ? gpu.deviceLimits
@@ -5117,9 +5143,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (!isKQ && !gemmaSerial) {
         initPrefillResources();
     } else if (gemmaSerial) {
-        const bool intelAdapter = gpu->adapterName.find("Intel") != std::string::npos;
         if (cfg.arch == "gemma4" && !weightsUseNativeKQ && gpu->supportsSubgroups &&
-            !intelAdapter) {
+            !std::getenv("BP_GEMMA_SERIAL_PREFILL")) {
             initGemmaPrefillResources();
         } else {
             fprintf(stderr, "  Prefill: skipped (Gemma sandwich/shared-KV, using serial decode)\n");
@@ -5215,6 +5240,9 @@ void ModelRunner::initGemmaPrefillResources() {
     (void)getKernel("gelu_mul_batched");
     (void)getKernel("ple_gelu_mul_batched");
     (void)getKernel("ple_combine_batched");
+    if (pleTokenEmbAsymmetric)
+        (void)gpu->getOrCreatePipeline("ple_token_q4_asym_gather_batched",
+            gemmaPleAsymGatherBatchedSource(), 6);
     for (const auto& pl : cfg.perLayer)
         if (pl.headDim) (void)getKernelHD(gpu->backendType == WGPUBackendType_D3D12
             ? "causal_attn" : "flash_attn_vulkan", pl.headDim);
@@ -6785,10 +6813,21 @@ int32_t ModelRunner::prefillGemmaBatched(
         if (cfg.pleSize > 0 && pleGpuPreprocess) {
             uint32_t totalPle = cfg.pleSize * cfg.nLayer;
             float ps = sqrtf((float)cfg.pleSize); memcpy(&scaleBits, &ps, 4);
-            auto pg = mkP("gpf_ple_gather_p", {M,totalPle,cfg.nVocab,scaleBits});
-            add(q4Gather, {{0,pleTokenEmbW},{1,pleTokenEmbS},{2,gemmaPf.tokens},
-                           {3,gemmaPf.pleSignal},{4,pg}},
-                (M*totalPle+255)/256,1,"gpf_ple_gather");
+            if (pleTokenEmbAsymmetric) {
+                auto pg = mkP("gpf_ple_gather_p",
+                    {M,totalPle,cfg.nVocab,cfg.pleSize,scaleBits});
+                auto& gather = gpu->getOrCreatePipeline(
+                    "ple_token_q4_asym_gather_batched",
+                    gemmaPleAsymGatherBatchedSource(), 6);
+                add(gather, {{0,pleTokenEmbW},{1,pleTokenEmbS},{2,pleTokenEmbZ},
+                             {3,gemmaPf.tokens},{4,gemmaPf.pleSignal},{5,pg}},
+                    (M*totalPle+255)/256,1,"gpf_ple_gather");
+            } else {
+                auto pg = mkP("gpf_ple_gather_p", {M,totalPle,cfg.nVocab,scaleBits});
+                add(q4Gather, {{0,pleTokenEmbW},{1,pleTokenEmbS},{2,gemmaPf.tokens},
+                               {3,gemmaPf.pleSignal},{4,pg}},
+                    (M*totalPle+255)/256,1,"gpf_ple_gather");
+            }
             auto pm = mkP("gpf_ple_model_p", {M,totalPle,cfg.nEmbd});
             mm(gemmaPf.x,pleModelProjW,pleModelProjS,gemmaPf.pleRaw,
                cfg.nEmbd,totalPle,"gpf_ple_model");
@@ -6956,7 +6995,7 @@ int32_t ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
     if (qwen35Pf.ready && !std::getenv("BP_QWEN35_SERIAL_PREFILL"))
         return prefillQwen35Batched(tokenIds,T,posOffset);
-    if (gemmaPf.ready && !pleTokenEmbAsymmetric &&
+    if (gemmaPf.ready &&
         !std::getenv("BP_GEMMA_SERIAL_PREFILL"))
         return prefillGemmaBatched(tokenIds, T, posOffset);
     if ((pleGpuPreprocess || cfg.arch == "qwen35") &&
