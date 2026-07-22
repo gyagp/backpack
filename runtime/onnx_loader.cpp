@@ -1114,7 +1114,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                      mapping.backpackName.find("mlp.down_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("self_attn.q_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("self_attn.k_proj.weight") != std::string::npos ||
-                     mapping.backpackName.find("self_attn.v_proj.weight") != std::string::npos)) {
+                     mapping.backpackName.find("self_attn.v_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("self_attn.o_proj.weight") != std::string::npos)) {
                     OnnxLoadResult::PackedQ4 packed;
                     packed.N = N; packed.K = K;
                     packed.weights.assign(wTensor.rawData,
@@ -1498,6 +1499,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         if (auto it=q4Weights.find(pfx+"self_attn.qkv_proj.weight");it!=q4Weights.end()){ld.qkvQ4=std::move(it->second);q4Weights.erase(it);}
         if (auto it=q4Weights.find(pfx+"self_attn.q_proj.weight");it!=q4Weights.end()){ld.qOnlyQ4=std::move(it->second);q4Weights.erase(it);}
         moveQ8(pfx + "self_attn.o_proj.weight", ld.o);
+        if(auto it=q4Weights.find(pfx+"self_attn.o_proj.weight");it!=q4Weights.end()){ld.oQ4=std::move(it->second);q4Weights.erase(it);}
         moveQ8(pfx + "mlp.gate_up_proj.weight", ld.gateup);
         if (auto it = q4Weights.find(pfx + "mlp.gate_up_proj.weight"); it != q4Weights.end()) {
             ld.gateupQ4 = std::move(it->second); q4Weights.erase(it);

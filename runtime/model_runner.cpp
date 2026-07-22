@@ -1041,6 +1041,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             lw.qOnlyQ4W=uploadBytes(*gpu,p+".w",ld.qOnlyQ4.weights);lw.qOnlyQ4S=uploadBytes(*gpu,p+".s",ld.qOnlyQ4.scales);lw.qOnlyQ4Z=uploadBytes(*gpu,p+".z",ld.qOnlyQ4.zeroPoints);
         }
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
+        if(ld.oQ4.N>0){const auto p="L"+std::to_string(i)+".o_q4";lw.oQ4W=uploadBytes(*gpu,p+".w",ld.oQ4.weights);lw.oQ4S=uploadBytes(*gpu,p+".s",ld.oQ4.scales);lw.oQ4Z=uploadBytes(*gpu,p+".z",ld.oQ4.zeroPoints);}
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
         if (ld.gateupQ4.N > 0) {
             const auto p = "L" + std::to_string(i) + ".gu_q4";
@@ -6943,7 +6944,10 @@ int32_t ModelRunner::prefillGemmaBatched(
                 cfg.nHead,(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),"gpf_attn");
 
             auto op=mkP("gpf_o_"+std::to_string(li),{M,cfg.nEmbd,qdim});
-            mm(gemmaPf.attn,lw.oW,lw.oS,gemmaPf.proj,qdim,cfg.nEmbd,"gpf_oproj");
+            if(lw.oQ4W.handle&&!std::getenv("BP_GEMMA_Q8_OPROJ")){
+                add(q4zp,{{0,gemmaPf.attn},{1,lw.oQ4W},{2,lw.oQ4S},{3,gemmaPf.proj},{4,op},{5,lw.oQ4Z}},
+                    (cfg.nEmbd+31)/32,(M+3)/4,"gpf_oproj_q4");
+            }else{mm(gemmaPf.attn,lw.oW,lw.oS,gemmaPf.proj,qdim,cfg.nEmbd,"gpf_oproj");}
             auto sp=mkP("gpf_sand_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
             add(sandwich,{{0,gemmaPf.x},{1,gemmaPf.proj},{2,lw.postNorm},
                           {3,lw.ffnNorm},{4,gemmaPf.norm},{5,gemmaPf.rstd},{6,sp}},

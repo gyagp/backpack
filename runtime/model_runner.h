@@ -141,6 +141,7 @@ struct ModelRunner {
         GPUBuffer qkvW, qkvS;       // Q8_0: weight + scale buffers
         GPUBuffer qkvQ4W, qkvQ4S, qkvQ4Z;
         GPUBuffer oW, oS;
+        GPUBuffer oQ4W, oQ4S, oQ4Z;
         GPUBuffer guW, guS;
         GPUBuffer guQ4W, guQ4S, guQ4Z;
         GPUBuffer dnW, dnS;
