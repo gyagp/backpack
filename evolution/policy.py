@@ -15,6 +15,13 @@ def _cv_percent(samples: list[float]) -> float:
     return abs(statistics.stdev(samples) / mean * 100.0)
 
 
+def _lower_is_better(metric: str) -> bool:
+    name = metric.lower()
+    return (name.endswith("_ms") or name.endswith("_latency") or
+            "latency" in name or name.startswith("time_to_") or
+            name in {"gpu_time", "cpu_time", "memory_bytes", "peak_memory_bytes"})
+
+
 def machine_matches(machine: dict[str, Any], selector: dict[str, Any]) -> bool:
     values = {**machine.get("fingerprint", {}), **machine.get("labels", {})}
     return all(values.get(key) == value for key, value in selector.items())
@@ -86,7 +93,11 @@ class PolicyEngine:
                 candidate_samples = [float(v) for v in candidate["samples"]]
                 base_median = statistics.median(base_samples)
                 candidate_median = statistics.median(candidate_samples)
-                delta = math.inf if base_median == 0 else (candidate_median / base_median - 1.0) * 100.0
+                lower_is_better = _lower_is_better(metric)
+                if lower_is_better:
+                    delta = math.inf if candidate_median == 0 else (base_median / candidate_median - 1.0) * 100.0
+                else:
+                    delta = math.inf if base_median == 0 else (candidate_median / base_median - 1.0) * 100.0
                 cv = max(_cv_percent(base_samples), _cv_percent(candidate_samples))
                 if cv > thresholds.max_cv_percent:
                     verdict = "inconclusive"
@@ -101,7 +112,9 @@ class PolicyEngine:
                     "machine_id": machine_id, "metric": metric, "verdict": verdict,
                     "base_median": base_median, "candidate_median": candidate_median,
                     "delta_percent": delta,
-                    "details": {"reason": why, "max_cv_percent": cv, "protected": metric in protected},
+                    "details": {"reason": why, "max_cv_percent": cv,
+                                "protected": metric in protected,
+                                "direction": "lower_is_better" if lower_is_better else "higher_is_better"},
                 })
 
         verdicts = {row["verdict"] for row in rows}

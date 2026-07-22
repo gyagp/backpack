@@ -105,6 +105,27 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("reject", result["aggregate_verdict"])
         self.assertIn("protected metric regressed", result["reason"])
 
+    def test_lower_gpu_time_is_an_improvement(self) -> None:
+        task = self.store.create_task({
+            "title": "Reduce GPU time", "kind": "optimization",
+            "hypothesis": "Less GPU time is faster",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["gpu_time_ms"]},
+            "device_policy": {"required": [self.machine["id"]]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "gpu_time_ms", "correctness": {"passed": True}}
+        self.store.add_evidence({**common, "variant": "base", "samples": [21.5, 21.6, 21.4],
+                                 "commit_sha": "base"}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [20.7, 20.8, 20.6],
+                                 "commit_sha": "candidate"}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("accept", result["aggregate_verdict"])
+        self.assertGreater(result["evaluations"][0]["delta_percent"], 0)
+        self.assertEqual("lower_is_better", result["evaluations"][0]["details"]["direction"])
+
     def test_commit_mismatch_is_rejected(self) -> None:
         with self.assertRaises(DomainError):
             self.store.add_evidence({"task_id": self.task["id"], "machine_id": self.machine["id"],
