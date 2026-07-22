@@ -1111,7 +1111,10 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                 if (cfg.arch == "gemma4" &&
                     (mapping.backpackName.find("mlp.gate_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("mlp.up_proj.weight") != std::string::npos ||
-                     mapping.backpackName.find("mlp.down_proj.weight") != std::string::npos)) {
+                     mapping.backpackName.find("mlp.down_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("self_attn.q_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("self_attn.k_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("self_attn.v_proj.weight") != std::string::npos)) {
                     OnnxLoadResult::PackedQ4 packed;
                     packed.N = N; packed.K = K;
                     packed.weights.assign(wTensor.rawData,
@@ -1419,6 +1422,14 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             q8Weights.erase(kKey);
             q8Weights.erase(vKey);
         }
+        if (q4Weights.count(qKey) && q4Weights.count(kKey) && q4Weights.count(vKey)) {
+            auto& q=q4Weights[qKey]; auto& k=q4Weights[kKey]; auto& v=q4Weights[vKey];
+            OnnxLoadResult::PackedQ4 fused; fused.N=q.N+k.N+v.N; fused.K=q.K;
+            fused.weights=std::move(q.weights); fused.weights.insert(fused.weights.end(),k.weights.begin(),k.weights.end()); fused.weights.insert(fused.weights.end(),v.weights.begin(),v.weights.end());
+            fused.scales=std::move(q.scales); fused.scales.insert(fused.scales.end(),k.scales.begin(),k.scales.end()); fused.scales.insert(fused.scales.end(),v.scales.begin(),v.scales.end());
+            fused.zeroPoints=std::move(q.zeroPoints); fused.zeroPoints.insert(fused.zeroPoints.end(),k.zeroPoints.begin(),k.zeroPoints.end()); fused.zeroPoints.insert(fused.zeroPoints.end(),v.zeroPoints.begin(),v.zeroPoints.end());
+            q4Weights[qkvKey]=std::move(fused); q4Weights.erase(qKey);q4Weights.erase(kKey);q4Weights.erase(vKey);
+        }
 
         std::string gateKey = "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
         std::string upKey = "layers." + std::to_string(i) + ".mlp.up_proj.weight";
@@ -1484,6 +1495,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         moveQ8(pfx + "self_attn.qkv_proj.weight", ld.qkv);
         if (ld.qkv.N == 0)
             moveQ8(pfx + "self_attn.q_proj.weight", ld.qOnly);
+        if (auto it=q4Weights.find(pfx+"self_attn.qkv_proj.weight");it!=q4Weights.end()){ld.qkvQ4=std::move(it->second);q4Weights.erase(it);}
+        if (auto it=q4Weights.find(pfx+"self_attn.q_proj.weight");it!=q4Weights.end()){ld.qOnlyQ4=std::move(it->second);q4Weights.erase(it);}
         moveQ8(pfx + "self_attn.o_proj.weight", ld.o);
         moveQ8(pfx + "mlp.gate_up_proj.weight", ld.gateup);
         if (auto it = q4Weights.find(pfx + "mlp.gate_up_proj.weight"); it != q4Weights.end()) {

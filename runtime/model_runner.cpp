@@ -1032,6 +1032,14 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
                            ld.qOnly, lw.qOnlyW, lw.qOnlyS);
             lw.qOnly = true;
         }
+        if (ld.qkvQ4.N > 0) {
+            const auto p="L"+std::to_string(i)+".qkv_q4";
+            lw.qkvQ4W=uploadBytes(*gpu,p+".w",ld.qkvQ4.weights);lw.qkvQ4S=uploadBytes(*gpu,p+".s",ld.qkvQ4.scales);lw.qkvQ4Z=uploadBytes(*gpu,p+".z",ld.qkvQ4.zeroPoints);
+        }
+        if (ld.qOnlyQ4.N > 0) {
+            const auto p="L"+std::to_string(i)+".qonly_q4";
+            lw.qOnlyQ4W=uploadBytes(*gpu,p+".w",ld.qOnlyQ4.weights);lw.qOnlyQ4S=uploadBytes(*gpu,p+".s",ld.qOnlyQ4.scales);lw.qOnlyQ4Z=uploadBytes(*gpu,p+".z",ld.qOnlyQ4.zeroPoints);
+        }
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
         if (ld.gateupQ4.N > 0) {
@@ -6895,8 +6903,16 @@ int32_t ModelRunner::prefillGemmaBatched(
             bool qonly = lw.qOnly;
             uint32_t qkvN = qonly ? qdim : qdim + 2u*kvdim;
             auto qp=mkP("gpf_qkv_"+std::to_string(li),{M,qkvN,cfg.nEmbd});
-            mm(gemmaPf.norm,qonly?lw.qOnlyW:lw.qkvW,qonly?lw.qOnlyS:lw.qkvS,
-               gemmaPf.qkv,cfg.nEmbd,qkvN,"gpf_qkv");
+            GPUBuffer q4w=qonly?lw.qOnlyQ4W:lw.qkvQ4W;
+            GPUBuffer q4s=qonly?lw.qOnlyQ4S:lw.qkvQ4S;
+            GPUBuffer q4z=qonly?lw.qOnlyQ4Z:lw.qkvQ4Z;
+            if(q4w.handle&&!std::getenv("BP_GEMMA_Q8_QKV")){
+                add(q4zp,{{0,gemmaPf.norm},{1,q4w},{2,q4s},{3,gemmaPf.qkv},{4,qp},{5,q4z}},
+                    (qkvN+31)/32,(M+3)/4,"gpf_qkv_q4");
+            }else{
+                mm(gemmaPf.norm,qonly?lw.qOnlyW:lw.qkvW,qonly?lw.qOnlyS:lw.qkvS,
+                   gemmaPf.qkv,cfg.nEmbd,qkvN,"gpf_qkv");
+            }
 
             bool swa = li<cfg.layerAttnTypes.size() &&
                        cfg.layerAttnTypes[li]==AttnLayerType::SlidingWindow;

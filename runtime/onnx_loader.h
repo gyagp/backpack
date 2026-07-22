@@ -33,6 +33,7 @@ struct OnnxLoadResult {
     struct LayerData {
         Q8Repacked qkv;         // fused Q/K/V projection (Q8 format)
         Q8Repacked qOnly;       // Q-only projection for shared-KV layers
+        PackedQ4 qkvQ4, qOnlyQ4;
         Q8Repacked o;           // output projection
         Q8Repacked gateup;      // fused gate + up projection
         PackedQ4 gateupQ4;      // original ONNX Q4G32 payload for prefill

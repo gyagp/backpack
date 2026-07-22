@@ -139,6 +139,7 @@ struct ModelRunner {
     // Per-layer weight buffers (read-only, shared)
     struct LayerWeights {
         GPUBuffer qkvW, qkvS;       // Q8_0: weight + scale buffers
+        GPUBuffer qkvQ4W, qkvQ4S, qkvQ4Z;
         GPUBuffer oW, oS;
         GPUBuffer guW, guS;
         GPUBuffer guQ4W, guQ4S, guQ4Z;
@@ -150,6 +151,7 @@ struct ModelRunner {
         // reused from an earlier layer's cache. qOnly = true marks these.
         bool qOnly = false;
         GPUBuffer qOnlyW, qOnlyS;   // Q-only projection (Q8)
+        GPUBuffer qOnlyQ4W, qOnlyQ4S, qOnlyQ4Z;
         // K-quant: single buffer per weight (raw block data as u32)
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
         GGUFType qkvKQType = (GGUFType)UINT32_MAX, oKQType = (GGUFType)UINT32_MAX;
