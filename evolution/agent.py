@@ -90,6 +90,7 @@ def sync_base(server: str, repo: Path, worktrees: Path) -> bool:
     sha = milestone["commit_sha"]
     target = worktrees / f"base-{sha[:12]}"
     if (target / ".git").exists() or (target / ".git").is_file():
+        (worktrees / "CURRENT_BASE").write_text(f"{sha}\n{target}\n", encoding="utf-8")
         return False
     worktrees.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "-C", str(repo), "fetch", milestone["remote"], sha], check=True, shell=False)
@@ -97,6 +98,26 @@ def sync_base(server: str, repo: Path, worktrees: Path) -> bool:
     (worktrees / "CURRENT_BASE").write_text(f"{sha}\n{target}\n", encoding="utf-8")
     print(f"Synchronized evolution base {sha} to {target}")
     return True
+
+
+def current_base_worktree(repo: Path) -> Path:
+    marker = repo / "gitignore" / "evolution" / "worktrees" / "CURRENT_BASE"
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        target = Path(lines[1])
+        if target.is_dir():
+            return target
+    except (OSError, IndexError):
+        pass
+    return repo
+
+
+def rewrite_repo_argv(argv: list[str], repo: Path, execution_repo: Path) -> list[str]:
+    if execution_repo == repo:
+        return argv
+    repo_prefix = str(repo).rstrip("\\/")
+    return [str(execution_repo) + value[len(repo_prefix):]
+            if value.lower().startswith(repo_prefix.lower()) else value for value in argv]
 
 
 def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None:
@@ -109,15 +130,13 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
     argv = manifest.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
         raise RuntimeError("argv adapter requires a non-empty string array")
-    execution_repo = repo
+    execution_repo = current_base_worktree(repo)
     prior_repair = (run.get("result") or {}).get("codex_repair") or {}
     if prior_repair.get("candidate_sha") and Path(prior_repair.get("worktree", "")).is_dir():
         execution_repo = Path(prior_repair["worktree"])
-        repo_prefix = str(repo).rstrip("\\/")
-        argv = [str(execution_repo) + value[len(repo_prefix):]
-                if value.lower().startswith(repo_prefix.lower()) else value for value in argv]
+    argv = rewrite_repo_argv(argv, repo, execution_repo)
     request_json(server + f"/api/runs/{run_id}", "POST",
-                 {"status": "running", "phase": "validating Codex repair" if execution_repo != repo else "executing",
+                 {"status": "running", "phase": "validating Codex repair" if prior_repair.get("candidate_sha") else "executing",
                   "progress": 10}, name)
     started = time.monotonic()
     timeout_seconds = int(manifest.get("timeout_seconds") or (1800 if task.get("kind") == "benchmark" else 7200))

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from evolution.agent import current_base_worktree, rewrite_repo_argv
 from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.store import Store
@@ -35,6 +36,22 @@ class FrameworkTest(unittest.TestCase):
                                  "correctness": {"passed": True}}, "test")
         self.store.add_evidence({**common, "variant": "candidate", "samples": candidate, "commit_sha": "candidate",
                                  "correctness": {"passed": passed}}, "test")
+
+    def test_agent_uses_synchronized_base_for_repository_commands(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        base = repo / "gitignore" / "evolution" / "worktrees" / "base-abc"
+        base.mkdir(parents=True)
+        (base.parent / "CURRENT_BASE").write_text(f"abc\n{base}\n", encoding="utf-8")
+
+        resolved = current_base_worktree(repo)
+        rewritten = rewrite_repo_argv(
+            ["python", str(repo / "evolution" / "benchmark_ort.py"),
+             "--model", r"D:\models\qwen"],
+            repo, resolved,
+        )
+        self.assertEqual(base, resolved)
+        self.assertEqual(str(base / "evolution" / "benchmark_ort.py"), rewritten[1])
+        self.assertEqual(r"D:\models\qwen", rewritten[3])
 
     def test_positive_candidate_is_accepted(self) -> None:
         self.add_pair([100, 101, 99], [110, 111, 109])
