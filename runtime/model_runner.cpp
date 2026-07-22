@@ -5109,9 +5109,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     bool isGemma = cfg.arch.rfind("gemma", 0) == 0;
     bool gemmaSerial = isGemma && (cfg.hasSandwichNorm || hasSharedKv);
     if (cfg.arch == "qwen35") {
-        const bool intelQwen4B = gpu->adapterName.find("Intel") != std::string::npos &&
-                                cfg.nEmbd > 2048;
-        if (!std::getenv("BP_QWEN35_SERIAL_PREFILL") && !intelQwen4B) {
+        if (!std::getenv("BP_QWEN35_SERIAL_PREFILL")) {
             initQwen35PrefillResources();
         } else {
             fprintf(stderr, "  Prefill: Qwen3.5 serial path\n");
