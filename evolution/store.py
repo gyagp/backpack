@@ -957,7 +957,7 @@ class Store:
                 continue
             origin, manifest = task.get("origin", {}), task.get("manifest", {})
             reason = ""
-            if origin.get("type") == "automatic" and manifest.get("metrics"):
+            if task["kind"] == "benchmark" and manifest.get("metrics"):
                 model_id, machine_id = origin.get("model_id"), origin.get("machine_id")
                 runtimes = manifest.get("runtimes") or []
                 valid = bool(model_id and machine_id and runtimes)

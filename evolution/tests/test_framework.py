@@ -158,6 +158,27 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(1, self.store.reconcile_completed_tasks())
         self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
 
+    def test_valid_latest_measurement_closes_validation_benchmark(self) -> None:
+        model = self.store.upsert_model({"id": "validated", "name": "Validated", "files": {"ort": {}}})
+        task = self.store.create_task({
+            "title": "Validate rebuilt runtime", "kind": "benchmark",
+            "hypothesis": "The rebuilt runtime remains conformant",
+            "origin": {"type": "validation", "model_id": model["id"],
+                       "machine_id": self.machine["id"]},
+            "manifest": {"metrics": ["prefill_tok_s", "decode_tok_s"],
+                         "runtimes": [{"framework": "ort", "format": "ort",
+                                       "backend": "webgpu"}]},
+        }, "test")
+        self.store.add_observation({
+            "model_id": model["id"], "machine_id": self.machine["id"],
+            "framework": "ort", "format": "ort", "backend": "webgpu",
+            "conformance": "pass", "revision": "source-build",
+            "metrics": {"prefill_tok_s": 500, "decode_tok_s": 25},
+        }, "test")
+
+        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
+
     def test_fleet_conformance_closes_diagnostic_correctness_task(self) -> None:
         model = self.store.upsert_model({"id": "diagnostic", "name": "Diagnostic",
                                          "files": {"ort": {}}})
