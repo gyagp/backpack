@@ -506,15 +506,15 @@ struct GenericOnnxState {
             return argmax(logits.data(), (int64_t)logits.size());
         }
 
-        // NVIDIA uses the sequence-causal Conv/LinearAttention graph together
-        // with a decode-equivalent batched GQA reduction. Other adapters retain
-        // the stable single-token capture until that numerical path is validated
-        // there; RunStep preserves recurrent/KV ordering while reusing the two
-        // Qwen ping-pong capture variants.
-        const bool nvidiaQwenBatch = arch == "qwen3_5_text" &&
-            gpu->adapterName.find("NVIDIA") != std::string::npos &&
+        // NVIDIA and AMD use the sequence-causal Conv/LinearAttention graph.
+        // AMD's GQA dispatch is selected separately in attention.cpp and uses
+        // the same subgroup-plus-workgroup reduction as conformant decode;
+        // this does not require subgroup matrices (unavailable on Windows).
+        const bool deviceQwenBatch = arch == "qwen3_5_text" &&
+            (gpu->adapterName.find("NVIDIA") != std::string::npos ||
+             gpu->adapterName.find("AMD") != std::string::npos) &&
             !std::getenv("BP_QWEN_SERIAL_PREFILL");
-        if (arch == "qwen3_5_text" && !nvidiaQwenBatch) {
+        if (arch == "qwen3_5_text" && !deviceQwenBatch) {
             prefillDone = true;
             std::vector<float> logits;
             for (uint32_t i = 0; i < T; ++i)

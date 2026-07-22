@@ -528,8 +528,15 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
 
         if (seqQ > 1) {
             // Batched prefill: single dispatch for all T query tokens
+            // Qwen 3.5 dense models use four query heads per KV head. Keep
+            // the AMD reduction-order change confined to that cared layout;
+            // Gemma and other AMD models retain their accepted path.
+            const bool amdQwenLayout =
+                ex.getGpu()->adapterName.find("AMD") != std::string::npos &&
+                head_dim == 256 && num_heads == 4 * kv_heads;
             const bool decodeEquivalent =
-                ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
+                ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos ||
+                amdQwenLayout;
             const bool portablePrefill =
                 ex.getGpu()->adapterName.find("Intel") != std::string::npos;
             auto& prefillPl = decodeEquivalent
