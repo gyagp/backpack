@@ -199,7 +199,8 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 task_id, target = match.group(1), body.get("state", "")
                 milestone = None
-                if target == "integrated":
+                task = self.server.store.get_task(task_id)
+                if target == "integrated" and task and task.get("kind") == "optimization":
                     milestone = self.server.milestones.publish(task_id)
                 result = self.server.store.transition_task(task_id, target, actor, body.get("reason", ""))
                 self.server.events.publish("task-updated", result)
