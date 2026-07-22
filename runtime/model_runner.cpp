@@ -3461,7 +3461,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 const bool amdValueMajorState = isAmdAdapter &&
                     (cfg.ssmTimeStepRank == 16u || cfg.ssmTimeStepRank == 32u);
                 const bool nvidiaValueMajorState = isNvidiaAdapter &&
-                    cfg.ssmTimeStepRank == 32u &&
+                    (cfg.ssmTimeStepRank == 16u || cfg.ssmTimeStepRank == 32u) &&
                     (qwen35VulkanDecode || qwen35SubgroupSuite);
                 const auto& plDelta = amdValueMajorState
                     ? gpu->getOrCreatePipeline("delta_net_decode_value_major",
