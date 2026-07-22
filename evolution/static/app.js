@@ -1006,13 +1006,6 @@ function digestCalendar(items) {
   return `<div class="digest-heatmap-wrap"><div class="digest-heatmap"><div class="digest-heatmap-months">${[...months].map(([w, label]) => `<span style="left:${w * 15}px">${esc(label)}</span>`).join("")}</div><div class="digest-heatmap-body"><div class="digest-heatmap-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div><div class="digest-heatmap-grid">${cells.join("")}</div></div><div class="digest-heatmap-footer"><span>Accepted progress only</span><span class="digest-legend">Less <i></i><i></i><i></i><i></i><i></i> More</span></div></div></div>`;
 }
 let selectedDigestDate = null;
-function roughDailyGain(items) {
-  const values = items
-    .map((item) => Number(item.impact?.value))
-    .filter((value) => Number.isFinite(value) && value > 0);
-  if (!values.length) return null;
-  return (values.reduce((factor, value) => factor * (1 + value / 100), 1) - 1) * 100;
-}
 function renderDigest(items, tasks = []) {
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const acceptedItems = items.filter((item) => {
@@ -1039,11 +1032,11 @@ function renderDigest(items, tasks = []) {
       );
       const selected = digest.filter(
         (item) => shortDate(item.created_at) === button.dataset.date,
-      ), roughGain = roughDailyGain(selected);
+      );
       const detail = $("#digest-day-detail");
       detail.className = "digest-day-detail";
       detail.innerHTML = selected.length
-        ? `<div class="digest-day-heading"><h2>${esc(button.dataset.date)}</h2><div><strong>${roughGain == null ? "No quantified gain" : `≈ ${roughGain >= 0 ? "+" : ""}${num(roughGain)}%`}</strong><span>rough overall gain</span></div></div>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
+        ? `<h2>${esc(button.dataset.date)}</h2>${selected.map((item) => `<article class="digest-detail-item"><header><div><strong>${esc(item.title)}</strong><div class="meta mono">Task ${esc(item.task_labels.join(", ") || "#—")} · Source: ${esc((item.task_ids || []).map((id) => taskSource(taskById.get(id))).filter(Boolean).join(", ") || "Unknown")}</div></div>${renderImpactBadge(item.impact)}</header><p>${esc(item.summary)}</p><div class="meta mono">${esc(item.commit_sha || "uncommitted")}</div></article>`).join("")}`
         : `<h2>${esc(button.dataset.date)}</h2><div class="empty compact">No progress was recorded on this date.</div>`;
     };
   });
