@@ -4663,15 +4663,28 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
     // LM head
     if (lmHeadIsKQ) {
+        const bool useAmdQ6Dp4a = lmHeadKQType == GGUF_TYPE_Q6_K &&
+            isAmdAdapter && useQ4KDp4a;
         bool useWideQ6 = lmHeadKQType == GGUF_TYPE_Q6_K &&
             gpu->backendType == WGPUBackendType_Vulkan &&
             !std::getenv("BP_Q6_LM_NARROW");
-        auto* lmKQ = useWideQ6 ? &getKernel("q6k_matmul_wide")
+        auto* lmKQ = useAmdQ6Dp4a ? &getKernel("q6k_matmul_prequant_dp4a")
+                               : useWideQ6 ? &getKernel("q6k_matmul_wide")
                                : kqPipelineFor(lmHeadKQType);
         uint32_t tile = useWideQ6 ? 16u : kqTileFor(lmHeadKQType);
-        auto bg = makeBG(*lmKQ, {
-            {0, normOutBuf}, {1, lmHeadKQ}, {2, zeroBiasV},
-            {3, logitsBuf}, {4, kqLmParams}});
+        if (useAmdQ6Dp4a) {
+            auto& plQuant = getKernel("q8_quantize_dp4a");
+            auto bgQuant = makeBG(plQuant, {
+                {0, normOutBuf}, {1, kqActQ8Buf},
+                {2, kqActScaleBuf}, {3, kqLmParams}});
+            allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
+                (cfg.nEmbd + 255u) / 256u, 1, 1, "lm_head_quant"});
+        }
+        auto bg = useAmdQ6Dp4a
+            ? makeBG(*lmKQ, {{0, kqActQ8Buf}, {1, kqActScaleBuf},
+                {2, lmHeadKQ}, {3, zeroBiasV}, {4, logitsBuf}, {5, kqLmParams}})
+            : makeBG(*lmKQ, {{0, normOutBuf}, {1, lmHeadKQ}, {2, zeroBiasV},
+                {3, logitsBuf}, {4, kqLmParams}});
         allDecodeDispatches.push_back({lmKQ->pipeline, bg,
             1, (cfg.nVocab + tile - 1) / tile, 1, "lm_head"});
     } else if (lmHeadIsQ4 && plQ4LmHead) {

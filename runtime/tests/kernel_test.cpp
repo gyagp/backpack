@@ -15,6 +15,7 @@
 #include "wgsl_template.h"
 #include "graph_executor.h"  // for TensorDtype enum
 #include "gguf_loader.h"
+#include "wgsl_shaders.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1900,6 +1901,39 @@ TEST(q6k_matmul_reference) {
     auto packed=pack_q6k(raw.data(),N,K);std::vector<float>deq(N*K),expected(N);dequant_kquant(raw.data(),deq.data(),N,K,GGUF_TYPE_Q6_K);for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[n]+=x[k]*deq[n*K+k];
     std::vector<float>bias(N,0);auto bx=makeBuffer(gpu,"X",x.data(),K),bw=makeBufferU32(gpu,"W",packed.data.data(),(int)packed.data.size()),bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),p=makeParams(gpu,"P",{K,N,packed.nBlocks,packed.rowStrideWords,0});
     auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
+}
+
+TEST(q6k_matmul_prequant_dp4a_reference) {
+    auto q=loadWgsl("quant_kq","q8_quantize_dp4a");
+    std::string mm=WGSL_Q6K_MATMUL_PREQUANT_DP4A;
+    if(q.empty()||mm.empty())return{false,"cannot load kernels"};
+    const int N=35,K=768,NB=K/256;Rng rng(0x66D4);auto x=rng.randnVec(K);
+    std::vector<uint8_t>raw(N*NB*210);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){
+        uint8_t*p=raw.data()+(n*NB+b)*210;
+        for(int i=0;i<208;i++)p[i]=uint8_t(n*29+b*23+i*19+5);
+        uint16_t d=f32ToF16(.02f+.001f*n+.0003f*b);memcpy(p+208,&d,2);
+    }
+    auto pk=pack_q6k(raw.data(),N,K);std::vector<float>dq(N*K),xq(K),bias(N),exp(N);
+    dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q6_K);
+    for(int b=0;b<K/32;b++){
+        float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[b*32+j]));
+        float s=amax/127.0f;for(int j=0;j<32;j++){
+            int v=s==0?0:std::max(-127,std::min(127,(int)std::round(x[b*32+j]/s)));
+            xq[b*32+j]=v*s;
+        }
+    }
+    for(int n=0;n<N;n++){bias[n]=.01f*n;exp[n]=bias[n];
+        for(int k=0;k<K;k++)exp[n]+=xq[k]*dq[n*K+k];}
+    auto bx=makeBuffer(gpu,"X",x.data(),K),bq=makeBufferU32(gpu,"XQ",nullptr,K/4),
+         bs=makeBuffer(gpu,"XS",nullptr,K/32),
+         bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),
+         bb=makeBuffer(gpu,"B",bias.data(),N),by=makeBuffer(gpu,"Y",nullptr,N),
+         p=makeParams(gpu,"P",{K,N,pk.nBlocks,pk.rowStrideWords,0});
+    dispatchAndReadback(gpu,q,{{0,bx},{1,bq},{2,bs},{3,p}},K/256,1,1,bq,K,4);
+    auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bb},{4,by},{5,p}},
+        1,ceilDiv(N,8),1,by,N*4,6);
+    return assertClose((const float*)r.data(),exp.data(),N,3e-3f,3e-3f);
 }
 
 TEST(q6k_gather_reference) {
