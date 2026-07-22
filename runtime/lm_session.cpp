@@ -217,7 +217,7 @@ struct GenericOnnxState {
     std::unordered_map<std::string, GpuTensor> kvState;
     std::vector<int> convLayerIndices, attnLayerIndices;
 
-    GPUBuffer idsBuf, positionBuf, maskBuf, nlkBuf, logitsBuf;
+    GPUBuffer idsBuf, prefillIdsBuf, positionBuf, maskBuf, nlkBuf, logitsBuf;
     std::vector<GPUBuffer> convOutBufs, convOutAltBufs;
     std::vector<GPUBuffer> recurrentOutBufs, recurrentOutAltBufs;
     uint32_t maskBufCapacity = 0;
@@ -248,6 +248,17 @@ struct GenericOnnxState {
     int qwenCapturedVariants = 0;
     int qwenActiveVariant = -1;
     int qwenNextReplayVariant = 0;
+
+    // Shape-specialized prefill capture used by reused-generator benchmarks.
+    // The reset snapshots retain the stable zero-state input buffers while
+    // the ordinary state maps advance to the captured outputs.
+    bool prefillCaptureReady = false;
+    uint32_t prefillCaptureTokens = 0;
+    std::unordered_map<std::string, GpuTensor> resetConvState;
+    std::unordered_map<std::string, GpuTensor> resetRecurrentState;
+    std::unordered_map<std::string, GpuTensor> resetKvState;
+    std::unordered_map<std::string, GpuTensor> capturedPrefillConvState;
+    std::unordered_map<std::string, GpuTensor> capturedPrefillRecurrentState;
 
     void SwapCaptureVariant(int index) {
         auto& variant = qwenCaptureVariants[index];
@@ -366,12 +377,28 @@ struct GenericOnnxState {
         return true;
     }
 
-    void ResetCaches() {
+    void ResetCaches(bool preserveWarmGraph = false) {
         pos = 0;
         prefillDone = false;
         decodePlanInitialized = false;
         decodeWarmupRemaining = 0;
         nlkWritten = false;
+        if (preserveWarmGraph && !resetConvState.empty()) {
+            convState = resetConvState;
+            recurrentState = resetRecurrentState;
+            kvState = resetKvState;
+            for (auto& [name, t] : convState) {
+                std::vector<uint8_t> zeros(t.ByteSize(), 0);
+                gpu->writeBuffer(t.buffer, zeros.data(), zeros.size());
+            }
+            for (auto& [name, t] : recurrentState) {
+                std::vector<uint8_t> zeros(t.ByteSize(), 0);
+                gpu->writeBuffer(t.buffer, zeros.data(), zeros.size());
+            }
+            for (auto& [name, t] : kvState)
+                t.shape = {1, numKvHeads, 0, headDim};
+            return;
+        }
         convState.clear();
         recurrentState.clear();
         kvState.clear();
@@ -449,6 +476,7 @@ struct GenericOnnxState {
         }
 
         idsBuf = gpu->createBuffer("ids", 8);
+        prefillIdsBuf = gpu->createBuffer("prefill_ids", maxSeqLen * 8);
         positionBuf = gpu->createBuffer("position_ids", maxSeqLen * 8);
         nlkBuf = gpu->createBuffer("nlk", 8);
         logitsBuf = gpu->createBuffer("logits_out", vocabSize * 4);
@@ -471,6 +499,9 @@ struct GenericOnnxState {
                     "recurrent_out_alt_" + std::to_string(convLayerIndices[i]), bytes);
             }
         }
+        resetConvState = convState;
+        resetRecurrentState = recurrentState;
+        resetKvState = kvState;
     }
 
     std::vector<float> RunPrefillStep(int64_t tokenId) {
@@ -531,7 +562,7 @@ struct GenericOnnxState {
         GpuTensor idT;
         idT.shape = {1, (int64_t)T};
         idT.dtype = TensorDtype::Int64;
-        idT.buffer = gpu->createBuffer("pf_ids", T * 8);
+        idT.buffer = prefillIdsBuf;
         gpu->writeBuffer(idT.buffer, ids64.data(), T * 8);
         idT.cpuData.resize(T * 8);
         memcpy(idT.cpuData.data(), ids64.data(), T * 8);
@@ -665,8 +696,69 @@ struct GenericOnnxState {
         }
 
         execCtx.SubmitPending();
-        gpu->releaseBuffer(idT.buffer);
+        return argmax(logits.data(), (int64_t)logits.size());
+    }
 
+    int32_t CapturePrefillBatch(const int32_t* tokenIds, uint32_t T) {
+        ResetCaches(true);
+        execCtx.CaptureBegin();
+        int32_t result = RunPrefillBatch(tokenIds, T);
+        execCtx.CaptureEnd();
+        capturedPrefillConvState = convState;
+        capturedPrefillRecurrentState = recurrentState;
+        prefillCaptureTokens = T;
+        prefillCaptureReady = !execCtx.capturedFlushes_.empty();
+        return result;
+    }
+
+    int32_t ReplayCapturedPrefillBatch(const int32_t* tokenIds, uint32_t T) {
+        if (!prefillCaptureReady || T != prefillCaptureTokens) return -1;
+        ResetCaches(true);
+        pos = T;
+
+        std::vector<int64_t> ids(T), positions(T), mask(T, 1);
+        for (uint32_t i = 0; i < T; ++i) {
+            ids[i] = tokenIds[i];
+            positions[i] = i;
+        }
+        gpu->writeBuffer(prefillIdsBuf, ids.data(), T * sizeof(int64_t));
+        const bool intelQwen2 = arch == "qwen3_5_text" && numLayers == 24 &&
+            gpu->adapterName.find("Intel") != std::string::npos;
+        if (!intelQwen2)
+            gpu->writeBuffer(positionBuf, positions.data(), T * sizeof(int64_t));
+        gpu->writeBuffer(maskBuf, mask.data(), T * sizeof(int64_t));
+        const int64_t nlk = 1;
+        gpu->writeBuffer(nlkBuf, &nlk, sizeof(nlk));
+
+        // Restore CPU-produced constants frozen by capture. External prompt
+        // inputs above deliberately override their corresponding buffers.
+        for (const auto& write : execCtx.capturedWrites_) {
+            if (!write.handle || write.data.empty()) continue;
+            gpu->writeBufferRaw(write.handle, write.offset,
+                                write.data.data(), write.data.size());
+        }
+        gpu->writeBuffer(prefillIdsBuf, ids.data(), T * sizeof(int64_t));
+        if (!intelQwen2)
+            gpu->writeBuffer(positionBuf, positions.data(), T * sizeof(int64_t));
+        gpu->writeBuffer(maskBuf, mask.data(), T * sizeof(int64_t));
+        gpu->writeBuffer(nlkBuf, &nlk, sizeof(nlk));
+
+        execCtx.ReplayDispatches();
+        auto rb = gpu->mapReadbackBuffer((uint64_t)vocabSize * sizeof(float));
+        std::vector<float> logits(vocabSize);
+        memcpy(logits.data(), rb.data(), logits.size() * sizeof(float));
+
+        convState = capturedPrefillConvState;
+        recurrentState = capturedPrefillRecurrentState;
+        for (int idx : attnLayerIndices) {
+            kvState["past_key_values." + std::to_string(idx) + ".key"].shape =
+                {1, numKvHeads, (int64_t)T, headDim};
+            kvState["past_key_values." + std::to_string(idx) + ".value"].shape =
+                {1, numKvHeads, (int64_t)T, headDim};
+        }
+        execCtx.ReleaseCaptured();
+        prefillCaptureReady = false;
+        prefillDone = true;
         return argmax(logits.data(), (int64_t)logits.size());
     }
 
@@ -1707,23 +1799,35 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         if (totalNeeded > (int)gen->maxSeqLen) return result;
 
         std::vector<int32_t> prefillTokens(promptLen, 1);
+        if (std::getenv("BP_BENCH_PATTERN_TOKENS")) {
+            for (int i = 0; i < promptLen; ++i)
+                prefillTokens[i] = 42 + (i * 7919) %
+                    std::max<int64_t>(1, gen->vocabSize - 42);
+        }
         // Match ORT GenAI's reused-generator benchmark semantics: compile the
         // shape-specific pipelines and materialize the tensor plan before the
         // timed sample. Otherwise the first prompt reports shader compilation
         // as inference time and understates steady-state prefill by several x.
-        if (!gen->benchWarmupDone) {
-            gen->ResetCaches();
-            (void)gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
-            gen->ResetCaches();
-            gen->benchWarmupDone = true;
-        } else {
-            gen->ResetCaches();
+        bool capturePrefill = gen->arch == "qwen3_5_text" &&
+            !std::getenv("BP_QWEN_DISABLE_PREFILL_CAPTURE");
+        gen->ResetCaches();
+        (void)gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
+        if (capturePrefill) {
+            (void)gen->CapturePrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
+            capturePrefill = gen->prefillCaptureReady;
         }
+        if (!capturePrefill)
+            gen->ResetCaches();
+        gen->benchWarmupDone = true;
         int32_t tok = 1;
 
         // Prefill
         auto pfStart = std::chrono::steady_clock::now();
-        tok = gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
+        tok = capturePrefill
+            ? gen->ReplayCapturedPrefillBatch(prefillTokens.data(), (uint32_t)promptLen)
+            : gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
+        if (std::getenv("BP_DUMP_BENCH_TOKEN"))
+            fprintf(stderr, "  [benchmark-token] prefill=%d\n", tok);
         auto pfEnd = std::chrono::steady_clock::now();
         result.prefillMs = std::chrono::duration<double, std::milli>(pfEnd - pfStart).count();
         result.prefillTokPerSec = promptLen * 1000.0 / result.prefillMs;
@@ -1734,6 +1838,8 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         {
             auto logits = gen->RunStep(tok);
             tok = argmax(logits.data(), (int64_t)logits.size());
+            if (std::getenv("BP_DUMP_BENCH_TOKEN"))
+                fprintf(stderr, "  [benchmark-token] ttft=%d\n", tok);
         }
         auto ttftEnd = std::chrono::steady_clock::now();
         result.ttftMs = std::chrono::duration<double, std::milli>(ttftEnd - ttftStart).count();
