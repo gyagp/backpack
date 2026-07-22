@@ -264,12 +264,13 @@ static void opSkipSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*Skip);
         ex.EnsureGpu(*W);
-        // ORT's workgroup-per-row reduction is substantially faster on
-        // NVIDIA and AMD. Intel's current D3D12 driver regresses with this
-        // layout, so retain the conformant serial row fallback there.
-        const bool useParallel = ex.getGpu()->adapterName.find("Intel") == std::string::npos;
-        const bool useVec4 = ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+        // ORT's component-vectorized workgroup reduction avoids the serial
+        // row bottleneck on adapters where four-component storage is native.
+        const bool useVec4 = (ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos ||
+                              ex.getGpu()->adapterName.find("Intel") != std::string::npos) &&
                              hiddenDim % 4 == 0;
+        const bool useParallel = useVec4 ||
+            ex.getGpu()->adapterName.find("Intel") == std::string::npos;
         auto& pl = useParallel
             ? ex.GetPipelineT(useVec4 ? "skip_rmsnorm_f16w_vec4" : "skip_rmsnorm_f16w", 6,
                 [useVec4]() { return std::string(useVec4 ? WGSL_SKIP_RMSNORM_F16W_VEC4
