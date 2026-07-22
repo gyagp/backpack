@@ -506,13 +506,14 @@ struct GenericOnnxState {
             return argmax(logits.data(), (int64_t)logits.size());
         }
 
-        // NVIDIA and AMD use the sequence-causal Conv/LinearAttention graph.
-        // AMD's GQA dispatch is selected separately in attention.cpp and uses
-        // the same subgroup-plus-workgroup reduction as conformant decode;
-        // this does not require subgroup matrices (unavailable on Windows).
+        // All cared Windows adapters use the sequence-causal
+        // Conv/LinearAttention graph. GQA selects the vendor-validated
+        // reduction in attention.cpp; none of these paths requires subgroup
+        // matrices, which are unavailable through Windows WebGPU.
         const bool deviceQwenBatch = arch == "qwen3_5_text" &&
             (gpu->adapterName.find("NVIDIA") != std::string::npos ||
-             gpu->adapterName.find("AMD") != std::string::npos) &&
+             gpu->adapterName.find("AMD") != std::string::npos ||
+             gpu->adapterName.find("Intel") != std::string::npos) &&
             !std::getenv("BP_QWEN_SERIAL_PREFILL");
         if (arch == "qwen3_5_text" && !deviceQwenBatch) {
             prefillDone = true;
