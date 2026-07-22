@@ -2260,6 +2260,8 @@ void ModelRunner::buildDecodePipeline() {
                    [](unsigned char c) { return (char)std::tolower(c); });
     const bool isNvidiaAdapter = decodeAdapter.find("nvidia") != std::string::npos;
     const bool isIntelAdapter = decodeAdapter.find("intel") != std::string::npos;
+    const bool isAmdAdapter = decodeAdapter.find("amd") != std::string::npos ||
+                              decodeAdapter.find("radeon") != std::string::npos;
     const bool canUse512ThreadKernels =
         gpu->supportsSubgroups &&
         limits.maxComputeInvocationsPerWorkgroup >= 512u &&
@@ -2343,7 +2345,7 @@ void ModelRunner::buildDecodePipeline() {
     // variant remains the portable default for AMD and Intel).  Keep explicit
     // overrides so cross-device experiments can compare either path.
     const bool useQ4KDecode256 = std::getenv("BP_Q4K_DECODE_256") ||
-        (isNvidiaAdapter && !std::getenv("BP_Q4K_DECODE_128"));
+        ((isNvidiaAdapter || isAmdAdapter) && !std::getenv("BP_Q4K_DECODE_128"));
     // Packed 4x8 integer dot products are conformant and faster on NVIDIA and
     // Intel. AMD exposes the operation but changes cared-model logits, so it
     // retains the floating-point Q4_K reduction.
