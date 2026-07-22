@@ -141,6 +141,25 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(1, self.store.reconcile_completed_tasks())
         self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
 
+    def test_fleet_conformance_closes_diagnostic_correctness_task(self) -> None:
+        model = self.store.upsert_model({"id": "diagnostic", "name": "Diagnostic",
+                                         "files": {"ort": {}}})
+        task = self.store.create_task({
+            "title": "Support packed diagnostic input", "kind": "correctness",
+            "hypothesis": "Fleet conformance proves the implementation is complete",
+            "origin": {"type": "diagnostic", "model_id": model["id"]},
+            "manifest": {"runtime": "backpack", "format": "ort", "backend": "webgpu"},
+        }, "test")
+        self.store.add_observation({
+            "model_id": model["id"], "machine_id": self.machine["id"],
+            "framework": "backpack", "format": "ort", "backend": "webgpu",
+            "conformance": "pass", "revision": "done",
+        }, "test")
+        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        closed = self.store.get_task(task["id"])
+        self.assertEqual("integrated", closed["state"])
+        self.assertEqual("accepted", closed["aggregate_verdict"])
+
     def test_successful_profiling_run_closes_task(self) -> None:
         task = self.store.create_task({
             "title": "Profile cared model", "kind": "profiling",

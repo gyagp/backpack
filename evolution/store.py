@@ -968,6 +968,19 @@ class Store:
                                            and metrics.get("decode_tok_s") is not None)
                 if valid:
                     reason = "Latest matching conformance and prefill/decode measurements are valid"
+            elif origin.get("type") == "diagnostic" and origin.get("model_id") and \
+                    manifest.get("runtime") and manifest.get("format"):
+                model_id = origin["model_id"]
+                framework = manifest["runtime"]
+                fmt = manifest["format"]
+                backend = manifest.get("backend", "webgpu")
+                if backend in {"d3d12", "webgpu-native"}:
+                    backend = "webgpu"
+                observations = [latest.get((model_id, machine["id"], framework, fmt, backend))
+                                for machine in self.list_machines()]
+                if observations and all(item and item.get("conformance") == "pass"
+                                        for item in observations):
+                    reason = "Latest matching conformance passes on every cared device"
             elif origin.get("type") in {"scheduled", "profiling"} or (
                     origin.get("type") == "continuous-learning"
                     and task["title"].startswith("Profile ")):
