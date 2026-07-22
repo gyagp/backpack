@@ -217,6 +217,28 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
         (name == "q4k_matmul_dp4a" ||
          name == "q4k_matmul_prequant_dp4a")) {
         std::string source = it->second.source;
+        if (name == "q4k_matmul_prequant_dp4a") {
+            // llama.cpp's Vulkan quantized matvec keeps the prequantized
+            // activation fragment in subgroup-local registers.  On AMD this
+            // trades a few cache-friendly duplicate reads for eliminating
+            // two workgroup-wide barriers per Q4_K block.
+            auto replaceOnce = [&](const std::string& from,
+                                   const std::string& to) {
+                const size_t at = source.find(from);
+                if (at != std::string::npos) source.replace(at, from.size(), to);
+            };
+            replaceOnce(
+                "        if (tid < 64u) { xq[tid] = XQ[b * 64u + tid]; }\n"
+                "        if (tid < 8u) { xs[tid] = XS[b * 8u + tid]; }\n"
+                "        workgroupBarrier();\n", "");
+            replaceOnce("        let aq0 = xq[lane * 2u];\n"
+                        "        let aq1 = xq[lane * 2u + 1u];",
+                        "        let aq0 = XQ[b * 64u + lane * 2u];\n"
+                        "        let aq1 = XQ[b * 64u + lane * 2u + 1u];\n"
+                        "        let xscale = XS[b * 8u + sb];");
+            replaceOnce("acc[c] += xs[sb] *", "acc[c] += xscale *");
+            replaceOnce("        workgroupBarrier();\n    }", "    }");
+        }
         const std::string from = name == "q4k_matmul_dp4a"
             ? "let total = subgroupAdd(acc);"
             : "let total = subgroupAdd(acc[c]);";
