@@ -3432,7 +3432,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             }
             {
                 const bool amdValueMajorState = isAmdAdapter &&
-                    cfg.ssmTimeStepRank == 32u;
+                    (cfg.ssmTimeStepRank == 16u || cfg.ssmTimeStepRank == 32u);
                 const bool nvidiaValueMajorState = isNvidiaAdapter &&
                     cfg.ssmTimeStepRank == 32u &&
                     (qwen35VulkanDecode || qwen35SubgroupSuite);
@@ -6462,8 +6462,10 @@ int32_t ModelRunner::prefillQwen35Batched(
         auto&bagKernel=getKernel("qwen35_alpha_beta_gate_batched");
         auto&convKernel=getKernel("qwen35_conv_scan_silu");
         auto&splitSsmKernel=getKernel("qwen35_split_qkv_l2_batched");
-        const bool valueMajorPrefill=(gpu->adapterName.find("NVIDIA")!=std::string::npos||
-            gpu->adapterName.find("AMD")!=std::string::npos)&&cfg.ssmTimeStepRank==32u;
+        const bool valueMajorPrefill=
+            (gpu->adapterName.find("NVIDIA")!=std::string::npos&&cfg.ssmTimeStepRank==32u)||
+            (gpu->adapterName.find("AMD")!=std::string::npos&&
+             (cfg.ssmTimeStepRank==16u||cfg.ssmTimeStepRank==32u));
         const auto&deltaKernel=valueMajorPrefill
             ? gpu->getOrCreatePipeline("delta_net_scan_x2_value_major",
                 deltaNetValueMajorSource(WGSL_DELTA_NET_SCAN_X2),8)
