@@ -746,18 +746,35 @@ function renderTaskTable(tasks, history = [], mode = "pending") {
         impact = records.length ? historyGroupImpact(records) : classifyHistoryImpact(null),
         result = records[0]?.summary || taskResult(task, running || latestRun),
         reason = failureReason(task);
-      return `<tr><td class="task-id-cell"><strong>${esc(taskLabel(task))}</strong></td><td><strong>${esc(task.title)}</strong><div class="meta mono">${esc(task.id)}</div></td><td>${esc(taskSource(task))}</td><td>${badge(running?.status || task.state)}</td><td><div class="task-table-result">${renderImpactBadge(impact)}<span>${esc(reason || result)}</span></div></td><td>${esc(stamp(task.created_at))}</td><td>${esc(stamp(started))}</td><td>${esc(stamp(done))}</td><td>${duration == null ? "—" : formatDuration(duration)}</td><td>${devices.length ? devices.map((device) => `<span class="task-device-chip">${esc(device)}</span>`).join("") : "—"}</td><td><button class="secondary detail" data-id="${esc(task.id)}">View</button></td></tr>`;
+      return `<tr><td class="task-id-cell"><strong>${esc(taskLabel(task))}</strong></td><td><strong>${esc(task.title)}</strong><div class="meta mono">${esc(task.id)}</div></td><td>${esc(taskSource(task))}</td><td>${badge(running?.status || taskDisplayStatus(task))}</td><td><div class="task-table-result">${renderImpactBadge(impact)}<span>${esc(reason || result)}</span></div></td><td>${esc(stamp(task.created_at))}</td><td>${esc(stamp(started))}</td><td>${esc(stamp(done))}</td><td>${duration == null ? "—" : formatDuration(duration)}</td><td>${devices.length ? devices.map((device) => `<span class="task-device-chip">${esc(device)}</span>`).join("") : "—"}</td><td><button class="secondary detail" data-id="${esc(task.id)}">View</button></td></tr>`;
     }).join("");
   return `<div class="table-wrap task-table-wrap"><table class="task-table"><thead><tr><th>ID</th><th>Task</th><th>Source</th><th>Status</th><th>Result</th><th>Created</th><th>Started</th><th>Done</th><th>Duration</th><th>Devices</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 function taskDisplayStatus(task) {
-  return (task.runs || []).some((run) => run.status === "running")
-    ? "running"
+  if ((task.runs || []).some((run) => run.status === "running")) return "running";
+  return task.kind !== "optimization" && task.state === "integrated"
+    ? "completed"
     : task.state;
+}
+const taskFilterCookie = "backpack-task-filters";
+function readTaskFilters() {
+  const prefix = `${taskFilterCookie}=`;
+  const value = document.cookie.split("; ").find((item) => item.startsWith(prefix));
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(decodeURIComponent(value.slice(prefix.length)));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+function writeTaskFilters(filters) {
+  document.cookie = `${taskFilterCookie}=${encodeURIComponent(JSON.stringify(filters))}; Max-Age=31536000; Path=/; SameSite=Lax`;
 }
 function renderTaskDirectory(tasks, history) {
   const search = $("#task-search"), status = $("#task-status-filter"),
-    source = $("#task-source-filter"), target = $("#all-tasks");
+    source = $("#task-source-filter"), target = $("#all-tasks"),
+    saved = readTaskFilters();
   const populate = (container, values) => {
     const current = new Set([...container.querySelectorAll("input:checked")].map((x) => x.value));
     container.innerHTML = [...new Set(values)].sort().map((x) =>
@@ -765,10 +782,18 @@ function renderTaskDirectory(tasks, history) {
   };
   populate(status, tasks.map(taskDisplayStatus));
   populate(source, tasks.map(taskSource));
+  search.value = typeof saved.search === "string" ? saved.search : "";
+  const restoreChecks = (container, values) => {
+    const wanted = new Set(Array.isArray(values) ? values : []);
+    container.querySelectorAll("input").forEach((input) => input.checked = wanted.has(input.value));
+  };
+  restoreChecks(status, saved.statuses);
+  restoreChecks(source, saved.sources);
   const apply = () => {
     const query = search.value.trim().toLowerCase(),
       statusValues = new Set([...status.querySelectorAll("input:checked")].map((x) => x.value)),
       sourceValues = new Set([...source.querySelectorAll("input:checked")].map((x) => x.value));
+    writeTaskFilters({search: search.value, statuses: [...statusValues], sources: [...sourceValues]});
     const filtered = tasks.filter((task) => {
       const haystack = [taskLabel(task), task.id, task.title, taskSource(task),
         taskResult(task), task.verdict_reason,

@@ -233,12 +233,15 @@ under the same task so earlier evidence remains visible.
    without an explicit human policy override.
 2. Any missing/inconclusive required device: block and retry within budget.
 3. All required devices positive or neutral, with at least one positive and no
-   protected-metric regression: ready to merge.
+   protected-metric regression: ready to merge. A large, stable improvement on
+   one target device is sufficient; non-target devices do not also need to
+   improve when they retain conformance and remain within the neutral band.
 4. Required devices have mixed positive/negative performance: structured
    debate.
-5. A backend-specific optimization may be accepted when its applicability is
-   reliably gated and non-target devices are correctness-neutral. The debate
-   must verify the dispatch predicate and maintenance cost.
+5. A device- or backend-specific optimization may be accepted when its
+   applicability is reliably gated and non-target devices retain correctness
+   without a meaningful performance regression. The debate must verify the
+   dispatch predicate and maintenance cost.
 6. The judge may recommend accept/reject/more evidence. High-risk changes,
    policy exceptions, and uncertain judgments enter `awaiting_human`.
 
