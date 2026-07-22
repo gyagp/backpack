@@ -4267,11 +4267,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
                             (cfg.nEmbd + 255) / 256, 1, 1, L+"kq_gateup_quant"});
                     }
-                    const bool useIntelReduc16 = isIntelAdapter && cfg.arch == "qwen35";
-                    layerKQ = &getKernel(useIntelReduc16
+                    const bool useLogicalReduc16 = (isIntelAdapter || isNvidiaAdapter) &&
+                        cfg.arch == "qwen35";
+                    layerKQ = &getKernel(useLogicalReduc16
                         ? "q4k_matmul_prequant_dp4a_reduc16"
                         : "q4k_matmul_prequant_dp4a");
-                    layerTile = useIntelReduc16 ? 16 : 8;
+                    layerTile = useLogicalReduc16 ? 16 : 8;
                 }
                 auto bg = prequantQ4K
                     ? makeBG(*layerKQ, {{0, kqActQ8Buf}, {1, kqActScaleBuf},
@@ -4335,11 +4336,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         {2, kqActScaleBuf}, {3, layerParams}});
                     allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
                         (plIM + 255) / 256, 1, 1, L+"kq_down_quant"});
-                    const bool useIntelReduc16 = isIntelAdapter && cfg.arch == "qwen35";
-                    layerKQ = &getKernel(useIntelReduc16
+                    const bool useLogicalReduc16 = (isIntelAdapter || isNvidiaAdapter) &&
+                        cfg.arch == "qwen35";
+                    layerKQ = &getKernel(useLogicalReduc16
                         ? "q4k_matmul_prequant_dp4a_reduc16"
                         : "q4k_matmul_prequant_dp4a");
-                    layerTile = useIntelReduc16 ? 16 : 8;
+                    layerTile = useLogicalReduc16 ? 16 : 8;
                 }
                 auto bgDn = prequantQ4K
                     ? makeBG(*layerKQ, {{0, kqActQ8Buf}, {1, kqActScaleBuf},
