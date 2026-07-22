@@ -506,15 +506,15 @@ struct GenericOnnxState {
             return argmax(logits.data(), (int64_t)logits.size());
         }
 
-        // Qwen's exported recurrent graph must advance one token at a time,
-        // but its per-token shape is identical during prompt ingestion and
-        // generation.  Route the serial prompt through the stable single-token
-        // plan so graph capture can amortize command encoding after the first
-        // few tokens.  RunPrefillStep() used to rebuild/submit the full ONNX
-        // graph for every prompt token, leaving the GPU idle for ~98% of wall
-        // time.  RunStep() preserves exactly the same recurrent/KV ordering
-        // while reusing the two Qwen ping-pong capture variants.
-        if (arch == "qwen3_5_text") {
+        // NVIDIA uses the sequence-causal Conv/LinearAttention graph together
+        // with a decode-equivalent batched GQA reduction. Other adapters retain
+        // the stable single-token capture until that numerical path is validated
+        // there; RunStep preserves recurrent/KV ordering while reusing the two
+        // Qwen ping-pong capture variants.
+        const bool nvidiaQwenBatch = arch == "qwen3_5_text" &&
+            gpu->adapterName.find("NVIDIA") != std::string::npos &&
+            !std::getenv("BP_QWEN_SERIAL_PREFILL");
+        if (arch == "qwen3_5_text" && !nvidiaQwenBatch) {
             prefillDone = true;
             std::vector<float> logits;
             for (uint32_t i = 0; i < T; ++i)
@@ -1737,8 +1737,16 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         auto ttftEnd = std::chrono::steady_clock::now();
         result.ttftMs = std::chrono::duration<double, std::milli>(ttftEnd - ttftStart).count();
 
-        // Warmup 2 more steps
+        // Warm up the ordinary decode tensor plan and both Qwen ping-pong
+        // capture variants before timing steady-state decode.  Batched prefill
+        // deliberately invalidates its prompt-shaped tensor plan, so a fixed
+        // two steps left capture work in the timed region while serial prefill
+        // happened to complete it during the prompt loop.
         for (int i = 0; i < 2; i++) {
+            auto logits = gen->RunStep(tok);
+            tok = argmax(logits.data(), (int64_t)logits.size());
+        }
+        for (int i = 0; gen->fastDecodeEnabled && !gen->fastDecodeCaptured && i < 4; i++) {
             auto logits = gen->RunStep(tok);
             tok = argmax(logits.data(), (int64_t)logits.size());
         }

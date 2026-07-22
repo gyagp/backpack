@@ -157,6 +157,87 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 )WGSL";
 
+// Batched prefill with the same 64-thread/two-subgroup reduction order as
+// gqa_decode.  One workgroup owns a (query, head) pair, so queries remain
+// batched without changing the floating-point association used by the
+// conformant token-at-a-time reference.
+static const char* kGqaPrefillDecodeEquivalent = R"WGSL(
+enable subgroups;
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read> params: array<u32>;
+var<workgroup> score_scratch: array<f32, 8>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(subgroup_invocation_id) sg_lane: u32,
+        @builtin(subgroup_id) sg_id: u32,
+        @builtin(num_subgroups) num_sg: u32) {
+    let num_heads = params[0];
+    let head_dim = params[1];
+    let past_seq = params[2];
+    let kv_heads = params[3];
+    let scale = bitcast<f32>(params[4]);
+    let kv_stride = params[5];
+    let query_index = wid.y / num_heads;
+    let head = wid.y % num_heads;
+    let kv_head = head / (num_heads / kv_heads);
+    let q_base = (query_index * num_heads + head) * head_dim;
+    let d0 = lid.x;
+    let causal_length = past_seq + query_index + 1u;
+
+    var acc0 = 0.0; var acc1 = 0.0;
+    var acc2 = 0.0; var acc3 = 0.0;
+    var running_max = -1e30;
+    var running_sum = 0.0;
+    for (var position = 0u; position < causal_length; position++) {
+        let kv_base = (kv_head * kv_stride + position) * head_dim;
+        var score = 0.0;
+        for (var dimension = d0; dimension < head_dim; dimension += 64u) {
+            score += q[q_base + dimension] * k[kv_base + dimension];
+        }
+        score = subgroupAdd(score);
+        if (sg_lane == 0u) { score_scratch[sg_id] = score; }
+        workgroupBarrier();
+        if (d0 == 0u) {
+            var total = 0.0;
+            for (var subgroup = 0u; subgroup < num_sg; subgroup++) {
+                total += score_scratch[subgroup];
+            }
+            score_scratch[0] = total;
+        }
+        workgroupBarrier();
+        score = score_scratch[0] * scale;
+
+        let next_max = max(running_max, score);
+        let previous_factor = exp(running_max - next_max);
+        let score_factor = exp(score - next_max);
+        let next_sum = running_sum * previous_factor + score_factor;
+        let rescale = running_sum * previous_factor / max(next_sum, 1e-10);
+        let weight = score_factor / max(next_sum, 1e-10);
+        acc0 = acc0 * rescale + weight * v[kv_base + d0];
+        if (d0 + 64u < head_dim) {
+            acc1 = acc1 * rescale + weight * v[kv_base + d0 + 64u];
+        }
+        if (d0 + 128u < head_dim) {
+            acc2 = acc2 * rescale + weight * v[kv_base + d0 + 128u];
+        }
+        if (d0 + 192u < head_dim) {
+            acc3 = acc3 * rescale + weight * v[kv_base + d0 + 192u];
+        }
+        running_max = next_max;
+        running_sum = next_sum;
+    }
+    output[q_base + d0] = acc0;
+    if (d0 + 64u < head_dim) { output[q_base + d0 + 64u] = acc1; }
+    if (d0 + 128u < head_dim) { output[q_base + d0 + 128u] = acc2; }
+    if (d0 + 192u < head_dim) { output[q_base + d0 + 192u] = acc3; }
+}
+)WGSL";
+
 static void opGQA(OpContext& ex, const OnnxGraphNode& n,
     const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* Q = in[0];
@@ -447,9 +528,14 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
 
         if (seqQ > 1) {
             // Batched prefill: single dispatch for all T query tokens
+            const bool decodeEquivalent =
+                ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
             const bool portablePrefill =
                 ex.getGpu()->adapterName.find("Intel") != std::string::npos;
-            auto& prefillPl = portablePrefill
+            auto& prefillPl = decodeEquivalent
+                ? ex.GetPipeline("gqa_prefill_decode_equivalent",
+                                 kGqaPrefillDecodeEquivalent, 5)
+                : portablePrefill
                 ? ex.GetPipeline("gqa_prefill_portable", kGqaPrefillPortable, 5)
                 : ex.GetPipelineT("gqa_prefill", 5, []() {
                     return std::string(WGSL_GQA_PREFILL);
@@ -464,7 +550,7 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
             auto prefillBg = ex.MakeBindGroup(prefillPl, {
                 {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
                 {3, out[0]->buffer}, {4, ppBuf}});
-            if (portablePrefill) {
+            if (decodeEquivalent || portablePrefill) {
                 ex.QueueDispatch(prefillPl.pipeline, prefillBg,
                     1, (uint32_t)(num_heads * seqQ), 1, "gqa_prefill_portable");
             } else {
