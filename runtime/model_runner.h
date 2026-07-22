@@ -169,6 +169,8 @@ struct ModelRunner {
         // PLE (Per-Layer Embedding)
         GPUBuffer pleInpGateW, pleInpGateS;  // [E, pleSize] gate projection
         GPUBuffer pleProjW, pleProjS;        // [pleSize, E] back-projection
+        GPUBuffer pleInpGateQ4W, pleInpGateQ4S, pleInpGateQ4Z;
+        GPUBuffer pleProjQ4W, pleProjQ4S, pleProjQ4Z;
         GPUBuffer plePostNorm;               // RMSNorm on PLE output
         // Per-layer output scale
         GPUBuffer outScale;        // scalar [1]

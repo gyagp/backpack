@@ -42,6 +42,7 @@ struct OnnxLoadResult {
         Q8Repacked down;        // down projection
         Q8Repacked pleInputGate;
         Q8Repacked pleProjection;
+        PackedQ4 pleInputGateQ4, pleProjectionQ4;
         // fp16 alternative (used when Q4 source — avoids double-quantization)
         std::vector<uint16_t> qkvFp16;
         std::vector<uint16_t> oFp16;

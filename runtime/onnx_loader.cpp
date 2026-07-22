@@ -1115,7 +1115,9 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                      mapping.backpackName.find("self_attn.q_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("self_attn.k_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("self_attn.v_proj.weight") != std::string::npos ||
-                     mapping.backpackName.find("self_attn.o_proj.weight") != std::string::npos)) {
+                     mapping.backpackName.find("self_attn.o_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("ple_input_gate.weight") != std::string::npos ||
+                     mapping.backpackName.find("ple_projection.weight") != std::string::npos)) {
                     OnnxLoadResult::PackedQ4 packed;
                     packed.N = N; packed.K = K;
                     packed.weights.assign(wTensor.rawData,
@@ -1510,6 +1512,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         }
         moveQ8(pfx + "ple_input_gate.weight", ld.pleInputGate);
         moveQ8(pfx + "ple_projection.weight", ld.pleProjection);
+        if(auto it=q4Weights.find(pfx+"ple_input_gate.weight");it!=q4Weights.end()){ld.pleInputGateQ4=std::move(it->second);q4Weights.erase(it);}
+        if(auto it=q4Weights.find(pfx+"ple_projection.weight");it!=q4Weights.end()){ld.pleProjectionQ4=std::move(it->second);q4Weights.erase(it);}
         moveNorm(pfx + "input_layernorm.weight", ld.inputNorm);
         moveNorm(pfx + "post_attention_layernorm.weight", ld.postAttnNorm);
         moveNorm(pfx + "q_norm.weight", ld.qNorm);

@@ -1068,9 +1068,11 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         if (ld.pleInputGate.N > 0)
             uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_gate",
                            ld.pleInputGate, lw.pleInpGateW, lw.pleInpGateS);
+        if(ld.pleInputGateQ4.N>0){const auto p="L"+std::to_string(i)+".ple_gate_q4";lw.pleInpGateQ4W=uploadBytes(*gpu,p+".w",ld.pleInputGateQ4.weights);lw.pleInpGateQ4S=uploadBytes(*gpu,p+".s",ld.pleInputGateQ4.scales);lw.pleInpGateQ4Z=uploadBytes(*gpu,p+".z",ld.pleInputGateQ4.zeroPoints);}
         if (ld.pleProjection.N > 0)
             uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_proj",
                            ld.pleProjection, lw.pleProjW, lw.pleProjS);
+        if(ld.pleProjectionQ4.N>0){const auto p="L"+std::to_string(i)+".ple_proj_q4";lw.pleProjQ4W=uploadBytes(*gpu,p+".w",ld.pleProjectionQ4.weights);lw.pleProjQ4S=uploadBytes(*gpu,p+".s",ld.pleProjectionQ4.scales);lw.pleProjQ4Z=uploadBytes(*gpu,p+".z",ld.pleProjectionQ4.zeroPoints);}
 
         // Norm weights
         if (!ld.inputNorm.empty()) {
@@ -6997,14 +6999,18 @@ int32_t ModelRunner::prefillGemmaBatched(
 
             if(cfg.pleSize>0&&(pleGpuPreprocess||!pleEmbCPU.empty())&&lw.pleInpGateW.handle){
                 auto p1=mkP("gpf_pg_"+std::to_string(li),{M,cfg.pleSize,cfg.nEmbd});
-                mm(gemmaPf.x,lw.pleInpGateW,lw.pleInpGateS,gemmaPf.pleGate,
-                   cfg.nEmbd,cfg.pleSize,"gpf_ple_gate");
+                if(lw.pleInpGateQ4W.handle&&!std::getenv("BP_GEMMA_Q8_PLE")){
+                    add(q4zp,{{0,gemmaPf.x},{1,lw.pleInpGateQ4W},{2,lw.pleInpGateQ4S},{3,gemmaPf.pleGate},{4,p1},{5,lw.pleInpGateQ4Z}},
+                        (cfg.pleSize+31)/32,(M+3)/4,"gpf_ple_gate_q4");
+                }else{mm(gemmaPf.x,lw.pleInpGateW,lw.pleInpGateS,gemmaPf.pleGate,cfg.nEmbd,cfg.pleSize,"gpf_ple_gate");}
                 auto p2=mkP("gpf_pm_"+std::to_string(li),{M,cfg.pleSize,li,cfg.nLayer});
                 add(pleMul,{{0,gemmaPf.pleGate},{1,gemmaPf.pleSignal},{2,p2}},
                     (M*cfg.pleSize+255)/256,1,"gpf_ple_mul");
                 auto p3=mkP("gpf_pp_"+std::to_string(li),{M,cfg.nEmbd,cfg.pleSize});
-                mm(gemmaPf.pleGate,lw.pleProjW,lw.pleProjS,gemmaPf.pleOut,
-                   cfg.pleSize,cfg.nEmbd,"gpf_ple_proj");
+                if(lw.pleProjQ4W.handle&&!std::getenv("BP_GEMMA_Q8_PLE")){
+                    add(q4zp,{{0,gemmaPf.pleGate},{1,lw.pleProjQ4W},{2,lw.pleProjQ4S},{3,gemmaPf.pleOut},{4,p3},{5,lw.pleProjQ4Z}},
+                        (cfg.nEmbd+31)/32,(M+3)/4,"gpf_ple_proj_q4");
+                }else{mm(gemmaPf.pleGate,lw.pleProjW,lw.pleProjS,gemmaPf.pleOut,cfg.pleSize,cfg.nEmbd,"gpf_ple_proj");}
                 auto p4=mkP("gpf_pa_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
                 add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.pleOut},{2,lw.plePostNorm},
                              {3,gemmaPf.rstd},{4,p4}},M,1,"gpf_ple_add");
