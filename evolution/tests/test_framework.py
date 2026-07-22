@@ -180,10 +180,6 @@ class FrameworkTest(unittest.TestCase):
         }, "test")
 
         self.assertEqual(0, self.store.reconcile_completed_tasks())
-        run = self.store.list_runs(task["id"])[0]
-        self.store.update_run(run["id"], {
-            "status": "completed", "progress": 100, "result": {"exit_code": 0},
-        }, "agent")
         self.store.add_observation({
             "model_id": model["id"], "machine_id": self.machine["id"],
             "framework": "ort", "format": "ort", "backend": "webgpu",
@@ -191,8 +187,13 @@ class FrameworkTest(unittest.TestCase):
             "conformance_details": {"source": f"benchmark task {task['id']}"},
             "metrics": {"prefill_tok_s": 505, "decode_tok_s": 26},
         }, "test")
+        self.assertEqual("proposed", self.store.get_task(task["id"])["state"])
+        run = self.store.list_runs(task["id"])[0]
+        self.store.update_run(run["id"], {
+            "status": "completed", "progress": 100, "result": {"exit_code": 0},
+        }, "agent")
 
-        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
         self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
 
     def test_fleet_conformance_closes_diagnostic_correctness_task(self) -> None:
@@ -229,7 +230,7 @@ class FrameworkTest(unittest.TestCase):
             "result": {"exit_code": 0},
         }, "agent")
 
-        self.assertEqual(1, self.store.reconcile_completed_tasks())
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
         closed = self.store.get_task(task["id"])
         self.assertEqual("integrated", closed["state"])
         self.assertEqual("accepted", closed["aggregate_verdict"])

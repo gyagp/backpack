@@ -747,6 +747,8 @@ class Store:
                            {"attempt": prior_failures + 1, "reason": data.get("error")})
             if status in {"completed", "failed", "blocked", "cancelled"}:
                 self._db.execute("UPDATE machines SET current_run_id=NULL WHERE current_run_id=?", (run_id,))
+        if status == "completed":
+            self.reconcile_completed_tasks()
         return self.get_run(run_id)  # type: ignore[return-value]
 
     def expire_stale_runs(self, benchmark_timeout_seconds: int = 1800) -> int:
