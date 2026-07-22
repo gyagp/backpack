@@ -2339,6 +2339,11 @@ void ModelRunner::buildDecodePipeline() {
     if (cfg.arch == "gemma4") {
         gqaChunkSize = gpu->adapterName.find("Intel") != std::string::npos
             ? 16u : 8u;
+    } else if (cfg.arch == "qwen35" && isAmdAdapter) {
+        // Qwen 3.5 has only six full-attention layers. The default 64-token
+        // chunks leave too few pass-1 workgroups to occupy AMD GPUs; a sweep
+        // over 8/16/32/64 selects 8 for both the 2B and 4B models.
+        gqaChunkSize = 8u;
     }
     if (const char* chunkEnv = std::getenv("BP_GQA_CHUNK_SIZE")) {
         const int requested = std::atoi(chunkEnv);
