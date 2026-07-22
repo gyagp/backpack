@@ -3847,10 +3847,64 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         // - Gemma sandwich: normalize attention output before residual add.
         // - Standard: residual add plus ffn_norm in one fused dispatch.
         if (cfg.arch == "qwen35" && lw.postNorm.handle) {
-            auto bg = makeBG(plAddRmsNorm, {
-                {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
-                {3, lw.postNorm}, {4, rstdBuf}, {5, rmsParams}});
-            allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg, 1, 1, 1, L+"q35_add_attn_post_norm"});
+            const bool fuseGateupQ8 = isAmdAdapter && useQ4KDp4a &&
+                lw.guKQ.handle && lw.guKQType == GGUF_TYPE_Q4_K;
+            if (fuseGateupQ8) {
+                static const char* ADD_RMS_Q8_WGSL = R"(
+requires packed_4x8_integer_dot_product;
+enable subgroups;
+@group(0) @binding(0) var<storage,read_write> X:array<f32>;
+@group(0) @binding(1) var<storage,read> R:array<f32>;
+@group(0) @binding(2) var<storage,read_write> Y:array<f32>;
+@group(0) @binding(3) var<storage,read> W:array<f32>;
+@group(0) @binding(4) var<storage,read_write> Rstd:array<f32>;
+@group(0) @binding(5) var<storage,read_write> XQ:array<u32>;
+@group(0) @binding(6) var<storage,read_write> XS:array<f32>;
+struct Params{stride:i32,N:i32,eps:f32};
+@group(0) @binding(7) var<storage,read> P:Params;
+var<workgroup> sums:array<f32,8>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(subgroup_invocation_id) sg_lane:u32,
+        @builtin(subgroup_size) sg_size:u32){
+ let tid=lid.x;let N=u32(P.N);var ss=0.0;
+ for(var k=tid;k<N;k+=256u){let v=X[k]+R[k];X[k]=v;ss+=v*v;}
+ let part=subgroupAdd(ss);let sg=tid/sg_size;
+ if(sg_lane==0u){sums[sg]=part;}workgroupBarrier();
+ if(tid==0u){var total=0.0;let nsg=(256u+sg_size-1u)/sg_size;
+  for(var s=0u;s<nsg;s++){total+=sums[s];}
+  let r=inverseSqrt(total/f32(N)+P.eps);sums[0]=r;Rstd[0]=r;
+ }workgroupBarrier();let rstd=sums[0];
+ for(var base=0u;base<N;base+=256u){
+  let k=base+tid;var y=0.0;if(k<N){y=(X[k]*rstd)*W[k];Y[k]=y;}
+  var amax=abs(y);amax=max(amax,subgroupShuffleXor(amax,16u));
+  amax=max(amax,subgroupShuffleXor(amax,8u));amax=max(amax,subgroupShuffleXor(amax,4u));
+  amax=max(amax,subgroupShuffleXor(amax,2u));amax=max(amax,subgroupShuffleXor(amax,1u));
+  let scale=amax/127.0;let lane=tid&31u;let block32=tid/32u;
+  if(lane==0u){XS[base/32u+block32]=scale;}
+  let safe=select(1.0,scale,scale!=0.0);let qi=clamp(i32(round(y/safe)),-127,127);
+  let pack_lane=lane&3u;let pack_group=lane/4u;
+  var packed=u32(qi&255)<<(pack_lane*8u);packed|=subgroupShuffleXor(packed,1u);
+  packed|=subgroupShuffleXor(packed,2u);
+  if(pack_lane==0u){XQ[base/4u+block32*8u+pack_group]=packed;}
+ }
+}
+)";
+                auto& plAddRmsQ8 = gpu->getOrCreatePipeline(
+                    "q35_add_rms_q8_amd", ADD_RMS_Q8_WGSL, 8);
+                auto bg = makeBG(plAddRmsQ8, {
+                    {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
+                    {3, lw.postNorm}, {4, rstdBuf}, {5, kqActQ8Buf},
+                    {6, kqActScaleBuf}, {7, rmsParams}});
+                allDecodeDispatches.push_back({plAddRmsQ8.pipeline, bg,
+                    1, 1, 1, L+"q35_add_attn_post_norm_q8"});
+            } else {
+                auto bg = makeBG(plAddRmsNorm, {
+                    {0, xBuf}, {1, projOutBuf}, {2, normOutBuf},
+                    {3, lw.postNorm}, {4, rstdBuf}, {5, rmsParams}});
+                allDecodeDispatches.push_back({plAddRmsNorm.pipeline, bg,
+                    1, 1, 1, L+"q35_add_attn_post_norm"});
+            }
         } else if (cfg.hasSandwichNorm && lw.postNorm.handle) {
             if (weightsAreNativeQ4 && !std::getenv("BP_UNFUSED_SANDWICH")) {
                 static const char* FUSED_SANDWICH_ATTN_WGSL = R"(
@@ -4203,12 +4257,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     cfg.nEmbd, 2 * plIM, lw.guKQNBlocks, lw.guKQRowStride);
                 const bool prequantQ4K = useQ4KDp4a && lw.guKQType == GGUF_TYPE_Q4_K;
                 if (prequantQ4K) {
-                    auto& plQuant = getKernel("q8_quantize_dp4a");
-                    auto bgQuant = makeBG(plQuant, {
-                        {0, normOutBuf}, {1, kqActQ8Buf},
-                        {2, kqActScaleBuf}, {3, layerParams}});
-                    allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
-                        (cfg.nEmbd + 255) / 256, 1, 1, L+"kq_gateup_quant"});
+                    const bool packedByPostNorm = cfg.arch == "qwen35" &&
+                        isAmdAdapter && lw.postNorm.handle;
+                    if (!packedByPostNorm) {
+                        auto& plQuant = getKernel("q8_quantize_dp4a");
+                        auto bgQuant = makeBG(plQuant, {
+                            {0, normOutBuf}, {1, kqActQ8Buf},
+                            {2, kqActScaleBuf}, {3, layerParams}});
+                        allDecodeDispatches.push_back({plQuant.pipeline, bgQuant,
+                            (cfg.nEmbd + 255) / 256, 1, 1, L+"kq_gateup_quant"});
+                    }
                     layerKQ = &getKernel("q4k_matmul_prequant_dp4a");
                     layerTile = 8;
                 }
