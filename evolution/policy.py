@@ -107,14 +107,12 @@ class PolicyEngine:
         verdicts = {row["verdict"] for row in rows}
         protected_negative = any(r["verdict"] == "negative" and r["metric"] in protected for r in rows)
         correctness_negative = any(r["details"].get("reason") == "candidate correctness failed" for r in rows)
-        if "inconclusive" in verdicts:
-            aggregate, reason = "blocked", "required evidence is missing or too noisy"
-        elif correctness_negative:
+        if correctness_negative:
             aggregate, reason = "reject", "correctness failed on a required device"
-        elif protected_negative and "positive" in verdicts:
-            aggregate, reason = "debate", "required devices or protected metrics have mixed results"
         elif protected_negative:
             aggregate, reason = "reject", "a protected metric regressed on a required device"
+        elif "inconclusive" in verdicts:
+            aggregate, reason = "blocked", "required evidence is missing or too noisy"
         elif "positive" in verdicts:
             aggregate, reason = "accept", "all required results are positive or neutral"
         else:

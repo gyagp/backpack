@@ -84,6 +84,27 @@ class FrameworkTest(unittest.TestCase):
         result = PolicyEngine(self.store).evaluate(self.task["id"])
         self.assertEqual("blocked", result["aggregate_verdict"])
 
+    def test_protected_regression_rejects_even_when_another_metric_is_missing(self) -> None:
+        task = self.store.create_task({
+            "title": "Regression with ancillary gap", "kind": "optimization",
+            "hypothesis": "A missing profile metric must not hide a decode regression",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s", "gpu_time_ms"]},
+            "device_policy": {"required": [self.machine["id"]]},
+            "decision_policy": {"protected_metrics": ["decode_tok_s"]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "decode_tok_s", "correctness": {"passed": True}}
+        self.store.add_evidence({**common, "variant": "base", "samples": [100, 101, 99],
+                                 "commit_sha": "base"}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [85, 84, 86],
+                                 "commit_sha": "candidate"}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("reject", result["aggregate_verdict"])
+        self.assertIn("protected metric regressed", result["reason"])
+
     def test_commit_mismatch_is_rejected(self) -> None:
         with self.assertRaises(DomainError):
             self.store.add_evidence({"task_id": self.task["id"], "machine_id": self.machine["id"],
