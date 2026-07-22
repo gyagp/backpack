@@ -1110,7 +1110,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                     N, K, blockSize, nGroups, blockHalf);
                 if (cfg.arch == "gemma4" &&
                     (mapping.backpackName.find("mlp.gate_proj.weight") != std::string::npos ||
-                     mapping.backpackName.find("mlp.up_proj.weight") != std::string::npos)) {
+                     mapping.backpackName.find("mlp.up_proj.weight") != std::string::npos ||
+                     mapping.backpackName.find("mlp.down_proj.weight") != std::string::npos)) {
                     OnnxLoadResult::PackedQ4 packed;
                     packed.N = N; packed.K = K;
                     packed.weights.assign(wTensor.rawData,
@@ -1489,6 +1490,9 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             ld.gateupQ4 = std::move(it->second); q4Weights.erase(it);
         }
         moveQ8(pfx + "mlp.down_proj.weight", ld.down);
+        if (auto it = q4Weights.find(pfx + "mlp.down_proj.weight"); it != q4Weights.end()) {
+            ld.downQ4 = std::move(it->second); q4Weights.erase(it);
+        }
         moveQ8(pfx + "ple_input_gate.weight", ld.pleInputGate);
         moveQ8(pfx + "ple_projection.weight", ld.pleProjection);
         moveNorm(pfx + "input_layernorm.weight", ld.inputNorm);

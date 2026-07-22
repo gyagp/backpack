@@ -36,6 +36,7 @@ struct OnnxLoadResult {
         Q8Repacked o;           // output projection
         Q8Repacked gateup;      // fused gate + up projection
         PackedQ4 gateupQ4;      // original ONNX Q4G32 payload for prefill
+        PackedQ4 downQ4;
         Q8Repacked down;        // down projection
         Q8Repacked pleInputGate;
         Q8Repacked pleProjection;

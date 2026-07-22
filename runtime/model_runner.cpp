@@ -1041,6 +1041,12 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             lw.guQ4Z = uploadBytes(*gpu, p + ".z", ld.gateupQ4.zeroPoints);
         }
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", ld.down, lw.dnW, lw.dnS);
+        if (ld.downQ4.N > 0) {
+            const auto p = "L" + std::to_string(i) + ".dn_q4";
+            lw.dnQ4W = uploadBytes(*gpu, p + ".w", ld.downQ4.weights);
+            lw.dnQ4S = uploadBytes(*gpu, p + ".s", ld.downQ4.scales);
+            lw.dnQ4Z = uploadBytes(*gpu, p + ".z", ld.downQ4.zeroPoints);
+        }
         if (ld.pleInputGate.N > 0)
             uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_gate",
                            ld.pleInputGate, lw.pleInpGateW, lw.pleInpGateS);
@@ -6940,7 +6946,14 @@ int32_t ModelRunner::prefillGemmaBatched(
             add(geluMul,{{0,gemmaPf.gateup},{1,gemmaPf.act},{2,gap}},
                 (M*im+255)/256,1,"gpf_gelu");
             auto dp=mkP("gpf_down_"+std::to_string(li),{M,cfg.nEmbd,im});
-            mm(gemmaPf.act,lw.dnW,lw.dnS,gemmaPf.proj,im,cfg.nEmbd,"gpf_down");
+            if (lw.dnQ4W.handle && !std::getenv("BP_GEMMA_Q8_DOWN")) {
+                add(q4zp, {{0,gemmaPf.act},{1,lw.dnQ4W},{2,lw.dnQ4S},
+                           {3,gemmaPf.proj},{4,dp},{5,lw.dnQ4Z}},
+                    (cfg.nEmbd+31)/32,(M+3)/4,"gpf_down_q4");
+            } else {
+                mm(gemmaPf.act,lw.dnW,lw.dnS,gemmaPf.proj,
+                   im,cfg.nEmbd,"gpf_down");
+            }
             auto np=mkP("gpf_ffn_add_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
             add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.proj},{2,lw.postFfwNorm},
                          {3,gemmaPf.rstd},{4,np}},M,1,"gpf_ffn_add");

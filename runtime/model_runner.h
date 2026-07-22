@@ -143,6 +143,7 @@ struct ModelRunner {
         GPUBuffer guW, guS;
         GPUBuffer guQ4W, guQ4S, guQ4Z;
         GPUBuffer dnW, dnS;
+        GPUBuffer dnQ4W, dnQ4S, dnQ4Z;
         GPUBuffer inputNorm, postAttnNorm;
         GPUBuffer qNorm, kNorm;
         // Shared-KV layers (Gemma 4 layers 15+): only a Q projection; K/V are
