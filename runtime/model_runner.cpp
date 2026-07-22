@@ -207,6 +207,34 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
                                              it->second.numBindings);
         }
     }
+    // AMD exposes wave64 here, while these kernels map one output column to
+    // each logical 32-lane half. subgroupAdd therefore mixes adjacent logits.
+    // XOR masks 16..1 reduce each half independently and retain the packed-dot
+    // arithmetic used by the NVIDIA/Intel path.
+    if (gpu->supportsSubgroups &&
+        (adapter.find("amd") != std::string::npos ||
+         adapter.find("radeon") != std::string::npos) &&
+        (name == "q4k_matmul_dp4a" ||
+         name == "q4k_matmul_prequant_dp4a")) {
+        std::string source = it->second.source;
+        const std::string from = name == "q4k_matmul_dp4a"
+            ? "let total = subgroupAdd(acc);"
+            : "let total = subgroupAdd(acc[c]);";
+        const std::string initial = name == "q4k_matmul_dp4a"
+            ? "var total = acc;" : "var total = acc[c];";
+        const std::string to = initial +
+            "\n        total += subgroupShuffleXor(total, 16u);"
+            "\n        total += subgroupShuffleXor(total, 8u);"
+            "\n        total += subgroupShuffleXor(total, 4u);"
+            "\n        total += subgroupShuffleXor(total, 2u);"
+            "\n        total += subgroupShuffleXor(total, 1u);";
+        const size_t pos = source.find(from);
+        if (pos != std::string::npos) {
+            source.replace(pos, from.size(), to);
+            return gpu->getOrCreatePipeline(name + "_amd_shuffle32", source,
+                                             it->second.numBindings);
+        }
+    }
     return gpu->getOrCreatePipeline(name, it->second.source, it->second.numBindings);
 }
 
@@ -2349,7 +2377,7 @@ void ModelRunner::buildDecodePipeline() {
     // Packed 4x8 integer dot products are conformant and faster on NVIDIA and
     // Intel. AMD exposes the operation but changes cared-model logits, so it
     // retains the floating-point Q4_K reduction.
-    const bool useQ4KDp4a = (isNvidiaAdapter || isIntelAdapter) &&
+    const bool useQ4KDp4a = (isNvidiaAdapter || isIntelAdapter || isAmdAdapter) &&
         !std::getenv("BP_Q4K_DISABLE_DP4A");
     auto kqPipelineFor = [&](GGUFType type) -> const CompiledPipeline* {
         switch (type) {
