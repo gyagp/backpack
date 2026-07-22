@@ -961,6 +961,7 @@ class Store:
                 model_id, machine_id = origin.get("model_id"), origin.get("machine_id")
                 runtimes = manifest.get("runtimes") or []
                 valid = bool(model_id and machine_id and runtimes)
+                requires_own_run = origin.get("type") != "automatic"
                 for runtime in runtimes:
                     backend = runtime.get("backend")
                     if backend in {"d3d12", "webgpu-native"}:
@@ -969,9 +970,16 @@ class Store:
                                               runtime.get("framework"),
                                               runtime.get("format"), backend))
                     metrics = observation.get("metrics", {}) if observation else {}
+                    source = str((observation or {}).get("conformance_details", {}).get("source", ""))
                     valid = valid and bool(observation and observation.get("conformance") == "pass"
                                            and metrics.get("prefill_tok_s") is not None
-                                           and metrics.get("decode_tok_s") is not None)
+                                           and metrics.get("decode_tok_s") is not None
+                                           and (not requires_own_run or task["id"] in source))
+                if requires_own_run:
+                    runs = self.list_runs(task["id"])
+                    valid = valid and bool(runs) and all(
+                        run["status"] == "completed"
+                        and run.get("result", {}).get("exit_code") == 0 for run in runs)
                 if valid:
                     reason = "Latest matching conformance and prefill/decode measurements are valid"
             elif origin.get("type") == "diagnostic" and origin.get("model_id") and \

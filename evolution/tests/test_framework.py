@@ -165,15 +165,31 @@ class FrameworkTest(unittest.TestCase):
             "hypothesis": "The rebuilt runtime remains conformant",
             "origin": {"type": "validation", "model_id": model["id"],
                        "machine_id": self.machine["id"]},
-            "manifest": {"metrics": ["prefill_tok_s", "decode_tok_s"],
+            "manifest": {"adapter": "argv", "argv": ["benchmark"],
+                         "metrics": ["prefill_tok_s", "decode_tok_s"],
                          "runtimes": [{"framework": "ort", "format": "ort",
                                        "backend": "webgpu"}]},
+            "device_policy": {"machine_ids": [self.machine["id"]]},
         }, "test")
+        self.store.ensure_task_runs()
         self.store.add_observation({
             "model_id": model["id"], "machine_id": self.machine["id"],
             "framework": "ort", "format": "ort", "backend": "webgpu",
             "conformance": "pass", "revision": "source-build",
             "metrics": {"prefill_tok_s": 500, "decode_tok_s": 25},
+        }, "test")
+
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
+        run = self.store.list_runs(task["id"])[0]
+        self.store.update_run(run["id"], {
+            "status": "completed", "progress": 100, "result": {"exit_code": 0},
+        }, "agent")
+        self.store.add_observation({
+            "model_id": model["id"], "machine_id": self.machine["id"],
+            "framework": "ort", "format": "ort", "backend": "webgpu",
+            "conformance": "pass", "revision": "source-build",
+            "conformance_details": {"source": f"benchmark task {task['id']}"},
+            "metrics": {"prefill_tok_s": 505, "decode_tok_s": 26},
         }, "test")
 
         self.assertEqual(1, self.store.reconcile_completed_tasks())
