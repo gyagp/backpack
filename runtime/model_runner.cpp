@@ -4733,7 +4733,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     // LM head
     if (lmHeadIsKQ) {
         const bool usePackedQ6Dp4a = lmHeadKQType == GGUF_TYPE_Q6_K &&
-            (isAmdAdapter || (isIntelAdapter && cfg.arch == "qwen35")) &&
+            (isAmdAdapter || ((isIntelAdapter || isNvidiaAdapter) &&
+                              cfg.arch == "qwen35")) &&
             useQ4KDp4a;
         bool useWideQ6 = lmHeadKQType == GGUF_TYPE_Q6_K &&
             gpu->backendType == WGPUBackendType_Vulkan &&
