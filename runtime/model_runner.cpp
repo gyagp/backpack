@@ -52,6 +52,15 @@ std::string q4kBatched8PortableSource(const char* source) {
     return result;
 }
 
+std::string q4ZpBatchedRows8Source() {
+    std::string result=getEmbeddedKernels().at("matmul_q4_zp_batched_dp4a").source;
+    auto replace=[&](const std::string& from,const std::string& to){
+        if(auto pos=result.find(from);pos!=std::string::npos)result.replace(pos,from.size(),to);
+    };
+    replace("const ROWS: u32 = 4u","const ROWS: u32 = 8u");
+    return result;
+}
+
 const char* gemmaPleAsymGatherBatchedSource() {
     return R"WGSL(
 @group(0) @binding(0) var<storage, read> B: array<u32>;
@@ -5266,6 +5275,9 @@ void ModelRunner::initGemmaPrefillResources() {
     // the first prompt rather than midway through inference.
     (void)getKernel("matmul_q4_batched");
     (void)getKernel("matmul_q4_zp_batched_dp4a");
+    if(gpu->adapterName.find("Intel")!=std::string::npos)
+        (void)gpu->getOrCreatePipeline("matmul_q4_zp_batched_dp4a_rows8",
+            q4ZpBatchedRows8Source(),6);
     (void)getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
     (void)getKernel("q4_gather_batched");
     (void)getKernel("gemma_sandwich_attn_batched");
@@ -6831,6 +6843,10 @@ int32_t ModelRunner::prefillGemmaBatched(
 
         auto& q4mm = getKernel("matmul_q4_batched");
         auto& q4zp = getKernel("matmul_q4_zp_batched_dp4a");
+        const bool useQ4Rows8=gpu->adapterName.find("Intel")!=std::string::npos&&
+            !std::getenv("BP_GEMMA_Q4_ROWS8");
+        const CompiledPipeline* q4zpRows8=useQ4Rows8?&gpu->getOrCreatePipeline(
+            "matmul_q4_zp_batched_dp4a_rows8",q4ZpBatchedRows8Source(),6):nullptr;
         auto& q8mm = getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
         auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
                       uint32_t K, uint32_t N, const std::string& name) {
@@ -6955,9 +6971,10 @@ int32_t ModelRunner::prefillGemmaBatched(
 
             auto gp=mkP("gpf_gu_"+std::to_string(li),{M,2u*im,cfg.nEmbd});
             if (lw.guQ4W.handle && !std::getenv("BP_GEMMA_Q8_GATEUP")) {
-                add(q4zp, {{0,gemmaPf.norm},{1,lw.guQ4W},{2,lw.guQ4S},
+                const auto& guKernel=q4zpRows8?*q4zpRows8:q4zp;
+                add(guKernel, {{0,gemmaPf.norm},{1,lw.guQ4W},{2,lw.guQ4S},
                            {3,gemmaPf.gateup},{4,gp},{5,lw.guQ4Z}},
-                    (2u*im+31)/32,(M+3)/4,"gpf_gateup_q4");
+                    (2u*im+31)/32,(M+(q4zpRows8?7u:3u))/(q4zpRows8?8u:4u),"gpf_gateup_q4");
             } else {
                 mm(gemmaPf.norm,lw.guW,lw.guS,gemmaPf.gateup,
                    cfg.nEmbd,2u*im,"gpf_gateup");
