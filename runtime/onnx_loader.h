@@ -78,6 +78,7 @@ struct OnnxLoadResult {
 
     /// LM head weights.
     Q8Repacked lmHeadQ8;
+    PackedQ4 lmHeadQ4;
     bool hasLmHeadQ8 = false;           // true if we have separate Q8 LM head
     bool tieWordEmbeddings = true;
 

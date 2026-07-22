@@ -229,6 +229,7 @@ struct ModelRunner {
     GPUBuffer finalNormW;
     GPUBuffer lmHeadW;           // fp16 LM head (fallback)
     GPUBuffer lmHeadQ8W, lmHeadQ8S;  // Q8 LM head (preferred)
+    GPUBuffer lmHeadQ4W, lmHeadQ4S, lmHeadQ4Z;
     GPUBuffer lmHeadKQ;          // K-quant LM head
     GGUFType lmHeadKQType = (GGUFType)UINT32_MAX;
     bool lmHeadIsQ8 = false;

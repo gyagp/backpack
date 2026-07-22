@@ -1117,7 +1117,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                      mapping.backpackName.find("self_attn.v_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("self_attn.o_proj.weight") != std::string::npos ||
                      mapping.backpackName.find("ple_input_gate.weight") != std::string::npos ||
-                     mapping.backpackName.find("ple_projection.weight") != std::string::npos)) {
+                     mapping.backpackName.find("ple_projection.weight") != std::string::npos ||
+                     mapping.backpackName == "lm_head.weight")) {
                     OnnxLoadResult::PackedQ4 packed;
                     packed.N = N; packed.K = K;
                     packed.weights.assign(wTensor.rawData,
@@ -1559,6 +1560,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             cfg.tieWordEmbeddings = false;
             q8Weights.erase(it);
         }
+        auto q4it=q4Weights.find("lm_head.weight");
+        if(q4it!=q4Weights.end()){result.lmHeadQ4=std::move(q4it->second);q4Weights.erase(q4it);}
     }
 
     // ─── 7. Extract pre-computed RoPE tables ─────────────────────────────

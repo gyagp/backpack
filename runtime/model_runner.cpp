@@ -1155,6 +1155,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     // LM head
     if (onnx.hasLmHeadQ8) {
         uploadQ8Weight(*gpu, "lm_head_q8", onnx.lmHeadQ8, lmHeadQ8W, lmHeadQ8S);
+        if(onnx.lmHeadQ4.N>0){lmHeadQ4W=uploadBytes(*gpu,"lm_head_q4_prefill.w",onnx.lmHeadQ4.weights);lmHeadQ4S=uploadBytes(*gpu,"lm_head_q4_prefill.s",onnx.lmHeadQ4.scales);lmHeadQ4Z=uploadBytes(*gpu,"lm_head_q4_prefill.z",onnx.lmHeadQ4.zeroPoints);}
         lmHeadIsQ8 = true;
         fprintf(stderr, "  LM head: separate (Q8)\n");
     } else if (cfg.tieWordEmbeddings) {
@@ -7036,10 +7037,16 @@ int32_t ModelRunner::prefillGemmaBatched(
                         {3,logitsBuf},{4,lp}},
                     (cfg.nVocab+31)/32,1,"gpf_lm");
             } else {
-                auto lp=mkP("gpf_lm_q8",{cfg.nEmbd,cfg.nVocab,1});
-                add(q8mm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
-                          {3,zeroBiasV},{4,logitsBuf},{5,lp}},
-                    1,(cfg.nVocab+31)/32,"gpf_lm");
+                if(lmHeadQ4W.handle&&!std::getenv("BP_GEMMA_Q8_PREFILL_LM")){
+                    auto lp=mkP("gpf_lm_q4",{1,cfg.nVocab,cfg.nEmbd});
+                    add(q4zp,{{0,lastNorm},{1,lmHeadQ4W},{2,lmHeadQ4S},{3,logitsBuf},{4,lp},{5,lmHeadQ4Z}},
+                        (cfg.nVocab+31)/32,1,"gpf_lm_q4");
+                }else{
+                    auto lp=mkP("gpf_lm_q8",{cfg.nEmbd,cfg.nVocab,1});
+                    add(q8mm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
+                              {3,zeroBiasV},{4,logitsBuf},{5,lp}},
+                        1,(cfg.nVocab+31)/32,"gpf_lm");
+                }
             }
             if(softcapPipeline&&softcapBG){
                 ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"logit_softcap"});
