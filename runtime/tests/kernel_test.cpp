@@ -1553,16 +1553,18 @@ TEST(qwen35_conv_scan_silu) {
 TEST(delta_net_scan_x2) {
     auto wgsl=loadWgsl("ssm","delta_net_scan_x2");
     if(wgsl.empty()) return {false,"cannot load kernel"};
-    const int T=3,NV=1,NK=1,DK=128,DV=2; Rng rng(654);
+    // Exercise grouped Q/K sharing: consecutive V heads share one Q/K head.
+    const int T=3,NV=2,NK=1,DK=128,DV=2; Rng rng(654);
     auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV);
     auto beta=rng.randnVec(T*NV),gate=rng.randnVec(T*NV),state=rng.randnVec(NV*DK*DV);
     for(float& b:beta)b=1.0f/(1.0f+std::exp(-b)); for(float& g:gate)g=-std::abs(g)*0.1f;
     auto ref=state;std::vector<float> expected(T*NV*DV);float qs=1.0f/std::sqrt(float(DK));
-    for(int t=0;t<T;t++)for(int vi=0;vi<DV;vi++){
-        float gh=std::exp(gate[t]),pred=0;for(int d=0;d<DK;d++)pred+=gh*ref[d*DV+vi]*k[t*DK+d];
-        float delta=(v[t*DV+vi]-pred)*beta[t],out=0;
-        for(int d=0;d<DK;d++){float sn=gh*ref[d*DV+vi]+k[t*DK+d]*delta;ref[d*DV+vi]=sn;out+=sn*q[t*DK+d]*qs;}
-        expected[t*DV+vi]=out;
+    for(int t=0;t<T;t++)for(int h=0;h<NV;h++)for(int vi=0;vi<DV;vi++){
+        int kh=h/(NV/NK),sb=h*DK*DV;float gh=std::exp(gate[t*NV+h]),pred=0;
+        for(int d=0;d<DK;d++)pred+=gh*ref[sb+d*DV+vi]*k[(t*NK+kh)*DK+d];
+        float delta=(v[(t*NV+h)*DV+vi]-pred)*beta[t*NV+h],out=0;
+        for(int d=0;d<DK;d++){float sn=gh*ref[sb+d*DV+vi]+k[(t*NK+kh)*DK+d]*delta;ref[sb+d*DV+vi]=sn;out+=sn*q[(t*NK+kh)*DK+d]*qs;}
+        expected[(t*NV+h)*DV+vi]=out;
     }
     auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size());
     auto bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size());

@@ -25,7 +25,7 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,
     let nv=P[0]; let nk=P[1]; let dk=P[2]; let dv=P[3]; let T=P[4];
     let head=wid.x; let pair=lid.x>>7u; let ki=lid.x&127u;
     let vi=wid.y*2u+pair; let valid=head<nv&&vi<dv;
-    let kh=head%nk; let sb=head*dk*dv; let qs=inverseSqrt(f32(dk));
+    let kh=head/max(1u,nv/nk); let sb=head*dk*dv; let qs=inverseSqrt(f32(dk));
     for(var t=0u;t<T;t++) {
         let qbase=(t*nk+kh)*dk; let vbase=(t*nv+head)*dv;
         let bh=select(0.0,Beta[t*nv+head],valid);

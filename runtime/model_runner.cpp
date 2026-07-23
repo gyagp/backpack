@@ -2483,7 +2483,7 @@ void ModelRunner::buildDecodePipeline() {
     const bool qwen35VulkanDecode =
         (cfg.arch == "qwen35" && gpu->backendType != WGPUBackendType_D3D12 &&
          !std::getenv("BP_Q35_GENERIC_KERNELS"));
-    const bool qwen35SubgroupSuite = cfg.arch == "qwen35" &&
+    const bool qwen35SubgroupSuite = cfg.arch == "qwen35" && modelFormat != "onnx" &&
         gpu->supportsSubgroups && isNvidiaAdapter &&
         !std::getenv("BP_Q35_GENERIC_KERNELS");
     uint32_t Q8_TILE = 8;
@@ -6748,13 +6748,19 @@ int32_t ModelRunner::prefillQwen35Batched(
             gpu->writeBuffer(qwen35Pf.x,emb.data(),emb.size()*sizeof(float));
         }
         if(traceQpf){fprintf(stderr,"[qwen-prefill] embed encoded\n");fflush(stderr);}
-        auto&rms=getKernel("rms_norm_batched");auto&q8=getKernel("q8_matmul_batched_dp4a");
-        auto&addnorm=getKernel("add_rms_norm_batched");auto&normadd=getKernel("gemma_norm_add_batched");
+        // Qwen 3.5's recurrent state amplifies the small rounding differences
+        // introduced by activation-quantized batched GEMM.  Specialized ONNX
+        // therefore uses the same float-activation Q8 arithmetic as decode;
+        // GGUF can retain the faster packed path while it remains opt-in.
+        const bool preciseQ8=modelFormat=="onnx"||std::getenv("BP_QWEN_Q8_PRECISE")!=nullptr;
+        auto&rms=getKernel(preciseQ8?"rms_norm":"rms_norm_batched");auto&q8=getKernel(preciseQ8?"q8_matmul":"q8_matmul_batched_dp4a");
+        auto&addnorm=getKernel(preciseQ8?"add_rms_norm":"add_rms_norm_batched");auto&normadd=getKernel("gemma_norm_add_batched");
         auto&addip=getKernel("add_inplace_batched");
         auto&silu=getKernel("silu_mul_batched");
         auto&bagKernel=getKernel("qwen35_alpha_beta_gate_batched");
         auto&convKernel=getKernel("qwen35_conv_scan_silu");
-        auto&splitSsmKernel=getKernel("qwen35_split_qkv_l2_batched");
+        const bool exactSingle=preciseQ8&&M==1;
+        auto&splitSsmKernel=getKernel(exactSingle?"qwen35_split_qkv_l2":"qwen35_split_qkv_l2_batched");
         const bool valueMajorPrefill=
             (gpu->adapterName.find("NVIDIA")!=std::string::npos&&cfg.ssmTimeStepRank==32u)||
             (gpu->adapterName.find("AMD")!=std::string::npos&&
@@ -6765,12 +6771,12 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool intelRank32=gpu->adapterName.find("Intel")!=std::string::npos&&
             cfg.ssmTimeStepRank==32u;
         const bool deltaX4=!intelRank32&&std::getenv("BP_QWEN_DISABLE_DELTA_X4")==nullptr;
-        const auto&deltaKernel=valueMajorPrefill
+        const auto&deltaKernel=exactSingle?getKernel("delta_net_decode"):valueMajorPrefill
             ? gpu->getOrCreatePipeline(deltaX4?"delta_net_scan_x4_value_major":"delta_net_scan_x2_value_major",
                 deltaNetValueMajorSource(deltaX4?WGSL_DELTA_NET_SCAN_X4:WGSL_DELTA_NET_SCAN_X2),8)
             : getKernel(deltaX4?"delta_net_scan_x4":"delta_net_scan_x2");
-        auto&normGateKernel=getKernel("qwen35_norm_gated_batched");
-        auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},(M+3)/4,(N+31)/32,1,n);};
+        auto&normGateKernel=getKernel(exactSingle?"qwen35_norm_gated":"qwen35_norm_gated_batched");
+        auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},preciseQ8?M:(M+3)/4,preciseQ8?(N+7)/8:(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
         const char* portableEnv=std::getenv("BP_Q4K_PREFILL_PORTABLE");
         // The override keeps an exact same-binary baseline for A/B validation.
@@ -6826,10 +6832,16 @@ int32_t ModelRunner::prefillQwen35Batched(
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u qkv built\n",li);fflush(stderr);}
                 proj(qwen35Pf.norm,lw.attnGateKQ,lw.attnGateKQType,lw.attnGateKQNBlocks,lw.attnGateKQRowStride,lw.attnGateW,lw.attnGateS,zeroBiasQKV,qwen35Pf.z,E,cfg.ssmInnerSize,L+"z");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u z built\n",li);fflush(stderr);}
-                mm(qwen35Pf.norm,lw.ssmBetaAlphaW,lw.ssmBetaAlphaS,zeroBiasQKV,qwen35Pf.qj,E,2u*R,L+"ba");
-                if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u ba built\n",li);fflush(stderr);}
-                auto bap=mkp(L+"bag_p",{M,R});
-                add(bagKernel,{{0,qwen35Pf.qj},{1,lw.ssmDtBias},{2,lw.ssmA},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,bap}},(M*R+63)/64,1,1,L+"bag");
+                if(preciseQ8&&M==1){
+                    auto&fusedBag=getKernel("qwen35_beta_alpha_gate_q8");
+                    auto bap=mkp(L+"bag_exact_p",{E,R});
+                    add(fusedBag,{{0,qwen35Pf.norm},{1,lw.ssmBetaAlphaW},{2,lw.ssmBetaAlphaS},{3,lw.ssmDtBias},{4,lw.ssmA},{5,qwen35Pf.beta},{6,qwen35Pf.gate},{7,bap}},1,(2u*R+7)/8,1,L+"bag_exact");
+                }else{
+                    mm(qwen35Pf.norm,lw.ssmBetaAlphaW,lw.ssmBetaAlphaS,zeroBiasQKV,qwen35Pf.qj,E,2u*R,L+"ba");
+                    if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u ba built\n",li);fflush(stderr);}
+                    auto bap=mkp(L+"bag_p",{M,R});
+                    add(bagKernel,{{0,qwen35Pf.qj},{1,lw.ssmDtBias},{2,lw.ssmA},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,bap}},(M*R+63)/64,1,1,L+"bag");
+                }
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u bag built\n",li);fflush(stderr);}
                 auto cp=mkp(L+"conv_p",{C,cfg.ssmConvKernel,M});
                 GPUBuffer convBias=lw.ssmConv1dBias.handle?lw.ssmConv1dBias:zeroBiasQKV;
@@ -6838,10 +6850,10 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
                 add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
                 auto dp=mkp(L+"delta_p",{R,cfg.ssmGroupCount,cfg.ssmStateSize,DV,M});
-                add(deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,(DV+(deltaX4?3u:1u))/(deltaX4?4u:2u),1,L+"delta");
+                add(deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,exactSingle?DV:(DV+(deltaX4?3u:1u))/(deltaX4?4u:2u),1,L+"delta");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u delta built\n",li);fflush(stderr);}
                 auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
-                add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,M,1,L+"normgate");
+                add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,exactSingle?1:M,1,L+"normgate");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u normgate built\n",li);fflush(stderr);}
                 proj(qwen35Pf.snorm,lw.ssmOutKQ,lw.ssmOutKQType,lw.ssmOutKQNBlocks,lw.ssmOutKQRowStride,lw.ssmOutW,lw.ssmOutS,zeroBiasE,qwen35Pf.proj,cfg.ssmInnerSize,E,L+"out");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u out built\n",li);fflush(stderr);}

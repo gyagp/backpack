@@ -218,7 +218,7 @@ int main(int argc, char* argv[]) {
     bool chat = !chatMessage.empty();
     bool qwenOnnxChat = false;
     if (chat) {
-        qwenOnnxChat = cfg.format == "onnx_generic" &&
+        qwenOnnxChat = (cfg.format == "onnx_generic" || cfg.format == "onnx") &&
             cfg.arch.find("qwen3") != std::string::npos;
         if (qwenOnnxChat) {
             // ORT GenAI advances Qwen's recurrent state with the system turn

@@ -39,7 +39,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let vi      = wid.y * 2u + pair;
     let is_active = head < nv && vi < dv;
 
-    let k_head_idx = head % nk;
+    let k_head_idx = head / max(1u, nv / nk);
     let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
     let v_base = head * dv;

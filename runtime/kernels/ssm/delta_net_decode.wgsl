@@ -61,7 +61,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     if (head >= nv || vi >= dv) { return; }
     let tid     = lid.x;
 
-    let k_head_idx = head % nk;  // mapping v-head -> repeated k/q head
+    // Q/K heads are repeated in consecutive groups across value heads.
+    let k_head_idx = head / max(1u, nv / nk);
 
     let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;

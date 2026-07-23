@@ -19572,7 +19572,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     if (head >= nv || vi >= dv) { return; }
     let tid     = lid.x;
 
-    let k_head_idx = head % nk;  // mapping v-head -> repeated k/q head
+    // Q/K heads are repeated in consecutive groups across value heads.
+    let k_head_idx = head / max(1u, nv / nk);
 
     let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
@@ -19653,7 +19654,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let vi      = wid.y * 2u + pair;
     let is_active = head < nv && vi < dv;
 
-    let k_head_idx = head % nk;
+    let k_head_idx = head / max(1u, nv / nk);
     let q_base = k_head_idx * dk;
     let k_base = k_head_idx * dk;
     let v_base = head * dv;
@@ -19720,7 +19721,7 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,
     let nv=P[0]; let nk=P[1]; let dk=P[2]; let dv=P[3]; let T=P[4];
     let head=wid.x; let pair=lid.x>>7u; let ki=lid.x&127u;
     let vi=wid.y*2u+pair; let valid=head<nv&&vi<dv;
-    let kh=head%nk; let sb=head*dk*dv; let qs=inverseSqrt(f32(dk));
+    let kh=head/max(1u,nv/nk); let sb=head*dk*dv; let qs=inverseSqrt(f32(dk));
     for(var t=0u;t<T;t++) {
         let qbase=(t*nk+kh)*dk; let vbase=(t*nv+head)*dv;
         let bh=select(0.0,Beta[t*nv+head],valid);
@@ -19758,7 +19759,7 @@ fn reduce128(x:f32,lane128:u32,pair:u32)->f32{let lane=lane128&31u;let warp=(lan
 fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec3<u32>){
  let nv=P[0];let nk=P[1];let dk=P[2];let dv=P[3];let T=P[4];let head=wid.x;let pair=lid.x>>7u;let ki=lid.x&127u;
  let vi0=wid.y*4u+pair*2u;let vi1=vi0+1u;let valid0=head<nv&&vi0<dv;let valid1=head<nv&&vi1<dv;let svi0=min(vi0,dv-1u);let svi1=min(vi1,dv-1u);
- let kh=head%nk;let sb=head*dk*dv;let qs=inverseSqrt(f32(dk));let idx0=sb+ki*dv+svi0;let idx1=sb+ki*dv+svi1;
+ let kh=head/max(1u,nv/nk);let sb=head*dk*dv;let qs=inverseSqrt(f32(dk));let idx0=sb+ki*dv+svi0;let idx1=sb+ki*dv+svi1;
  var st0=select(0.0,State[idx0],valid0&&ki<dk);var st1=select(0.0,State[idx1],valid1&&ki<dk);
  for(var t=0u;t<T;t++){
   let qbase=(t*nk+kh)*dk;let vbase=(t*nv+head)*dv;let bh=select(0.0,Beta[t*nv+head],head<nv);let gh=select(0.0,exp(Gate[t*nv+head]),head<nv);
