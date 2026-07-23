@@ -1,7 +1,7 @@
 # C++ LLM Application
 #
 # End-to-end text generation using the Backpack public API (backpack.h).
-# Supports all architectures (Phi-4, Qwen, LLaMA, etc.) in GGUF and ONNX,
+# Supports all architectures (Gemma 4, Qwen 3.5, Phi-4, LLaMA, etc.) in GGUF and ONNX,
 # plus non-standard architectures (LFM2 conv+MoE) via generic ONNX.
 #
 # ─── Build ────────────────────────────────────────────────────────────────
@@ -19,6 +19,11 @@
 #
 # Chat with Phi-4 (ONNX):
 #   ./Release/backpack_llm --model E:/ai-models/phi-4/ --chat "What is 2+2?"
+#
+# Manually check cared-model correctness (ONNX directories or GGUF files):
+#   ./Release/backpack_llm --model E:/ai-models/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf --chat "What is 2+2? Answer with only the number." --max-tokens 8
+#   ./Release/backpack_llm --model E:/ai-models/Qwen3.5-2B/onnx-webgpu --chat "What is 2+2? Answer with only the number." --max-tokens 8
+#   ./Release/backpack_llm --model E:/ai-models/Qwen3.5-4B/onnx-webgpu --chat "What is 2+2? Answer with only the number." --max-tokens 8
 #
 # Raw prompt:
 #   ./Release/backpack_llm --model models/qwen-3/ --prompt "Once upon a time"

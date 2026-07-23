@@ -79,12 +79,12 @@ inline std::string applyChatTemplate(const std::string& message,
     if (arch.find("lfm2") != std::string::npos)
         return "<|startoftext|><|im_start|>user\n" + message +
                "<|im_end|>\n<|im_start|>assistant\n";
-    // Gemma 4: <|turn>/<turn|> tokens (asymmetric, like <|im_start|>/<|im_end|>
-    // but Gemma 4 specific). BOS is added by the tokenizer when add_bos_token
-    // is set in GGUF metadata.
+    // Gemma 4: match the text-only portion of the model's shipped Jinja
+    // template.  Do not spell <bos> here: both the GGUF and ONNX tokenizers
+    // add it, and a literal token would condition the model on a duplicate.
     if (arch == "gemma4")
-        return "<bos><|turn>system\nYou are a helpful AI assistant.<turn|>\n\n\n"
-               "<bos><|turn>user\n" + message + "<turn|>\n"
+        return "<|turn>system\nYou are a helpful AI assistant.<turn|>\n"
+               "<|turn>user\n" + message + "<turn|>\n"
                "<|turn>model\n";
     // Gemma 2/3 (and original Gemma) use <start_of_turn>/<end_of_turn>.
     if (arch.find("gemma") != std::string::npos)
