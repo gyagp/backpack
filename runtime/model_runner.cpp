@@ -937,10 +937,21 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     }
 
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
-        if (i >= onnx.layers.size() ||
-            (onnx.layers[i].qkv.N == 0 && onnx.layers[i].qOnly.N == 0) ||
-            onnx.layers[i].o.N == 0 || onnx.layers[i].gateup.N == 0 ||
-            onnx.layers[i].down.N == 0) {
+        const bool qwenLayer = cfg.arch == "qwen35" && i < onnx.layers.size();
+        const bool qwenAttention = qwenLayer && cfg.isAttentionLayer(i) &&
+            onnx.layers[i].qwenAttnQ.N && onnx.layers[i].qwenAttnK.N &&
+            onnx.layers[i].qwenAttnV.N && onnx.layers[i].o.N;
+        const bool qwenSsm = qwenLayer && !cfg.isAttentionLayer(i) &&
+            onnx.layers[i].qwenSsmQkv.N && onnx.layers[i].qwenSsmZ.N &&
+            onnx.layers[i].qwenSsmBeta.N && onnx.layers[i].qwenSsmAlpha.N &&
+            onnx.layers[i].qwenSsmOut.N && !onnx.layers[i].qwenSsmConvWeight.empty() &&
+            !onnx.layers[i].qwenSsmDtBias.empty() && !onnx.layers[i].qwenSsmA.empty() &&
+            !onnx.layers[i].qwenSsmNorm.empty();
+        const bool attentionReady = qwenLayer ? (qwenAttention || qwenSsm) :
+            ((onnx.layers[i].qkv.N != 0 || onnx.layers[i].qOnly.N != 0) &&
+             onnx.layers[i].o.N != 0);
+        if (i >= onnx.layers.size() || !attentionReady ||
+            onnx.layers[i].gateup.N == 0 || onnx.layers[i].down.N == 0) {
             fprintf(stderr,
                 "Unsupported/incomplete ONNX transformer layer %u: "
                 "qkv=%u qOnly=%u o=%u gateup=%u down=%u\n", i,
@@ -1047,6 +1058,44 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         auto& lw = layerWeights[i];
         auto& ld = onnx.layers[i];
 
+        if (cfg.arch == "qwen35" && cfg.isAttentionLayer(i)) {
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_qj",
+                           ld.qwenAttnQ, lw.qjW, lw.qjS);
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_k",
+                           ld.qwenAttnK, lw.kSepW, lw.kSepS);
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_v",
+                           ld.qwenAttnV, lw.vSepW, lw.vSepS);
+        } else if (cfg.arch == "qwen35") {
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_qkv",
+                           ld.qwenSsmQkv, lw.qkvW, lw.qkvS);
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_z",
+                           ld.qwenSsmZ, lw.attnGateW, lw.attnGateS);
+            Q8Repacked betaAlpha;
+            betaAlpha.N = ld.qwenSsmBeta.N + ld.qwenSsmAlpha.N;
+            betaAlpha.K = ld.qwenSsmBeta.K;
+            betaAlpha.weights = ld.qwenSsmBeta.weights;
+            betaAlpha.weights.insert(betaAlpha.weights.end(),
+                ld.qwenSsmAlpha.weights.begin(), ld.qwenSsmAlpha.weights.end());
+            betaAlpha.scales = ld.qwenSsmBeta.scales;
+            betaAlpha.scales.insert(betaAlpha.scales.end(),
+                ld.qwenSsmAlpha.scales.begin(), ld.qwenSsmAlpha.scales.end());
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_beta_alpha",
+                           betaAlpha, lw.ssmBetaAlphaW, lw.ssmBetaAlphaS);
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_out",
+                           ld.qwenSsmOut, lw.ssmOutW, lw.ssmOutS);
+            auto uploadRaw = [&](const std::string& name, const std::vector<float>& src,
+                                 GPUBuffer& dst) {
+                dst = gpu->createBuffer(name, src.size() * sizeof(float));
+                gpu->writeBuffer(dst, src.data(), src.size() * sizeof(float));
+            };
+            const std::string p = "L" + std::to_string(i) + ".qwen_ssm_";
+            uploadRaw(p + "conv", ld.qwenSsmConvWeight, lw.ssmConv1dW);
+            uploadRaw(p + "conv_bias", ld.qwenSsmConvBias, lw.ssmConv1dBias);
+            uploadRaw(p + "dt_bias", ld.qwenSsmDtBias, lw.ssmDtBias);
+            uploadRaw(p + "a", ld.qwenSsmA, lw.ssmA);
+            uploadRaw(p + "norm", ld.qwenSsmNorm, lw.ssmNorm);
+        }
+
         if (ld.qkv.N > 0) {
             uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv",
                            ld.qkv, lw.qkvW, lw.qkvS);
@@ -1063,7 +1112,8 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             const auto p="L"+std::to_string(i)+".qonly_q4";
             lw.qOnlyQ4W=uploadBytes(*gpu,p+".w",ld.qOnlyQ4.weights);lw.qOnlyQ4S=uploadBytes(*gpu,p+".s",ld.qOnlyQ4.scales);lw.qOnlyQ4Z=uploadBytes(*gpu,p+".z",ld.qOnlyQ4.zeroPoints);
         }
-        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
+        if (ld.o.N > 0)
+            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
         if(ld.oQ4.N>0){const auto p="L"+std::to_string(i)+".o_q4";lw.oQ4W=uploadBytes(*gpu,p+".w",ld.oQ4.weights);lw.oQ4S=uploadBytes(*gpu,p+".s",ld.oQ4.scales);lw.oQ4Z=uploadBytes(*gpu,p+".z",ld.oQ4.zeroPoints);}
         uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
         if (ld.gateupQ4.N > 0) {
@@ -1095,7 +1145,8 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             gpu->writeBuffer(lw.inputNorm, ld.inputNorm.data(), ld.inputNorm.size() * 4);
         }
         if (!ld.postAttnNorm.empty()) {
-            GPUBuffer& dst = cfg.arch == "gemma4" ? lw.postNorm : lw.postAttnNorm;
+            GPUBuffer& dst = (cfg.arch == "gemma4" || cfg.arch == "qwen35")
+                ? lw.postNorm : lw.postAttnNorm;
             dst = gpu->createBuffer("L" + std::to_string(i) + ".panorm",
                                                  ld.postAttnNorm.size() * 4);
             gpu->writeBuffer(dst, ld.postAttnNorm.data(), ld.postAttnNorm.size() * 4);
@@ -3393,6 +3444,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             uint32_t qkDimSsm = cfg.ssmGroupCount * cfg.ssmStateSize;
             uint32_t headV = cfg.ssmInnerSize / cfg.ssmTimeStepRank;
             bool useSsmKQ = lw.qkvKQ.handle != nullptr;
+            GPUBuffer convBias = lw.ssmConv1dBias.handle ? lw.ssmConv1dBias : zeroBiasQKV;
 
             {
                 auto bg = makeBG(plRmsNorm, {
@@ -3534,7 +3586,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                      headV, cfg.ssmConvKernel, epsBits});
                 auto bg = makeBG(plConvSplit, {
                     {0, ssmConvState[i]}, {1, qkvBuf}, {2, lw.ssmConv1dW},
-                    {3, zeroBiasQKV}, {4, q35SsmQBuf}, {5, q35SsmKBuf},
+                    {3, convBias}, {4, q35SsmQBuf}, {5, q35SsmKBuf},
                     {6, q35SsmVBuf}, {7, p}});
                 allDecodeDispatches.push_back({plConvSplit.pipeline, bg,
                     3, std::max(cfg.ssmGroupCount, cfg.ssmTimeStepRank), 1,
@@ -3545,7 +3597,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 auto p = mkP32("p_ssm_conv_silu_L"+std::to_string(i), {convChannels, cfg.ssmConvKernel});
                 auto bg = makeBG(plConvSilu, {
                     {0, ssmConvState[i]}, {1, qkvBuf}, {2, lw.ssmConv1dW},
-                    {3, zeroBiasQKV}, {4, q35ConvOutBuf}, {5, p}});
+                    {3, convBias}, {4, q35ConvOutBuf}, {5, p}});
                 allDecodeDispatches.push_back({plConvSilu.pipeline, bg,
                     (convChannels + 255) / 256, 1, 1, L+"ssm_conv_silu"});
             }
@@ -6686,8 +6738,15 @@ int32_t ModelRunner::prefillQwen35Batched(
             auto bg=makeBG(pl,std::vector<std::pair<uint32_t,GPUBuffer>>(bind));bgs.push_back(bg);ds.push_back({pl.pipeline,bg,x,y,z,n});
         };
         uint32_t eb;memcpy(&eb,&cfg.rmsNormEps,4);uint32_t cacheLen=kvCache[0].len;
-        auto&gather=getKernel("q6k_gather_batched");auto ep=mkp("qpf_ep",{M,E,kqLmRowStride});
-        add(gather,{{0,lmHeadKQ},{1,qwen35Pf.tokens},{2,qwen35Pf.x},{3,ep}},(M*E+255)/256,1,1,"qpf_embed");
+        if(lmHeadKQ.handle){
+            auto&gather=getKernel("q6k_gather_batched");auto ep=mkp("qpf_ep",{M,E,kqLmRowStride});
+            add(gather,{{0,lmHeadKQ},{1,qwen35Pf.tokens},{2,qwen35Pf.x},{3,ep}},(M*E+255)/256,1,1,"qpf_embed");
+        }else{
+            std::vector<float>emb((size_t)M*E);
+            for(uint32_t t=0;t<M;t++)memcpy(emb.data()+(size_t)t*E,
+                embeddingCPU.data()+(size_t)toks[t]*E,(size_t)E*sizeof(float));
+            gpu->writeBuffer(qwen35Pf.x,emb.data(),emb.size()*sizeof(float));
+        }
         if(traceQpf){fprintf(stderr,"[qwen-prefill] embed encoded\n");fflush(stderr);}
         auto&rms=getKernel("rms_norm_batched");auto&q8=getKernel("q8_matmul_batched_dp4a");
         auto&addnorm=getKernel("add_rms_norm_batched");auto&normadd=getKernel("gemma_norm_add_batched");
@@ -6749,6 +6808,12 @@ int32_t ModelRunner::prefillQwen35Batched(
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos&&!useIntelFourRows){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
             else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
+        auto proj=[&](GPUBuffer x,GPUBuffer kqw,GGUFType type,uint32_t nb,uint32_t rs,
+                      GPUBuffer q8w,GPUBuffer q8s,GPUBuffer bias,GPUBuffer y,
+                      uint32_t K,uint32_t N,const std::string&n){
+            if(kqw.handle)mmk(x,kqw,type,nb,rs,bias,y,K,N,n);
+            else mm(x,q8w,q8s,bias,y,K,N,n);
+        };
         for(uint32_t li=0;li<cfg.nLayer;li++){
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u build begin\n",li);fflush(stderr);}
             auto&lw=layerWeights[li];auto&pl=cfg.perLayer[li];std::string L="qpf_L"+std::to_string(li)+"/";
@@ -6757,9 +6822,9 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(!cfg.isAttentionLayer(li)){
                 uint32_t C=cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize;
                 uint32_t R=cfg.ssmTimeStepRank,DV=cfg.ssmInnerSize/R;
-                mmk(qwen35Pf.norm,lw.qkvKQ,lw.qkvKQType,lw.qkvKQNBlocks,lw.qkvKQRowStride,zeroBiasQKV,qwen35Pf.qkv,E,C,L+"qkv");
+                proj(qwen35Pf.norm,lw.qkvKQ,lw.qkvKQType,lw.qkvKQNBlocks,lw.qkvKQRowStride,lw.qkvW,lw.qkvS,zeroBiasQKV,qwen35Pf.qkv,E,C,L+"qkv");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u qkv built\n",li);fflush(stderr);}
-                mmk(qwen35Pf.norm,lw.attnGateKQ,lw.attnGateKQType,lw.attnGateKQNBlocks,lw.attnGateKQRowStride,zeroBiasQKV,qwen35Pf.z,E,cfg.ssmInnerSize,L+"z");
+                proj(qwen35Pf.norm,lw.attnGateKQ,lw.attnGateKQType,lw.attnGateKQNBlocks,lw.attnGateKQRowStride,lw.attnGateW,lw.attnGateS,zeroBiasQKV,qwen35Pf.z,E,cfg.ssmInnerSize,L+"z");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u z built\n",li);fflush(stderr);}
                 mm(qwen35Pf.norm,lw.ssmBetaAlphaW,lw.ssmBetaAlphaS,zeroBiasQKV,qwen35Pf.qj,E,2u*R,L+"ba");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u ba built\n",li);fflush(stderr);}
@@ -6767,7 +6832,8 @@ int32_t ModelRunner::prefillQwen35Batched(
                 add(bagKernel,{{0,qwen35Pf.qj},{1,lw.ssmDtBias},{2,lw.ssmA},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,bap}},(M*R+63)/64,1,1,L+"bag");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u bag built\n",li);fflush(stderr);}
                 auto cp=mkp(L+"conv_p",{C,cfg.ssmConvKernel,M});
-                add(convKernel,{{0,ssmConvState[li]},{1,qwen35Pf.qkv},{2,lw.ssmConv1dW},{3,zeroBiasQKV},{4,qwen35Pf.conv},{5,cp}},(C+255)/256,1,1,L+"conv");
+                GPUBuffer convBias=lw.ssmConv1dBias.handle?lw.ssmConv1dBias:zeroBiasQKV;
+                add(convKernel,{{0,ssmConvState[li]},{1,qwen35Pf.qkv},{2,lw.ssmConv1dW},{3,convBias},{4,qwen35Pf.conv},{5,cp}},(C+255)/256,1,1,L+"conv");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u conv built\n",li);fflush(stderr);}
                 auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
                 add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
@@ -6777,13 +6843,13 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
                 add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,M,1,L+"normgate");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u normgate built\n",li);fflush(stderr);}
-                mmk(qwen35Pf.snorm,lw.ssmOutKQ,lw.ssmOutKQType,lw.ssmOutKQNBlocks,lw.ssmOutKQRowStride,zeroBiasE,qwen35Pf.proj,cfg.ssmInnerSize,E,L+"out");
+                proj(qwen35Pf.snorm,lw.ssmOutKQ,lw.ssmOutKQType,lw.ssmOutKQNBlocks,lw.ssmOutKQRowStride,lw.ssmOutW,lw.ssmOutS,zeroBiasE,qwen35Pf.proj,cfg.ssmInnerSize,E,L+"out");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u out built\n",li);fflush(stderr);}
             }else{
                 uint32_t hd=pl.headDim,qd=pl.qDim,kd=pl.kvDim;
-                mmk(qwen35Pf.norm,lw.qjKQ,lw.qjKQType,lw.qjKQNBlocks,lw.qjKQRowStride,zeroBiasV,qwen35Pf.qj,E,2u*qd,L+"q");
-                mmk(qwen35Pf.norm,lw.kSepKQ,lw.kSepKQType,lw.kSepKQNBlocks,lw.kSepKQRowStride,zeroBiasV,qwen35Pf.ak,E,kd,L+"k");
-                mmk(qwen35Pf.norm,lw.vSepKQ,lw.vSepKQType,lw.vSepKQNBlocks,lw.vSepKQRowStride,zeroBiasV,qwen35Pf.av,E,kd,L+"v");
+                proj(qwen35Pf.norm,lw.qjKQ,lw.qjKQType,lw.qjKQNBlocks,lw.qjKQRowStride,lw.qjW,lw.qjS,zeroBiasV,qwen35Pf.qj,E,2u*qd,L+"q");
+                proj(qwen35Pf.norm,lw.kSepKQ,lw.kSepKQType,lw.kSepKQNBlocks,lw.kSepKQRowStride,lw.kSepW,lw.kSepS,zeroBiasV,qwen35Pf.ak,E,kd,L+"k");
+                proj(qwen35Pf.norm,lw.vSepKQ,lw.vSepKQType,lw.vSepKQNBlocks,lw.vSepKQRowStride,lw.vSepW,lw.vSepS,zeroBiasV,qwen35Pf.av,E,kd,L+"v");
                 auto spp=mkp(L+"split_p",{M,cfg.nHead,hd});auto&sp=getKernel("qwen35_split_qg_batched");
                 add(sp,{{0,qwen35Pf.qj},{1,qwen35Pf.aq},{2,qwen35Pf.ag},{3,spp}},(M*qd+255)/256,1,1,L+"split");
                 auto&hn=getKernel("head_rmsnorm_batched");auto qnp=mkp(L+"qn_p",{M,cfg.nHead,hd,eb});
@@ -6797,14 +6863,14 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto&att=getKernelHD(mmaAttn?"flash_attn_vulkan":"causal_attn",hd);
                 add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),1,L+"attn");
                 auto gp=mkp(L+"gate_p",{M*qd});auto&go=getKernel("gated_output_batched");add(go,{{0,qwen35Pf.attn},{1,qwen35Pf.ag},{2,qwen35Pf.aout},{3,gp}},(M*qd+255)/256,1,1,L+"gate");
-                mmk(qwen35Pf.aout,lw.oKQ,lw.oKQType,lw.oKQNBlocks,lw.oKQRowStride,zeroBiasE,qwen35Pf.proj,qd,E,L+"oproj");
+                proj(qwen35Pf.aout,lw.oKQ,lw.oKQType,lw.oKQNBlocks,lw.oKQRowStride,lw.oW,lw.oS,zeroBiasE,qwen35Pf.proj,qd,E,L+"oproj");
             }
             auto anp=mkp(L+"addnorm_p",{E,E,eb});add(addnorm,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,qwen35Pf.norm},{3,lw.postNorm},{4,qwen35Pf.rstd},{5,anp}},M,1,1,L+"postnorm");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u postnorm built\n",li);fflush(stderr);}
-            uint32_t im=pl.intermediateSize;mmk(qwen35Pf.norm,lw.guKQ,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
+            uint32_t im=pl.intermediateSize;proj(qwen35Pf.norm,lw.guKQ,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,lw.guW,lw.guS,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u gateup built\n",li);fflush(stderr);}
             auto sap=mkp(L+"silu_p",{M,im});add(silu,{{0,qwen35Pf.gateup},{1,qwen35Pf.act},{2,sap}},(M*im+255)/256,1,1,L+"silu");
-            mmk(qwen35Pf.act,lw.dnKQ,lw.dnKQType,lw.dnKQNBlocks,lw.dnKQRowStride,zeroBiasE,qwen35Pf.proj,im,E,L+"down");
+            proj(qwen35Pf.act,lw.dnKQ,lw.dnKQType,lw.dnKQNBlocks,lw.dnKQRowStride,lw.dnW,lw.dnS,zeroBiasE,qwen35Pf.proj,im,E,L+"down");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u down built\n",li);fflush(stderr);}
             if(lw.postFfwNorm.handle){auto nap=mkp(L+"normadd_p",{E,E,eb});add(normadd,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,lw.postFfwNorm},{3,qwen35Pf.rstd},{4,nap}},M,1,1,L+"ffn_add");}
             else{auto ap=mkp(L+"add_p",{M*E});add(addip,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,ap}},(M*E+255)/256,1,1,L+"ffn_add");}
@@ -6823,7 +6889,12 @@ int32_t ModelRunner::prefillQwen35Batched(
         if(last){
             auto fp=mkp("qpf_final_p",{E,E,eb});add(rms,{{0,qwen35Pf.x},{1,qwen35Pf.norm},{2,finalNormW},{3,qwen35Pf.rstd},{4,fp}},M,1,1,"qpf_final");
             GPUBuffer lastn=qwen35Pf.norm;lastn.offset=(uint64_t)(M-1)*E*4;lastn.size=E*4;
-            auto lp=mkp("qpf_lm_p",{E,cfg.nVocab,kqLmNBlocks,kqLmRowStride,0});auto&lmp=getKernel("q6k_matmul_wide");add(lmp,{{0,lastn},{1,lmHeadKQ},{2,zeroBiasV},{3,logitsBuf},{4,lp}},1,(cfg.nVocab+15)/16,1,"qpf_lm");
+            if(lmHeadKQ.handle){
+                auto lp=mkp("qpf_lm_p",{E,cfg.nVocab,kqLmNBlocks,kqLmRowStride,0});auto&lmp=getKernel("q6k_matmul_wide");add(lmp,{{0,lastn},{1,lmHeadKQ},{2,zeroBiasV},{3,logitsBuf},{4,lp}},1,(cfg.nVocab+15)/16,1,"qpf_lm");
+            }else{
+                auto lp=mkp("qpf_lm_q8_p",{E,cfg.nVocab,1});
+                add(q8,{{0,lastn},{1,lmHeadQ8W},{2,lmHeadQ8S},{3,zeroBiasV},{4,logitsBuf},{5,lp}},1,(cfg.nVocab+31)/32,1,"qpf_lm_q8");
+            }
             if(softcapPipeline&&softcapBG)ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"softcap"});
             ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
             gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);

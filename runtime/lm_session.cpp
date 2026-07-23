@@ -49,6 +49,10 @@ static bool isNonStandardArch(const std::string& path) {
     if (!fs::exists(cfgPath)) return false;
     std::ifstream f(cfgPath);
     std::string s{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+    if (std::getenv("BP_QWEN35_SPECIALIZED_ONNX") &&
+        (s.find("\"qwen3_5_text\"") != std::string::npos ||
+         s.find("\"qwen3_5\"") != std::string::npos))
+        return false;
     return s.find("\"layer_types\"") != std::string::npos ||
            s.find("\"conv_L_cache\"") != std::string::npos;
 }

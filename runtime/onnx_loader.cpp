@@ -383,6 +383,11 @@ WeightMapping mapOnnxName(const std::string& onnxName) {
         {"attn.k_proj",   "self_attn.k_proj.weight"},
         {"attn.v_proj",   "self_attn.v_proj.weight"},
         {"attn.o_proj",   "self_attn.o_proj.weight"},
+        {"linear_attn.in_proj_qkv", "qwen_ssm.qkv.weight"},
+        {"linear_attn.in_proj_z",   "qwen_ssm.z.weight"},
+        {"linear_attn.in_proj_b",   "qwen_ssm.beta.weight"},
+        {"linear_attn.in_proj_a",   "qwen_ssm.alpha.weight"},
+        {"linear_attn.out_proj",    "qwen_ssm.out.weight"},
         {"mlp.gate_up_proj", "mlp.gate_up_proj.weight"},
         {"mlp.gate_proj", "mlp.gate_proj.weight"},
         {"mlp.up_proj",   "mlp.up_proj.weight"},
@@ -442,6 +447,8 @@ std::string mapOnnxNormName(const std::string& onnxName) {
         return layerNormName("post_ffn_norm.weight");
     if (name.find("post_per_layer_input_norm") != std::string::npos)
         return layerNormName("ple_post_norm.weight");
+    if (name.find("linear_attn.norm.weight") != std::string::npos)
+        return layerNormName("qwen_ssm.norm.weight");
 
     if (name.find("input_layernorm") != std::string::npos) {
         // Extract layer number
@@ -763,6 +770,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
     auto configJson = json_parse(configStr);
 
     auto& cfg = result.cfg;
+    cfg.rmsNormEps = 1e-5f;
+    cfg.ropeTheta = 10000.0f;
     if (useGenaiFormat) {
         // GenAI format: model.decoder.num_attention_heads, etc.
         auto& model = configJson["model"];
@@ -777,25 +786,53 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         cfg.arch = model.has("type") ? model["type"].as_string() : "phi3";
     } else {
         // HuggingFace config.json format: flat keys
-        cfg.nHead = configJson.has("num_attention_heads")
-            ? configJson["num_attention_heads"].as_uint() : 32;
-        cfg.nKvHeads = configJson.has("num_key_value_heads")
-            ? configJson["num_key_value_heads"].as_uint() : cfg.nHead;
-        cfg.nEmbd = configJson.has("hidden_size")
-            ? configJson["hidden_size"].as_uint() : 2048;
-        cfg.headDim = cfg.nEmbd / cfg.nHead;
-        cfg.nLayer = configJson.has("num_hidden_layers")
-            ? configJson["num_hidden_layers"].as_uint() : 24;
-        cfg.nVocab = configJson.has("vocab_size")
-            ? configJson["vocab_size"].as_uint() : 32000;
-        cfg.arch = configJson.has("model_type")
-            ? configJson["model_type"].as_string() : "llama";
+        // Multimodal Qwen 3.5 keeps the language model configuration under
+        // text_config.  Reading the outer object silently produced default
+        // dimensions and left the hybrid executor unreachable.
+        const JsonValue& text = configJson.has("text_config")
+            ? configJson["text_config"] : configJson;
+        cfg.nHead = text.has("num_attention_heads")
+            ? text["num_attention_heads"].as_uint() : 32;
+        cfg.nKvHeads = text.has("num_key_value_heads")
+            ? text["num_key_value_heads"].as_uint() : cfg.nHead;
+        cfg.nEmbd = text.has("hidden_size")
+            ? text["hidden_size"].as_uint() : 2048;
+        cfg.headDim = text.has("head_dim")
+            ? text["head_dim"].as_uint() : cfg.nEmbd / cfg.nHead;
+        cfg.nLayer = text.has("num_hidden_layers")
+            ? text["num_hidden_layers"].as_uint() : 24;
+        cfg.nVocab = text.has("vocab_size")
+            ? text["vocab_size"].as_uint() : 32000;
+        cfg.arch = text.has("model_type")
+            ? text["model_type"].as_string() : "llama";
+        if (cfg.arch == "qwen3_5_text" || cfg.arch == "qwen3_5") {
+            cfg.arch = "qwen35";
+            cfg.intermediateSize = text["intermediate_size"].as_uint();
+            cfg.fullAttentionInterval = text["full_attention_interval"].as_uint();
+            cfg.ssmConvKernel = text["linear_conv_kernel_dim"].as_uint();
+            cfg.ssmGroupCount = text["linear_num_key_heads"].as_uint();
+            cfg.ssmStateSize = text["linear_key_head_dim"].as_uint();
+            cfg.ssmTimeStepRank = text["linear_num_value_heads"].as_uint();
+            cfg.ssmInnerSize = cfg.ssmTimeStepRank * text["linear_value_head_dim"].as_uint();
+            cfg.kvHeadDim = cfg.headDim;
+            if (text.has("rms_norm_eps")) cfg.rmsNormEps = (float)text["rms_norm_eps"].as_number();
+            if (text.has("rope_parameters")) {
+                const auto& rope = text["rope_parameters"];
+                if (rope.has("rope_theta")) cfg.ropeTheta = (float)rope["rope_theta"].as_number();
+                if (rope.has("mrope_section") && rope["mrope_section"].is_array()) {
+                    cfg.ropeSections.assign(4, 0);
+                    const auto& sections = rope["mrope_section"].as_array();
+                    for (size_t i = 0; i < std::min<size_t>(3, sections.size()); ++i)
+                        cfg.ropeSections[i] = sections[i].as_int();
+                }
+                if (rope.has("partial_rotary_factor"))
+                    result.rotaryDim = (uint32_t)(cfg.headDim * rope["partial_rotary_factor"].as_number());
+            }
+        }
     }
-    cfg.rmsNormEps = 1e-5f;
-    cfg.ropeTheta = 10000.0f;
     cfg.tieWordEmbeddings = true;
     cfg.hasQkNorm = false;
-    cfg.intermediateSize = 0;  // inferred from weights
+    if (cfg.arch != "qwen35") cfg.intermediateSize = 0;  // inferred from weights
     if (cfg.arch == "gemma4") {
         cfg.rmsNormEps = 1e-6f;
         cfg.ropeTheta = 1000000.0f;
@@ -1406,7 +1443,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         std::string vKey = "layers." + std::to_string(i) + ".self_attn.v_proj.weight";
         std::string qkvKey = "layers." + std::to_string(i) + ".self_attn.qkv_proj.weight";
 
-        if (q8Weights.count(qKey) && q8Weights.count(kKey) && q8Weights.count(vKey)) {
+        if (cfg.arch != "qwen35" && q8Weights.count(qKey) && q8Weights.count(kKey) && q8Weights.count(vKey)) {
             auto& qr = q8Weights[qKey];
             auto& kr = q8Weights[kKey];
             auto& vr = q8Weights[vKey];
@@ -1426,7 +1463,7 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             q8Weights.erase(kKey);
             q8Weights.erase(vKey);
         }
-        if (q4Weights.count(qKey) && q4Weights.count(kKey) && q4Weights.count(vKey)) {
+        if (cfg.arch != "qwen35" && q4Weights.count(qKey) && q4Weights.count(kKey) && q4Weights.count(vKey)) {
             auto& q=q4Weights[qKey]; auto& k=q4Weights[kKey]; auto& v=q4Weights[vKey];
             OnnxLoadResult::PackedQ4 fused; fused.N=q.N+k.N+v.N; fused.K=q.K;
             fused.weights=std::move(q.weights); fused.weights.insert(fused.weights.end(),k.weights.begin(),k.weights.end()); fused.weights.insert(fused.weights.end(),v.weights.begin(),v.weights.end());
@@ -1495,9 +1532,25 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
                 normWeights.erase(it);
             }
         };
+        auto copyInitializer = [&](const std::string& key, std::vector<float>& dst) {
+            auto it = initializers.find(key);
+            if (it == initializers.end() || !it->second.rawData) return;
+            const auto& tensor = it->second;
+            uint32_t count = 1;
+            for (auto d : tensor.dims) count *= (uint32_t)d;
+            dst.resize(count);
+            if (tensor.dataType == ONNX_FLOAT16) {
+                const auto* src = reinterpret_cast<const uint16_t*>(tensor.rawData);
+                for (uint32_t j = 0; j < count; ++j) dst[j] = fp16_to_f32(src[j]);
+            } else if (tensor.dataType == ONNX_FLOAT) {
+                memcpy(dst.data(), tensor.rawData, (size_t)count * sizeof(float));
+            } else {
+                dst.clear();
+            }
+        };
 
         moveQ8(pfx + "self_attn.qkv_proj.weight", ld.qkv);
-        if (ld.qkv.N == 0)
+        if (ld.qkv.N == 0 && cfg.arch != "qwen35")
             moveQ8(pfx + "self_attn.q_proj.weight", ld.qOnly);
         if (auto it=q4Weights.find(pfx+"self_attn.qkv_proj.weight");it!=q4Weights.end()){ld.qkvQ4=std::move(it->second);q4Weights.erase(it);}
         if (auto it=q4Weights.find(pfx+"self_attn.q_proj.weight");it!=q4Weights.end()){ld.qOnlyQ4=std::move(it->second);q4Weights.erase(it);}
@@ -1523,6 +1576,24 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         moveNorm(pfx + "post_ffn_norm.weight", ld.postFfnNorm);
         moveNorm(pfx + "ple_post_norm.weight", ld.plePostNorm);
         moveNorm(pfx + "output_scale", ld.outputScale);
+
+        if (cfg.arch == "qwen35") {
+            moveQ8(pfx + "self_attn.q_proj.weight", ld.qwenAttnQ);
+            moveQ8(pfx + "self_attn.k_proj.weight", ld.qwenAttnK);
+            moveQ8(pfx + "self_attn.v_proj.weight", ld.qwenAttnV);
+            moveQ8(pfx + "qwen_ssm.qkv.weight", ld.qwenSsmQkv);
+            moveQ8(pfx + "qwen_ssm.z.weight", ld.qwenSsmZ);
+            moveQ8(pfx + "qwen_ssm.beta.weight", ld.qwenSsmBeta);
+            moveQ8(pfx + "qwen_ssm.alpha.weight", ld.qwenSsmAlpha);
+            moveQ8(pfx + "qwen_ssm.out.weight", ld.qwenSsmOut);
+            moveNorm(pfx + "qwen_ssm.norm.weight", ld.qwenSsmNorm);
+
+            const std::string onnxPfx = "model.layers." + std::to_string(i) + ".linear_attn.";
+            copyInitializer(onnxPfx + "conv1d.weight", ld.qwenSsmConvWeight);
+            copyInitializer(onnxPfx + "conv1d.bias", ld.qwenSsmConvBias);
+            copyInitializer(onnxPfx + "dt_bias", ld.qwenSsmDtBias);
+            copyInitializer(onnxPfx + "neg_exp_A", ld.qwenSsmA);
+        }
 
         if (i % 7 == 6 || i == cfg.nLayer - 1)
             fprintf(stderr, "  processed layer %u/%u\n", i + 1, cfg.nLayer);

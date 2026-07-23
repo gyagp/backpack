@@ -33,6 +33,12 @@ struct OnnxLoadResult {
     struct LayerData {
         Q8Repacked qkv;         // fused Q/K/V projection (Q8 format)
         Q8Repacked qOnly;       // Q-only projection for shared-KV layers
+        // Qwen 3.5 hybrid attention/DeltaNet projections.  These remain
+        // separate because full-attention Q also carries an output gate and
+        // linear-attention layers have four distinct input projections.
+        Q8Repacked qwenAttnQ, qwenAttnK, qwenAttnV;
+        Q8Repacked qwenSsmQkv, qwenSsmZ;
+        Q8Repacked qwenSsmBeta, qwenSsmAlpha, qwenSsmOut;
         PackedQ4 qkvQ4, qOnlyQ4;
         Q8Repacked o;           // output projection
         PackedQ4 oQ4;
@@ -61,6 +67,11 @@ struct OnnxLoadResult {
         std::vector<float> postFfnNorm;
         std::vector<float> plePostNorm;
         std::vector<float> outputScale;
+        std::vector<float> qwenSsmConvWeight;
+        std::vector<float> qwenSsmConvBias;
+        std::vector<float> qwenSsmDtBias;
+        std::vector<float> qwenSsmA;
+        std::vector<float> qwenSsmNorm;
     };
     std::vector<LayerData> layers;
 

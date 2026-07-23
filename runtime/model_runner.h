@@ -212,6 +212,7 @@ struct ModelRunner {
         // Tensor names: ssm_conv1d.weight, ssm_dt.bias, ssm_a, ssm_beta.weight,
         // ssm_alpha.weight, ssm_norm.weight, ssm_out.weight.
         GPUBuffer ssmConv1dW;       // [d_inner, conv_k] depthwise conv1d
+        GPUBuffer ssmConv1dBias;    // optional ONNX convolution bias
         GPUBuffer ssmDtBias;        // [d_inner] bias for dt projection
         GPUBuffer ssmA;             // [d_inner, d_state] state matrix (init log-space)
         GPUBuffer ssmBetaAlphaW, ssmBetaAlphaS; // fused beta || alpha projection
