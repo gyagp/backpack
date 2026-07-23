@@ -67,11 +67,11 @@ inline std::string applyChatTemplate(const std::string& message,
     // Empty <think></think> block disables thinking mode.
     if (arch.find("qwen3") != std::string::npos ||
         arch.find("qwen2") != std::string::npos)
-          // Match ORT GenAI model_chat: its system-only Jinja application
-          // falls back to plain system text, then the user turn uses ChatML.
-          return "You are a helpful AI assistant."
-                 "<|im_start|>user\n" + message + "<|im_end|>\n"
-                 "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        // GGUF uses the regular ChatML system turn.  ONNX GenAI's unusual
+        // two-stage system prefill is handled separately by apps/llm.
+        return "<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n"
+               "<|im_start|>user\n" + message + "<|im_end|>\n"
+               "<|im_start|>assistant\n<think>\n\n</think>\n\n";
     // Phi-3/Phi-4-mini: uses <|user|>/<|end|>/<|assistant|> tokens
     if (arch.find("phi3") != std::string::npos ||
         arch.find("phi4") != std::string::npos)

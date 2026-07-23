@@ -32,6 +32,7 @@ int main(int argc, char* argv[]) {
     std::string formatOverride;
     int maxTokens = 100;
     bool benchmark = false, profile = false, noFastDecode = false;
+    bool fastPrefill = false;
     bool saveBaseline = false;
     std::string baselinePath;
     int benchPromptLen = 0, benchGenTokens = 128;
@@ -52,6 +53,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--profile")                  profile = true;
         else if (arg == "--no-fast-decode")            noFastDecode = true;
         else if (arg == "--fast-decode")              {}
+        else if (arg == "--fast-prefill")             fastPrefill = true;
         else if (arg == "--bench-prompt-len" && i+1 < argc) benchPromptLen = atoi(argv[++i]);
         else if (arg == "--bench-gen-tokens" && i+1 < argc) benchGenTokens = atoi(argv[++i]);
         else if (arg == "--max-seq-len" && i+1 < argc)    maxSeqLenOverride = atoi(argv[++i]);
@@ -76,6 +78,7 @@ int main(int argc, char* argv[]) {
             "  --backend <name>   vulkan / d3d12 / metal\n"
             "  --format <fmt>     Force model format: gguf / onnx\n"
             "  --no-fast-decode   Disable fast decode\n"
+            "  --fast-prefill     Use experimental batched Qwen 3.5 prefill\n"
             "  --temperature <f>  Sampling temperature (0 = greedy)\n"
             "  --top-k <n>       Top-k sampling (0 = disabled)\n"
             "  --seed <n>        Random seed for sampling\n"
@@ -92,6 +95,18 @@ int main(int argc, char* argv[]) {
 
     if (prompt.empty() && chatMessage.empty() && !benchmark)
         prompt = "Hello";
+
+    // Interactive generation is a manual correctness surface.  Qwen 3.5's
+    // batched GGUF prefill is still under conformance investigation, whereas
+    // the serial path produces stable text.  Benchmarks explicitly retain
+    // the optimized path; --fast-prefill permits deliberate manual testing.
+    if (!benchmark && !fastPrefill) {
+#ifdef _WIN32
+        _putenv_s("BP_QWEN35_SERIAL_PREFILL", "1");
+#else
+        setenv("BP_QWEN35_SERIAL_PREFILL", "1", 1);
+#endif
+    }
 
     // 1. Create device
     auto device = app::createDevice(backendStr);
