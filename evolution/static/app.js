@@ -746,15 +746,18 @@ function renderTaskTable(tasks, history = [], mode = "pending") {
         impact = records.length ? historyGroupImpact(records) : classifyHistoryImpact(null),
         result = records[0]?.summary || taskResult(task, running || latestRun),
         reason = failureReason(task);
-      return `<tr><td class="task-id-cell"><strong>${esc(taskLabel(task))}</strong></td><td><strong>${esc(task.title)}</strong><div class="meta mono">${esc(task.id)}</div></td><td>${esc(taskSource(task))}</td><td>${badge(running?.status || taskDisplayStatus(task))}</td><td><div class="task-table-result">${renderImpactBadge(impact)}<span>${esc(reason || result)}</span></div></td><td>${esc(stamp(task.created_at))}</td><td>${esc(stamp(started))}</td><td>${esc(stamp(done))}</td><td>${duration == null ? "—" : formatDuration(duration)}</td><td>${devices.length ? devices.map((device) => `<span class="task-device-chip">${esc(device)}</span>`).join("") : "—"}</td><td><button class="secondary detail" data-id="${esc(task.id)}">View</button></td></tr>`;
+      return `<tr><td class="task-id-cell"><strong>${esc(taskLabel(task))}</strong></td><td><strong>${esc(task.title)}</strong><div class="meta mono">${esc(task.id)}</div></td><td>${esc(taskSource(task))}</td><td>${badge(taskDisplayStatus(task))}</td><td><div class="task-table-result">${renderImpactBadge(impact)}<span>${esc(reason || result)}</span></div></td><td>${esc(stamp(task.created_at))}</td><td>${esc(stamp(started))}</td><td>${esc(stamp(done))}</td><td>${duration == null ? "—" : formatDuration(duration)}</td><td>${devices.length ? devices.map((device) => `<span class="task-device-chip">${esc(device)}</span>`).join("") : "—"}</td><td><button class="secondary detail" data-id="${esc(task.id)}">View</button></td></tr>`;
     }).join("");
   return `<div class="table-wrap task-table-wrap"><table class="task-table"><thead><tr><th>ID</th><th>Task</th><th>Source</th><th>Status</th><th>Result</th><th>Created</th><th>Started</th><th>Done</th><th>Duration</th><th>Devices</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 function taskDisplayStatus(task) {
-  if ((task.runs || []).some((run) => run.status === "running")) return "running";
-  return task.kind !== "optimization" && task.state === "integrated"
-    ? "completed"
-    : task.state;
+  const terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
+    active = new Set(["implementing", "candidate_ready", "validating", "evaluating",
+      "debating", "ready_to_merge", "integrating", "observing"]);
+  if (terminal.has(task.state)) return "done";
+  if ((task.runs || []).some((run) => run.status === "running") || active.has(task.state))
+    return "active";
+  return "pending";
 }
 const taskFilterCookie = "backpack-task-filters";
 function readTaskFilters() {
