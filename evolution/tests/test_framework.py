@@ -9,7 +9,7 @@ from evolution.agent import (conformance_passed, current_base_worktree,
 from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
-from evolution.store import Store
+from evolution.store import Store, latest_backpack_executable
 
 
 class FrameworkTest(unittest.TestCase):
@@ -81,6 +81,16 @@ class FrameworkTest(unittest.TestCase):
     def test_agent_preserves_non_python_adapter(self) -> None:
         argv = [r"D:\tools\llama-bench.exe", "--model", r"D:\models\qwen.gguf"]
         self.assertEqual(argv, rewrite_python_argv(argv))
+
+    def test_latest_backpack_executable_uses_revisioned_backup(self) -> None:
+        root = Path(self.tmp.name) / "backups"
+        older = root / "aaaaaaa-20260723" / "backpack_llm.exe"
+        latest = root / "bbbbbbb-20260724" / "backpack_llm.exe"
+        older.parent.mkdir(parents=True)
+        latest.parent.mkdir(parents=True)
+        older.touch()
+        latest.touch()
+        self.assertEqual(latest, latest_backpack_executable(root))
 
     def test_positive_candidate_is_accepted(self) -> None:
         self.add_pair([100, 101, 99], [110, 111, 109])

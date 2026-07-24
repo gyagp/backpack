@@ -13,6 +13,14 @@ from .domain import DomainError, json_text, parse_json, require, utc_now, valida
 
 STATUS_PROMPT_TOKENS = 512
 STATUS_GENERATED_TOKENS = 128
+BACKPACK_BACKUP_ROOT = Path(r"D:\backup\x64\backpack")
+
+
+def latest_backpack_executable(root: Path = BACKPACK_BACKUP_ROOT) -> Path | None:
+    candidates = [path for path in root.glob("*-20??????/backpack_llm.exe") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.parent.stat().st_mtime, path.parent.name))
 
 
 SCHEMA = """
@@ -597,6 +605,11 @@ class Store:
                     manifest = {**manifest, "conformance_spec": model.get("conformance_spec", {})}
                 if argv and argv[0] == "gitignore/runtime/build/backpack_llm.exe":
                     manifest = {**manifest, "argv": [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", *argv[1:]]}
+                elif argv and argv[0] == r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe":
+                    backed_up = latest_backpack_executable()
+                    if backed_up:
+                        manifest = {**manifest, "argv": [str(backed_up), *argv[1:]],
+                                    "artifact_revision": backed_up.parent.name}
                 if manifest != task.get("manifest", {}):
                     with self._lock, self._db:
                         self._db.execute("UPDATE tasks SET manifest_json=?,updated_at=? WHERE id=?",
@@ -605,6 +618,7 @@ class Store:
                 continue
             model_id = origin.get("model_id") or next(iter(manifest.get("models") or []), "")
             model = self.get_model(model_id)
+            backed_up: Path | None = None
             files = (model or {}).get("files", {})
             runtime = next(iter(manifest.get("runtimes") or []), {})
             model_entry = files.get(runtime.get("format")) or files.get("gguf") or files.get("ort")
@@ -624,7 +638,9 @@ class Store:
                         "--generation-tokens", str(STATUS_GENERATED_TOKENS),
                         "--repetitions", "5"]
             else:
-                argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"]]
+                backed_up = latest_backpack_executable()
+                executable = str(backed_up) if backed_up else r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe"
+                argv = [executable, "--model", model_entry["path"]]
             if task["kind"] == "benchmark":
                 if runtime.get("framework") == "backpack":
                     argv += ["--benchmark", "--bench-prompt-len", str(STATUS_PROMPT_TOKENS),
@@ -637,6 +653,8 @@ class Store:
                 argv += ["--prompt", spec.get("prompt", "What is 2 + 2?"),
                          "--max-tokens", str(spec.get("max_tokens", 64))]
             manifest = {**manifest, "adapter": "argv", "argv": argv}
+            if backed_up:
+                manifest["artifact_revision"] = backed_up.parent.name
             with self._lock, self._db:
                 self._db.execute("UPDATE tasks SET manifest_json=?,updated_at=? WHERE id=?",
                                  (json_text(manifest), utc_now(), task["id"]))
