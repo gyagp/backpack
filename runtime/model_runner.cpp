@@ -6528,6 +6528,12 @@ void ModelRunner::destroy() {
     releaseBG(pfCache.lmBG);
     releaseBG(pfCache.argmaxBG);
 
+    for (auto& bg : qwen35PrefillPlan.bindGroups)
+        releaseBG(bg);
+    qwen35PrefillPlan.bindGroups.clear();
+    qwen35PrefillPlan.dispatches.clear();
+    qwen35PrefillPlan.ready = false;
+
     for (auto& slot : pool) {
         for (int i = slot.cbIdx; i < (int)slot.cbPool.size(); i++) {
             if (slot.cbPool[i])
