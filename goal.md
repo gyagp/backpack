@@ -86,6 +86,17 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
   gains back to their source study, and summarize meaningful accepted findings
   in the daily Digest.
 
+## Operability and visibility
+
+- Keep Dashboard Status, Tasks, Evolution, Digest, Devices, performance
+  analysis, and related views synchronized with the latest valid execution
+  state. Active work, failures, reasons, revisions, commands, and accepted
+  results must be visible promptly; stale or invalid data must be corrected or
+  removed.
+- Keep the common LLM application under `apps/` working with every currently
+  cared model and supported format, so a person can run an end-to-end prompt
+  and review correctness manually before accepting performance evidence.
+
 ## Milestone gate
 
 A milestone may be pushed and synchronized as the next base only after:
@@ -94,7 +105,9 @@ A milestone may be pushed and synchronized as the next base only after:
 2. comparable repeated performance evidence exists for all protected metrics;
 3. no required device has a confirmed regression beyond policy;
 4. every result is attached to the exact revision and dated artifact; and
-5. the dashboard Tasks, Status, Digest, and performance history are updated.
+5. the dashboard Tasks, Status, Evolution, Digest, and performance history are
+   updated; and
+6. the common application remains conformant for the affected cared models.
 
 Accepted milestones are pushed automatically, backed up, and synchronized to
 all cared devices as the base for subsequent evolution.
