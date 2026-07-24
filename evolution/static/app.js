@@ -203,7 +203,7 @@ async function refresh() {
       created_at: "confirmed by two measurements",
     })),
   ];
-  renderMatrix(matrix);
+  renderMatrix(matrix, observations);
   renderPerformanceAnalysis();
   renderPerformanceTrend(observations);
   renderTaskDirectory(enriched, history);
@@ -311,17 +311,17 @@ function performanceCommand(r) {
   const modelPath = r.model.files?.[r.format]?.path || "<model-path>",
     q = (s) => `"${String(s).replaceAll('"', '\\"')}"`;
   if (r.framework === "llamacpp")
-    return `cd /d D:\\workspace\\project\\agents\\webgfx-agents\\ai-test\nnode scripts\\perf-test-llamacpp.js --llamacpp-backend vulkan --model ${q(modelPath)} -pl 128 -gl 128 -r 5 --ngl 99\n\nllama-bench records prompt processing (pp128) and token generation (tg128) separately. The collector maps plTs to prefill_tok_s and decode_tok_s.`;
+    return `cd /d D:\\workspace\\project\\agents\\webgfx-agents\\ai-test\nnode scripts\\perf-test-llamacpp.js --llamacpp-backend vulkan --model ${q(modelPath)} -pl 512 -gl 128 -r 5 --ngl 99\n\nStatus tracks 512 prompt tokens and 128 generated tokens. llama-bench records prompt processing and token generation separately; the collector maps plTs to prefill_tok_s and decode_tok_s.`;
   if (r.framework === "ort") {
     const qwen = r.model.id === "qwen3.5-2b" || r.model.id === "qwen3.5-4b",
       capture = qwen ? "0" : "1",
       note = qwen
         ? "Temporary Qwen 3.5 exception: graph capture is disabled; results are marked graph_capture=false."
         : "Graph capture is the ORT WebGPU default; --reuse_generator is required.";
-    return `Set model.decoder.session_options.provider_options[].webgpu.enableGraphCapture to "${capture}" in:\n${modelPath}\\genai_config.json\n\ncd /d D:\\backup\\x64\\ort\\20260720-ort-da90494371-genai-87047e6d77\nmodel_benchmark.exe -i ${q(modelPath)} -l 128 -g 128 -r 5 --reuse_generator\n\n${note} Timeout: 60 seconds per prompt length.`;
+    return `Set model.decoder.session_options.provider_options[].webgpu.enableGraphCapture to "${capture}" in:\n${modelPath}\\genai_config.json\n\ncd /d D:\\backup\\x64\\ort\\20260720-ort-da90494371-genai-87047e6d77\nmodel_benchmark.exe -i ${q(modelPath)} -l 512 -g 128 -r 5 --reuse_generator\n\nStatus tracks 512 prompt tokens and 128 generated tokens. ${note} Timeout: 120 seconds per run.`;
   }
   const format = r.format === "ort" ? "onnx" : "gguf";
-  return `cd /d D:\\workspace\\project\\backpack\ngitignore\\runtime\\build\\backpack_llm.exe --model ${q(modelPath)} --format ${format} --benchmark --bench-prompt-len 128 --bench-gen-tokens 64\n\nThis bounded command measures the Status row directly and avoids the expensive 128-to-4096 sweep. Timeout: 240 seconds.`;
+  return `cd /d D:\\workspace\\project\\backpack\ngitignore\\runtime\\build\\backpack_llm.exe --model ${q(modelPath)} --format ${format} --benchmark --bench-prompt-len 512 --bench-gen-tokens 128\n\nStatus tracks 512 prompt tokens and 128 generated tokens. This bounded command avoids the expensive full sweep. Timeout: 300 seconds.`;
 }
 function showPerformanceCommand(button) {
   $("#detail").innerHTML =
@@ -329,7 +329,8 @@ function showPerformanceCommand(button) {
   $("#detail-dialog").showModal();
 }
 let validationRows = [],
-  trendObservations = [];
+  trendObservations = [],
+  statusPerformanceProfile = { prompt_tokens: 512, generated_tokens: 128 };
 const statusModelStorageKey = "backpack.status.model";
 function savedStatusModel() {
   try {
@@ -389,8 +390,14 @@ function renderStatusModelTabs() {
       ),
     );
 }
-function renderMatrix(matrix) {
+function renderMatrix(matrix, observations = []) {
+  statusPerformanceProfile = matrix.performance_profile || statusPerformanceProfile;
   validationRows = [];
+  const trackedMetrics = new Map();
+  for (const item of comparableStatusTrendObservations(observations)) {
+    const key = `${item.model_id}/${item.machine_id}/${item.framework}/${item.format}/${item.backend}`;
+    if (!trackedMetrics.has(key)) trackedMetrics.set(key, item);
+  }
   for (const row of matrix.models || []) {
     for (const cell of row.cells) {
       const seen = new Set();
@@ -406,20 +413,22 @@ function renderMatrix(matrix) {
               (x) => x.conformance === "pass" || x.conformance === "fail",
             ) || matches[0],
           metricsResult =
-            matches.find(
-              (x) =>
-                x.performance_validated && Object.keys(x.metrics || {}).length,
-            ) || result,
+            trackedMetrics.get(
+              `${row.model.id}/${cell.machine.id}/${spec.framework}/${spec.format}/${spec.backend}`,
+            ) || null,
           conformance = result?.conformance || "pending",
           combined =
-            result && metricsResult && result !== metricsResult
+            result && metricsResult
               ? {
                   ...result,
                   metrics: metricsResult.metrics,
                   revision: metricsResult.revision,
                   created_at: metricsResult.created_at,
+                  conformance_details: metricsResult.conformance_details,
                 }
-              : result;
+              : result
+                ? { ...result, metrics: {} }
+                : null;
         validationRows.push({
           model: row.model,
           machine: cell.machine,
@@ -563,10 +572,10 @@ function renderValidationRows() {
     (r) => r.model.id === activeStatusModel,
   )?.model;
   $("#validation-count").textContent =
-    `${rows.length} comparison rows${selected ? ` · ${selected.name}` : ""}`;
+    `${rows.length} comparison rows${selected ? ` · ${selected.name}` : ""} · input ${statusPerformanceProfile.prompt_tokens} / output ${statusPerformanceProfile.generated_tokens} tokens`;
   renderStatusChart(rows);
   $("#model-matrix").innerHTML = rows.length
-    ? `<table class="status-table status-comparison"><thead><tr><th rowspan="2">Device</th><th colspan="6" class="instance-group">Instance A</th><th colspan="6" class="instance-group reference-group">Instance B</th></tr><tr><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS</th><th>Decode TPS</th><th>Revision / Date</th><th>Command</th><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS</th><th>Decode TPS</th><th>Revision / Date</th><th>Command</th></tr></thead><tbody>${rows
+    ? `<div class="status-perf-profile"><strong>Tracked performance profile</strong><span>Input/prompt: ${statusPerformanceProfile.prompt_tokens} tokens</span><span>Output/generation: ${statusPerformanceProfile.generated_tokens} tokens</span><span>Only this exact shape is compared below and plotted in trends.</span></div><table class="status-table status-comparison"><thead><tr><th rowspan="2">Device</th><th colspan="6" class="instance-group">Instance A</th><th colspan="6" class="instance-group reference-group">Instance B</th></tr><tr><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS<br><small>${statusPerformanceProfile.prompt_tokens} input</small></th><th>Decode TPS<br><small>${statusPerformanceProfile.generated_tokens} output</small></th><th>Revision / Date</th><th>Command</th><th>Runtime / Backend / Format</th><th>Conformance</th><th>Prefill TPS<br><small>${statusPerformanceProfile.prompt_tokens} input</small></th><th>Decode TPS<br><small>${statusPerformanceProfile.generated_tokens} output</small></th><th>Revision / Date</th><th>Command</th></tr></thead><tbody>${rows
         .map((r, i) => {
           const p = rows[i - 1],
             n = rows[i + 1],
@@ -2295,9 +2304,9 @@ function performanceBenchmarkSignature(row) {
 function comparableStatusTrendObservations(items) {
   return validPerformanceObservations(items).filter((row) => {
     const signature = performanceBenchmarkSignature(row);
-    // The status trend is the standardized, like-for-like 128/64 benchmark.
+    // The status trend is the standardized, like-for-like 512/128 benchmark.
     // Other shapes remain in raw history but must never share this polyline.
-    return signature?.prompt === 128 && signature.generated === 64;
+    return signature?.prompt === 512 && signature.generated === 128;
   });
 }
 function renderPerformanceTrend(observations) {

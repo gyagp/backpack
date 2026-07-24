@@ -11,6 +11,9 @@ from typing import Any, Iterable
 
 from .domain import DomainError, json_text, parse_json, require, utc_now, validate_transition
 
+STATUS_PROMPT_TOKENS = 512
+STATUS_GENERATED_TOKENS = 128
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -609,13 +612,14 @@ class Store:
             runtime = next(iter(manifest.get("runtimes") or []), {})
             if task["kind"] == "benchmark" and runtime.get("framework") == "llamacpp":
                 argv = [sys.executable, r"D:\workspace\project\backpack\evolution\benchmark_llamacpp.py",
-                        "--model", model_entry["path"], "--prompt-tokens", "128",
-                        "--generation-tokens", "128", "--repetitions", "5"]
+                        "--model", model_entry["path"], "--prompt-tokens", str(STATUS_PROMPT_TOKENS),
+                        "--generation-tokens", str(STATUS_GENERATED_TOKENS), "--repetitions", "5"]
             else:
                 argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"]]
             if task["kind"] == "benchmark":
                 if runtime.get("framework") != "llamacpp":
-                    argv.append("--benchmark")
+                    argv += ["--benchmark", "--bench-prompt-len", str(STATUS_PROMPT_TOKENS),
+                             "--bench-gen-tokens", str(STATUS_GENERATED_TOKENS)]
             else:
                 spec = (model or {}).get("conformance_spec", {})
                 # Some conformant models emit a short reasoning/preamble before
@@ -1174,6 +1178,21 @@ class Store:
             return metric == passed or metric.startswith(passed + "-") or passed.startswith(metric + "-")
 
         observations = []
+
+        def status_shape(item: dict[str, Any]) -> tuple[int, int] | None:
+            metrics = item.get("metrics", {})
+
+            def number(*names: str) -> int | None:
+                value = next((metrics.get(name) for name in names
+                              if isinstance(metrics.get(name), (int, float))
+                              and not isinstance(metrics.get(name), bool)), None)
+                return int(value) if value is not None else None
+
+            prompt = number("prompt_tokens", "prompt_length")
+            generated = number("generated_tokens", "decode_tokens",
+                               "generation_tokens", "generation_length")
+            return (prompt, generated) if prompt is not None and generated is not None else None
+
         grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
         for item in self.list_observations({}):
             key = tuple(item[name] for name in ("model_id", "machine_id", "framework", "format", "backend"))
@@ -1181,7 +1200,9 @@ class Store:
         for items in grouped.values():
             passes = [item for item in items if item["conformance"] == "pass"]
             conformance = next((item for item in items if item["conformance"] in {"pass", "fail"}), None)
-            metrics = next((item for item in items if item.get("metrics") and (
+            metrics = next((item for item in items if
+                status_shape(item) == (STATUS_PROMPT_TOKENS, STATUS_GENERATED_TOKENS)
+                and item.get("metrics") and (
                 item["conformance"] == "pass" or any(
                     compatible_revision(item.get("revision"), passed.get("revision")) for passed in passes
                 ))), None)
@@ -1207,7 +1228,9 @@ class Store:
                               "conformance": backpack["conformance"] if backpack else "unknown",
                               "results": items})
             rows.append({"model": model, "cells": cells})
-        return {"models": rows, "machines": machines}
+        return {"models": rows, "machines": machines,
+                "performance_profile": {"prompt_tokens": STATUS_PROMPT_TOKENS,
+                                        "generated_tokens": STATUS_GENERATED_TOKENS}}
 
     def ensure_automatic_tasks(self) -> list[dict[str, Any]]:
         """Create conformance work first, then perf collection for passing cells."""
@@ -1268,7 +1291,9 @@ class Store:
                         "origin": {"type": "automatic", "automation_key": key, "model_id": model["id"],
                                    "machine_id": machine["id"]},
                         "manifest": {"models": [model["id"]], "metrics": ["prefill_tok_s", "decode_tok_s"],
-                                     "runtimes": [runtime], "conformance_first": True},
+                                     "runtimes": [runtime], "conformance_first": True,
+                                     "prompt_tokens": STATUS_PROMPT_TOKENS,
+                                     "generated_tokens": STATUS_GENERATED_TOKENS},
                         "device_policy": {"machine_ids": [machine["id"]]},
                     }, "automation")
                     created.append(task)

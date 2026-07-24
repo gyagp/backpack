@@ -10,7 +10,7 @@ from pathlib import Path
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run llama.cpp Vulkan prefill and decode benchmark")
     parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--prompt-tokens", type=int, default=128)
+    parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--generation-tokens", type=int, default=128)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--prompt")

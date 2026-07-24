@@ -199,7 +199,11 @@ class FrameworkTest(unittest.TestCase):
                   "framework": "llamacpp", "format": "gguf", "backend": "vulkan"}
         self.store.add_observation({**common, "conformance": "pass", "revision": "b10069-20260720"}, "test")
         self.store.add_observation({**common, "conformance": "not_applicable", "revision": "b10069",
-                                    "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20}}, "test")
+                                    "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20,
+                                                "prompt_tokens": 512, "generated_tokens": 128}}, "test")
+        self.store.add_observation({**common, "conformance": "not_applicable", "revision": "b10069",
+                                    "metrics": {"prefill_tok_s": 777, "decode_tok_s": 777,
+                                                "prompt_tokens": 128, "generated_tokens": 64}}, "test")
         self.store.add_observation({**common, "conformance": "not_applicable", "revision": "unverified-newer",
                                     "metrics": {"prefill_tok_s": 999, "decode_tok_s": 999}}, "test")
         cell = next(row for row in self.store.model_matrix()["models"]
@@ -207,6 +211,8 @@ class FrameworkTest(unittest.TestCase):
         metric = next(item for item in cell["results"] if item.get("performance_validated"))
         self.assertEqual("b10069", metric["revision"])
         self.assertEqual(20, metric["metrics"]["decode_tok_s"])
+        self.assertEqual({"prompt_tokens": 512, "generated_tokens": 128},
+                         self.store.model_matrix()["performance_profile"])
 
     def test_confirmed_regression_requires_comparable_passing_samples(self) -> None:
         model = self.store.upsert_model({"id": "regression-model", "name": "Regression",
