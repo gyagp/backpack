@@ -483,7 +483,8 @@ class FrameworkTest(unittest.TestCase):
             self.store.transition_task(task["id"], "ready_to_merge", "test")
 
     def test_passing_conformance_schedules_missing_performance(self) -> None:
-        self.store.upsert_model({"id": "perf-model", "name": "Perf", "files": {"gguf": {}}})
+        self.store.upsert_model({"id": "perf-model", "name": "Perf",
+                                 "files": {"gguf": {"path": r"D:\models\model.gguf"}}})
         self.store.add_observation({"model_id": "perf-model", "machine_id": self.machine["id"],
                                     "framework": "backpack", "format": "gguf", "backend": "d3d12",
                                     "conformance": "pass", "metrics": {}, "revision": "test"}, "test")
@@ -496,6 +497,34 @@ class FrameworkTest(unittest.TestCase):
         self.assertTrue(any(item["framework"] == "backpack" for item in runtimes))
         self.assertTrue(any(item["framework"] == "llamacpp" for item in runtimes))
         self.assertTrue(all(len(task["manifest"]["runtimes"]) == 1 for task in perf))
+        self.assertTrue(all(task["manifest"]["prompt_tokens"] == 512 for task in perf))
+        self.assertTrue(all(task["manifest"]["generated_tokens"] == 128 for task in perf))
+        self.store.ensure_runnable_automatic_tasks()
+        refreshed = [self.store.get_task(task["id"]) for task in perf]
+        llama = next(task for task in refreshed
+                     if task["manifest"]["runtimes"][0]["framework"] == "llamacpp")
+        self.assertIn("--prompt-tokens", llama["manifest"]["argv"])
+        self.assertIn("512", llama["manifest"]["argv"])
+
+    def test_ort_benchmark_routes_to_ort_adapter_and_onnx_artifact(self) -> None:
+        self.store.upsert_model({"id": "ort-perf", "name": "ORT Perf",
+                                 "files": {"ort": {"path": r"D:\models\ort-perf"}},
+                                 "conformance_spec": {"prompt": "2+2?", "required_fact": "4"}})
+        common = {"model_id": "ort-perf", "machine_id": self.machine["id"],
+                  "format": "ort", "backend": "webgpu", "conformance": "pass",
+                  "metrics": {}, "revision": "test"}
+        self.store.add_observation({**common, "framework": "backpack"}, "test")
+        self.store.add_observation({**common, "framework": "ort"}, "test")
+        tasks = [task for task in self.store.ensure_automatic_tasks()
+                 if task["kind"] == "benchmark"]
+        self.store.ensure_runnable_automatic_tasks()
+        ort = next(self.store.get_task(task["id"]) for task in tasks
+                   if task["manifest"]["runtimes"][0]["framework"] == "ort")
+        argv = ort["manifest"]["argv"]
+        self.assertTrue(str(argv[1]).endswith("benchmark_ort.py"))
+        self.assertEqual(r"D:\models\ort-perf", argv[argv.index("--model") + 1])
+        self.assertEqual("512", argv[argv.index("--prompt-tokens") + 1])
+        self.assertEqual("128", argv[argv.index("--generation-tokens") + 1])
 
     def test_device_runs_track_real_execution_state_and_result(self) -> None:
         self.store.ensure_task_runs()

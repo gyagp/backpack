@@ -606,18 +606,27 @@ class Store:
             model_id = origin.get("model_id") or next(iter(manifest.get("models") or []), "")
             model = self.get_model(model_id)
             files = (model or {}).get("files", {})
-            model_entry = files.get("gguf") or files.get("ort")
+            runtime = next(iter(manifest.get("runtimes") or []), {})
+            model_entry = files.get(runtime.get("format")) or files.get("gguf") or files.get("ort")
             if not model_entry or not model_entry.get("path"):
                 continue
-            runtime = next(iter(manifest.get("runtimes") or []), {})
             if task["kind"] == "benchmark" and runtime.get("framework") == "llamacpp":
                 argv = [sys.executable, r"D:\workspace\project\backpack\evolution\benchmark_llamacpp.py",
                         "--model", model_entry["path"], "--prompt-tokens", str(STATUS_PROMPT_TOKENS),
                         "--generation-tokens", str(STATUS_GENERATED_TOKENS), "--repetitions", "5"]
+            elif task["kind"] == "benchmark" and runtime.get("framework") == "ort":
+                spec = (model or {}).get("conformance_spec", {})
+                argv = [sys.executable, r"D:\workspace\project\backpack\evolution\benchmark_ort.py",
+                        "--model", model_entry["path"],
+                        "--prompt", spec.get("prompt", "What is 2 + 2?"),
+                        "--required-fact", spec.get("required_fact", "4"),
+                        "--prompt-tokens", str(STATUS_PROMPT_TOKENS),
+                        "--generation-tokens", str(STATUS_GENERATED_TOKENS),
+                        "--repetitions", "5"]
             else:
                 argv = [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", "--model", model_entry["path"]]
             if task["kind"] == "benchmark":
-                if runtime.get("framework") != "llamacpp":
+                if runtime.get("framework") == "backpack":
                     argv += ["--benchmark", "--bench-prompt-len", str(STATUS_PROMPT_TOKENS),
                              "--bench-gen-tokens", str(STATUS_GENERATED_TOKENS)]
             else:
