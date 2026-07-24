@@ -525,6 +525,7 @@ private:
         GPUBuffer qj, aq, ag, ak, av, qrot, attn, aout;
         GPUBuffer kqActQ8, kqActScale;
         GPUBuffer q4DenseScratch, q4ScaleMinScratch;
+        GPUBuffer q5ProjectionDenseScratch, q5ProjectionScaleMinScratch;
         GPUBuffer paramArena;
     } qwen35Pf;
 };

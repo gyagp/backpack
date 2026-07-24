@@ -146,6 +146,16 @@ fn pack8(p0:u32,p1:u32,high:bool)->u32{var r=0u;for(var i=0u;i<4u;i++){let b=(p0
 )WGSL";
 }
 
+const char* q5kRepackOrtDenseSource() {
+    return R"WGSL(@group(0) @binding(0)var<storage,read>Raw:array<u32>;
+@group(0) @binding(1)var<storage,read_write>Dense:array<u32>;
+@group(0) @binding(2)var<storage,read_write>ScaleMin:array<f32>;
+@group(0) @binding(3)var<storage,read>P:array<u32>;
+fn pack4Bytes(low:u32,highBits:u32,sb:u32)->u32{var r=0u;for(var i=0u;i<4u;i++){let lo=(low>>(i*8u))&15u;let hi=((highBits>>(i*8u+sb))&1u)<<4u;r|=(lo|hi)<<(i*8u);}return r;}
+@compute @workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let K=P[0];let N=P[1];let nb=P[2];let rs=P[3];let groups=K/32u;let g=gid.x;if(g>=N*groups){return;}let row=g/groups;let gr=g%groups;let block=gr/8u;let sb=gr&7u;if(block>=nb){return;}let base=row*rs+block*44u;let qgroup=sb/2u;let high=(sb&1u)!=0u;let qb=base+12u+qgroup*8u;for(var part=0u;part<8u;part++){let packed=Raw[qb+part];let low=select(packed&0x0F0F0F0Fu,(packed>>4u)&0x0F0F0F0Fu,high);Dense[g*8u+part]=pack4Bytes(low,Raw[base+4u+part],sb);}let dm=unpack2x16float(Raw[base]);let sh=(sb&3u)*8u;let dv=(Raw[base+1u]>>sh)&255u;let mv=(Raw[base+2u]>>sh)&255u;var sc:u32;var mn:u32;if(sb<4u){sc=dv&63u;mn=mv&63u;}else{let hi=(Raw[base+3u]>>sh)&255u;sc=(hi&15u)|((dv>>2u)&48u);mn=(hi>>4u)|((mv>>2u)&48u);}ScaleMin[g*2u]=dm.x*f32(sc);ScaleMin[g*2u+1u]=dm.y*f32(mn);}
+)WGSL";
+}
+
 std::string q4kOrtRepackedTileSource() {
     std::string s(WGSL_ORT_DP4A_MATMUL_EXACT);
     auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
@@ -160,6 +170,15 @@ fn loadSHMA(batch:u32,a_global_base:u32,kidx_v:u32,row:u32,col:u32){let ar=a_glo
 fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);if(col==0u){scale_B[row]=scales_b[br*(uniforms.K/32u)+kidx_v/2u];}}
 
 )WGSL";cut("fn loadSHMA(","@compute @workgroup_size",loaders);return s;
+}
+
+std::string q5kOrtRepackedTileSource() {
+    std::string s=q4kOrtRepackedTileSource();
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    all("input_b: array<vec2<u32>>","input_b: array<vec4<u32>>");
+    all("let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);",
+        "let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=v;");
+    return s;
 }
 
 std::string q4ZpBatchedRows8Source() {
@@ -5455,6 +5474,20 @@ void ModelRunner::initQwen35PrefillResources() {
         (void)gpu->getOrCreatePipeline("q4k_repack_ort_dense",q4kRepackOrtDenseSource(),4);
         (void)gpu->getOrCreatePipeline("q4k_ort_dense_tile64",q4kOrtRepackedTileSource(),6);
     }
+    if(gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+       std::getenv("BP_Q5K_DISABLE_PROJECTION_DENSE_TILE")==nullptr){
+        uint64_t maxProjectionElems=(uint64_t)
+            (cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize)*E;
+        for(const auto& pl:cfg.perLayer){
+            maxProjectionElems=std::max(maxProjectionElems,(uint64_t)2u*pl.qDim*E);
+            maxProjectionElems=std::max(maxProjectionElems,(uint64_t)pl.kvDim*E);
+            maxProjectionElems=std::max(maxProjectionElems,(uint64_t)pl.qDim*E);
+        }
+        qwen35Pf.q5ProjectionDenseScratch=gpu->createBuffer("qpf_q5_projection_dense",std::max<uint64_t>(4,maxProjectionElems));
+        qwen35Pf.q5ProjectionScaleMinScratch=gpu->createBuffer("qpf_q5_projection_scale_min",std::max<uint64_t>(4,(maxProjectionElems/32)*8));
+        (void)gpu->getOrCreatePipeline("q5k_projection_repack_ort_dense",q5kRepackOrtDenseSource(),4);
+        (void)gpu->getOrCreatePipeline("q5k_projection_ort_dense_tile64",q5kOrtRepackedTileSource(),6);
+    }
     qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",256u*1024u,
         BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
@@ -6990,7 +7023,26 @@ int32_t ModelRunner::prefillQwen35Batched(
         const CompiledPipeline* ortQ4Tile=useOrtQ4Tile
             ?&gpu->getOrCreatePipeline("q4k_ort_dense_tile64",q4kOrtRepackedTileSource(),6):nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GPUBuffer dense,GPUBuffer scaleMin,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
-            if(t==GGUF_TYPE_Q4_K&&dense.handle&&scaleMin.handle&&ortQ4Tile){
+            auto endsWith=[&](const char*s){const size_t z=std::strlen(s);return n.size()>=z&&n.compare(n.size()-z,z,s)==0;};
+            const bool projectionName=endsWith("/qkv")||endsWith("/out")||endsWith("/q")||
+                endsWith("/k")||endsWith("/v")||endsWith("/oproj");
+            const bool q5ProjectionDense=t==GGUF_TYPE_Q5_K&&M>=64&&
+                qwen35Pf.q5ProjectionDenseScratch.handle&&projectionName;
+            if(q5ProjectionDense){
+                auto qp=mkp(n+"_q5_quant_p",{K,N,M,nb,rs});
+                auto&quant=getKernel("q8_quantize_batched_dp4a");
+                add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,qp}},(K+255)/256,M,1,n+"_quant");
+                auto&repack=gpu->getOrCreatePipeline("q5k_projection_repack_ort_dense",q5kRepackOrtDenseSource(),4);
+                auto rp=mkp(n+"_q5_repack_p",{K,N,nb,rs});
+                add(repack,{{0,w},{1,qwen35Pf.q5ProjectionDenseScratch},{2,qwen35Pf.q5ProjectionScaleMinScratch},{3,rp}},
+                    (N*(K/32u)+255u)/256u,1,1,n+"_q5_repack");
+                auto&tile=gpu->getOrCreatePipeline("q5k_projection_ort_dense_tile64",q5kOrtRepackedTileSource(),6);
+                const uint32_t mt=(M+63)/64,nt=(N+63)/64;
+                auto p=mkp(n+"_q5_ort_p",{1,M,N,K,K/8,K/16,mt,nt,0,0});
+                add(tile,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,qwen35Pf.q5ProjectionDenseScratch},
+                    {3,qwen35Pf.q5ProjectionScaleMinScratch},{4,y},{5,p}},mt*nt,1,1,n+"_q5_ort64");
+            }
+            else if(t==GGUF_TYPE_Q4_K&&dense.handle&&scaleMin.handle&&ortQ4Tile){
                 auto qp=mkp(n+"_ort_quant_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,qp}},(K+255)/256,M,1,n+"_quant");
