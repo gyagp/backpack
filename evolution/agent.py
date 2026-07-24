@@ -47,6 +47,56 @@ def conformance_passed(spec: dict[str, Any], output: str) -> bool:
     return bool(required and required in output.lower())
 
 
+def argv_option(argv: list[str], option: str, default: str = "") -> str:
+    """Return the final value for a simple ``--option value`` argument."""
+    return next((argv[index + 1] for index in range(len(argv) - 2, -1, -1)
+                 if argv[index] == option), default)
+
+
+def backpack_conformance_argv(argv: list[str], spec: dict[str, Any]) -> list[str]:
+    """Turn a Backpack benchmark command into a same-artifact chat validation."""
+    value_options = {"--bench-prompt-len", "--bench-gen-tokens", "--prompt",
+                     "--chat", "--max-tokens", "--temperature", "--top-k", "--seed"}
+    flag_options = {"--benchmark", "--profile", "--save-baseline"}
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if value in value_options:
+            index += 2
+            continue
+        if value in flag_options:
+            index += 1
+            # --save-baseline accepts an optional path.
+            if value == "--save-baseline" and index < len(argv) and not argv[index].startswith("--"):
+                index += 1
+            continue
+        result.append(value)
+        index += 1
+    result += ["--chat", str(spec.get("prompt") or "What is 2 + 2?"),
+               "--temperature", str(spec.get("temperature", 0)),
+               "--max-tokens", str(spec.get("max_tokens", 64))]
+    return result
+
+
+def extract_backpack_output(stdout: str, stderr: str) -> str:
+    match = re.search(r"--- Output ---\s*(.*?)\s*--- Performance ---",
+                      stdout + "\n" + stderr, re.S)
+    return match.group(1).strip() if match else ""
+
+
+def validate_backpack_benchmark(argv: list[str], spec: dict[str, Any], cwd: Path,
+                                timeout: int = 600) -> dict[str, Any]:
+    validation_argv = backpack_conformance_argv(argv, spec)
+    completed = subprocess.run(validation_argv, cwd=cwd, text=True, encoding="utf-8",
+                               errors="replace", capture_output=True, timeout=timeout, shell=False)
+    output = extract_backpack_output(completed.stdout, completed.stderr)
+    passed = completed.returncode == 0 and bool(output) and conformance_passed(spec, output)
+    return {"passed": passed, "argv": validation_argv, "exit_code": completed.returncode,
+            "output": output, "stdout_tail": completed.stdout[-12000:],
+            "stderr_tail": completed.stderr[-12000:]}
+
+
 def fingerprint(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     gpu = os.environ.get("BP_EVOLUTION_GPU", "")
     driver = os.environ.get("BP_EVOLUTION_DRIVER", "")
@@ -249,19 +299,36 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
             prompt_tokens, prefill_ms, prefill_rate, decode_ms, decode_rate, fence_ms, fence_pct = rows[-1]
             origin, manifest = task.get("origin", {}), task.get("manifest", {})
             model_path = next((argv[i + 1] for i, value in enumerate(argv[:-1]) if value == "--model"), "")
+            generated_tokens = int(argv_option(argv, "--bench-gen-tokens", "0") or 0)
             metrics = {"prompt_tokens": int(prompt_tokens), "prefill_ms": float(prefill_ms),
                        "prefill_tok_s": float(prefill_rate), "decode_ms": float(decode_ms),
-                       "decode_tok_s": float(decode_rate)}
+                       "decode_tok_s": float(decode_rate), "generated_tokens": generated_tokens}
             if fence_ms:
                 metrics.update({"fence_ms": float(fence_ms), "fence_percent": float(fence_pct)})
+            spec = manifest.get("conformance_spec") or {}
+            validation: dict[str, Any]
+            try:
+                validation = validate_backpack_benchmark(argv, spec, execution_repo)
+            except (OSError, subprocess.SubprocessError) as exc:
+                validation = {"passed": False, "argv": backpack_conformance_argv(argv, spec),
+                              "exit_code": None, "output": "", "error": str(exc)}
+            result["conformance_validation"] = validation
+            if not validation["passed"]:
+                status = "failed"
             request_json(server + "/api/observations", "POST", {
                 "model_id": origin.get("model_id") or next(iter(manifest.get("models") or []), ""),
                 "machine_id": run["machine_id"], "framework": "backpack",
                 "format": "gguf" if model_path.lower().endswith(".gguf") else "ort",
-                "backend": "webgpu", "conformance": "not_applicable",
-                "revision": _command_output(["git", "-C", str(repo), "rev-parse", "HEAD"]) or "unknown",
+                "backend": "webgpu", "conformance": "pass" if validation["passed"] else "fail",
+                "revision": manifest.get("artifact_revision") or "unknown",
                 "conformance_details": {"source": f"benchmark task {task.get('id', run['task_id'])}",
-                                        "reason": "throughput-only command did not validate generated output"},
+                                        "prompt": spec.get("prompt"),
+                                        "required_fact": spec.get("required_fact"),
+                                        "expected_output": spec.get("expected_output"),
+                                        "match_mode": "exact" if spec.get("expected_output") else "contains",
+                                        "output": validation.get("output", "")[-4000:],
+                                        "validation_exit_code": validation.get("exit_code"),
+                                        "error": validation.get("error")},
                 "metrics": metrics, "artifacts": [],
             }, name)
     elif status == "completed" and task.get("kind") in {"correctness", "conformance"}:
@@ -287,7 +354,11 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                                         "output": output[-4000:], "source": f"task {task.get('id', run['task_id'])}"},
                 "metrics": {}, "artifacts": [],
             }, name)
-    error = None if completed.returncode == 0 else f"process exited {completed.returncode}"
+    error = None if status == "completed" else f"process exited {completed.returncode}"
+    validation = result.get("conformance_validation") or {}
+    if validation and not validation.get("passed"):
+        error = ("Backpack benchmark output failed same-artifact conformance validation"
+                 + (f": {validation.get('error')}" if validation.get("error") else ""))
     repair_result = result.get("codex_repair") or {}
     if repair_result.get("status") == "authentication_required":
         error = (f"Codex CLI is not authenticated on {name}. Run 'codex login' on that device "

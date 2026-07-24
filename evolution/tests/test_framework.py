@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from evolution.agent import (conformance_passed, current_base_worktree,
-                             rewrite_python_argv, rewrite_repo_argv)
+from evolution.agent import (argv_option, backpack_conformance_argv,
+                             conformance_passed, current_base_worktree,
+                             extract_backpack_output, rewrite_python_argv,
+                             rewrite_repo_argv)
 from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
@@ -13,6 +15,23 @@ from evolution.store import Store, latest_backpack_executable
 
 
 class FrameworkTest(unittest.TestCase):
+    def test_backpack_benchmark_builds_same_artifact_chat_validation(self) -> None:
+        benchmark = [r"D:\backup\x64\backpack\abc-20260724\backpack_llm.exe",
+                     "--model", r"D:\models\qwen.gguf", "--benchmark",
+                     "--bench-prompt-len", "512", "--bench-gen-tokens", "128"]
+        validation = backpack_conformance_argv(
+            benchmark, {"prompt": "What is 2 + 2?", "temperature": 0, "max_tokens": 8})
+        self.assertEqual(benchmark[0], validation[0])
+        self.assertEqual(r"D:\models\qwen.gguf", argv_option(validation, "--model"))
+        self.assertNotIn("--benchmark", validation)
+        self.assertNotIn("--bench-gen-tokens", validation)
+        self.assertEqual("What is 2 + 2?", argv_option(validation, "--chat"))
+        self.assertEqual("8", argv_option(validation, "--max-tokens"))
+
+    def test_backpack_output_extraction_excludes_prompt_and_performance(self) -> None:
+        stderr = "Prompt: 12 tokens\n--- Output ---\n4\n\n--- Performance ---\nGenerate: 1"
+        self.assertEqual("4", extract_backpack_output("", stderr))
+
     def test_exact_conformance_rejects_factually_correct_extra_text(self) -> None:
         spec = {"required_fact": "4", "expected_output": "4"}
         self.assertTrue(conformance_passed(spec, "4"))

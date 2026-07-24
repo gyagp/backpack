@@ -601,7 +601,7 @@ class Store:
                 argv = manifest.get("argv") or []
                 model_id = origin.get("model_id") or next(iter(manifest.get("models") or []), "")
                 model = self.get_model(model_id)
-                if task["kind"] == "correctness" and model:
+                if task["kind"] in {"correctness", "benchmark"} and model:
                     manifest = {**manifest, "conformance_spec": model.get("conformance_spec", {})}
                 if argv and argv[0] == "gitignore/runtime/build/backpack_llm.exe":
                     manifest = {**manifest, "argv": [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", *argv[1:]]}
@@ -655,6 +655,8 @@ class Store:
                 argv += ["--prompt", spec.get("prompt", "What is 2 + 2?"),
                          "--max-tokens", str(spec.get("max_tokens", 64))]
             manifest = {**manifest, "adapter": "argv", "argv": argv}
+            if task["kind"] == "benchmark" and runtime.get("framework") == "backpack" and model:
+                manifest["conformance_spec"] = model.get("conformance_spec", {})
             if backed_up:
                 manifest["artifact_revision"] = backed_up.parent.name
             with self._lock, self._db:
