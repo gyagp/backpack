@@ -1,10 +1,19 @@
 # Backpack Goal
 
-Build Backpack into a continuously improving, portable WebGPU inference runtime for:
+Build Backpack into a continuously improving, portable WebGPU inference runtime
+that can expand to additional model families over time.
+
+The current priority models are:
 
 - Gemma 4 E2B IT QAT
 - Qwen 3.5 2B
 - Qwen 3.5 4B
+
+This list is the present execution focus, not a permanent limit. New models may
+be added to the cared-model set through Goal review as priorities evolve. Every
+newly cared model inherits the same correctness, measurement, regression, and
+milestone requirements below; adding one must not weaken coverage for models
+that remain cared.
 
 The cared devices are `webgfx-104` (server/NVIDIA), `webgfx-103` (AMD), and
 `webgfx-31` (Intel). All three devices must remain productively assigned to
