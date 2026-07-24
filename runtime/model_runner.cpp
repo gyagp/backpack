@@ -5754,6 +5754,10 @@ void ModelRunner::initGemmaPrefillResources() {
     gemmaPf.gateup = mk("gpf_gateup", C * 2ull * maxIM);
     gemmaPf.act    = mk("gpf_act", C * maxIM);
     gemmaPf.rstd   = mk("gpf_rstd", C);
+    if (!std::getenv("BP_GEMMA_DISABLE_PARAM_ARENA")) {
+        gemmaPf.paramArena = gpu->createBuffer("gpf_param_arena", 512u * 1024u,
+            BUF_STORAGE | BUF_UNIFORM | BUF_COPY_DST);
+    }
     const uint32_t maxK = std::max({cfg.nEmbd, maxIM, maxQkv});
     const bool gemmaPrequantAdapter =
         gpu->adapterName.find("NVIDIA") != std::string::npos ||
@@ -7480,14 +7484,32 @@ int32_t ModelRunner::prefillGemmaBatched(
         std::vector<Dispatch> ds;
         std::vector<WGPUBindGroup> bgs;
         std::vector<GPUBuffer> params;
+        const bool useParamArena = gemmaPf.paramArena.handle != nullptr;
+        uint64_t paramCursor = 0;
+        std::vector<uint8_t> paramHost(useParamArena ? gemmaPf.paramArena.size : 0, 0);
         auto mkP = [&](const std::string& name, std::initializer_list<uint32_t> v,
                        bool uniform = false) {
             uint32_t d[8] = {};
             size_t n = 0; for (uint32_t x : v) d[n++] = x;
             uint64_t bytes = n > 4 ? 32 : 16;
+            if (useParamArena) {
+                if (paramCursor + 256 > gemmaPf.paramArena.size) {
+                    fprintf(stderr, "Gemma prefill parameter arena exhausted\n");
+                    std::abort();
+                }
+                GPUBuffer b = gemmaPf.paramArena;
+                b.offset = paramCursor; b.size = bytes;
+                memcpy(paramHost.data() + paramCursor, d, bytes);
+                paramCursor += 256;
+                return b;
+            }
             auto b = gpu->createBuffer(name, bytes,
                 uniform ? (BUF_UNIFORM | BUF_COPY_DST) : (BUF_STORAGE | BUF_COPY_DST));
             gpu->writeBuffer(b, d, bytes); params.push_back(b); return b;
+        };
+        auto flushParams = [&]() {
+            if (useParamArena && paramCursor)
+                gpu->writeBuffer(gemmaPf.paramArena, paramHost.data(), paramCursor);
         };
         auto add = [&](const CompiledPipeline& pl,
                        std::initializer_list<std::pair<uint32_t, GPUBuffer>> binds,
@@ -7763,6 +7785,7 @@ int32_t ModelRunner::prefillGemmaBatched(
             }
             ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);
             ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
+            flushParams();
             auto buildEnd = PrefillClock::now();
             auto bytes=gpu->submitAndReadback(ds,argmaxResultBuf,4,passPerDispatch);
             auto submitEnd = PrefillClock::now();
@@ -7770,6 +7793,7 @@ int32_t ModelRunner::prefillGemmaBatched(
             submitMs += std::chrono::duration<double, std::milli>(submitEnd-buildEnd).count();
             memcpy(&resultToken,bytes.data(),4);
         } else {
+            flushParams();
             auto buildEnd = PrefillClock::now();
             // Bind groups and per-dispatch parameter buffers are released and
             // the shared scratch arena is reused below.  A multi-chunk prompt

@@ -517,6 +517,7 @@ private:
         GPUBuffer tokens, x, norm, qkv, qrot, attn, proj, gateup, act, rstd;
         GPUBuffer actQ8, actScale;
         GPUBuffer pleSignal, pleRaw, pleGate, pleOut;
+        GPUBuffer paramArena;
     } gemmaPf;
     struct Qwen35PrefillCache {
         bool ready = false;
