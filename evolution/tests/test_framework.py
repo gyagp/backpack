@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from evolution.agent import conformance_passed, current_base_worktree, rewrite_repo_argv
+from evolution.agent import (conformance_passed, current_base_worktree,
+                             rewrite_python_argv, rewrite_repo_argv)
 from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
@@ -67,6 +68,19 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(base, resolved)
         self.assertEqual(str(base / "evolution" / "benchmark_ort.py"), rewritten[1])
         self.assertEqual(r"D:\models\qwen", rewritten[3])
+
+    def test_agent_uses_its_local_python_for_python_adapter(self) -> None:
+        rewritten = rewrite_python_argv([
+            r"C:\Users\server\Python312\python.exe",
+            r"D:\workspace\project\backpack\evolution\benchmark_ort.py",
+            "--model", r"D:\models\qwen",
+        ])
+        self.assertEqual(Path(rewritten[0]).resolve(), Path(__import__("sys").executable).resolve())
+        self.assertEqual("--model", rewritten[2])
+
+    def test_agent_preserves_non_python_adapter(self) -> None:
+        argv = [r"D:\tools\llama-bench.exe", "--model", r"D:\models\qwen.gguf"]
+        self.assertEqual(argv, rewrite_python_argv(argv))
 
     def test_positive_candidate_is_accepted(self) -> None:
         self.add_pair([100, 101, 99], [110, 111, 109])

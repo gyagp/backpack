@@ -129,6 +129,16 @@ def rewrite_repo_argv(argv: list[str], repo: Path, execution_repo: Path) -> list
             if value.lower().startswith(repo_prefix.lower()) else value for value in argv]
 
 
+def rewrite_python_argv(argv: list[str]) -> list[str]:
+    """Run Python adapters with the interpreter hosting this device agent."""
+    if len(argv) < 2 or not argv[1].lower().endswith(".py"):
+        return argv
+    executable = Path(argv[0]).name.lower()
+    if executable in {"python", "python.exe", "python3", "python3.exe"} or executable.startswith("python3"):
+        return [sys.executable, *argv[1:]]
+    return argv
+
+
 def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None:
     """Execute only explicit, typed adapters; never interpret server text as a shell command."""
     task, run_id = run["task"], run["id"]
@@ -143,7 +153,7 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
     prior_repair = (run.get("result") or {}).get("codex_repair") or {}
     if prior_repair.get("candidate_sha") and Path(prior_repair.get("worktree", "")).is_dir():
         execution_repo = Path(prior_repair["worktree"])
-    argv = rewrite_repo_argv(argv, repo, execution_repo)
+    argv = rewrite_python_argv(rewrite_repo_argv(argv, repo, execution_repo))
     request_json(server + f"/api/runs/{run_id}", "POST",
                  {"status": "running", "phase": "validating Codex repair" if prior_repair.get("candidate_sha") else "executing",
                   "progress": 10}, name)
