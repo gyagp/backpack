@@ -7162,6 +7162,31 @@ int32_t ModelRunner::prefillQwen35Batched(
     double buildMs=0.0,submitMs=0.0,cleanupMs=0.0;
     const bool traceQpf=std::getenv("BP_PROFILE_QWEN_PREFILL")!=nullptr;
     if(traceQpf){fprintf(stderr,"[qwen-prefill] enter T=%u\n",T);fflush(stderr);}
+    const uint32_t initialCacheLen=kvCache.empty()?0:kvCache[0].len;
+    const bool replayPlan=qwen35PrefillPlan.ready&&
+        std::getenv("BP_QWEN_DISABLE_PREFILL_PLAN_CACHE")==nullptr&&
+        !profiler&&T==qwen35PrefillPlan.tokens&&
+        posOffset==qwen35PrefillPlan.posOffset&&
+        initialCacheLen==qwen35PrefillPlan.cacheLen&&T<=qwen35Pf.capacity;
+    if(replayPlan){
+        std::vector<int32_t> toks(T);
+        for(uint32_t i=0;i<T;i++){
+            const int32_t v=tokenIds[i];
+            toks[i]=(v>=0&&(uint32_t)v<cfg.nVocab)?v:0;
+        }
+        gpu->writeBuffer(qwen35Pf.tokens,toks.data(),T*4);
+        gpu->writeBuffer(qwen35Pf.paramArena,qwen35PrefillPlan.params.data(),
+                         qwen35PrefillPlan.params.size());
+        auto bytes=gpu->submitAndReadback(qwen35PrefillPlan.dispatches,
+                                          argmaxResultBuf,4,passPerDispatch);
+        int32_t result=-1;
+        if(bytes.size()>=4)memcpy(&result,bytes.data(),4);
+        for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=T;
+        if(profileCpu)fprintf(stderr,
+            "[qwen-prefill-cpu] T=%u cached-plan=1 dispatches=%zu\n",
+            T,qwen35PrefillPlan.dispatches.size());
+        return result;
+    }
     int32_t result=-1;uint32_t done=0;
     while(done<T){
         auto buildStart=QwenPrefillClock::now();
@@ -7431,6 +7456,20 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(softcapPipeline&&softcapBG)ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"softcap"});
             ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
             gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
+            const bool capturePlan=std::getenv("BP_QWEN_DISABLE_PREFILL_PLAN_CACHE")==nullptr&&
+                !profiler&&done==0&&M==T&&posOffset==0&&cacheLen==0;
+            if(capturePlan){
+                for(auto bg:qwen35PrefillPlan.bindGroups)
+                    if(bg)wgpuBindGroupRelease(bg);
+                qwen35PrefillPlan.ready=true;
+                qwen35PrefillPlan.tokens=T;
+                qwen35PrefillPlan.posOffset=posOffset;
+                qwen35PrefillPlan.cacheLen=cacheLen;
+                qwen35PrefillPlan.dispatches=ds;
+                qwen35PrefillPlan.bindGroups=std::move(bgs);
+                qwen35PrefillPlan.params.assign(paramHost.begin(),
+                                                paramHost.begin()+paramCursor);
+            }
             auto buildEnd=QwenPrefillClock::now();
             auto bytes=(profiler&&profiler->enabled())
                 ?gpu->submitAndReadbackProfiled(ds,argmaxResultBuf,4,*profiler)

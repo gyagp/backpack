@@ -397,7 +397,9 @@ struct ModelRunner {
     bool loadDecodeAutotuneCache();
     void saveDecodeAutotuneCache() const;
     void printActiveDecodeTuning(const char* prefix = "  Active decode tuning") const;
-    bool hasBatchedPrefill() const { return pfCache.ready || gemmaPf.ready; }
+    bool hasBatchedPrefill() const {
+        return pfCache.ready || gemmaPf.ready || qwen35Pf.ready;
+    }
     void destroy();
 
     // ─── MTP (Multi-Token Prediction) ────────────────────────────────────
@@ -530,4 +532,11 @@ private:
         GPUBuffer q5ProjectionDenseScratch, q5ProjectionScaleMinScratch;
         GPUBuffer paramArena;
     } qwen35Pf;
+    struct Qwen35PrefillPlan {
+        bool ready = false;
+        uint32_t tokens = 0, posOffset = 0, cacheLen = 0;
+        std::vector<Dispatch> dispatches;
+        std::vector<WGPUBindGroup> bindGroups;
+        std::vector<uint8_t> params;
+    } qwen35PrefillPlan;
 };
