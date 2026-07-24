@@ -3972,6 +3972,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 const bool nvidiaValueMajorState = isNvidiaAdapter &&
                     (cfg.ssmTimeStepRank == 16u || cfg.ssmTimeStepRank == 32u) &&
                     (qwen35VulkanDecode || qwen35SubgroupSuite);
+                const bool intelValueMajorState = isIntelAdapter &&
+                    cfg.ssmTimeStepRank == 32u &&
+                    std::getenv("BP_QWEN_DISABLE_INTEL_DELTA_SCAN_TILE") == nullptr;
                 const bool repeatedGgufHeads = modelFormat != "onnx" &&
                     cfg.ssmTimeStepRank > cfg.ssmGroupCount;
                 auto deltaSource = [&](const char* source, bool valueMajor) {
@@ -3983,7 +3986,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 // four 32-lane subgroup reduction is only valid for wave32;
                 // x2 uses explicit workgroup-memory reductions and is portable.
                 const bool useX2 = isAmdAdapter || qwen35VulkanDecode || qwen35SubgroupSuite;
-                const bool valueMajor = nvidiaValueMajorState;
+                const bool valueMajor = nvidiaValueMajorState || intelValueMajorState;
                 const CompiledPipeline* plDelta = nullptr;
                 if (repeatedGgufHeads) {
                     const std::string name = std::string("delta_net_decode_gguf_repeat") +
@@ -3992,9 +3995,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                         deltaSource(useX2 ? WGSL_DELTA_NET_DECODE_X2
                                           : WGSL_DELTA_NET_DECODE,
                                     valueMajor), 8);
-                } else if (nvidiaValueMajorState) {
-                    plDelta = &gpu->getOrCreatePipeline("delta_net_decode_x2_value_major",
-                        deltaNetValueMajorSource(WGSL_DELTA_NET_DECODE_X2), 8);
+                } else if (valueMajor) {
+                    const char* source = useX2 ? WGSL_DELTA_NET_DECODE_X2
+                                               : WGSL_DELTA_NET_DECODE;
+                    plDelta = &gpu->getOrCreatePipeline(
+                        useX2 ? "delta_net_decode_x2_value_major"
+                              : "delta_net_decode_value_major",
+                        deltaNetValueMajorSource(source), 8);
                 } else {
                     plDelta = &(useX2 ? getKernel("delta_net_decode_x2")
                                       : getKernel("delta_net_decode"));
@@ -7247,8 +7254,11 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool exactSingle=preciseQ8&&M==1;
         auto&splitSsmKernel=getKernel(exactSingle?"qwen35_split_qkv_l2":"qwen35_split_qkv_l2_batched");
         const bool valueMajorPrefill=
-            gpu->adapterName.find("NVIDIA")!=std::string::npos&&
-            (cfg.ssmTimeStepRank==16u||cfg.ssmTimeStepRank==32u);
+            (gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+             (cfg.ssmTimeStepRank==16u||cfg.ssmTimeStepRank==32u)) ||
+            (gpu->adapterName.find("Intel")!=std::string::npos&&
+             cfg.ssmTimeStepRank==32u&&
+             std::getenv("BP_QWEN_DISABLE_INTEL_DELTA_SCAN_TILE")==nullptr);
         // Intel rank-32 (Qwen 4B) loses occupancy with two resident state
         // columns per lane; retain x2 there while rank-16 and other vendors
         // benefit or remain neutral.
