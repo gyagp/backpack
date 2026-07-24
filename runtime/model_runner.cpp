@@ -138,6 +138,53 @@ fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+r
 )WGSL";cut("fn loadSHMA(","@compute @workgroup_size",loaders);return s;
 }
 
+const char* q4PrequantBatchedSource() {
+    // llama.cpp's Vulkan MMQ path quantizes each activation row once and then
+    // reuses it across the output-column tile.  Gemma's older Q4_0 kernel
+    // repeated that quantization in every 32-column workgroup.
+    return R"WGSL(requires packed_4x8_integer_dot_product;
+@group(0) @binding(0)var<storage,read>XQ:array<u32>;
+@group(0) @binding(1)var<storage,read>XS:array<f32>;
+@group(0) @binding(2)var<storage,read>B:array<u32>;
+@group(0) @binding(3)var<storage,read>S:array<u32>;
+@group(0) @binding(4)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(5)var<storage,read>P:array<u32>;
+var<workgroup>sxq:array<u32,512>;
+var<workgroup>sxs:array<f32,64>;
+var<workgroup>reduce_scratch:array<f32,256>;
+fn reduce32(v:f32,tid:u32)->f32{
+ reduce_scratch[tid]=v;workgroupBarrier();
+ for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){reduce_scratch[tid]+=reduce_scratch[tid+off];}workgroupBarrier();}
+ return reduce_scratch[(tid/32u)*32u];
+}
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
+ let tid=lid.x;let warp=tid/32u;let lane=tid&31u;let row0=wid.x*8u;let col=wid.y*8u+warp;
+ let K=P[0];let N=P[1];let M=P[2];let qStride=(K+3u)/4u;let sStride=(K+31u)/32u;
+ let nblocks=K/32u;let words=K/8u;var acc:array<f32,8>;
+ for(var g=0u;g<K;g+=256u){
+  let lr=row0+warp;let lq=warp*64u+lane*2u;
+  if(lr<M){let qb=lr*qStride+g/4u+lane*2u;sxq[lq]=XQ[qb];sxq[lq+1u]=XQ[qb+1u];}
+  else{sxq[lq]=0u;sxq[lq+1u]=0u;}
+  if(tid<64u){let m=tid/8u;let sb=tid&7u;let row=row0+m;
+   sxs[tid]=select(0.0,XS[row*sStride+g/32u+sb],row<M);}
+  workgroupBarrier();
+  if(col<N){
+   let q4=B[col*words+g/8u+lane];let b0=q4&255u;let b1=(q4>>8u)&255u;let b2=(q4>>16u)&255u;let b3=q4>>24u;
+   let wq0=(((b0&15u)-8u)&255u)|((((b0>>4u)-8u)&255u)<<8u)|((((b1&15u)-8u)&255u)<<16u)|((((b1>>4u)-8u)&255u)<<24u);
+   let wq1=(((b2&15u)-8u)&255u)|((((b2>>4u)-8u)&255u)<<8u)|((((b3&15u)-8u)&255u)<<16u)|((((b3>>4u)-8u)&255u)<<24u);
+   let sb=lane/4u;let wb=g/32u+sb;let si=col*nblocks+wb;let sp=unpack2x16float(S[si/2u]);let ws=select(sp.x,sp.y,(si&1u)!=0u);
+   for(var m=0u;m<8u;m++){if(row0+m<M){let base=m*64u+lane*2u;
+    let dot=dot4I8Packed(sxq[base],wq0)+dot4I8Packed(sxq[base+1u],wq1);
+    acc[m]+=f32(dot)*sxs[m*8u+sb]*ws;}}
+  }
+  workgroupBarrier();
+ }
+ for(var m=0u;m<8u;m++){let total=reduce32(acc[m],tid);if(lane==0u&&col<N&&row0+m<M){Y[(row0+m)*N+col]=total;}}
+}
+)WGSL";
+}
+
 std::string q5kOrtRepackedTileSource() {
     std::string s=q4kOrtRepackedTileSource();
     auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
@@ -5566,6 +5613,16 @@ void ModelRunner::initGemmaPrefillResources() {
     gemmaPf.gateup = mk("gpf_gateup", C * 2ull * maxIM);
     gemmaPf.act    = mk("gpf_act", C * maxIM);
     gemmaPf.rstd   = mk("gpf_rstd", C);
+    const uint32_t maxK = std::max({cfg.nEmbd, maxIM, maxQkv});
+    if (weightsAreNativeQ4 && gpu->adapterName.find("NVIDIA") != std::string::npos &&
+        !std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4")) {
+        gemmaPf.actQ8 = mk("gpf_act_q8", (uint64_t)C * maxK, 1);
+        gemmaPf.actScale = mk("gpf_act_scale",
+            (uint64_t)C * ((maxK + 31u) / 32u));
+        (void)getKernel("q8_quantize_batched_dp4a");
+        (void)gpu->getOrCreatePipeline("q4_prequant_batched",
+            q4PrequantBatchedSource(), 6);
+    }
     if (cfg.pleSize > 0) {
         uint64_t totalPle = (uint64_t)cfg.pleSize * cfg.nLayer;
         gemmaPf.pleSignal = mk("gpf_ple_signal", C * totalPle);
@@ -7308,10 +7365,24 @@ int32_t ModelRunner::prefillGemmaBatched(
         const CompiledPipeline* q4zpRows8=useQ4Rows8?&gpu->getOrCreatePipeline(
             "matmul_q4_zp_batched_dp4a_rows8",q4ZpBatchedRows8Source(),6):nullptr;
         auto& q8mm = getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
+        const bool prequantQ4 = weightsAreNativeQ4 && gemmaPf.actQ8.handle &&
+            !std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4");
+        const CompiledPipeline* q8quant = prequantQ4
+            ? &getKernel("q8_quantize_batched_dp4a") : nullptr;
+        const CompiledPipeline* q4prequant = prequantQ4
+            ? &gpu->getOrCreatePipeline("q4_prequant_batched",
+                q4PrequantBatchedSource(), 6) : nullptr;
         auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
                       uint32_t K, uint32_t N, const std::string& name) {
             auto p = mkP(name + "_p", {M,N,K});
-            if (weightsAreNativeQ4) {
+            if (prequantQ4) {
+                auto qp = mkP(name + "_quant_p", {K,N,M});
+                add(*q8quant, {{0,x},{1,gemmaPf.actQ8},{2,gemmaPf.actScale},{3,qp}},
+                    (K+255)/256,M,name+"_quant");
+                add(*q4prequant, {{0,gemmaPf.actQ8},{1,gemmaPf.actScale},
+                    {2,w},{3,s},{4,y},{5,p}},
+                    (M+7)/8,(N+7)/8,name);
+            } else if (weightsAreNativeQ4) {
                 add(q4mm, {{0,x},{1,w},{2,s},{3,y},{4,p}},
                     (N+31)/32,(M+3)/4,name);
             } else {

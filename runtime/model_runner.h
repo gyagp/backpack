@@ -515,6 +515,7 @@ private:
         bool ready = false;
         uint32_t capacity = 128;
         GPUBuffer tokens, x, norm, qkv, qrot, attn, proj, gateup, act, rstd;
+        GPUBuffer actQ8, actScale;
         GPUBuffer pleSignal, pleRaw, pleGate, pleOut;
     } gemmaPf;
     struct Qwen35PrefillCache {
