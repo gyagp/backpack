@@ -13,6 +13,14 @@ def conformance_passed(output: str, required_fact: str, expected_output: str = "
     return bool(required_fact.strip() and required_fact.lower() in output.lower())
 
 
+def final_answer(output: str) -> str:
+    """Remove an optional reasoning trace and llama.cpp terminal marker."""
+    if "</think>" in output:
+        output = output.rsplit("</think>", 1)[1]
+    output = re.sub(r"\s*\[end of text\]\s*$", "", output, flags=re.I)
+    return output.strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run llama.cpp Vulkan prefill and decode benchmark")
     parser.add_argument("--model", required=True, type=Path)
@@ -22,7 +30,7 @@ def main() -> int:
     parser.add_argument("--prompt")
     parser.add_argument("--required-fact")
     parser.add_argument("--expected-output")
-    parser.add_argument("--conformance-tokens", type=int, default=64)
+    parser.add_argument("--conformance-tokens", type=int, default=256)
     parser.add_argument("--root", type=Path,
                         default=Path(r"D:\backup\x64\llamacpp"))
     args = parser.parse_args()
@@ -43,13 +51,13 @@ def main() -> int:
         prompt = args.prompt or "What is 2 + 2?"
         check_command = [str(completion), "-m", str(args.model), "-p", prompt,
                          "--temp", "0", "-ngl", "99", "--no-display-prompt",
-                         "-st", "--jinja", "--reasoning", "off",
+                         "--conversation", "-st", "--jinja", "--reasoning", "off",
                          "--reasoning-budget", "0", "-n", str(args.conformance_tokens)]
         checked = subprocess.run(check_command, cwd=completion.parent, text=True, encoding="utf-8",
                                  errors="replace", capture_output=True, timeout=300, shell=False)
         # --no-display-prompt keeps stdout limited to generated text; llama.cpp
         # diagnostics remain on stderr and must not satisfy an exact-output gate.
-        output = checked.stdout.strip()
+        output = final_answer(checked.stdout)
         passed = checked.returncode == 0 and conformance_passed(
             output, args.required_fact, args.expected_output or "")
         print("EVOLUTION_CONFORMANCE " + json.dumps({

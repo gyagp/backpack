@@ -12,13 +12,18 @@ from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
 from evolution.store import Store, latest_backpack_executable
-from evolution.benchmark_llamacpp import conformance_passed as llamacpp_conformance_passed
+from evolution.benchmark_llamacpp import (conformance_passed as llamacpp_conformance_passed,
+                                          final_answer as llamacpp_final_answer)
 
 
 class FrameworkTest(unittest.TestCase):
     def test_llamacpp_exact_conformance_rejects_extra_text(self) -> None:
         self.assertTrue(llamacpp_conformance_passed("4", "4", "4"))
         self.assertFalse(llamacpp_conformance_passed("The answer is 4", "4", "4"))
+
+    def test_llamacpp_extracts_answer_after_reasoning(self) -> None:
+        output = "Thinking Process:\n2 + 2 = 4.\n</think>\n\n4 [end of text]\n"
+        self.assertEqual("4", llamacpp_final_answer(output))
 
     def test_backpack_benchmark_builds_same_artifact_chat_validation(self) -> None:
         benchmark = [r"D:\backup\x64\backpack\abc-20260724\backpack_llm.exe",
