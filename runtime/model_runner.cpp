@@ -5462,8 +5462,11 @@ void ModelRunner::initQwen35PrefillResources() {
     const uint64_t maxK=std::max<uint64_t>({E,im,2u*qdim,cfg.ssmInnerSize});
     qwen35Pf.kqActQ8=gpu->createBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
     qwen35Pf.kqActScale=mk("qpf_kq_act_scales",(uint64_t)C*((maxK+31u)/32u));
-    if(gpu->adapterName.find("NVIDIA")!=std::string::npos&&
-       std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr){
+    const bool ortTileAdapter=gpu->adapterName.find("NVIDIA")!=std::string::npos||
+        gpu->adapterName.find("AMD")!=std::string::npos;
+    if(ortTileAdapter&&std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr){
+        // AMD uses the disposable repack buffers to avoid retaining a second
+        // copy of every Q4_K projection solely for prefill.
         uint64_t maxWeightElems=0;
         for(const auto& pl:cfg.perLayer){
             maxWeightElems=std::max(maxWeightElems,(uint64_t)2u*pl.intermediateSize*E);
