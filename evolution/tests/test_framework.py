@@ -12,9 +12,14 @@ from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
 from evolution.store import Store, latest_backpack_executable
+from evolution.benchmark_llamacpp import conformance_passed as llamacpp_conformance_passed
 
 
 class FrameworkTest(unittest.TestCase):
+    def test_llamacpp_exact_conformance_rejects_extra_text(self) -> None:
+        self.assertTrue(llamacpp_conformance_passed("4", "4", "4"))
+        self.assertFalse(llamacpp_conformance_passed("The answer is 4", "4", "4"))
+
     def test_backpack_benchmark_builds_same_artifact_chat_validation(self) -> None:
         benchmark = [r"D:\backup\x64\backpack\abc-20260724\backpack_llm.exe",
                      "--model", r"D:\models\qwen.gguf", "--benchmark",
@@ -563,6 +568,8 @@ class FrameworkTest(unittest.TestCase):
                      if task["manifest"]["runtimes"][0]["framework"] == "llamacpp")
         self.assertIn("--prompt-tokens", llama["manifest"]["argv"])
         self.assertIn("512", llama["manifest"]["argv"])
+        self.assertIn("--required-fact", llama["manifest"]["argv"])
+        self.assertIn("--prompt", llama["manifest"]["argv"])
 
     def test_ort_benchmark_routes_to_ort_adapter_and_onnx_artifact(self) -> None:
         self.store.upsert_model({"id": "ort-perf", "name": "ORT Perf",

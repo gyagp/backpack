@@ -627,9 +627,14 @@ class Store:
             if not model_entry or not model_entry.get("path"):
                 continue
             if task["kind"] == "benchmark" and runtime.get("framework") == "llamacpp":
+                spec = (model or {}).get("conformance_spec", {})
                 argv = [sys.executable, r"D:\workspace\project\backpack\evolution\benchmark_llamacpp.py",
                         "--model", model_entry["path"], "--prompt-tokens", str(STATUS_PROMPT_TOKENS),
-                        "--generation-tokens", str(STATUS_GENERATED_TOKENS), "--repetitions", "5"]
+                        "--generation-tokens", str(STATUS_GENERATED_TOKENS), "--repetitions", "5",
+                        "--prompt", spec.get("prompt", "What is 2 + 2?"),
+                        "--required-fact", spec.get("required_fact", "4")]
+                if spec.get("expected_output"):
+                    argv += ["--expected-output", str(spec["expected_output"])]
             elif task["kind"] == "benchmark" and runtime.get("framework") == "ort":
                 spec = (model or {}).get("conformance_spec", {})
                 argv = [sys.executable, r"D:\workspace\project\backpack\evolution\benchmark_ort.py",

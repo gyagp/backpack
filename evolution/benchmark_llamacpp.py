@@ -7,6 +7,12 @@ import subprocess
 from pathlib import Path
 
 
+def conformance_passed(output: str, required_fact: str, expected_output: str = "") -> bool:
+    if expected_output.strip():
+        return output.strip() == expected_output.strip()
+    return bool(required_fact.strip() and required_fact.lower() in output.lower())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run llama.cpp Vulkan prefill and decode benchmark")
     parser.add_argument("--model", required=True, type=Path)
@@ -15,6 +21,7 @@ def main() -> int:
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--prompt")
     parser.add_argument("--required-fact")
+    parser.add_argument("--expected-output")
     parser.add_argument("--conformance-tokens", type=int, default=64)
     parser.add_argument("--root", type=Path,
                         default=Path(r"D:\backup\x64\llamacpp"))
@@ -40,11 +47,15 @@ def main() -> int:
                          "--reasoning-budget", "0", "-n", str(args.conformance_tokens)]
         checked = subprocess.run(check_command, cwd=completion.parent, text=True, encoding="utf-8",
                                  errors="replace", capture_output=True, timeout=300, shell=False)
-        output = (checked.stdout + "\n" + checked.stderr).strip()
-        passed = checked.returncode == 0 and args.required_fact.lower() in output.lower()
+        # --no-display-prompt keeps stdout limited to generated text; llama.cpp
+        # diagnostics remain on stderr and must not satisfy an exact-output gate.
+        output = checked.stdout.strip()
+        passed = checked.returncode == 0 and conformance_passed(
+            output, args.required_fact, args.expected_output or "")
         print("EVOLUTION_CONFORMANCE " + json.dumps({
             "passed": passed, "prompt": prompt, "required_fact": args.required_fact,
-            "output": output[-4000:], "revision": revision,
+            "expected_output": args.expected_output, "output": output[-4000:],
+            "revision": revision,
         }, separators=(",", ":")))
         if not passed:
             return checked.returncode or 2
