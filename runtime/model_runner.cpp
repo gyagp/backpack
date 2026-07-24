@@ -5722,10 +5722,13 @@ void ModelRunner::initGemmaPrefillResources() {
     const uint32_t maxK = std::max({cfg.nEmbd, maxIM, maxQkv});
     const bool gemmaPrequantAdapter =
         gpu->adapterName.find("NVIDIA") != std::string::npos ||
-        gpu->adapterName.find("AMD") != std::string::npos;
+        gpu->adapterName.find("AMD") != std::string::npos ||
+        gpu->adapterName.find("Intel") != std::string::npos;
     const bool disableGemmaPrequant = std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4") ||
         (gpu->adapterName.find("AMD") != std::string::npos &&
-         std::getenv("BP_GEMMA_DISABLE_AMD_PREQUANT_Q4"));
+         std::getenv("BP_GEMMA_DISABLE_AMD_PREQUANT_Q4")) ||
+        (gpu->adapterName.find("Intel") != std::string::npos &&
+         std::getenv("BP_GEMMA_DISABLE_INTEL_PREQUANT_Q4"));
     if (weightsAreNativeQ4 && gemmaPrequantAdapter && !disableGemmaPrequant) {
         gemmaPf.actQ8 = mk("gpf_act_q8", (uint64_t)C * maxK, 1);
         gemmaPf.actScale = mk("gpf_act_scale",
@@ -7482,7 +7485,9 @@ int32_t ModelRunner::prefillGemmaBatched(
         auto& q8mm = getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
         const bool disablePrequantQ4 = std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4") ||
             (gpu->adapterName.find("AMD") != std::string::npos &&
-             std::getenv("BP_GEMMA_DISABLE_AMD_PREQUANT_Q4"));
+             std::getenv("BP_GEMMA_DISABLE_AMD_PREQUANT_Q4")) ||
+            (gpu->adapterName.find("Intel") != std::string::npos &&
+             std::getenv("BP_GEMMA_DISABLE_INTEL_PREQUANT_Q4"));
         const bool prequantQ4 = weightsAreNativeQ4 && gemmaPf.actQ8.handle &&
             !disablePrequantQ4;
         const CompiledPipeline* q8quant = prequantQ4
