@@ -5339,7 +5339,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ((cfg.ssmTimeStepRank == 32u &&
               (gpu->adapterName.find("NVIDIA") != std::string::npos ||
                gpu->adapterName.find("AMD") != std::string::npos || intelAdapter)) ||
-             (cfg.ssmTimeStepRank == 16u && intelAdapter));
+             (cfg.ssmTimeStepRank == 16u &&
+              (intelAdapter||gpu->adapterName.find("NVIDIA")!=std::string::npos)));
         qwen35FastPrefill = !forceSerial && (forceFast || validatedGguf);
         if (qwen35FastPrefill) {
             initQwen35PrefillResources();
@@ -6860,13 +6861,17 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool exactSingle=preciseQ8&&M==1;
         auto&splitSsmKernel=getKernel(exactSingle?"qwen35_split_qkv_l2":"qwen35_split_qkv_l2_batched");
         const bool valueMajorPrefill=
-            gpu->adapterName.find("NVIDIA")!=std::string::npos&&cfg.ssmTimeStepRank==32u;
+            gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+            (cfg.ssmTimeStepRank==16u||cfg.ssmTimeStepRank==32u);
         // Intel rank-32 (Qwen 4B) loses occupancy with two resident state
         // columns per lane; retain x2 there while rank-16 and other vendors
         // benefit or remain neutral.
         const bool intelRank32=gpu->adapterName.find("Intel")!=std::string::npos&&
             cfg.ssmTimeStepRank==32u;
-        const bool deltaX4=!intelRank32&&std::getenv("BP_QWEN_DISABLE_DELTA_X4")==nullptr;
+        const bool nvidiaRank16=gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+            cfg.ssmTimeStepRank==16u;
+        const bool deltaX4=!intelRank32&&!nvidiaRank16&&
+            std::getenv("BP_QWEN_DISABLE_DELTA_X4")==nullptr;
         const bool repeatedGgufHeads=modelFormat!="onnx"&&
             cfg.ssmTimeStepRank>cfg.ssmGroupCount;
         const bool portableAmdScan=gpu->adapterName.find("AMD")!=std::string::npos&&!exactSingle;
