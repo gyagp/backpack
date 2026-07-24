@@ -997,9 +997,10 @@ class Store:
                 if observations and all(item and item.get("conformance") == "pass"
                                         for item in observations):
                     reason = "Latest matching conformance passes on every cared device"
-            elif origin.get("type") in {"scheduled", "profiling"} or (
-                    origin.get("type") == "continuous-learning"
-                    and task["title"].startswith("Profile ")):
+            elif task["kind"] != "optimization" and (
+                    origin.get("type") in {"scheduled", "profiling"} or (
+                        origin.get("type") == "continuous-learning"
+                        and task["title"].startswith("Profile "))):
                 runs = self.list_runs(task["id"])
                 if runs and all(run["status"] == "completed"
                                 and run.get("result", {}).get("exit_code") == 0 for run in runs):

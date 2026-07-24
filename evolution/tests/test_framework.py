@@ -323,6 +323,26 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("integrated", closed["state"])
         self.assertEqual("accepted", closed["aggregate_verdict"])
 
+    def test_successful_profiling_origin_does_not_auto_integrate_optimization(self) -> None:
+        task = self.store.create_task({
+            "title": "Retain experimental weight layout", "kind": "optimization",
+            "hypothesis": "The layout may improve prefill",
+            "origin": {"type": "profiling"},
+            "manifest": {"adapter": "argv", "argv": ["profile"]},
+            "device_policy": {"machine_ids": [self.machine["id"]]},
+        }, "test")
+        self.store.ensure_task_runs()
+        run = self.store.list_runs(task["id"])[0]
+        self.store.update_run(run["id"], {
+            "status": "completed", "progress": 100,
+            "result": {"exit_code": 0},
+        }, "agent")
+
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
+        current = self.store.get_task(task["id"])
+        self.assertNotEqual("integrated", current["state"])
+        self.assertIsNone(current["aggregate_verdict"])
+
     def test_cross_device_optimization_history_closes_stale_task(self) -> None:
         second = self.store.register_machine({"name": "gpu-2"})
         task = self.store.create_task({
