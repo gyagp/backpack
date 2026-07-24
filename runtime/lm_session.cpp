@@ -1315,7 +1315,18 @@ struct StandardState {
     }
 
     std::vector<int32_t> Tokenize(const std::string& text) {
-        if (format == "onnx") return onnxTokenizer.encode(text);
+        if (format == "onnx") {
+            auto ids = onnxTokenizer.encode(text);
+            // Gemma's shipped ONNX chat template begins with bos_token. The
+            // tokenizer.json encoder does not add it automatically, unlike
+            // the GGUF tokenizer's add_bos_token path below.
+            if (runner.cfg.arch.rfind("gemma", 0) == 0 &&
+                onnxTokenizer.bos_token_id >= 0 &&
+                (ids.empty() || ids.front() != onnxTokenizer.bos_token_id)) {
+                ids.insert(ids.begin(), onnxTokenizer.bos_token_id);
+            }
+            return ids;
+        }
         auto ids = ggufTokenizer.encode(text);
         // Prepend BOS when the tokenizer flags add_bos_token (e.g. Gemma).
         // Tokens already starting with BOS (e.g. <bos> literal in the input)
