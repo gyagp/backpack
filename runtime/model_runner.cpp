@@ -101,6 +101,27 @@ std::string q4kBatched8PortableSource(const char* source) {
     return result;
 }
 
+std::string kqPrequantBatchedPortableReductionSource(const char* source) {
+    // Q4_K/Q5_K prefill assigns one output column to each logical 32-lane
+    // group. subgroupAdd spans the full AMD wave64 and mixes adjacent columns,
+    // so reduce each logical group explicitly in the shader's existing
+    // 256-element scratch array. No subgroup matrix support is used.
+    std::string result(source);
+    const std::string q4 =
+        "for(var m=0u;m<8u;m++){let total=subgroupAdd(acc[m]);let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}}";
+    const std::string portable =
+        "for(var m=0u;m<8u;m++){sxsum[tid]=acc[m];workgroupBarrier();"
+        "for(var off=16u;off>0u;off=off/2u){if(lane<off){sxsum[tid]+=sxsum[tid+off];}workgroupBarrier();}"
+        "let total=sxsum[warp*32u];let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}workgroupBarrier();}";
+    auto pos = result.find(q4);
+    if (pos == std::string::npos) {
+        fprintf(stderr, "K-quant portable prefill reduction transform failed\n");
+        std::abort();
+    }
+    result.replace(pos, q4.size(), portable);
+    return result;
+}
+
 std::string kqGlobalActivationSource(const char* source) {
     std::string result(source);
     auto replace=[&](const std::string&from,const std::string&to){auto p=result.find(from);if(p==std::string::npos){fprintf(stderr,"K-quant source transform failed\n");std::abort();}result.replace(p,from.size(),to);};
@@ -5316,6 +5337,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const bool validatedGguf4B = modelFormat == "gguf" &&
             cfg.ssmTimeStepRank == 32u &&
             (gpu->adapterName.find("NVIDIA") != std::string::npos ||
+             gpu->adapterName.find("AMD") != std::string::npos ||
              gpu->adapterName.find("Intel") != std::string::npos);
         qwen35FastPrefill = !forceSerial && (forceFast || validatedGguf4B);
         if (qwen35FastPrefill) {
@@ -6886,6 +6908,7 @@ int32_t ModelRunner::prefillQwen35Batched(
             (!intelRowsEnv||std::strcmp(intelRowsEnv,"8")!=0);
         const bool packedQ4Prefill=std::getenv("BP_Q4K_DISABLE_PACKED_PREFILL")==nullptr;
         const bool packedQ5Prefill=std::getenv("BP_Q5K_DISABLE_PACKED_PREFILL")==nullptr;
+        const bool portableAmdKq=gpu->adapterName.find("AMD")!=std::string::npos;
         const bool sharedKq=gpu->adapterName.find("Intel")==std::string::npos&&
             std::getenv("BP_QWEN_DISABLE_SHARED_KQ")==nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
@@ -6893,16 +6916,22 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
-                const auto&kp=sharedKq?getKernel("q4k_matmul_prequant_batched_dp4a"):
-                    gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6);
+                const auto&kp=portableAmdKq
+                    ?gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_portable",
+                        kqPrequantBatchedPortableReductionSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6)
+                    :(sharedKq?getKernel("q4k_matmul_prequant_batched_dp4a"):
+                      gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6));
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q5_K&&packedQ5Prefill){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
-                const auto&kp=sharedKq?getKernel("q5k_matmul_prequant_batched_dp4a"):
-                    gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6);
+                const auto&kp=portableAmdKq
+                    ?gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_portable",
+                        kqPrequantBatchedPortableReductionSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6)
+                    :(sharedKq?getKernel("q5k_matmul_prequant_batched_dp4a"):
+                      gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6));
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
@@ -6997,7 +7026,11 @@ int32_t ModelRunner::prefillQwen35Batched(
             auto fp=mkp("qpf_final_p",{E,E,eb});add(rms,{{0,qwen35Pf.x},{1,qwen35Pf.norm},{2,finalNormW},{3,qwen35Pf.rstd},{4,fp}},M,1,1,"qpf_final");
             GPUBuffer lastn=qwen35Pf.norm;lastn.offset=(uint64_t)(M-1)*E*4;lastn.size=E*4;
             if(lmHeadKQ.handle){
-                auto lp=mkp("qpf_lm_p",{E,cfg.nVocab,kqLmNBlocks,kqLmRowStride,0});auto&lmp=getKernel("q6k_matmul_wide");add(lmp,{{0,lastn},{1,lmHeadKQ},{2,zeroBiasV},{3,logitsBuf},{4,lp}},1,(cfg.nVocab+15)/16,1,"qpf_lm");
+                auto lp=mkp("qpf_lm_p",{E,cfg.nVocab,kqLmNBlocks,kqLmRowStride,0});
+                const bool amdLmHead=gpu->adapterName.find("AMD")!=std::string::npos;
+                auto&lmp=getKernel(amdLmHead?"q6k_matmul":"q6k_matmul_wide");
+                add(lmp,{{0,lastn},{1,lmHeadKQ},{2,zeroBiasV},{3,logitsBuf},{4,lp}},1,
+                    amdLmHead?(cfg.nVocab+7)/8:(cfg.nVocab+15)/16,1,"qpf_lm");
             }else{
                 auto lp=mkp("qpf_lm_q8_p",{E,cfg.nVocab,1});
                 add(q8,{{0,lastn},{1,lmHeadQ8W},{2,lmHeadQ8S},{3,zeroBiasV},{4,logitsBuf},{5,lp}},1,(cfg.nVocab+31)/32,1,"qpf_lm_q8");
