@@ -84,6 +84,22 @@ class PolicyEngine:
                                  "details": {"reason": "missing base or candidate evidence"}})
                     continue
                 base, candidate = pair["base"], pair["candidate"]
+                expected_base = task.get("base_sha")
+                expected_candidate = task.get("candidate_sha")
+                if ((expected_base and base.get("commit_sha") != expected_base) or
+                        (expected_candidate and candidate.get("commit_sha") != expected_candidate)):
+                    rows.append({
+                        "machine_id": machine_id, "metric": metric,
+                        "verdict": "inconclusive",
+                        "details": {
+                            "reason": "evidence revision does not match frozen candidate",
+                            "expected_base_sha": expected_base,
+                            "observed_base_sha": base.get("commit_sha"),
+                            "expected_candidate_sha": expected_candidate,
+                            "observed_candidate_sha": candidate.get("commit_sha"),
+                        },
+                    })
+                    continue
                 correctness = candidate.get("correctness", {})
                 if not correctness.get("passed", False):
                     rows.append({"machine_id": machine_id, "metric": metric, "verdict": "negative",

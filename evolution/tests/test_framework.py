@@ -146,6 +146,19 @@ class FrameworkTest(unittest.TestCase):
             self.store.add_evidence({"task_id": self.task["id"], "machine_id": self.machine["id"],
                                      "variant": "candidate", "samples": [1, 2], "commit_sha": "wrong"}, "test")
 
+    def test_candidate_revision_change_invalidates_existing_evidence(self) -> None:
+        self.add_pair([100, 101, 99], [110, 111, 109])
+        self.store.set_candidate(self.task["id"], "base", "candidate-v2", "test")
+
+        result = PolicyEngine(self.store).evaluate(self.task["id"])
+
+        self.assertEqual("blocked", result["aggregate_verdict"])
+        self.assertEqual("inconclusive", result["evaluations"][0]["verdict"])
+        self.assertEqual(
+            "evidence revision does not match frozen candidate",
+            result["evaluations"][0]["details"]["reason"],
+        )
+
     def test_transition_is_guarded_and_audited(self) -> None:
         self.store.transition_task(self.task["id"], "triaged", "reviewer")
         detail = self.store.task_detail(self.task["id"])
