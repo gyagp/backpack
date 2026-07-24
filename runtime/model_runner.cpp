@@ -323,6 +323,13 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
     if (adapter.find("nvidia") != std::string::npos) {
         std::string source = it->second.source;
         bool patched = false;
+        auto replaceOnce = [&](const std::string& from,
+                               const std::string& replacement) {
+            const size_t pos = source.find(from);
+            if (pos == std::string::npos) return;
+            source.replace(pos, from.size(), replacement);
+            patched = true;
+        };
         auto replaceRange = [&](const std::string& begin, const std::string& end,
                                 const std::string& replacement) {
             size_t first = source.find(begin);
@@ -344,6 +351,38 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
             replaceRange("reduce_scratch[tid] = acc;",
                          "let " + result + " = reduce_scratch[warp_id * 32u];",
                          "let " + result + " = subgroupAdd(acc);");
+        } else if (name == "matmul_q4_batched") {
+            replaceOnce("reduce32(acc[c * ROWS + r], tid)",
+                        "subgroupAdd(acc[c * ROWS + r])");
+        } else if (name == "q4k_matmul_dp4a") {
+            replaceOnce("reduce32(acc, tid)", "subgroupAdd(acc)");
+        } else if (name == "q4k_matmul_prequant_dp4a") {
+            replaceOnce("reduce32(acc[c], tid)", "subgroupAdd(acc[c])");
+        } else if (name == "q6k_matmul_wide") {
+            replaceOnce("reduce32(acc[c],tid)", "subgroupAdd(acc[c])");
+        } else if (name == "q8_matmul_batched_dp4a") {
+            replaceOnce("reduce32(acc[c*ROWS+r],tid)",
+                        "subgroupAdd(acc[c*ROWS+r])");
+        } else if (name == "q4k_matmul_batched4" ||
+                   name == "q5k_matmul_batched4" ||
+                   name == "q6k_matmul_batched4" ||
+                   name == "q4k_matmul_batched8") {
+            replaceOnce("reduce32(acc[m],tid)", "subgroupAdd(acc[m])");
+            replaceOnce("fn reduce32(v:f32,tid:u32)->f32{sx[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sx[tid]+=sx[tid+off];}workgroupBarrier();}return sx[(tid/32u)*32u];}\n", "");
+        } else if (name == "qwen35_split_qkv_l2_batched") {
+            replaceOnce("let ss=reduce32(x*x,d);",
+                        "let ss=subgroupAdd(x*x);if((d&31u)==0u){sums[d/32u]=ss;}workgroupBarrier();");
+            replaceOnce("sums[0]+sums[32]+sums[64]+sums[96]",
+                        "sums[0]+sums[1]+sums[2]+sums[3]");
+            replaceOnce("var<workgroup> sums: array<f32, 128>;",
+                        "var<workgroup> sums: array<f32, 4>;");
+        } else if (name == "qwen35_conv_scan_split_l2") {
+            replaceOnce("let ss=reduce32(value*value,d);",
+                        "let ss=subgroupAdd(value*value);if((d&31u)==0u){sums[d/32u]=ss;}workgroupBarrier();");
+            replaceOnce("sums[0]+sums[32]+sums[64]+sums[96]",
+                        "sums[0]+sums[1]+sums[2]+sums[3]");
+            replaceOnce("var<workgroup>sums:array<f32,128>;",
+                        "var<workgroup>sums:array<f32,4>;");
         }
         if (patched) {
             source.insert(0, "enable subgroups;\n");
