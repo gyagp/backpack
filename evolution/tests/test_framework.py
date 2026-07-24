@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from evolution.agent import current_base_worktree, rewrite_repo_argv
+from evolution.agent import conformance_passed, current_base_worktree, rewrite_repo_argv
 from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
@@ -12,6 +12,11 @@ from evolution.store import Store
 
 
 class FrameworkTest(unittest.TestCase):
+    def test_exact_conformance_rejects_factually_correct_extra_text(self) -> None:
+        spec = {"required_fact": "4", "expected_output": "4"}
+        self.assertTrue(conformance_passed(spec, "4"))
+        self.assertFalse(conformance_passed(spec, "The result is 4."))
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "state.db")

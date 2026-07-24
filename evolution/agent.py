@@ -38,6 +38,15 @@ def _command_output(argv: list[str]) -> str:
         return ""
 
 
+def conformance_passed(spec: dict[str, Any], output: str) -> bool:
+    """Evaluate explicit exact-output gates before looser factual checks."""
+    expected = str(spec.get("expected_output") or "").strip()
+    if expected:
+        return output.strip() == expected
+    required = str(spec.get("required_fact") or "").strip().lower()
+    return bool(required and required in output.lower())
+
+
 def fingerprint(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     gpu = os.environ.get("BP_EVOLUTION_GPU", "")
     driver = os.environ.get("BP_EVOLUTION_DRIVER", "")
@@ -239,20 +248,22 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                 "model_id": origin.get("model_id") or next(iter(manifest.get("models") or []), ""),
                 "machine_id": run["machine_id"], "framework": "backpack",
                 "format": "gguf" if model_path.lower().endswith(".gguf") else "ort",
-                "backend": "webgpu", "conformance": "pass",
+                "backend": "webgpu", "conformance": "not_applicable",
                 "revision": _command_output(["git", "-C", str(repo), "rev-parse", "HEAD"]) or "unknown",
-                "conformance_details": {"source": f"benchmark task {task.get('id', run['task_id'])}"},
+                "conformance_details": {"source": f"benchmark task {task.get('id', run['task_id'])}",
+                                        "reason": "throughput-only command did not validate generated output"},
                 "metrics": metrics, "artifacts": [],
             }, name)
     elif status == "completed" and task.get("kind") in {"correctness", "conformance"}:
         manifest, origin = task.get("manifest", {}), task.get("origin", {})
         spec = manifest.get("conformance_spec") or {}
         required = str(spec.get("required_fact") or "").strip().lower()
+        expected = str(spec.get("expected_output") or "").strip()
         output_match = re.search(r"--- Output ---\s*(.*?)\s*--- Performance ---",
                                  completed.stdout + "\n" + completed.stderr, re.S)
         output = output_match.group(1).strip() if output_match else completed.stdout[-2000:].strip()
-        if required:
-            passed = required in output.lower()
+        if required or expected:
+            passed = conformance_passed(spec, output)
             model_path = next((argv[i + 1] for i, value in enumerate(argv[:-1]) if value == "--model"), "")
             request_json(server + "/api/observations", "POST", {
                 "model_id": origin.get("model_id") or next(iter(manifest.get("models") or []), ""),
@@ -261,6 +272,8 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                 "backend": "webgpu", "conformance": "pass" if passed else "fail",
                 "revision": _command_output(["git", "-C", str(repo), "rev-parse", "HEAD"]) or "unknown",
                 "conformance_details": {"prompt": spec.get("prompt"), "required_fact": required,
+                                        "expected_output": expected or None,
+                                        "match_mode": "exact" if expected else "contains",
                                         "output": output[-4000:], "source": f"task {task.get('id', run['task_id'])}"},
                 "metrics": {}, "artifacts": [],
             }, name)

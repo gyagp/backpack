@@ -29,7 +29,7 @@
         "relative_dir": "Qwen3.5-4B/onnx-webgpu"
       }
     },
-    "conformance_spec": {"prompt": "Answer with only the number. What is 2 + 2?", "required_fact": "4", "temperature": 0}
+    "conformance_spec": {"prompt": "Answer with only the number. What is 2 + 2?", "required_fact": "4", "expected_output": "4", "temperature": 0}
   },
   {
     "id": "qwen3.5-2b",
@@ -45,6 +45,6 @@
         "relative_dir": "Qwen3.5-2B/onnx-webgpu"
       }
     },
-    "conformance_spec": {"prompt": "Answer with only the number. What is 2 + 2?", "required_fact": "4", "temperature": 0}
+    "conformance_spec": {"prompt": "Answer with only the number. What is 2 + 2?", "required_fact": "4", "expected_output": "4", "temperature": 0}
   }
 ]
