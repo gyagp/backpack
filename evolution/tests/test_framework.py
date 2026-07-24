@@ -190,6 +190,37 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("b10069", metric["revision"])
         self.assertEqual(20, metric["metrics"]["decode_tok_s"])
 
+    def test_confirmed_regression_requires_comparable_passing_samples(self) -> None:
+        model = self.store.upsert_model({"id": "regression-model", "name": "Regression",
+                                         "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "gguf", "backend": "webgpu",
+                  "conformance": "pass"}
+
+        sequence = 0
+        def observe(revision: str, rate: float, prompt: int, generated: int,
+                    conformance: str = "pass") -> None:
+            nonlocal sequence
+            sequence += 1
+            self.store.add_observation({**common, "id": f"obs-{sequence:02d}",
+                "conformance": conformance,
+                "revision": revision, "metrics": {"prefill_tok_s": rate,
+                    "prompt_tokens": prompt, "generated_tokens": generated}}, "test")
+
+        observe("base", 100, 128, 64)
+        observe("different-shape-1", 50, 32, 128)
+        observe("different-shape-2", 45, 32, 128)
+        observe("failed-sample", 10, 128, 64, "fail")
+        self.assertEqual([], self.store.confirmed_regressions())
+
+        observe("comparable-1", 80, 128, 64)
+        observe("comparable-2", 79, 128, 64)
+        regressions = self.store.confirmed_regressions()
+        self.assertEqual(1, len(regressions))
+        self.assertEqual({"prompt_tokens": 128, "generated_tokens": 64,
+                          "graph_capture": "not_applicable"},
+                         regressions[0]["benchmark_signature"])
+
     def test_valid_latest_measurement_closes_automatic_task(self) -> None:
         model = self.store.upsert_model({"id": "measured", "name": "Measured", "files": {"gguf": {}}})
         task = self.store.create_task({

@@ -1081,8 +1081,50 @@ class Store:
     def confirmed_regressions(self, threshold_percent: float = 10.0) -> list[dict[str, Any]]:
         rows = self._all("SELECT * FROM observations ORDER BY created_at,id")
         groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+
+        def first_number(values: list[Any]) -> int | None:
+            for value in values:
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return int(value)
+            return None
+
+        def graph_capture(row: dict[str, Any]) -> str | None:
+            metrics = row.get("metrics", {})
+            details = row.get("conformance_details", {})
+            value = metrics.get("graph_capture", details.get("graph_capture"))
+            if isinstance(value, bool):
+                return "enabled" if value else "disabled"
+            if isinstance(value, str):
+                normalized = value.strip().lower().replace("_", " ")
+                if normalized in {"enabled", "enable", "on", "true", "yes"}:
+                    return "enabled"
+                if normalized in {"disabled", "disable", "off", "false", "no"}:
+                    return "disabled"
+                if normalized in {"not applicable", "n/a", "na"}:
+                    return "not_applicable"
+            return None
+
+        def benchmark_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
+            metrics = row.get("metrics", {})
+            prompt = first_number([metrics.get("prompt_tokens"), metrics.get("prompt_length")])
+            generated = first_number([metrics.get("generated_tokens"), metrics.get("decode_tokens"),
+                                      metrics.get("generation_length")])
+            if prompt is None or generated is None:
+                return None
+            capture = graph_capture(row)
+            if str(row.get("format", "")).lower() in {"onnx", "ort"} and capture is None:
+                return None
+            return prompt, generated, capture or "not_applicable"
+
         for row in rows:
-            key = tuple(str(row[name]) for name in ("model_id", "machine_id", "framework", "format", "backend"))
+            # Performance is protected only after deterministic correctness has
+            # passed for the exact observation. Missing benchmark-shape metadata
+            # is insufficient evidence for a like-for-like regression decision.
+            signature = benchmark_signature(row)
+            if row.get("conformance") != "pass" or signature is None:
+                continue
+            key = tuple(str(row[name]) for name in
+                        ("model_id", "machine_id", "framework", "format", "backend")) + signature
             groups.setdefault(key, []).append(row)
         result = []
         for key, samples in groups.items():
@@ -1096,11 +1138,15 @@ class Store:
                     continue
                 deltas = [(float(item["metrics"][metric]) / base - 1) * 100 for item in (check1, check2)]
                 if all(delta <= -threshold_percent for delta in deltas):
-                    result.append({"id": "confirmed:" + ":".join(key) + ":" + metric,
-                                   "model_id": key[0], "machine_id": key[1], "framework": key[2],
-                                   "format": key[3], "backend": key[4], "metric": metric,
+                    identity = key[:5]
+                    result.append({"id": "confirmed:" + ":".join(identity) + ":" + metric,
+                                   "model_id": identity[0], "machine_id": identity[1], "framework": identity[2],
+                                   "format": identity[3], "backend": identity[4], "metric": metric,
                                    "baseline": base, "latest": check2["metrics"][metric],
                                    "delta_percent": deltas[1], "revision": check2.get("revision"),
+                                   "benchmark_signature": {"prompt_tokens": key[5],
+                                                           "generated_tokens": key[6],
+                                                           "graph_capture": key[7]},
                                    "confirmed_by": [check1["id"], check2["id"]]})
         return result
 
