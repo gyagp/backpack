@@ -185,6 +185,84 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
 )WGSL";
 }
 
+const char* q4PrequantBatchedAmdSource() {
+    // AMD D3D12 exposes 64-lane subgroups.  Let one physical wave own one
+    // output column and reuse its Q4 word across eight prompt rows.  A
+    // 512-element K tile maps exactly to 64 lanes x eight values, avoiding
+    // the logical-32 workgroup reductions used by the NVIDIA layout.
+    return R"WGSL(requires packed_4x8_integer_dot_product;
+enable subgroups;
+@group(0) @binding(0)var<storage,read>XQ:array<u32>;
+@group(0) @binding(1)var<storage,read>XS:array<f32>;
+@group(0) @binding(2)var<storage,read>B:array<u32>;
+@group(0) @binding(3)var<storage,read>S:array<u32>;
+@group(0) @binding(4)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(5)var<storage,read>P:array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(subgroup_invocation_id)lane:u32,@builtin(subgroup_id)wave:u32,
+        @builtin(workgroup_id)wid:vec3<u32>){
+ let row0=wid.x*8u;let col=wid.y*4u+wave;
+ let K=P[0];let N=P[1];let M=P[2];let qStride=(K+3u)/4u;
+ let sStride=(K+31u)/32u;let nblocks=K/32u;let words=K/8u;
+ var acc:array<f32,8>;
+ if(col<N){
+  for(var g=0u;g<K;g+=512u){
+   let q4=B[col*words+g/8u+lane];
+   let b0=q4&255u;let b1=(q4>>8u)&255u;
+   let b2=(q4>>16u)&255u;let b3=q4>>24u;
+   let wq0=(((b0&15u)-8u)&255u)|((((b0>>4u)-8u)&255u)<<8u)|
+           ((((b1&15u)-8u)&255u)<<16u)|((((b1>>4u)-8u)&255u)<<24u);
+   let wq1=(((b2&15u)-8u)&255u)|((((b2>>4u)-8u)&255u)<<8u)|
+           ((((b3&15u)-8u)&255u)<<16u)|((((b3>>4u)-8u)&255u)<<24u);
+   let sb=lane/4u;let si=col*nblocks+g/32u+sb;
+   let sp=unpack2x16float(S[si/2u]);let ws=select(sp.x,sp.y,(si&1u)!=0u);
+   for(var m=0u;m<8u;m++){
+    let row=row0+m;
+    if(row<M){
+     let qb=row*qStride+g/4u+lane*2u;
+     let dot=dot4I8Packed(XQ[qb],wq0)+dot4I8Packed(XQ[qb+1u],wq1);
+     acc[m]+=f32(dot)*XS[row*sStride+g/32u+sb]*ws;
+    }
+   }
+  }
+ }
+ for(var m=0u;m<8u;m++){
+  let total=subgroupAdd(acc[m]);let row=row0+m;
+  if(lane==0u&&col<N&&row<M){Y[row*N+col]=total;}
+ }
+}
+)WGSL";
+}
+
+const char* q4DecodeAmdSource() {
+    // One RDNA wave64 computes one output column.  This avoids every logical
+    // wave32 assumption in the generic Q4 decode/PLE kernels while retaining
+    // the model's original Q4_0 values (rather than expanding them to Q8).
+    return R"WGSL(enable subgroups;
+@group(0) @binding(0)var<storage,read>X:array<f32>;
+@group(0) @binding(1)var<storage,read>B:array<u32>;
+@group(0) @binding(2)var<storage,read>S:array<u32>;
+@group(0) @binding(3)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(4)var<storage,read>P:array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(subgroup_invocation_id)lane:u32,@builtin(subgroup_id)wave:u32,
+        @builtin(workgroup_id)wid:vec3<u32>){
+ let N=P[1];let K=P[2];let row=wid.x*4u+wave;var acc=0.0;
+ if(row<N){
+  for(var k=lane*8u;k<K;k+=512u){
+   let w=B[row*(K/8u)+k/8u];
+   let b=row*(K/32u)+k/32u;let sp=unpack2x16float(S[b/2u]);
+   let sc=select(sp.x,sp.y,(b&1u)!=0u);
+   for(var j=0u;j<8u;j++){
+    let q=i32((w>>(j*4u))&15u)-8;acc+=X[k+j]*f32(q)*sc;
+   }
+  }
+ }
+ let total=subgroupAdd(acc);if(lane==0u&&row<N){Y[row]=total;}
+}
+)WGSL";
+}
+
 std::string q5kOrtRepackedTileSource() {
     std::string s=q4kOrtRepackedTileSource();
     auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
@@ -1686,13 +1764,12 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                      weightQuantType == GGUF_TYPE_Q5_K ||
                      weightQuantType == GGUF_TYPE_Q6_K);
     weightsUseNativeKQ = isKQuant;
-    // The decode kernels below implement logical 32-lane warps with XOR
-    // shuffles.  NVIDIA and Intel D3D12 adapters have been validated with
-    // that mapping, while AMD exposes wave64 here and produces incorrect
-    // Gemma logits.  Keep AMD on the conformant Q8-expanded path until a
-    // wave64-native kernel is available.
+    // NVIDIA and Intel use the established logical-wave32 kernels. AMD now
+    // has dedicated wave64-native decode and prefill kernels; retain one
+    // explicit whole-path fallback to the older conformant Q8 expansion.
     const bool nativeQ4AdapterValidated =
-        gpu->adapterName.find("AMD") == std::string::npos;
+        gpu->adapterName.find("AMD") == std::string::npos ||
+        !std::getenv("BP_GEMMA_DISABLE_AMD_NATIVE_Q4");
     weightsAreNativeQ4 = cfg.arch == "gemma4" &&
                          weightQuantType == GGUF_TYPE_Q4_0 &&
                          nativeQ4AdapterValidated &&
@@ -2807,7 +2884,11 @@ void ModelRunner::buildDecodePipeline() {
     auto& plChunkP1    = getKernelHD(chunkP1Kernel);
     auto& plChunkP2    = getKernelHD("gqa_chunked_pass2");
     const CompiledPipeline* plQ4Decode = weightsAreNativeQ4
-        ? &getKernel("matmul_q4_decode") : nullptr;
+        ? (isAmdAdapter
+            ? &gpu->getOrCreatePipeline("matmul_q4_decode_amd_wave64",
+                q4DecodeAmdSource(), 5)
+            : &getKernel("matmul_q4_decode"))
+        : nullptr;
     static const char* Q4_PREQUANT_DOWN_WGSL = R"(
 requires packed_4x8_integer_dot_product;
 enable subgroups;
@@ -2850,7 +2931,7 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,
     uint32_t Q4_DECODE_TILE_N = 32;
     int q4Cols = std::getenv("BP_Q4_COLS") ? std::atoi(std::getenv("BP_Q4_COLS"))
                                              : isIntelAdapter ? 2 : 1;
-    if (weightsAreNativeQ4 && (q4Cols >= 1 && q4Cols <= 3)) {
+    if (weightsAreNativeQ4 && !isAmdAdapter && (q4Cols >= 1 && q4Cols <= 3)) {
             std::string src = getEmbeddedKernels().at("matmul_q4_decode").source;
             auto replaceAll = [&](const std::string& from, const std::string& to) {
                 size_t pos = 0;
@@ -2874,7 +2955,7 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,
     }
     const CompiledPipeline* plQ4Gateup = plQ4Decode;
     uint32_t Q4_GATEUP_TILE_N = Q4_DECODE_TILE_N;
-    if (weightsAreNativeQ4) {
+    if (weightsAreNativeQ4 && !isAmdAdapter) {
         int gateCols = std::getenv("BP_Q4_GATEUP_COLS")
             ? std::atoi(std::getenv("BP_Q4_GATEUP_COLS"))
             : isIntelAdapter ? 3 : 2;
@@ -2900,8 +2981,23 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,
     // The vocabulary projection is vastly wider than per-layer projections;
     // use the embedded four-column tile to amortize activation quantization.
     const CompiledPipeline* plQ4LmHead = weightsAreNativeQ4
-        ? &getKernel("matmul_q4_decode") : nullptr;
-    constexpr uint32_t Q4_LM_TILE_N = 32;
+        ? (isAmdAdapter
+            ? &gpu->getOrCreatePipeline("matmul_q4_decode_amd_wave64",
+                q4DecodeAmdSource(), 5)
+            : &getKernel("matmul_q4_decode"))
+        : nullptr;
+    uint32_t Q4_LM_TILE_N = 32;
+    if (weightsAreNativeQ4 && isAmdAdapter) {
+        auto& amdQ4 = gpu->getOrCreatePipeline(
+            "matmul_q4_decode_amd_wave64", q4DecodeAmdSource(), 5);
+        plQ4Decode = &amdQ4;
+        plQ4Gateup = &amdQ4;
+        plQ4LmHead = &amdQ4;
+        Q4_DECODE_TILE_N = 4;
+        Q4_GATEUP_TILE_N = 4;
+        Q4_LM_TILE_N = 4;
+        fprintf(stderr, "  Native Q4 decode: AMD wave64 (4 outputs/WG)\n");
+    }
     static const char* Q4_A32_WGSL = R"(
 enable subgroups;
 @group(0) @binding(0) var<storage, read> X: array<f32>;
@@ -2931,7 +3027,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 )";
     const CompiledPipeline* plQ4A32 = weightsAreNativeQ4
-        ? &gpu->getOrCreatePipeline("q4_matmul_a32", std::string(Q4_A32_WGSL), 5)
+        ? (isAmdAdapter
+            ? &gpu->getOrCreatePipeline("matmul_q4_decode_amd_wave64",
+                q4DecodeAmdSource(), 5)
+            : &gpu->getOrCreatePipeline("q4_matmul_a32", std::string(Q4_A32_WGSL), 5))
         : nullptr;
     static const char* Q4_A32_WIDE_WGSL = R"(
 enable subgroups;
@@ -2950,10 +3049,17 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec
     const bool useNarrowPleQ4 = std::getenv("BP_PLE_Q4_NARROW") ||
         (isNvidiaAdapter && !std::getenv("BP_PLE_Q4_WIDE"));
     const CompiledPipeline* plQ4A32Ple = weightsAreNativeQ4 &&
-        !useNarrowPleQ4
+        !useNarrowPleQ4 && !isAmdAdapter
         ? &gpu->getOrCreatePipeline("q4_matmul_a32_ple_wide", std::string(Q4_A32_WIDE_WGSL), 5)
         : plQ4A32;
-    const uint32_t Q4_A32_PLE_TILE = useNarrowPleQ4 ? 4u : 8u;
+    uint32_t Q4_A32_PLE_TILE = useNarrowPleQ4 ? 4u : 8u;
+    if (weightsAreNativeQ4 && isAmdAdapter) {
+        auto& amdQ4 = gpu->getOrCreatePipeline(
+            "matmul_q4_decode_amd_wave64", q4DecodeAmdSource(), 5);
+        plQ4A32 = &amdQ4;
+        plQ4A32Ple = &amdQ4;
+        Q4_A32_PLE_TILE = 4;
+    }
     static const char* PLE_TOKEN_Q4_GATHER_WGSL = R"(
 @group(0) @binding(0) var<storage, read> B: array<u32>;
 @group(0) @binding(1) var<storage, read> S: array<u32>;
@@ -5614,14 +5720,23 @@ void ModelRunner::initGemmaPrefillResources() {
     gemmaPf.act    = mk("gpf_act", C * maxIM);
     gemmaPf.rstd   = mk("gpf_rstd", C);
     const uint32_t maxK = std::max({cfg.nEmbd, maxIM, maxQkv});
-    if (weightsAreNativeQ4 && gpu->adapterName.find("NVIDIA") != std::string::npos &&
-        !std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4")) {
+    const bool gemmaPrequantAdapter =
+        gpu->adapterName.find("NVIDIA") != std::string::npos ||
+        gpu->adapterName.find("AMD") != std::string::npos;
+    const bool disableGemmaPrequant = std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4") ||
+        (gpu->adapterName.find("AMD") != std::string::npos &&
+         std::getenv("BP_GEMMA_DISABLE_AMD_PREQUANT_Q4"));
+    if (weightsAreNativeQ4 && gemmaPrequantAdapter && !disableGemmaPrequant) {
         gemmaPf.actQ8 = mk("gpf_act_q8", (uint64_t)C * maxK, 1);
         gemmaPf.actScale = mk("gpf_act_scale",
             (uint64_t)C * ((maxK + 31u) / 32u));
         (void)getKernel("q8_quantize_batched_dp4a");
         (void)gpu->getOrCreatePipeline("q4_prequant_batched",
             q4PrequantBatchedSource(), 6);
+        if (gpu->adapterName.find("AMD") != std::string::npos) {
+            (void)gpu->getOrCreatePipeline("q4_prequant_batched_amd",
+                q4PrequantBatchedAmdSource(), 6);
+        }
     }
     if (cfg.pleSize > 0) {
         uint64_t totalPle = (uint64_t)cfg.pleSize * cfg.nLayer;
@@ -7365,13 +7480,22 @@ int32_t ModelRunner::prefillGemmaBatched(
         const CompiledPipeline* q4zpRows8=useQ4Rows8?&gpu->getOrCreatePipeline(
             "matmul_q4_zp_batched_dp4a_rows8",q4ZpBatchedRows8Source(),6):nullptr;
         auto& q8mm = getKernel(useDP4A ? "q8_matmul_batched_dp4a" : "q8_matmul_d3d12");
+        const bool disablePrequantQ4 = std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4") ||
+            (gpu->adapterName.find("AMD") != std::string::npos &&
+             std::getenv("BP_GEMMA_DISABLE_AMD_PREQUANT_Q4"));
         const bool prequantQ4 = weightsAreNativeQ4 && gemmaPf.actQ8.handle &&
-            !std::getenv("BP_GEMMA_DISABLE_PREQUANT_Q4");
+            !disablePrequantQ4;
         const CompiledPipeline* q8quant = prequantQ4
             ? &getKernel("q8_quantize_batched_dp4a") : nullptr;
         const CompiledPipeline* q4prequant = prequantQ4
-            ? &gpu->getOrCreatePipeline("q4_prequant_batched",
-                q4PrequantBatchedSource(), 6) : nullptr;
+            ? &gpu->getOrCreatePipeline(
+                gpu->adapterName.find("AMD") != std::string::npos
+                    ? "q4_prequant_batched_amd" : "q4_prequant_batched",
+                gpu->adapterName.find("AMD") != std::string::npos
+                    ? q4PrequantBatchedAmdSource() : q4PrequantBatchedSource(), 6)
+            : nullptr;
+        const uint32_t q4PrequantCols =
+            gpu->adapterName.find("AMD") != std::string::npos ? 4u : 8u;
         auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
                       uint32_t K, uint32_t N, const std::string& name) {
             auto p = mkP(name + "_p", {M,N,K});
@@ -7381,7 +7505,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                     (K+255)/256,M,name+"_quant");
                 add(*q4prequant, {{0,gemmaPf.actQ8},{1,gemmaPf.actScale},
                     {2,w},{3,s},{4,y},{5,p}},
-                    (M+7)/8,(N+7)/8,name);
+                    (M+7)/8,(N+q4PrequantCols-1)/q4PrequantCols,name);
             } else if (weightsAreNativeQ4) {
                 add(q4mm, {{0,x},{1,w},{2,s},{3,y},{4,p}},
                     (N+31)/32,(M+3)/4,name);
@@ -7560,10 +7684,15 @@ int32_t ModelRunner::prefillGemmaBatched(
             lastNorm.offset=(uint64_t)(M-1)*cfg.nEmbd*4; lastNorm.size=cfg.nEmbd*4;
             if (weightsAreNativeQ4) {
                 auto lp=mkP("gpf_lm",{0,cfg.nVocab,cfg.nEmbd,0});
-                auto& lm=getKernel("matmul_q4_decode");
+                const bool amdNativeQ4 = gpu->adapterName.find("AMD") != std::string::npos;
+                auto& lm = amdNativeQ4
+                    ? gpu->getOrCreatePipeline("matmul_q4_decode_amd_wave64",
+                        q4DecodeAmdSource(), 5)
+                    : getKernel("matmul_q4_decode");
+                const uint32_t lmTile = amdNativeQ4 ? 4u : 32u;
                 add(lm,{{0,lastNorm},{1,lmHeadQ8W},{2,lmHeadQ8S},
                         {3,logitsBuf},{4,lp}},
-                    (cfg.nVocab+31)/32,1,"gpf_lm");
+                    (cfg.nVocab+lmTile-1)/lmTile,1,"gpf_lm");
             } else {
                 if(lmHeadQ4W.handle&&!std::getenv("BP_GEMMA_Q8_PREFILL_LM")){
                     auto lp=mkP("gpf_lm_q4",{1,cfg.nVocab,cfg.nEmbd});
