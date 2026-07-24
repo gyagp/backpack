@@ -68,6 +68,10 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
 ### Performance direction
 
 - Record prefill TPS and decode TPS separately, with bounded execution time.
+- After conformance is established, prioritize prefill throughput. The immediate
+  GGUF objective is to close the large Backpack/WebGPU prefill gap against
+  llama.cpp/Vulkan, while preserving exact output and decode performance on
+  every cared device.
 - First make Backpack/ONNX faster than ORT/WebGPU for each cared model/device;
   then close and exceed the corresponding llama.cpp/Vulkan targets for GGUF.
 - Preserve revision-linked history for every valid tested combination, including
