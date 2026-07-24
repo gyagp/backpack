@@ -74,7 +74,13 @@ fn reduce128(x: f32, lane128: u32, pair: u32) -> f32 {
         }
         workgroupBarrier();
     }
-    return reduce_scratch[pair * 128u];
+    // Every lane consumes the shared result.  Keep the scratch array stable
+    // until all lanes have copied it locally; otherwise an invocation that
+    // enters the next reduction early can overwrite the value beneath a
+    // slower invocation (observed on AMD wave64).
+    let total = reduce_scratch[pair * 128u];
+    workgroupBarrier();
+    return total;
 }
 )WGSL";
     result.replace(begin, end - begin, portable);
@@ -320,6 +326,38 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
     std::string adapter = gpu->adapterName;
     std::transform(adapter.begin(), adapter.end(), adapter.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
+    if (adapter.find("amd") != std::string::npos &&
+        (name == "qwen35_split_qkv_l2_batched" ||
+         name == "qwen35_conv_scan_split_l2")) {
+        std::string source = it->second.source;
+        auto replaceAll = [&](const std::string& from, const std::string& to) {
+            size_t pos = 0;
+            while ((pos = source.find(from, pos)) != std::string::npos) {
+                source.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        };
+        const size_t begin = source.find("fn reduce32(");
+        const size_t end = begin == std::string::npos ? std::string::npos :
+            source.find("@compute", begin);
+        if (begin != std::string::npos && end != std::string::npos) {
+            const std::string reducer =
+                "fn reduce128(v:f32,tid:u32)->f32{"
+                "sums[tid]=v;workgroupBarrier();"
+                "for(var off=64u;off>0u;off>>=1u){"
+                "if(tid<off){sums[tid]+=sums[tid+off];}workgroupBarrier();}"
+                "let total=sums[0];workgroupBarrier();return total;}\n";
+            source.replace(begin, end - begin, reducer);
+            replaceAll("let ss=reduce32(x*x,d);",
+                       "let ss=reduce128(x*x,d);");
+            replaceAll("let ss=reduce32(value*value,d);",
+                       "let ss=reduce128(value*value,d);");
+            replaceAll("sqrt(sums[0]+sums[32]+sums[64]+sums[96])",
+                       "sqrt(ss)");
+            return gpu->getOrCreatePipeline(name + "_amd_reduce128", source,
+                                             it->second.numBindings);
+        }
+    }
     if (adapter.find("nvidia") != std::string::npos) {
         std::string source = it->second.source;
         bool patched = false;
@@ -497,8 +535,10 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
 
 const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32_t headDim) {
     const bool subgroupChunkedP1 = name == "gqa_chunked_pass1_subgroup";
-    const std::string sourceName = subgroupChunkedP1 ? "gqa_chunked_pass1" : name;
-    if (!subgroupChunkedP1 && headDim == 128 &&
+    const bool portableCausal = name == "causal_attn_portable";
+    const std::string sourceName = subgroupChunkedP1 ? "gqa_chunked_pass1" :
+        (portableCausal ? "causal_attn" : name);
+    if (!subgroupChunkedP1 && !portableCausal && headDim == 128 &&
         (name != "gqa_chunked_pass1" || gqaChunkSize == 64))
         return getKernel(name);
 
@@ -515,6 +555,40 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32
     }
 
     std::string patchedSource = patchShaderHD(it->second.source, headDim);
+    if (portableCausal) {
+        auto replaceAll = [&](const std::string& from, const std::string& to) {
+            size_t pos = 0;
+            while ((pos = patchedSource.find(from, pos)) != std::string::npos) {
+                patchedSource.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        };
+        replaceAll("enable subgroups;\n", "");
+        replaceAll("const HD_PER_THREAD: u32 = " +
+                       std::to_string((headDim + 31u) / 32u) + "u;",
+                   "const HD_PER_THREAD: u32 = " +
+                       std::to_string((headDim + 127u) / 128u) + "u;");
+        replaceAll("const QUERIES_PER_WG: u32 = 4u;",
+                   "const QUERIES_PER_WG: u32 = 1u;");
+        replaceAll("let warp_id = tid / 32u;", "let warp_id = 0u;");
+        replaceAll("let lane = tid % 32u;", "let lane = tid;");
+        replaceAll("let dot_qk = subgroupAdd(partial);",
+                   "let dot_qk = reduce128(partial, tid);");
+        const std::string marker = "@compute @workgroup_size(128)";
+        const std::string reducer =
+            "var<workgroup> dot_scratch: array<f32, 128>;\n"
+            "fn reduce128(v: f32, tid: u32) -> f32 {\n"
+            "    dot_scratch[tid] = v; workgroupBarrier();\n"
+            "    for (var off = 64u; off > 0u; off >>= 1u) {\n"
+            "        if (tid < off) { dot_scratch[tid] += dot_scratch[tid + off]; }\n"
+            "        workgroupBarrier();\n"
+            "    }\n"
+            "    let total = dot_scratch[0]; workgroupBarrier(); return total;\n"
+            "}\n";
+        const size_t markerPos = patchedSource.find(marker);
+        if (markerPos != std::string::npos)
+            patchedSource.insert(markerPos, reducer);
+    }
     if (sourceName == "gqa_chunked_pass1" && gqaChunkSize != 64) {
         const std::string from = "const CHUNK: u32 = 64u;";
         const std::string to = "const CHUNK: u32 = " + std::to_string(gqaChunkSize) + "u;";
@@ -5363,7 +5437,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
               (gpu->adapterName.find("NVIDIA") != std::string::npos ||
                gpu->adapterName.find("AMD") != std::string::npos || intelAdapter)) ||
              (cfg.ssmTimeStepRank == 16u &&
-              (intelAdapter||gpu->adapterName.find("NVIDIA")!=std::string::npos)));
+              (intelAdapter||gpu->adapterName.find("NVIDIA")!=std::string::npos||
+               gpu->adapterName.find("AMD")!=std::string::npos)));
         qwen35FastPrefill = !forceSerial && (forceFast || validatedGguf);
         if (qwen35FastPrefill) {
             initQwen35PrefillResources();
@@ -7090,9 +7165,13 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto&rope=getKernel("qwen35_rope_kv_batched");add(rope,{{0,qwen35Pf.aq},{1,qwen35Pf.ak},{2,qwen35Pf.av},{3,qwen35Pf.qrot},{4,kvCache[li].K},{5,kvCache[li].V},{6,ropeCosBuf},{7,ropeSinBuf},{8,ropep}},std::max(cfg.nHead,cfg.nKvHeads),M,1,L+"rope");
                 float sc=1.0f/sqrtf((float)hd),ni=-1e9f;uint32_t sb,nb;memcpy(&sb,&sc,4);memcpy(&nb,&ni,4);
                 auto ap=mkp(L+"attn_p",{kd,cfg.nHead/cfg.nKvHeads,cacheLen+M,cacheLen,M,sb,nb,0},true);
-                const bool mmaAttn=gpu->backendType!=WGPUBackendType_D3D12&&gpu->supportsSubgroupMatrix;
-                auto&att=getKernelHD(mmaAttn?"flash_attn_vulkan":"causal_attn",hd);
-                add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),1,L+"attn");
+                const bool mmaAttn=gpu->backendType!=WGPUBackendType_D3D12&&gpu->supportsSubgroupMatrix&&
+                    std::getenv("BP_QWEN_PREFILL_PORTABLE_ATTN")==nullptr;
+                const bool portableCausal=!mmaAttn&&gpu->adapterName.find("AMD")!=std::string::npos;
+                auto&att=getKernelHD(mmaAttn?"flash_attn_vulkan":
+                    (portableCausal?"causal_attn_portable":"causal_attn"),hd);
+                add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,
+                    portableCausal?M:(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),1,L+"attn");
                 auto gp=mkp(L+"gate_p",{M*qd});auto&go=getKernel("gated_output_batched");add(go,{{0,qwen35Pf.attn},{1,qwen35Pf.ag},{2,qwen35Pf.aout},{3,gp}},(M*qd+255)/256,1,1,L+"gate");
                 proj(qwen35Pf.aout,lw.oKQ,lw.oQ4Dense,lw.oQ4ScaleMin,lw.oKQType,lw.oKQNBlocks,lw.oKQRowStride,lw.oW,lw.oS,zeroBiasE,qwen35Pf.proj,qd,E,L+"oproj");
             }

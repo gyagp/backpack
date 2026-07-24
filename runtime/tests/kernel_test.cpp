@@ -73,7 +73,7 @@ fn reduce128(x:f32,lane128:u32,pair:u32)->f32 {
         if(lane128<offset){reduce_scratch[tid]+=reduce_scratch[tid+offset];}
         workgroupBarrier();
     }
-    return reduce_scratch[pair*128u];
+    let total=reduce_scratch[pair*128u]; workgroupBarrier(); return total;
 }
 )WGSL";
     result.replace(begin,end-begin,portable);return result;
@@ -1634,6 +1634,28 @@ TEST(delta_net_scan_x2) {
     auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},
         NV,ceilDiv(DV,2),1,by,T*NV*DV*4,8);
     return assertClose((const float*)result.data(),expected.data(),T*NV*DV,3e-4f,3e-4f);
+}
+
+TEST(delta_net_scan_x2_portable) {
+    // Exercise the Windows WebGPU fallback even on wave32 adapters.  A final
+    // barrier is required after copying the shared sum: without it, the next
+    // reduction can overwrite scratch while slower lanes still read it.
+    auto wgsl=usePortableDeltaScanReduction(WGSL_DELTA_NET_SCAN_X2);
+    const int T=3,NV=2,NK=1,DK=128,DV=2; Rng rng(658);
+    auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV);
+    auto beta=rng.randnVec(T*NV),gate=rng.randnVec(T*NV),state=rng.randnVec(NV*DK*DV);
+    for(float&b:beta)b=1/(1+std::exp(-b));for(float&g:gate)g=-std::abs(g)*.1f;
+    auto ref=state;std::vector<float>expected(T*NV*DV);float qs=1/std::sqrt(float(DK));
+    for(int t=0;t<T;t++)for(int h=0;h<NV;h++)for(int vi=0;vi<DV;vi++){
+        int kh=h/(NV/NK),sb=h*DK*DV;float gh=std::exp(gate[t*NV+h]),pred=0;
+        for(int d=0;d<DK;d++)pred+=gh*ref[sb+d*DV+vi]*k[(t*NK+kh)*DK+d];
+        float delta=(v[(t*NV+h)*DV+vi]-pred)*beta[t*NV+h],out=0;
+        for(int d=0;d<DK;d++){float sn=gh*ref[sb+d*DV+vi]+k[(t*NK+kh)*DK+d]*delta;ref[sb+d*DV+vi]=sn;out+=sn*q[(t*NK+kh)*DK+d]*qs;}
+        expected[(t*NV+h)*DV+vi]=out;
+    }
+    auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size()),bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size()),bg=makeBuffer(gpu,"G",gate.data(),gate.size()),bs=makeBuffer(gpu,"S",state.data(),state.size()),by=makeBuffer(gpu,"Y",nullptr,T*NV*DV),p=makeParams(gpu,"P",{NV,NK,DK,DV,T});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},NV,ceilDiv(DV,2),1,by,T*NV*DV*4,8);
+    return assertClose((const float*)result.data(),expected.data(),expected.size(),3e-4f,3e-4f);
 }
 
 TEST(delta_net_scan_x2_repeated_heads) {
