@@ -68,6 +68,16 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
 ### Performance direction
 
 - Record prefill TPS and decode TPS separately, with bounded execution time.
+- In general, work on the largest validated performance gap first. Rank gaps by
+  Backpack's relative deficit against the matching independent reference on the
+  same model, device, format, prompt length, generation length, and options:
+  ORT/WebGPU for ONNX and llama.cpp/Vulkan for GGUF. Missing or non-conformant
+  measurements take precedence because a gap cannot be trusted until it is
+  measured correctly.
+- Prefer an experiment that can materially close the largest gap over one that
+  only refines an already competitive metric. Recompute priorities whenever new
+  valid Status evidence lands; do not let task creation order or an early popular
+  research direction override measured gap size.
 - After conformance is established, prioritize prefill throughput. The immediate
   GGUF objective is to close the large Backpack/WebGPU prefill gap against
   llama.cpp/Vulkan, while preserving exact output and decode performance on
