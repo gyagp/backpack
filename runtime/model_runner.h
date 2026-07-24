@@ -347,6 +347,9 @@ struct ModelRunner {
     uint32_t swaRotaryDim = 0;      // architecture-specific SWA rotary width
     bool hasPrecomputedRope = false; // true = use ONNX cos/sin cache
     std::string modelFormat;        // "gguf" or "onnx"
+    // True only for a cross-checked, conformant Qwen batched-prefill tuple.
+    // Kept as runtime state so every application uses the same safe policy.
+    bool qwen35FastPrefill = false;
 
     // --- API ---
     bool load(GPUContext& ctx, const std::string& ggufPath);

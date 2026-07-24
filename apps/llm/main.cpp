@@ -96,16 +96,13 @@ int main(int argc, char* argv[]) {
     if (prompt.empty() && chatMessage.empty() && !benchmark)
         prompt = "Hello";
 
-    // Interactive generation is a manual correctness surface.  Qwen 3.5's
-    // batched GGUF prefill is still under conformance investigation, whereas
-    // the serial path produces stable text. Performance evidence must use the
-    // conformant path too; --fast-prefill permits a deliberate experiment but
-    // must not silently contaminate the default benchmark history.
-    if (!fastPrefill) {
+    // Runtime selection defaults to validated device/model tuples. This flag
+    // is an explicit experimental override for conformance investigation.
+    if (fastPrefill) {
 #ifdef _WIN32
-        _putenv_s("BP_QWEN35_SERIAL_PREFILL", "1");
+        _putenv_s("BP_QWEN35_FORCE_FAST_PREFILL", "1");
 #else
-        setenv("BP_QWEN35_SERIAL_PREFILL", "1", 1);
+        setenv("BP_QWEN35_FORCE_FAST_PREFILL", "1", 1);
 #endif
     }
 

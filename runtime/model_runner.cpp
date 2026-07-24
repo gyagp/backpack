@@ -5311,8 +5311,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     bool isGemma = cfg.arch.rfind("gemma", 0) == 0;
     bool gemmaSerial = isGemma && (cfg.hasSandwichNorm || hasSharedKv);
     if (cfg.arch == "qwen35") {
-        if (!std::getenv("BP_QWEN35_SERIAL_PREFILL")) {
+        const bool forceFast = std::getenv("BP_QWEN35_FORCE_FAST_PREFILL") != nullptr;
+        const bool forceSerial = std::getenv("BP_QWEN35_SERIAL_PREFILL") != nullptr;
+        const bool validatedGguf4B = modelFormat == "gguf" &&
+            cfg.ssmTimeStepRank == 32u &&
+            (gpu->adapterName.find("NVIDIA") != std::string::npos ||
+             gpu->adapterName.find("Intel") != std::string::npos);
+        qwen35FastPrefill = !forceSerial && (forceFast || validatedGguf4B);
+        if (qwen35FastPrefill) {
             initQwen35PrefillResources();
+            fprintf(stderr, "  Prefill: Qwen3.5 precise batched path (%s)\n",
+                    forceFast && !validatedGguf4B ? "experimental override" : "validated tuple");
         } else {
             fprintf(stderr, "  Prefill: Qwen3.5 serial path\n");
         }
@@ -6818,7 +6827,7 @@ int32_t ModelRunner::prefillQwen35Batched(
         // introduced by activation-quantized batched GEMM.  Specialized ONNX
         // therefore uses the same float-activation Q8 arithmetic as decode;
         // GGUF can retain the faster packed path while it remains opt-in.
-        const bool preciseQ8=modelFormat=="onnx"||std::getenv("BP_QWEN_Q8_PRECISE")!=nullptr;
+        const bool preciseQ8=qwen35FastPrefill||modelFormat=="onnx"||std::getenv("BP_QWEN_Q8_PRECISE")!=nullptr;
         auto&rms=getKernel(preciseQ8?"rms_norm":"rms_norm_batched");auto&q8=getKernel(preciseQ8?"q8_matmul":"q8_matmul_batched_dp4a");
         auto&addnorm=getKernel(preciseQ8?"add_rms_norm":"add_rms_norm_batched");auto&normadd=getKernel("gemma_norm_add_batched");
         auto&addip=getKernel("add_inplace_batched");
@@ -7323,7 +7332,7 @@ int32_t ModelRunner::prefillGemmaBatched(
 
 int32_t ModelRunner::prefillBatched(
         const int32_t* tokenIds, uint32_t T, uint32_t posOffset) {
-    if (qwen35Pf.ready && !std::getenv("BP_QWEN35_SERIAL_PREFILL"))
+    if (qwen35Pf.ready && qwen35FastPrefill)
         return prefillQwen35Batched(tokenIds,T,posOffset);
     if (gemmaPf.ready &&
         !std::getenv("BP_GEMMA_SERIAL_PREFILL"))

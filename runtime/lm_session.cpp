@@ -1384,7 +1384,7 @@ struct StandardState {
         int32_t next;
         bool pooledPrefill = runner.pleGpuPreprocess || runner.cfg.arch == "qwen35";
         bool qwenBatched = runner.cfg.arch == "qwen35" && n > 16 &&
-                           !std::getenv("BP_QWEN35_SERIAL_PREFILL");
+                           runner.qwen35FastPrefill;
         if (qwenBatched && !std::getenv("BP_SYNC_PREFILL")) {
             next = runner.prefillBatched(tokens, n, 0);
         } else if (pooledPrefill && !std::getenv("BP_SYNC_PREFILL")) {
