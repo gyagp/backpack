@@ -330,7 +330,22 @@ function showPerformanceCommand(button) {
 }
 let validationRows = [],
   trendObservations = [];
-let activeStatusModel = "";
+const statusModelStorageKey = "backpack.status.model";
+function savedStatusModel() {
+  try {
+    return localStorage.getItem(statusModelStorageKey) || "";
+  } catch (_) {
+    return "";
+  }
+}
+function saveStatusModel(modelId) {
+  try {
+    localStorage.setItem(statusModelStorageKey, modelId);
+  } catch (_) {
+    // Storage can be disabled by browser policy; the tab still works in-memory.
+  }
+}
+let activeStatusModel = savedStatusModel();
 function applyStatusModelFilter() {
   document
     .querySelectorAll(".status-model-tab")
@@ -347,8 +362,10 @@ function renderStatusModelTabs() {
   const models = [
     ...new Map(validationRows.map((r) => [r.model.id, r.model])).values(),
   ];
-  if (!models.some((model) => model.id === activeStatusModel))
+  if (!models.some((model) => model.id === activeStatusModel)) {
     activeStatusModel = models[0]?.id || "";
+    if (activeStatusModel) saveStatusModel(activeStatusModel);
+  }
   $("#status-model-tabs").innerHTML = models
     .map(
       (model) =>
@@ -359,6 +376,7 @@ function renderStatusModelTabs() {
     (button) =>
       (button.onclick = () => {
         activeStatusModel = button.dataset.model;
+        saveStatusModel(activeStatusModel);
         applyStatusModelFilter();
       }),
   );
