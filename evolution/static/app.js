@@ -41,6 +41,55 @@ function shortDate(v) {
     ? String(v).slice(0, 10)
     : d.toISOString().slice(0, 10);
 }
+let goalDocument = { content: "", revision: "", updated_at: null };
+function goalInlineMarkdown(text) {
+  return esc(text)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+function goalMarkdown(text) {
+  const html = [],
+    lines = String(text || "").split(/\r?\n/);
+  let list = "";
+  const closeList = () => {
+    if (list) html.push(`</${list}>`);
+    list = "";
+  };
+  for (const line of lines) {
+    const heading = line.match(/^(#{1,3})\s+(.+)$/),
+      bullet = line.match(/^\s*[-*]\s+(.+)$/),
+      numbered = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      html.push(`<h${level}>${goalInlineMarkdown(heading[2])}</h${level}>`);
+    } else if (bullet || numbered) {
+      const type = bullet ? "ul" : "ol";
+      if (list !== type) {
+        closeList();
+        list = type;
+        html.push(`<${type}>`);
+      }
+      html.push(`<li>${goalInlineMarkdown((bullet || numbered)[1])}</li>`);
+    } else if (!line.trim()) {
+      closeList();
+    } else {
+      closeList();
+      html.push(`<p>${goalInlineMarkdown(line)}</p>`);
+    }
+  }
+  closeList();
+  return html.join("") || '<p class="goal-empty">No goal has been recorded.</p>';
+}
+function renderGoal(value) {
+  goalDocument = value || goalDocument;
+  $("#goal-view").innerHTML = goalMarkdown(goalDocument.content);
+  $("#goal-editor").value = goalDocument.content || "";
+  const updated = goalDocument.updated_at
+    ? new Date(goalDocument.updated_at * 1000).toLocaleString()
+    : "not saved";
+  $("#goal-status").textContent = `${goalDocument.revision || "unversioned"} · ${updated}`;
+}
 function taskLabel(t) {
   return t?.task_number ? `#${t.task_number}` : "#—";
 }
@@ -100,6 +149,7 @@ async function refresh() {
     regressions,
     studies,
     observations,
+    goal,
   ] = await Promise.all([
     api("/api/status"),
     api("/api/tasks"),
@@ -112,6 +162,7 @@ async function refresh() {
     api("/api/regressions/confirmed"),
     api("/api/studies"),
     api("/api/observations"),
+    api("/api/goal"),
   ]);
   const states = status.tasks || {};
   $("#stats").innerHTML = [
@@ -156,6 +207,7 @@ async function refresh() {
   renderStudyFeedback(studies, tasks, history);
   renderDevices(machines);
   renderActivity(activity);
+  renderGoal(goal);
   document
     .querySelectorAll(".activity-toggle")
     .forEach((b) => (b.onclick = () => toggleDeviceActivity(b)));
@@ -1530,6 +1582,7 @@ $("#task-form").onsubmit = async (e) => {
 };
 const tabPaths = {
     status: "tasks",
+    goal: "goal",
     evolution: "evolution",
     validation: "status",
     analysis: "performance-analysis",
@@ -1579,6 +1632,40 @@ const initialUrl = new URL(location.href),
   );
 history.replaceState({ view: initialTab }, "", canonicalUrl);
 navigate(initialTab, false);
+function setGoalEditing(editing) {
+  $("#goal-view").classList.toggle("hidden", editing);
+  $("#goal-form").classList.toggle("hidden", !editing);
+  $("#edit-goal").classList.toggle("hidden", editing);
+  if (editing) {
+    $("#goal-editor").value = goalDocument.content || "";
+    $("#goal-editor").focus();
+  }
+}
+$("#edit-goal").onclick = () => setGoalEditing(true);
+$("#cancel-goal").onclick = () => setGoalEditing(false);
+$("#goal-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget,
+    save = $("#save-goal");
+  form.classList.add("goal-saving");
+  save.disabled = true;
+  try {
+    const result = await api("/api/goal", {
+      method: "POST",
+      body: JSON.stringify({
+        content: $("#goal-editor").value,
+        revision: goalDocument.revision,
+      }),
+    });
+    renderGoal(result);
+    setGoalEditing(false);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    form.classList.remove("goal-saving");
+    save.disabled = false;
+  }
+};
 $("#provision-device").onclick = () => openProvision();
 $("#cancel-provision").onclick = () => $("#provision-dialog").close();
 $("#provision-form").onsubmit = async (e) => {

@@ -7,6 +7,7 @@ from pathlib import Path
 from evolution.agent import current_base_worktree, rewrite_repo_argv
 from evolution.domain import DomainError
 from evolution.policy import PolicyEngine
+from evolution.server import read_goal, write_goal
 from evolution.store import Store
 
 
@@ -36,6 +37,15 @@ class FrameworkTest(unittest.TestCase):
                                  "correctness": {"passed": True}}, "test")
         self.store.add_evidence({**common, "variant": "candidate", "samples": candidate, "commit_sha": "candidate",
                                  "correctness": {"passed": passed}}, "test")
+
+    def test_goal_document_round_trip_and_validation(self) -> None:
+        path = Path(self.tmp.name) / "goal.md"
+        saved = write_goal("# Goal\r\n\r\n- Stay conformant", path)
+        self.assertEqual("# Goal\n\n- Stay conformant\n", path.read_text(encoding="utf-8"))
+        self.assertEqual(saved, read_goal(path))
+        self.assertEqual(12, len(saved["revision"]))
+        with self.assertRaises(DomainError):
+            write_goal("   ", path)
 
     def test_agent_uses_synchronized_base_for_repository_commands(self) -> None:
         repo = Path(self.tmp.name) / "repo"

@@ -40,6 +40,7 @@
     <nav id="sidebar">
       <button class="sidebar-item active" data-tab="validation"><span class="nav-icon">✓</span><span>Status</span></button>
       <button class="sidebar-item" data-tab="status"><span class="nav-icon">◫</span><span>Tasks</span></button>
+      <button class="sidebar-item" data-tab="goal"><span class="nav-icon">◎</span><span>Goal</span></button>
       <button class="sidebar-item" data-tab="evolution"><span class="nav-icon">↻</span><span>Evolution</span></button>
       <button class="sidebar-item" data-tab="analysis"><span class="nav-icon">⌁</span><span>Performance Analysis</span></button>
       <button class="sidebar-item" data-tab="digest"><span class="nav-icon">↗</span><span>Digest</span></button>
@@ -58,6 +59,18 @@
       <section id="evolution-tab" class="tab-page hidden">
         <div class="page-header"><div><h1>Evolution</h1><p>Completed upstream and experience studies that generate new conformance and performance tasks.</p></div><span id="study-count"></span></div>
         <section class="card"><div id="studies"></div></section>
+      </section>
+
+      <section id="goal-tab" class="tab-page hidden">
+        <div class="page-header"><div><h1>Goal</h1><p>Review and update the acceptance criteria that govern continuous evolution.</p></div><div class="goal-header-actions"><span id="goal-status" class="muted"></span><button id="edit-goal" class="secondary" type="button">Edit</button></div></div>
+        <section class="card goal-card">
+          <article id="goal-view" class="goal-document"></article>
+          <form id="goal-form" class="hidden">
+            <label for="goal-editor">Goal Markdown</label>
+            <textarea id="goal-editor" spellcheck="true"></textarea>
+            <div class="actions"><button id="cancel-goal" class="secondary" type="button">Cancel</button><button id="save-goal" type="submit">Save goal</button></div>
+          </form>
+        </section>
       </section>
 
       <section id="validation-tab" class="tab-page hidden">

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import os
@@ -23,6 +24,29 @@ from .store import Store
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = Path(__file__).with_name("static")
 DEFAULT_DB = ROOT / "gitignore" / "evolution" / "state.db"
+GOAL_PATH = ROOT / "goal.md"
+
+
+def read_goal(path: Path = GOAL_PATH) -> dict[str, Any]:
+    content = path.read_text(encoding="utf-8") if path.is_file() else ""
+    stat = path.stat() if path.is_file() else None
+    return {
+        "content": content,
+        "revision": hashlib.sha256(content.encode("utf-8")).hexdigest()[:12],
+        "updated_at": stat.st_mtime if stat else None,
+    }
+
+
+def write_goal(content: Any, path: Path = GOAL_PATH) -> dict[str, Any]:
+    if not isinstance(content, str):
+        raise DomainError("goal content must be text")
+    content = content.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    if not content.strip():
+        raise DomainError("goal content cannot be empty")
+    if len(content.encode("utf-8")) > 256 * 1024:
+        raise DomainError("goal content is too large")
+    path.write_text(content, encoding="utf-8", newline="\n")
+    return read_goal(path)
 
 
 class EventBus:
@@ -133,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/api/status":
                 return self._send_json(self.server.store.status())
+            if path == "/api/goal":
+                return self._send_json(read_goal())
             if path == "/api/activity":
                 self.server.store.ensure_daily_upstream_tasks()
                 query = parse_qs(urlparse(self.path).query)
@@ -190,6 +216,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             path, body, actor = urlparse(self.path).path, self._json_body(), self._actor()
+            if path == "/api/goal":
+                expected = body.get("revision")
+                current = read_goal()
+                if expected and expected != current["revision"]:
+                    raise DomainError("goal.md changed since it was opened; reload before saving")
+                result = write_goal(body.get("content"))
+                self.server.store.audit("goal", "goal.md", "goal_updated", actor,
+                                        {"revision": result["revision"]})
+                self.server.events.publish("goal-updated", result)
+                return self._send_json(result)
             if path == "/api/tasks":
                 result = self.server.store.create_task(body, actor)
                 self.server.store.ensure_task_runs()
@@ -339,7 +375,7 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path: str) -> None:
         app_routes = {
             "", "/", "/tasks", "/evolution", "/human-intervention",
-            "/status", "/performance-analysis", "/digest", "/history", "/devices",
+            "/status", "/goal", "/performance-analysis", "/digest", "/history", "/devices",
         }
         relative = "index.html" if path in app_routes else path.lstrip("/")
         candidate = (STATIC_DIR / relative).resolve()
