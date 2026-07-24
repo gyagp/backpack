@@ -39,7 +39,12 @@ function shortDate(v) {
   const d = new Date(v);
   return Number.isNaN(d.valueOf())
     ? String(v).slice(0, 10)
-    : d.toISOString().slice(0, 10);
+    : new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(d);
 }
 let goalDocument = { content: "", revision: "", updated_at: null };
 function goalInlineMarkdown(text) {
