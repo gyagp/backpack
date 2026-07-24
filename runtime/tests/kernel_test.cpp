@@ -79,6 +79,24 @@ fn reduce128(x:f32,lane128:u32,pair:u32)->f32 {
     result.replace(begin,end-begin,portable);return result;
 }
 
+static std::string q4kOrtRepackedTileTestSource() {
+    std::string s(WGSL_ORT_DP4A_MATMUL_EXACT);
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    auto cut=[&](const std::string&begin,const std::string&end,const std::string&to){auto a=s.find(begin),b=s.find(end,a);if(a==std::string::npos||b==std::string::npos)return false;s.replace(a,b-a,to);return true;};
+    all("enable f16;\n","");all("scales_a: array<f16>","scales_a: array<f32>");all("scales_b: array<f16>","scales_b: array<vec2<f32>>");
+    all("output: array<vec4<f16>>","output: array<vec4<f32>>");all("alias output_element_t = f16;","alias output_element_t = f32;");all("var<uniform> uniforms: Uniforms;","var<storage, read> uniforms: Uniforms;");
+    all("var<workgroup> scale_A : array<output_element_t, tile_size>;","var<workgroup> scale_A : array<vec2<output_element_t>, tile_size>;");all("var<workgroup> scale_B : array<output_element_t, tile_size>;","var<workgroup> scale_B : array<vec2<output_element_t>, tile_size>;");
+    all("var own_scale_a: output_element_t","var own_scale_a: vec2<output_element_t>");all("var own_scale_b: output_element_t","var own_scale_b: vec2<output_element_t>");
+    all("SDP8AI(a1:vec4<u32>, b1:vec4<u32>, a2:vec4<u32>, b2:vec4<u32>, scale:output_element_t)","SDP8AI(a1:vec4<u32>, b1:vec4<u32>, a2:vec4<u32>, b2:vec4<u32>, scale:vec2<output_element_t>)");all("return output_element_t(mul_precision(local_sum) * mul_precision(scale));","return output_element_t(mul_precision(local_sum) * mul_precision(scale.x) - mul_precision(scale.y));");
+    const std::string loaders=R"WGSL(fn sumPacked(v:vec4<u32>)->i32{return dot4I8Packed(v.x,0x01010101u)+dot4I8Packed(v.y,0x01010101u)+dot4I8Packed(v.z,0x01010101u)+dot4I8Packed(v.w,0x01010101u);}
+fn loadSHMA(batch:u32,a_global_base:u32,kidx_v:u32,row:u32,col:u32){let ar=a_global_base+row;if(ar>=uniforms.M){return;}let off=ar*uniforms.K16+kidx_v;tile_A[col][row]=input_a[off+col];if(col==0u){let a0=input_a[off];let a1=input_a[off+1u];let xs=scales_a[ar*(uniforms.K/32u)+kidx_v/2u];scale_A[row]=vec2<f32>(xs,xs*f32(sumPacked(a0)+sumPacked(a1)));}}
+fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);if(col==0u){scale_B[row]=scales_b[br*(uniforms.K/32u)+kidx_v/2u];}}
+
+)WGSL";
+    if(!cut("fn loadSHMA(","@compute @workgroup_size",loaders))return {};
+    return s;
+}
+
 static uint32_t f32AsU32(float x) {
     uint32_t u;
     memcpy(&u, &x, 4);
@@ -1986,6 +2004,34 @@ fn main(@builtin(global_invocation_id)gid:vec3<u32>){let flat=gid.x;let N=P[0];l
     auto bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),by=makeBuffer(gpu,"Y",nullptr,N*K),p=makeParams(gpu,"P",{N,K,pk.rowStrideWords});
     auto r=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,by},{2,p}},ceilDiv(N*K,256),1,1,by,N*K*4,3);
     return assertClose((const float*)r.data(),expected.data(),N*K,1e-6f,1e-6f);
+}
+
+TEST(q4k_ort_tile64_reference) {
+    std::string mm=q4kOrtRepackedTileTestSource();if(mm.empty())return{false,"cannot adapt ORT tile"};
+    const int M=64,N=64,K=256,NB=1;Rng rng(0x4A64);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*144);
+    for(int n=0;n<N;n++){uint8_t*p=raw.data()+n*144;uint16_t d=f32ToF16(.02f+.0002f*n),dm=f32ToF16(.01f+.0001f*n);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+j*17);}
+    auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),xq(M*K),expected(M*N),sm(N*(K/32)*2);std::vector<uint32_t>dense(N*K/8);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){const uint8_t*blk=raw.data()+(n*NB+b)*144;float d=f16ToF32(*(const uint16_t*)blk),dm=f16ToF32(*(const uint16_t*)(blk+2));for(int sb=0;sb<8;sb++){int sc,mn;if(sb<4){sc=blk[4+sb]&63;mn=blk[8+sb]&63;}else{int j=sb-4;sc=(blk[12+j]&15)|((blk[4+j]>>2)&48);mn=(blk[12+j]>>4)|((blk[8+j]>>2)&48);}int gi=n*(K/32)+b*8+sb;sm[gi*2]=d*sc;sm[gi*2+1]=dm*mn;for(int i=0;i<32;i++){int k=b*256+sb*32+i;int q=((sb&1)?blk[16+(sb/2)*32+i]>>4:blk[16+(sb/2)*32+i])&15;int ni=n*K+k;dense[ni/8]|=uint32_t(q)<<(4*(ni&7));}}}
+    for(int m=0;m<M;m++)for(int b=0;b<K/32;b++){float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[m*K+b*32+j]));float sc=amax/127.0f;for(int j=0;j<32;j++){int q=sc==0?0:std::max(-127,std::min(127,(int)std::round(x[m*K+b*32+j]/sc)));xq[m*K+b*32+j]=q*sc;}}
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[m*N+n]+=xq[m*K+k]*dq[n*K+k];
+    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bs=makeBuffer(gpu,"XS",nullptr,M*K/32),bw=makeBufferU32(gpu,"W",dense.data(),(int)dense.size()),bsm=makeBuffer(gpu,"SM",sm.data(),(int)sm.size()),by=makeBuffer(gpu,"Y",nullptr,M*N),qp=makeParams(gpu,"QP",{K,N,M,NB,pk.rowStrideWords});
+    dispatchAndReadback(gpu,WGSL_Q8_QUANTIZE_BATCHED_DP4A,{{0,bx},{1,bq},{2,bs},{3,qp}},1,M,1,bq,M*K,4);
+    auto p=makeParams(gpu,"P",{1,M,N,K,K/8,K/16,1,1,pk.rowStrideWords,0});
+    auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bsm},{4,by},{5,p}},1,1,1,by,M*N*4,6);
+    return assertClose((const float*)r.data(),expected.data(),M*N,5e-3f,5e-3f);
+}
+
+TEST(ort_dp4a_tile64_upstream_reference) {
+    const int M=64,N=64,K=256;Rng rng(0x0A64);auto x=rng.randnVec(M*K);
+    std::vector<uint32_t>aq(M*K/4),wq(N*K/8),as16((M*K/128+1)/2),ws16((N*K/32+1)/2);
+    std::vector<float>adeq(M*K),wdeq(N*K),expected(M*N);
+    for(int m=0;m<M;m++)for(int g=0;g<K/128;g++){float mx=0;for(int j=0;j<128;j++)mx=std::max(mx,std::abs(x[m*K+g*128+j]));float sc=mx/127.0f;uint16_t h=f32ToF16(sc);int si=m*(K/128)+g;as16[si/2]|=uint32_t(h)<<(16*(si&1));for(int j=0;j<128;j++){int k=g*128+j;int q=sc==0?0:std::max(-127,std::min(127,(int)std::round(x[m*K+k]/sc)));adeq[m*K+k]=q*sc;aq[(m*K+k)/4]|=uint32_t(q&255)<<(8*(k&3));}}
+    for(int n=0;n<N;n++)for(int g=0;g<K/32;g++){float sc=.01f+.0001f*(n+g);int si=n*(K/32)+g;ws16[si/2]|=uint32_t(f32ToF16(sc))<<(16*(si&1));for(int j=0;j<32;j++){int k=g*32+j;int q=(n*13+k*7+3)&15;wdeq[n*K+k]=(q-8)*f16ToF32(f32ToF16(sc));int nib=n*K+k;wq[nib/8]|=uint32_t(q)<<(4*(nib&7));}}
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[m*N+n]+=adeq[m*K+k]*wdeq[n*K+k];
+    auto ba=makeBufferU32(gpu,"A",aq.data(),(int)aq.size()),bas=makeBufferU32(gpu,"AS",as16.data(),(int)as16.size()),bw=makeBufferU32(gpu,"W",wq.data(),(int)wq.size()),bws=makeBufferU32(gpu,"WS",ws16.data(),(int)ws16.size()),by=makeBufferU32(gpu,"Y",nullptr,M*N/2),p=makeParams(gpu,"P",{1,M,N,K,K/8,K/16,1,1,0,0});
+    auto r=dispatchAndReadback(gpu,WGSL_ORT_DP4A_MATMUL_EXACT,{{0,ba},{1,bas},{2,bw},{3,bws},{4,by},{5,p}},1,1,1,by,M*N*2,6);
+    std::vector<float>actual(M*N);const uint16_t*hp=(const uint16_t*)r.data();for(int i=0;i<M*N;i++)actual[i]=f16ToF32(hp[i]);
+    return assertClose(actual.data(),expected.data(),M*N,.08f,.02f);
 }
 
 TEST(q4k_matmul_dp4a_reference) {
