@@ -487,7 +487,9 @@ class FrameworkTest(unittest.TestCase):
                                  "files": {"gguf": {"path": r"D:\models\model.gguf"}}})
         self.store.add_observation({"model_id": "perf-model", "machine_id": self.machine["id"],
                                     "framework": "backpack", "format": "gguf", "backend": "d3d12",
-                                    "conformance": "pass", "metrics": {}, "revision": "test"}, "test")
+                                    "conformance": "pass", "metrics": {"prefill_tok_s": 999,
+                                        "decode_tok_s": 999, "prompt_tokens": 128,
+                                        "generated_tokens": 64}, "revision": "test"}, "test")
         self.store.add_observation({"model_id": "perf-model", "machine_id": self.machine["id"],
                                     "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
                                     "conformance": "pass", "metrics": {}, "revision": "test"}, "test")

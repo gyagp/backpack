@@ -1278,7 +1278,8 @@ class Store:
                                and item["format"] == fmt and item["backend"] == backend]
                     passed = any(item["conformance"] == "pass" for item in matches)
                     measured = next((item for item in matches
-                                     if item.get("metrics", {}).get("prefill_tok_s") is not None
+                                     if item.get("performance_validated")
+                                     and item.get("metrics", {}).get("prefill_tok_s") is not None
                                      and item.get("metrics", {}).get("decode_tok_s") is not None), None)
                     if passed and not measured:
                         missing.append({"framework": framework, "format": fmt, "backend": backend})
