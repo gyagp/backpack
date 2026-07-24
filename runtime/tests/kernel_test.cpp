@@ -97,6 +97,15 @@ fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+r
     return s;
 }
 
+static std::string q5kOrtRepackedTileTestSource() {
+    std::string s=q4kOrtRepackedTileTestSource();
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    all("input_b: array<vec2<u32>>","input_b: array<vec4<u32>>");
+    const std::string old="let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);";
+    const std::string replacement="let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=v;";
+    all(old,replacement);return s;
+}
+
 static uint32_t f32AsU32(float x) {
     uint32_t u;
     memcpy(&u, &x, 4);
@@ -2018,6 +2027,15 @@ TEST(q4k_gpu_repack_ort_dense_reference) {
     return assertClose((const float*)scaleBytes.data(),expected.scalesMins.data(),(int)expected.scalesMins.size(),1e-6f,1e-6f);
 }
 
+TEST(q5k_gpu_repack_ort_dense_reference) {
+    auto wgsl=loadWgsl("quant_kq","q5k_repack_ort_dense");if(wgsl.empty())return{false,"cannot load Q5 repack kernel"};
+    const int N=67,K=512,NB=K/256;std::vector<uint8_t>raw(N*NB*176);std::vector<uint32_t>dense(N*K/4);std::vector<float>sm(N*(K/32)*2);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*176;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<176;j++)p[j]=uint8_t(n*31+b*13+j*17);float df=f16ToF32(d),mf=f16ToF32(dm);for(int sb=0;sb<8;sb++){int sc,mn;if(sb<4){sc=p[4+sb]&63;mn=p[8+sb]&63;}else{int j=sb-4;sc=(p[12+j]&15)|((p[4+j]>>2)&48);mn=(p[12+j]>>4)|((p[8+j]>>2)&48);}int gi=n*(K/32)+b*8+sb;sm[gi*2]=df*sc;sm[gi*2+1]=mf*mn;for(int i=0;i<32;i++){int qlo=((sb&1)?p[48+(sb/2)*32+i]>>4:p[48+(sb/2)*32+i])&15;int q=qlo|(((p[16+i]>>sb)&1)<<4);int ni=n*K+b*256+sb*32+i;dense[ni/4]|=uint32_t(q)<<(8*(ni&3));}}}
+    auto pk=pack_q5k(raw.data(),N,K);auto br=makeBufferU32(gpu,"Raw",pk.data.data(),(int)pk.data.size()),bd=makeBufferU32(gpu,"Dense",nullptr,(int)dense.size()),bs=makeBuffer(gpu,"ScaleMin",nullptr,(int)sm.size()),p=makeParams(gpu,"P",{K,N,pk.nBlocks,pk.rowStrideWords});
+    auto bytes=dispatchAndReadback(gpu,wgsl,{{0,br},{1,bd},{2,bs},{3,p}},ceilDiv(N*(K/32),256),1,1,bd,dense.size()*4,4);if(memcmp(bytes.data(),dense.data(),bytes.size())!=0)return{false,"Q5 dense byte layout mismatch"};
+    auto scaleBytes=dispatchAndReadback(gpu,wgsl,{{0,br},{1,bd},{2,bs},{3,p}},ceilDiv(N*(K/32),256),1,1,bs,sm.size()*4,4);return assertClose((const float*)scaleBytes.data(),sm.data(),(int)sm.size(),1e-6f,1e-6f);
+}
+
 TEST(q4k_ort_tile64_reference) {
     std::string mm=q4kOrtRepackedTileTestSource();if(mm.empty())return{false,"cannot adapt ORT tile"};
     const int M=64,N=64,K=256,NB=1;Rng rng(0x4A64);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*144);
@@ -2030,6 +2048,15 @@ TEST(q4k_ort_tile64_reference) {
     auto p=makeParams(gpu,"P",{1,M,N,K,K/8,K/16,1,1,pk.rowStrideWords,0});
     auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bsm},{4,by},{5,p}},1,1,1,by,M*N*4,6);
     return assertClose((const float*)r.data(),expected.data(),M*N,5e-3f,5e-3f);
+}
+
+TEST(q5k_ort_tile64_reference) {
+    auto repack=loadWgsl("quant_kq","q5k_repack_ort_dense");std::string mm=q5kOrtRepackedTileTestSource();if(repack.empty()||mm.empty())return{false,"cannot load Q5 dense tile"};
+    const int M=64,N=64,K=256;Rng rng(0x5A64);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*176);for(int n=0;n<N;n++){uint8_t*p=raw.data()+n*176;uint16_t d=f32ToF16(.02f+.0002f*n),dm=f32ToF16(.01f+.0001f*n);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<176;j++)p[j]=uint8_t(n*31+j*17);}
+    auto pk=pack_q5k(raw.data(),N,K);std::vector<float>dq(N*K),xq(M*K),expected(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q5_K);for(int m=0;m<M;m++)for(int b=0;b<K/32;b++){float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[m*K+b*32+j]));float sc=amax/127.0f;for(int j=0;j<32;j++){int q=sc==0?0:std::max(-127,std::min(127,(int)std::round(x[m*K+b*32+j]/sc)));xq[m*K+b*32+j]=q*sc;}}for(int m=0;m<M;m++)for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[m*N+n]+=xq[m*K+k]*dq[n*K+k];
+    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bas=makeBuffer(gpu,"XS",nullptr,M*K/32),br=makeBufferU32(gpu,"Raw",pk.data.data(),(int)pk.data.size()),bw=makeBufferU32(gpu,"W",nullptr,N*K/4),bsm=makeBuffer(gpu,"SM",nullptr,N*(K/32)*2),by=makeBuffer(gpu,"Y",nullptr,M*N),qp=makeParams(gpu,"QP",{K,N,M,pk.nBlocks,pk.rowStrideWords});
+    dispatchAndReadback(gpu,WGSL_Q8_QUANTIZE_BATCHED_DP4A,{{0,bx},{1,bq},{2,bas},{3,qp}},1,M,1,bq,M*K,4);auto rp=makeParams(gpu,"RP",{K,N,pk.nBlocks,pk.rowStrideWords});dispatchAndReadback(gpu,repack,{{0,br},{1,bw},{2,bsm},{3,rp}},ceilDiv(N*(K/32),256),1,1,bw,N*K,4);
+    auto p=makeParams(gpu,"P",{1,M,N,K,K/8,K/16,1,1,0,0});auto bytes=dispatchAndReadback(gpu,mm,{{0,bq},{1,bas},{2,bw},{3,bsm},{4,by},{5,p}},1,1,1,by,M*N*4,6);return assertClose((const float*)bytes.data(),expected.data(),M*N,5e-3f,5e-3f);
 }
 
 TEST(ort_dp4a_tile64_upstream_reference) {
