@@ -400,6 +400,7 @@ struct ModelRunner {
     bool hasBatchedPrefill() const {
         return pfCache.ready || gemmaPf.ready || qwen35Pf.ready;
     }
+    bool qwenPrefillPlanCacheEnabled() const;
     void destroy();
 
     // ─── MTP (Multi-Token Prediction) ────────────────────────────────────

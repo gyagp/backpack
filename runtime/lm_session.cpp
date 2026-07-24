@@ -1897,7 +1897,9 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         // so use a minimal warmup (single token) when batched prefill is unavailable
         // Match ORT reused-generator benchmarking: materialize the exact
         // shape-specific Qwen prefill plan before timing it.
-        int warmupT = st->runner.hasBatchedPrefill() ? promptLen : 1;
+        int warmupT = st->runner.qwenPrefillPlanCacheEnabled()
+            ? promptLen
+            : (st->runner.hasBatchedPrefill() ? std::min(promptLen, 32) : 1);
         std::vector<int32_t> w(warmupT, 0);
         int32_t t = st->runner.prefillBatched(w.data(), (uint32_t)w.size(), 0);
         st->runner.seedDecodeTokenInputs(t);

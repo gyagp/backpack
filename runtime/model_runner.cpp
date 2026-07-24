@@ -6595,6 +6595,11 @@ void ModelRunner::destroy() {
     }
 }
 
+bool ModelRunner::qwenPrefillPlanCacheEnabled() const {
+    return gpu && gpu->adapterName.find("NVIDIA") != std::string::npos &&
+           std::getenv("BP_QWEN_DISABLE_PREFILL_PLAN_CACHE") == nullptr;
+}
+
 // ─── Inference ───────────────────────────────────────────────────────────────
 
 void ModelRunner::uploadEmbedding(int32_t tokenId) {
@@ -7168,9 +7173,14 @@ int32_t ModelRunner::prefillQwen35Batched(
     double buildMs=0.0,submitMs=0.0,cleanupMs=0.0;
     const bool traceQpf=std::getenv("BP_PROFILE_QWEN_PREFILL")!=nullptr;
     if(traceQpf){fprintf(stderr,"[qwen-prefill] enter T=%u\n",T);fflush(stderr);}
+    // Command replay is a measured NVIDIA optimization.  Retaining and
+    // replaying this large bind-group/dispatch set regresses Intel Arc Qwen
+    // 4B prefill substantially, so keep the portable build/submit path on
+    // every other adapter until it independently clears the device gate.
+    const bool qwenPlanCacheEnabled = qwenPrefillPlanCacheEnabled();
     const uint32_t initialCacheLen=kvCache.empty()?0:kvCache[0].len;
     const bool replayPlan=qwen35PrefillPlan.ready&&
-        std::getenv("BP_QWEN_DISABLE_PREFILL_PLAN_CACHE")==nullptr&&
+        qwenPlanCacheEnabled&&
         !profiler&&T==qwen35PrefillPlan.tokens&&
         posOffset==qwen35PrefillPlan.posOffset&&
         initialCacheLen==qwen35PrefillPlan.cacheLen&&T<=qwen35Pf.capacity;
@@ -7462,7 +7472,7 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(softcapPipeline&&softcapBG)ds.push_back({softcapPipeline,softcapBG,softcapDispatchX,1,1,"softcap"});
             ds.push_back(allDecodeDispatches[argmaxDispatchIndex]);ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
             gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
-            const bool capturePlan=std::getenv("BP_QWEN_DISABLE_PREFILL_PLAN_CACHE")==nullptr&&
+            const bool capturePlan=qwenPlanCacheEnabled&&
                 !profiler&&done==0&&M==T&&posOffset==0&&cacheLen==0;
             if(capturePlan){
                 for(auto bg:qwen35PrefillPlan.bindGroups)
