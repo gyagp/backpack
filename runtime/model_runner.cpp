@@ -5334,16 +5334,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cfg.arch == "qwen35") {
         const bool forceFast = std::getenv("BP_QWEN35_FORCE_FAST_PREFILL") != nullptr;
         const bool forceSerial = std::getenv("BP_QWEN35_SERIAL_PREFILL") != nullptr;
-        const bool validatedGguf4B = modelFormat == "gguf" &&
-            cfg.ssmTimeStepRank == 32u &&
-            (gpu->adapterName.find("NVIDIA") != std::string::npos ||
-             gpu->adapterName.find("AMD") != std::string::npos ||
-             gpu->adapterName.find("Intel") != std::string::npos);
-        qwen35FastPrefill = !forceSerial && (forceFast || validatedGguf4B);
+        const bool intelAdapter=gpu->adapterName.find("Intel")!=std::string::npos;
+        const bool validatedGguf = modelFormat == "gguf" &&
+            ((cfg.ssmTimeStepRank == 32u &&
+              (gpu->adapterName.find("NVIDIA") != std::string::npos ||
+               gpu->adapterName.find("AMD") != std::string::npos || intelAdapter)) ||
+             (cfg.ssmTimeStepRank == 16u && intelAdapter));
+        qwen35FastPrefill = !forceSerial && (forceFast || validatedGguf);
         if (qwen35FastPrefill) {
             initQwen35PrefillResources();
             fprintf(stderr, "  Prefill: Qwen3.5 precise batched path (%s)\n",
-                    forceFast && !validatedGguf4B ? "experimental override" : "validated tuple");
+                    forceFast && !validatedGguf ? "experimental override" : "validated tuple");
         } else {
             fprintf(stderr, "  Prefill: Qwen3.5 serial path\n");
         }
