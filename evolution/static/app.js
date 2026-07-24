@@ -2254,6 +2254,52 @@ function validPerformanceObservations(items) {
       );
   });
 }
+function performanceGraphCapture(row) {
+  const value = row.metrics?.graph_capture ?? row.conformance_details?.graph_capture;
+  if (typeof value === "boolean") return value ? "enabled" : "disabled";
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("_", " ");
+  if (["enabled", "enable", "on", "true", "yes"].includes(normalized))
+    return "enabled";
+  if (["disabled", "disable", "off", "false", "no"].includes(normalized))
+    return "disabled";
+  if (["not applicable", "n/a", "na"].includes(normalized))
+    return "not_applicable";
+  return null;
+}
+function performanceBenchmarkSignature(row) {
+  const number = (...values) => {
+    const value = values.find(
+      (candidate) =>
+        typeof candidate === "number" && Number.isFinite(candidate),
+    );
+    return value == null ? null : Math.trunc(value);
+  };
+  const prompt = number(row.metrics?.prompt_tokens, row.metrics?.prompt_length),
+    generated = number(
+      row.metrics?.generated_tokens,
+      row.metrics?.decode_tokens,
+      row.metrics?.generation_tokens,
+      row.metrics?.generation_length,
+    ),
+    capture = performanceGraphCapture(row),
+    needsCapture = ["onnx", "ort"].includes(
+      String(row.format || "").toLowerCase(),
+    );
+  if (prompt == null || generated == null || (needsCapture && capture == null))
+    return null;
+  return { prompt, generated, capture: capture || "not_applicable" };
+}
+function comparableStatusTrendObservations(items) {
+  return validPerformanceObservations(items).filter((row) => {
+    const signature = performanceBenchmarkSignature(row);
+    // The status trend is the standardized, like-for-like 128/64 benchmark.
+    // Other shapes remain in raw history but must never share this polyline.
+    return signature?.prompt === 128 && signature.generated === 64;
+  });
+}
 function renderPerformanceTrend(observations) {
   trendObservations = observations || trendObservations;
   const el = $("#performance-trend");
@@ -2261,7 +2307,7 @@ function renderPerformanceTrend(observations) {
   const machineMap = new Map(
       validationRows.map((r) => [r.machine.id, r.machine.name]),
     ),
-    measured = validPerformanceObservations(trendObservations).filter(
+    measured = comparableStatusTrendObservations(trendObservations).filter(
       (x) => x.model_id === activeStatusModel,
     ),
     devices = [...new Set(measured.map((x) => x.machine_id))].filter((x) =>
@@ -2336,7 +2382,8 @@ function renderStatusTrendChart(observations, machineMap) {
     daily = new Map();
   for (const row of rawRows) {
     const day = new Date(row.time).toISOString().slice(0, 10),
-      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${day}`;
+      signature = performanceBenchmarkSignature(row),
+      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${signature.capture}|${day}`;
     daily.set(key, {
       ...row,
       sample_time: row.time,
@@ -2346,7 +2393,8 @@ function renderStatusTrendChart(observations, machineMap) {
   const rows = [...daily.values()].sort((a, b) => a.time - b.time),
     groups = new Map();
   for (const row of rows) {
-    const key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}`;
+    const signature = performanceBenchmarkSignature(row),
+      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${signature.capture}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
@@ -2467,13 +2515,15 @@ function renderStatusTrendChart(observations, machineMap) {
     daily = new Map();
   for (const row of raw) {
     const day = new Date(row.time).toISOString().slice(0, 10),
-      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${day}`;
+      signature = performanceBenchmarkSignature(row),
+      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${signature.capture}|${day}`;
     daily.set(key, { ...row, time: Date.parse(`${day}T00:00:00Z`) });
   }
   const rows = [...daily.values()].sort((a, b) => a.time - b.time),
     groups = new Map();
   for (const row of rows) {
-    const key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}`;
+    const signature = performanceBenchmarkSignature(row),
+      key = `${row.machine_id}|${statusTrendRuntime(row)}|${row.metric}|${signature.capture}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
@@ -2504,8 +2554,14 @@ function renderStatusTrendChart(observations, machineMap) {
       "#be123c",
     ],
     allSeries = [...groups.values()],
-    label = (data) =>
-      `${statusTrendRuntimeLabel(statusTrendRuntime(data[0]))} · ${data[0].metric === "prefill_tok_s" ? "Prefill" : "Decode"}`;
+    label = (data) => {
+      const signature = performanceBenchmarkSignature(data[0]),
+        capture =
+          signature.capture === "not_applicable"
+            ? ""
+            : ` · graph capture ${signature.capture}`;
+      return `${statusTrendRuntimeLabel(statusTrendRuntime(data[0]))} · ${data[0].metric === "prefill_tok_s" ? "Prefill" : "Decode"}${capture}`;
+    };
   const chart = (deviceId) => {
     const deviceRows = rows.filter((row) => row.machine_id === deviceId),
       series = allSeries.filter((data) => data[0].machine_id === deviceId),
