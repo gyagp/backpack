@@ -155,6 +155,8 @@ struct ModelRunner {
         GPUBuffer qOnlyQ4W, qOnlyQ4S, qOnlyQ4Z;
         // K-quant: single buffer per weight (raw block data as u32)
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
+        GPUBuffer qkvQ4Dense, qkvQ4ScaleMin, oQ4Dense, oQ4ScaleMin;
+        GPUBuffer guQ4Dense, guQ4ScaleMin, dnQ4Dense, dnQ4ScaleMin;
         GGUFType qkvKQType = (GGUFType)UINT32_MAX, oKQType = (GGUFType)UINT32_MAX;
         GGUFType guKQType = (GGUFType)UINT32_MAX, dnKQType = (GGUFType)UINT32_MAX;
         uint32_t qkvKQNBlocks = 0, qkvKQRowStride = 0;
@@ -200,6 +202,8 @@ struct ModelRunner {
         GPUBuffer kSepW, kSepS; // K alone (size [kvDim, E])
         GPUBuffer vSepW, vSepS; // V alone (size [kvDim, E])
         GPUBuffer qjKQ, kSepKQ, vSepKQ;
+        GPUBuffer qjQ4Dense, qjQ4ScaleMin, kSepQ4Dense, kSepQ4ScaleMin;
+        GPUBuffer vSepQ4Dense, vSepQ4ScaleMin;
         GGUFType qjKQType = (GGUFType)UINT32_MAX;
         GGUFType kSepKQType = (GGUFType)UINT32_MAX;
         GGUFType vSepKQType = (GGUFType)UINT32_MAX;
