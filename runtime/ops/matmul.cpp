@@ -435,7 +435,8 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             (K % 128u) == 0u && (N % 64u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups &&
-            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+            (ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos ||
+             ex.getGpu()->adapterName.find("Intel") != std::string::npos) &&
             !std::getenv("BP_QWEN_Q4_DISABLE_ORT_PREFILL");
         if (useOrtDp4aPrefill) {
             GpuTensor xq = ex.AllocTensor({M, (int64_t)K / 4}, TensorDtype::Int32);
