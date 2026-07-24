@@ -2006,6 +2006,18 @@ fn main(@builtin(global_invocation_id)gid:vec3<u32>){let flat=gid.x;let N=P[0];l
     return assertClose((const float*)r.data(),expected.data(),N*K,1e-6f,1e-6f);
 }
 
+TEST(q4k_gpu_repack_ort_dense_reference) {
+    auto wgsl=loadWgsl("quant_kq","q4k_repack_ort_dense");if(wgsl.empty())return{false,"cannot load repack kernel"};
+    const int N=67,K=512,NB=K/256;std::vector<uint8_t>raw(N*NB*144);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}
+    auto rawPacked=pack_q4k(raw.data(),N,K);auto expected=repack_q4k_dense(raw.data(),N,K);
+    auto br=makeBufferU32(gpu,"Raw",rawPacked.data.data(),(int)rawPacked.data.size()),bd=makeBufferU32(gpu,"Dense",nullptr,(int)expected.weights.size()),bs=makeBuffer(gpu,"ScaleMin",nullptr,(int)expected.scalesMins.size()),p=makeParams(gpu,"P",{K,N,rawPacked.nBlocks,rawPacked.rowStrideWords});
+    auto bytes=dispatchAndReadback(gpu,wgsl,{{0,br},{1,bd},{2,bs},{3,p}},ceilDiv(N*(K/32),256),1,1,bd,expected.weights.size()*4,4);
+    if(memcmp(bytes.data(),expected.weights.data(),bytes.size())!=0)return{false,"dense nibble layout mismatch"};
+    auto scaleBytes=dispatchAndReadback(gpu,wgsl,{{0,br},{1,bd},{2,bs},{3,p}},ceilDiv(N*(K/32),256),1,1,bs,expected.scalesMins.size()*4,4);
+    return assertClose((const float*)scaleBytes.data(),expected.scalesMins.data(),(int)expected.scalesMins.size(),1e-6f,1e-6f);
+}
+
 TEST(q4k_ort_tile64_reference) {
     std::string mm=q4kOrtRepackedTileTestSource();if(mm.empty())return{false,"cannot adapt ORT tile"};
     const int M=64,N=64,K=256,NB=1;Rng rng(0x4A64);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*144);
