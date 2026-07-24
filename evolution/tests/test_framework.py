@@ -259,8 +259,17 @@ class FrameworkTest(unittest.TestCase):
         self.store.add_observation({
             "model_id": model["id"], "machine_id": self.machine["id"],
             "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
+            "conformance": "pass", "revision": "old-shape",
+            "metrics": {"prefill_tok_s": 999, "decode_tok_s": 999,
+                        "prompt_tokens": 128, "generated_tokens": 64},
+        }, "test")
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
+        self.store.add_observation({
+            "model_id": model["id"], "machine_id": self.machine["id"],
+            "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
             "conformance": "pass", "revision": "b1",
-            "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20},
+            "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20,
+                        "prompt_tokens": 512, "generated_tokens": 128},
         }, "test")
         self.assertEqual(1, self.store.reconcile_completed_tasks())
         self.assertEqual("integrated", self.store.get_task(task["id"])["state"])
@@ -283,7 +292,8 @@ class FrameworkTest(unittest.TestCase):
             "model_id": model["id"], "machine_id": self.machine["id"],
             "framework": "ort", "format": "ort", "backend": "webgpu",
             "conformance": "pass", "revision": "source-build",
-            "metrics": {"prefill_tok_s": 500, "decode_tok_s": 25},
+            "metrics": {"prefill_tok_s": 500, "decode_tok_s": 25,
+                        "prompt_tokens": 512, "generated_tokens": 128},
         }, "test")
 
         self.assertEqual(0, self.store.reconcile_completed_tasks())
@@ -292,7 +302,8 @@ class FrameworkTest(unittest.TestCase):
             "framework": "ort", "format": "ort", "backend": "webgpu",
             "conformance": "pass", "revision": "source-build",
             "conformance_details": {"source": f"benchmark task {task['id']}"},
-            "metrics": {"prefill_tok_s": 505, "decode_tok_s": 26},
+            "metrics": {"prefill_tok_s": 505, "decode_tok_s": 26,
+                        "prompt_tokens": 512, "generated_tokens": 128},
         }, "test")
         self.assertEqual("proposed", self.store.get_task(task["id"])["state"])
         run = self.store.list_runs(task["id"])[0]

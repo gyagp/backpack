@@ -977,6 +977,8 @@ class Store:
                 runtimes = manifest.get("runtimes") or []
                 valid = bool(model_id and machine_id and runtimes)
                 requires_own_run = origin.get("type") != "automatic"
+                expected_prompt = int(manifest.get("prompt_tokens", STATUS_PROMPT_TOKENS))
+                expected_generated = int(manifest.get("generated_tokens", STATUS_GENERATED_TOKENS))
                 for runtime in runtimes:
                     backend = runtime.get("backend")
                     if backend in {"d3d12", "webgpu-native"}:
@@ -986,9 +988,14 @@ class Store:
                                               runtime.get("format"), backend))
                     metrics = observation.get("metrics", {}) if observation else {}
                     source = str((observation or {}).get("conformance_details", {}).get("source", ""))
+                    prompt = metrics.get("prompt_tokens", metrics.get("prompt_length"))
+                    generated = metrics.get("generated_tokens", metrics.get("decode_tokens",
+                                metrics.get("generation_tokens", metrics.get("generation_length"))))
                     valid = valid and bool(observation and observation.get("conformance") == "pass"
                                            and metrics.get("prefill_tok_s") is not None
                                            and metrics.get("decode_tok_s") is not None
+                                           and prompt == expected_prompt
+                                           and generated == expected_generated
                                            and (not requires_own_run or task["id"] in source))
                 if requires_own_run:
                     runs = self.list_runs(task["id"])
