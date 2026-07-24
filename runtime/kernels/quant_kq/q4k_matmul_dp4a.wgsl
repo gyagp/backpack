@@ -11,6 +11,19 @@ const QK_K: u32 = 256u;
 const BLOCK_WORDS: u32 = 36u;
 var<workgroup> xq: array<u32, 64>;
 var<workgroup> xs: array<f32, 8>;
+var<workgroup> reduce_scratch: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    reduce_scratch[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[(tid / 32u) * 32u];
+}
 
 fn u8_at(base: u32, off: u32) -> u32 {
     return (W[base + off / 4u] >> ((off & 3u) * 8u)) & 255u;
@@ -95,7 +108,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let total = subgroupAdd(acc);
+    let total = reduce32(acc, tid);
     if (lane == 0u && col < N) {
         Y[row * N + col] = total + Bias[col];
     }

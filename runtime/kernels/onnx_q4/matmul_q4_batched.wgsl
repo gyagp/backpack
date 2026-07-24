@@ -19,6 +19,19 @@ const COLS_PER_WARP: u32 = 4u;
 
 var<workgroup> xq: array<u32, ROWS * 64u>;
 var<workgroup> xs: array<f32, ROWS * 8u>;
+var<workgroup> reduce_scratch: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    reduce_scratch[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[(tid / 32u) * 32u];
+}
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -100,7 +113,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     for (var c = 0u; c < COLS_PER_WARP; c++) {
         for (var r = 0u; r < ROWS; r++) {
-            let sum = subgroupAdd(acc[c * ROWS + r]);
+            let sum = reduce32(acc[c * ROWS + r], tid);
             if (lane == 0u && valid[c]) {
                 let row = row0 + r;
                 if (row < M) { Y[row * N + cols[c]] = sum; }

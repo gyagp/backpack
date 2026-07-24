@@ -1,5 +1,4 @@
 // @meta bindings=7
-enable subgroups;
 
 // Gemma sandwich attention epilogue, one workgroup per prompt row:
 //   A = RMSNorm(A, post_attn_weight)
@@ -14,18 +13,16 @@ enable subgroups;
 @group(0) @binding(5) var<storage, read_write> Rstd: array<f32>;
 @group(0) @binding(6) var<storage, read> P: array<u32>;
 
-var<workgroup> sums: array<f32, 8>;
+var<workgroup> sums: array<f32, 256>;
 
 fn reduce_sum(v: f32, tid: u32) -> f32 {
-    let lane = tid & 31u;
-    let warp = tid / 32u;
-    let ws = subgroupAdd(v);
-    if (lane == 0u) { sums[warp] = ws; }
+    sums[tid] = v;
     workgroupBarrier();
-    var total = 0.0;
-    for (var i = 0u; i < 8u; i++) { total += sums[i]; }
-    workgroupBarrier();
-    return total;
+    for (var offset = 128u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) { sums[tid] += sums[tid + offset]; }
+        workgroupBarrier();
+    }
+    return sums[0];
 }
 
 @compute @workgroup_size(256)

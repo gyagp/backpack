@@ -1,5 +1,4 @@
 requires packed_4x8_integer_dot_product;
-enable subgroups;
 
 // Q4_K matvec over an activation quantized once by q8_quantize_dp4a.
 // Each workgroup produces eight output rows (one per subgroup). Keeping one
@@ -16,6 +15,19 @@ const BLOCK_WORDS: u32 = 36u;
 const COLS_PER_WARP: u32 = 1u;
 var<workgroup> xq: array<u32, 64>;
 var<workgroup> xs: array<f32, 8>;
+var<workgroup> reduce_scratch: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    reduce_scratch[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[(tid / 32u) * 32u];
+}
 
 fn u8_at(base: u32, off: u32) -> u32 {
     return (W[base + off / 4u] >> ((off & 3u) * 8u)) & 255u;
@@ -92,7 +104,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
 
     for (var c = 0u; c < COLS_PER_WARP; c++) {
-        let total = subgroupAdd(acc[c]);
+        let total = reduce32(acc[c], tid);
         if (lane == 0u && valid[c]) {
             Y[cols[c]] = total + Bias[cols[c]];
         }

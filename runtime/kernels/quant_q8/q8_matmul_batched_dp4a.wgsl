@@ -11,7 +11,8 @@ enable subgroups;
 @group(0) @binding(4) var<storage,read_write>Y:array<f32>;
 @group(0) @binding(5) var<storage,read>P:array<u32>;
 const ROWS:u32=4u;const COLS:u32=4u;const BK:u32=256u;
-var<workgroup>xq:array<u32,256>;var<workgroup>xs:array<f32,32>;
+var<workgroup>xq:array<u32,256>;var<workgroup>xs:array<f32,32>;var<workgroup>reduce_scratch:array<f32,256>;
+fn reduce32(v:f32,tid:u32)->f32{reduce_scratch[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){reduce_scratch[tid]+=reduce_scratch[tid+off];}workgroupBarrier();}return reduce_scratch[(tid/32u)*32u];}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
  let K=P[0];let N=P[1];let M=P[2];let tid=lid.x;let warp=tid/32u;let lane=tid&31u;let row0=wid.x*ROWS;
@@ -26,6 +27,6 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
   for(var c=0u;c<COLS;c++){if(valid[c]){let col=cols[c];let off=col*words+kb/4u+lane*2u;let w0=W[off];let w1=W[off+1u];let si=col*blocks+wb;let sp=unpack2x16float(S[si/2u]);let ws=select(sp.x,sp.y,(si&1u)!=0u);
     for(var r=0u;r<ROWS;r++){let base=r*64u+lane*2u;let d=dot4I8Packed(xq[base],w0)+dot4I8Packed(xq[base+1u],w1);acc[c*ROWS+r]+=f32(d)*ws*xs[r*8u+xb];}}}workgroupBarrier();}
  for(var c=0u;c<COLS;c++){
-  for(var r=0u;r<ROWS;r++){let sum=subgroupAdd(acc[c*ROWS+r]);if(lane==0u&&valid[c]){let row=row0+r;if(row<M){Y[row*N+cols[c]]=sum+Bias[cols[c]];}}}
+  for(var r=0u;r<ROWS;r++){let sum=reduce32(acc[c*ROWS+r],tid);if(lane==0u&&valid[c]){let row=row0+r;if(row<M){Y[row*N+cols[c]]=sum+Bias[cols[c]];}}}
  }
 }

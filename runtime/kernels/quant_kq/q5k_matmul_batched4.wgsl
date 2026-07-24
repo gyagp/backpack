@@ -1,10 +1,10 @@
-enable subgroups;
 @group(0) @binding(0)var<storage,read>X:array<f32>;
 @group(0) @binding(1)var<storage,read>W:array<u32>;
 @group(0) @binding(2)var<storage,read>B:array<f32>;
 @group(0) @binding(3)var<storage,read_write>Y:array<f32>;
 @group(0) @binding(4)var<storage,read>P:array<u32>;
 var<workgroup>sx:array<f32,1024>;
+fn reduce32(v:f32,tid:u32)->f32{sx[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sx[tid]+=sx[tid+off];}workgroupBarrier();}return sx[(tid/32u)*32u];}
 fn u8at(b:u32,o:u32)->u32{let a=b+o;return(W[a/4u]>>((a&3u)*8u))&255u;}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
@@ -19,5 +19,5 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    }
   }workgroupBarrier();
  }
- for(var m=0u;m<4u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
+ for(var m=0u;m<4u;m++){let s=reduce32(acc[m],tid);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
 }

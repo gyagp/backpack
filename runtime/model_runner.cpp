@@ -81,51 +81,11 @@ fn reduce128(x: f32, lane128: u32, pair: u32) -> f32 {
     return result;
 }
 
-std::string q4kBatched8PortableSource(const char* source) {
-    // The fast kernel maps one output column to each logical 32-lane group.
-    // subgroupAdd combines two columns on AMD wave64, so reduce each logical
-    // group explicitly while retaining eight-row Q4_K weight reuse.
-    std::string result(source);
-    const std::string subgroupEnable = "enable subgroups;\n";
-    if (auto pos = result.find(subgroupEnable); pos != std::string::npos)
-        result.erase(pos, subgroupEnable.size());
-
-    const std::string subgroupReduction =
-        " for(var m=0u;m<8u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}";
-    const std::string portableReduction =
-        " for(var m=0u;m<8u;m++){sx[m*256u+tid]=acc[m];}workgroupBarrier();"
-        " for(var off=16u;off>0u;off=off/2u){if(lane<off){for(var m=0u;m<8u;m++){sx[m*256u+tid]+=sx[m*256u+tid+off];}}workgroupBarrier();}"
-        " if(lane==0u&&col<N){for(var m=0u;m<8u;m++){if(m0+m<M){Y[(m0+m)*N+col]=sx[m*256u+warp*32u]+B[col];}}}";
-    if (auto pos = result.find(subgroupReduction); pos != std::string::npos)
-        result.replace(pos, subgroupReduction.size(), portableReduction);
-    return result;
-}
-
-std::string kqPrequantBatchedPortableReductionSource(const char* source) {
-    // Q4_K/Q5_K prefill assigns one output column to each logical 32-lane
-    // group. subgroupAdd spans the full AMD wave64 and mixes adjacent columns,
-    // so reduce each logical group explicitly in the shader's existing
-    // 256-element scratch array. No subgroup matrix support is used.
-    std::string result(source);
-    const std::string q4 =
-        "for(var m=0u;m<8u;m++){let total=subgroupAdd(acc[m]);let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}}";
-    const std::string portable =
-        "for(var m=0u;m<8u;m++){sxsum[tid]=acc[m];workgroupBarrier();"
-        "for(var off=16u;off>0u;off=off/2u){if(lane<off){sxsum[tid]+=sxsum[tid+off];}workgroupBarrier();}"
-        "let total=sxsum[warp*32u];let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}workgroupBarrier();}";
-    auto pos = result.find(q4);
-    if (pos == std::string::npos) {
-        fprintf(stderr, "K-quant portable prefill reduction transform failed\n");
-        std::abort();
-    }
-    result.replace(pos, q4.size(), portable);
-    return result;
-}
-
 std::string kqGlobalActivationSource(const char* source) {
     std::string result(source);
     auto replace=[&](const std::string&from,const std::string&to){auto p=result.find(from);if(p==std::string::npos){fprintf(stderr,"K-quant source transform failed\n");std::abort();}result.replace(p,from.size(),to);};
-    replace("var<workgroup>sxq:array<u32,512>;var<workgroup>sxs:array<f32,64>;var<workgroup>sxsum:array<f32,256>;\n","");
+    replace("var<workgroup>sxq:array<u32,512>;var<workgroup>sxs:array<f32,64>;var<workgroup>sxsum:array<f32,256>;\n",
+            "var<workgroup>sxsum:array<f32,256>;\n");
     replace("  let lm=tid/32u;let ll=tid&31u;let lr=row0+lm;let lq=lm*64u+ll*2u;\n  if(lr<M){let qb=lr*qStride+b*64u+ll*2u;sxq[lq]=XQ[qb];sxq[lq+1u]=XQ[qb+1u];}else{sxq[lq]=0u;sxq[lq+1u]=0u;}\n  if(tid<64u){let sm=tid/8u;let ss=tid&7u;let sr=row0+sm;if(sr<M){sxs[tid]=XS[sr*sStride+b*8u+ss];}else{sxs[tid]=0.0;}}\n  workgroupBarrier();let sa0=sxq[lq];let sa1=sxq[lq+1u];sxsum[tid]=f32(dot4I8Packed(sa0,0x01010101u)+dot4I8Packed(sa1,0x01010101u));workgroupBarrier();\n  if(col<N){",
             "  if(col<N){");
     replace("   let aq0=sxq[m*64u+lane*2u];let aq1=sxq[m*64u+lane*2u+1u];let asum=sxsum[m*32u+lane];",
@@ -388,56 +348,6 @@ const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
         if (patched) {
             source.insert(0, "enable subgroups;\n");
             return gpu->getOrCreatePipeline(name + "_subgroup32", source,
-                                             it->second.numBindings);
-        }
-    }
-    // AMD exposes wave64 here, while these kernels map one output column to
-    // each logical 32-lane half. subgroupAdd therefore mixes adjacent logits.
-    // XOR masks 16..1 reduce each half independently and retain the packed-dot
-    // arithmetic used by the NVIDIA/Intel path.
-    if (gpu->supportsSubgroups &&
-        (adapter.find("amd") != std::string::npos ||
-         adapter.find("radeon") != std::string::npos) &&
-        (name == "q4k_matmul_dp4a" ||
-         name == "q4k_matmul_prequant_dp4a")) {
-        std::string source = it->second.source;
-        if (name == "q4k_matmul_prequant_dp4a") {
-            // llama.cpp's Vulkan quantized matvec keeps the prequantized
-            // activation fragment in subgroup-local registers.  On AMD this
-            // trades a few cache-friendly duplicate reads for eliminating
-            // two workgroup-wide barriers per Q4_K block.
-            auto replaceOnce = [&](const std::string& from,
-                                   const std::string& to) {
-                const size_t at = source.find(from);
-                if (at != std::string::npos) source.replace(at, from.size(), to);
-            };
-            replaceOnce(
-                "        if (tid < 64u) { xq[tid] = XQ[b * 64u + tid]; }\n"
-                "        if (tid < 8u) { xs[tid] = XS[b * 8u + tid]; }\n"
-                "        workgroupBarrier();\n", "");
-            replaceOnce("        let aq0 = xq[lane * 2u];\n"
-                        "        let aq1 = xq[lane * 2u + 1u];",
-                        "        let aq0 = XQ[b * 64u + lane * 2u];\n"
-                        "        let aq1 = XQ[b * 64u + lane * 2u + 1u];\n"
-                        "        let xscale = XS[b * 8u + sb];");
-            replaceOnce("acc[c] += xs[sb] *", "acc[c] += xscale *");
-            replaceOnce("        workgroupBarrier();\n    }", "    }");
-        }
-        const std::string from = name == "q4k_matmul_dp4a"
-            ? "let total = subgroupAdd(acc);"
-            : "let total = subgroupAdd(acc[c]);";
-        const std::string initial = name == "q4k_matmul_dp4a"
-            ? "var total = acc;" : "var total = acc[c];";
-        const std::string to = initial +
-            "\n        total += subgroupShuffleXor(total, 16u);"
-            "\n        total += subgroupShuffleXor(total, 8u);"
-            "\n        total += subgroupShuffleXor(total, 4u);"
-            "\n        total += subgroupShuffleXor(total, 2u);"
-            "\n        total += subgroupShuffleXor(total, 1u);";
-        const size_t pos = source.find(from);
-        if (pos != std::string::npos) {
-            source.replace(pos, from.size(), to);
-            return gpu->getOrCreatePipeline(name + "_amd_shuffle32", source,
                                              it->second.numBindings);
         }
     }
@@ -5503,9 +5413,6 @@ void ModelRunner::initQwen35PrefillResources() {
     (void)getKernel("q5k_matmul_prequant_batched_dp4a");
     (void)gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6);
     (void)gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6);
-    if(gpu->adapterName.find("AMD")!=std::string::npos)
-        (void)gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",
-            q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5);
     (void)getKernel("q5k_matmul_batched4");
     (void)getKernel("q6k_matmul_batched4");
     (void)getKernel("qwen35_conv_scan_silu");(void)getKernel("qwen35_split_qkv_l2_batched");
@@ -7011,15 +6918,13 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool useAmdPortableQ4=gpu->adapterName.find("AMD")!=std::string::npos&&
             (!portableEnv||std::strcmp(portableEnv,"0")!=0);
         const CompiledPipeline* amdPortableQ4=useAmdPortableQ4
-            ?&gpu->getOrCreatePipeline("q4k_matmul_batched8_portable",q4kBatched8PortableSource(WGSL_Q4K_MATMUL_BATCHED8),5)
-            :nullptr;
+            ?&getKernel("q4k_matmul_batched8") :nullptr;
         const char* intelRowsEnv=std::getenv("BP_INTEL_Q4K_PREFILL_ROWS");
         const bool useIntelFourRows=cfg.nEmbd>2048&&
             gpu->adapterName.find("Intel")!=std::string::npos&&
             (!intelRowsEnv||std::strcmp(intelRowsEnv,"8")!=0);
         const bool packedQ4Prefill=std::getenv("BP_Q4K_DISABLE_PACKED_PREFILL")==nullptr;
         const bool packedQ5Prefill=std::getenv("BP_Q5K_DISABLE_PACKED_PREFILL")==nullptr;
-        const bool portableAmdKq=gpu->adapterName.find("AMD")!=std::string::npos;
         const bool sharedKq=gpu->adapterName.find("Intel")==std::string::npos&&
             std::getenv("BP_QWEN_DISABLE_SHARED_KQ")==nullptr;
         const bool useOrtQ4Tile=qwen35Pf.q4DenseScratch.handle&&M>=64;
@@ -7073,22 +6978,16 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
-                const auto&kp=portableAmdKq
-                    ?gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_portable",
-                        kqPrequantBatchedPortableReductionSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6)
-                    :(sharedKq?getKernel("q4k_matmul_prequant_batched_dp4a"):
-                      gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6));
+                const auto&kp=sharedKq?getKernel("q4k_matmul_prequant_batched_dp4a"):
+                    gpu->getOrCreatePipeline("q4k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A),6);
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q5_K&&packedQ5Prefill){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
-                const auto&kp=portableAmdKq
-                    ?gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_portable",
-                        kqPrequantBatchedPortableReductionSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6)
-                    :(sharedKq?getKernel("q5k_matmul_prequant_batched_dp4a"):
-                      gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6));
+                const auto&kp=sharedKq?getKernel("q5k_matmul_prequant_batched_dp4a"):
+                    gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6);
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}

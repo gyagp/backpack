@@ -1,5 +1,3 @@
-enable subgroups;
-
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<u32>;
 @group(0) @binding(2) var<storage, read> Bias: array<f32>;
@@ -7,6 +5,16 @@ enable subgroups;
 @group(0) @binding(4) var<storage, read> P: array<u32>;
 
 var<workgroup> sx: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    sx[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) { sx[tid] += sx[tid + offset]; }
+        workgroupBarrier();
+    }
+    return sx[(tid / 32u) * 32u];
+}
 
 fn u8_at(base_byte: u32, off: u32) -> u32 {
     let a = base_byte + off;
@@ -52,7 +60,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
     for(var c=0u;c<2u;c++){
-        let col=col0+c;let sum=subgroupAdd(acc[c]);
+        let col=col0+c;let sum=reduce32(acc[c],tid);
         if(lane==0u&&col<N){Y[wid.x*N+col+yo]=sum+Bias[col];}
     }
 }

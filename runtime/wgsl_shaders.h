@@ -7225,8 +7225,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 // [norm] gemma_sandwich_attn_batched
 static const char* WGSL_GEMMA_SANDWICH_ATTN_BATCHED = R"WGSL(
-enable subgroups;
-
 // Gemma sandwich attention epilogue, one workgroup per prompt row:
 //   A = RMSNorm(A, post_attn_weight)
 //   X += A
@@ -7240,18 +7238,16 @@ enable subgroups;
 @group(0) @binding(5) var<storage, read_write> Rstd: array<f32>;
 @group(0) @binding(6) var<storage, read> P: array<u32>;
 
-var<workgroup> sums: array<f32, 8>;
+var<workgroup> sums: array<f32, 256>;
 
 fn reduce_sum(v: f32, tid: u32) -> f32 {
-    let lane = tid & 31u;
-    let warp = tid / 32u;
-    let ws = subgroupAdd(v);
-    if (lane == 0u) { sums[warp] = ws; }
+    sums[tid] = v;
     workgroupBarrier();
-    var total = 0.0;
-    for (var i = 0u; i < 8u; i++) { total += sums[i]; }
-    workgroupBarrier();
-    return total;
+    for (var offset = 128u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) { sums[tid] += sums[tid + offset]; }
+        workgroupBarrier();
+    }
+    return sums[0];
 }
 
 @compute @workgroup_size(256)
@@ -9231,6 +9227,19 @@ const COLS_PER_WARP: u32 = 4u;
 
 var<workgroup> xq: array<u32, ROWS * 64u>;
 var<workgroup> xs: array<f32, ROWS * 8u>;
+var<workgroup> reduce_scratch: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    reduce_scratch[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[(tid / 32u) * 32u];
+}
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -9312,7 +9321,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     for (var c = 0u; c < COLS_PER_WARP; c++) {
         for (var r = 0u; r < ROWS; r++) {
-            let sum = subgroupAdd(acc[c * ROWS + r]);
+            let sum = reduce32(acc[c * ROWS + r], tid);
             if (lane == 0u && valid[c]) {
                 let row = row0 + r;
                 if (row < M) { Y[row * N + cols[c]] = sum; }
@@ -12897,7 +12906,6 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
 // packed weight fragment is loaded once and reused across the eight-row tile.
 static const char* WGSL_Q4K_MATMUL_PREQUANT_BATCHED_DP4A = R"WGSL(
 requires packed_4x8_integer_dot_product;
-enable subgroups;
 @group(0) @binding(0)var<storage,read>XQ:array<u32>;
 @group(0) @binding(1)var<storage,read>XS:array<f32>;
 @group(0) @binding(2)var<storage,read>W:array<u32>;
@@ -12906,6 +12914,7 @@ enable subgroups;
 @group(0) @binding(5)var<storage,read>P:array<u32>;
 const BLOCK_WORDS:u32=36u;
 var<workgroup>sxq:array<u32,512>;var<workgroup>sxs:array<f32,64>;var<workgroup>sxsum:array<f32,256>;
+fn reduce32(v:f32,tid:u32)->f32{sxsum[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sxsum[tid]+=sxsum[tid+off];}workgroupBarrier();}return sxsum[(tid/32u)*32u];}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
  let tid=lid.x;let warp=tid/32u;let lane=tid&31u;let row0=wid.x*8u;let col=wid.y*8u+warp;
@@ -12929,14 +12938,13 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    acc[m]+=sxs[m*8u+sb]*(dm.x*f32(sc)*f32(dot)-dm.y*f32(mn)*asum);
   }}
  }workgroupBarrier();}
- for(var m=0u;m<8u;m++){let total=subgroupAdd(acc[m]);let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}}
+ for(var m=0u;m<8u;m++){let total=reduce32(acc[m],tid);let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}}
 }
 )WGSL";
 
 // [quant_kq] q4k_matmul_prequant_dp4a
 static const char* WGSL_Q4K_MATMUL_PREQUANT_DP4A = R"WGSL(
 requires packed_4x8_integer_dot_product;
-enable subgroups;
 
 // Q4_K matvec over an activation quantized once by q8_quantize_dp4a.
 // Each workgroup produces eight output rows (one per subgroup). Keeping one
@@ -12953,6 +12961,19 @@ const BLOCK_WORDS: u32 = 36u;
 const COLS_PER_WARP: u32 = 1u;
 var<workgroup> xq: array<u32, 64>;
 var<workgroup> xs: array<f32, 8>;
+var<workgroup> reduce_scratch: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    reduce_scratch[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[(tid / 32u) * 32u];
+}
 
 fn u8_at(base: u32, off: u32) -> u32 {
     return (W[base + off / 4u] >> ((off & 3u) * 8u)) & 255u;
@@ -13029,7 +13050,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
 
     for (var c = 0u; c < COLS_PER_WARP; c++) {
-        let total = subgroupAdd(acc[c]);
+        let total = reduce32(acc[c], tid);
         if (lane == 0u && valid[c]) {
             Y[cols[c]] = total + Bias[cols[c]];
         }
@@ -13104,6 +13125,19 @@ const QK_K: u32 = 256u;
 const BLOCK_WORDS: u32 = 36u;
 var<workgroup> xq: array<u32, 64>;
 var<workgroup> xs: array<f32, 8>;
+var<workgroup> reduce_scratch: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    reduce_scratch[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[(tid / 32u) * 32u];
+}
 
 fn u8_at(base: u32, off: u32) -> u32 {
     return (W[base + off / 4u] >> ((off & 3u) * 8u)) & 255u;
@@ -13188,7 +13222,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
 
-    let total = subgroupAdd(acc);
+    let total = reduce32(acc, tid);
     if (lane == 0u && col < N) {
         Y[row * N + col] = total + Bias[col];
     }
@@ -13317,13 +13351,13 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
 
 // [quant_kq] q4k_matmul_batched4
 static const char* WGSL_Q4K_MATMUL_BATCHED4 = R"WGSL(
-enable subgroups;
 @group(0) @binding(0)var<storage,read>X:array<f32>;
 @group(0) @binding(1)var<storage,read>W:array<u32>;
 @group(0) @binding(2)var<storage,read>B:array<f32>;
 @group(0) @binding(3)var<storage,read_write>Y:array<f32>;
 @group(0) @binding(4)var<storage,read>P:array<u32>;
 var<workgroup>sx:array<f32,1024>;
+fn reduce32(v:f32,tid:u32)->f32{sx[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sx[tid]+=sx[tid+off];}workgroupBarrier();}return sx[(tid/32u)*32u];}
 fn u8at(b:u32,o:u32)->u32{let a=b+o;return(W[a/4u]>>((a&3u)*8u))&255u;}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
@@ -13338,19 +13372,19 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    }
   }workgroupBarrier();
  }
- for(var m=0u;m<4u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
+ for(var m=0u;m<4u;m++){let s=reduce32(acc[m],tid);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
 }
 )WGSL";
 
 // [quant_kq] q4k_matmul_batched8
 static const char* WGSL_Q4K_MATMUL_BATCHED8 = R"WGSL(
-enable subgroups;
 @group(0) @binding(0)var<storage,read>X:array<f32>;
 @group(0) @binding(1)var<storage,read>W:array<u32>;
 @group(0) @binding(2)var<storage,read>B:array<f32>;
 @group(0) @binding(3)var<storage,read_write>Y:array<f32>;
 @group(0) @binding(4)var<storage,read>P:array<u32>;
 var<workgroup>sx:array<f32,2048>;
+fn reduce32(v:f32,tid:u32)->f32{sx[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sx[tid]+=sx[tid+off];}workgroupBarrier();}return sx[(tid/32u)*32u];}
 fn u8at(b:u32,o:u32)->u32{let a=b+o;return(W[a/4u]>>((a&3u)*8u))&255u;}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
@@ -13365,7 +13399,7 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    }
   }workgroupBarrier();
  }
- for(var m=0u;m<8u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
+ for(var m=0u;m<8u;m++){let s=reduce32(acc[m],tid);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
 }
 )WGSL";
 
@@ -13648,13 +13682,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [quant_kq] q5k_matmul_batched4
 static const char* WGSL_Q5K_MATMUL_BATCHED4 = R"WGSL(
-enable subgroups;
 @group(0) @binding(0)var<storage,read>X:array<f32>;
 @group(0) @binding(1)var<storage,read>W:array<u32>;
 @group(0) @binding(2)var<storage,read>B:array<f32>;
 @group(0) @binding(3)var<storage,read_write>Y:array<f32>;
 @group(0) @binding(4)var<storage,read>P:array<u32>;
 var<workgroup>sx:array<f32,1024>;
+fn reduce32(v:f32,tid:u32)->f32{sx[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sx[tid]+=sx[tid+off];}workgroupBarrier();}return sx[(tid/32u)*32u];}
 fn u8at(b:u32,o:u32)->u32{let a=b+o;return(W[a/4u]>>((a&3u)*8u))&255u;}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
@@ -13669,7 +13703,7 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    }
   }workgroupBarrier();
  }
- for(var m=0u;m<4u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
+ for(var m=0u;m<4u;m++){let s=reduce32(acc[m],tid);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
 }
 )WGSL";
 
@@ -13677,7 +13711,6 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
 // share every packed weight fragment, matching the accepted Q4_K row tile.
 static const char* WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A = R"WGSL(
 requires packed_4x8_integer_dot_product;
-enable subgroups;
 @group(0) @binding(0)var<storage,read>XQ:array<u32>;
 @group(0) @binding(1)var<storage,read>XS:array<f32>;
 @group(0) @binding(2)var<storage,read>W:array<u32>;
@@ -13686,6 +13719,7 @@ enable subgroups;
 @group(0) @binding(5)var<storage,read>P:array<u32>;
 const BLOCK_WORDS:u32=44u;
 var<workgroup>sxq:array<u32,512>;var<workgroup>sxs:array<f32,64>;var<workgroup>sxsum:array<f32,256>;
+fn reduce32(v:f32,tid:u32)->f32{sxsum[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sxsum[tid]+=sxsum[tid+off];}workgroupBarrier();}return sxsum[(tid/32u)*32u];}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
  let tid=lid.x;let warp=tid/32u;let lane=tid&31u;let row0=wid.x*8u;let col=wid.y*8u+warp;
@@ -13712,7 +13746,7 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    acc[m]+=sxs[m*8u+sb]*(dm.x*f32(sc)*f32(dot)-dm.y*f32(mn)*asum);
   }}
  }workgroupBarrier();}
- for(var m=0u;m<8u;m++){let total=subgroupAdd(acc[m]);let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}}
+ for(var m=0u;m<8u;m++){let total=reduce32(acc[m],tid);let row=row0+m;if(lane==0u&&col<N&&row<M){Y[row*N+col]=total+Bias[col];}}
 }
 )WGSL";
 
@@ -14322,13 +14356,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>,
 
 // [quant_kq] q6k_matmul_batched4
 static const char* WGSL_Q6K_MATMUL_BATCHED4 = R"WGSL(
-enable subgroups;
 @group(0) @binding(0)var<storage,read>X:array<f32>;
 @group(0) @binding(1)var<storage,read>W:array<u32>;
 @group(0) @binding(2)var<storage,read>B:array<f32>;
 @group(0) @binding(3)var<storage,read_write>Y:array<f32>;
 @group(0) @binding(4)var<storage,read>P:array<u32>;
 var<workgroup>sx:array<f32,1024>;
+fn reduce32(v:f32,tid:u32)->f32{sx[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sx[tid]+=sx[tid+off];}workgroupBarrier();}return sx[(tid/32u)*32u];}
 fn u8at(b:u32,o:u32)->u32{let a=b+o;return(W[a/4u]>>((a&3u)*8u))&255u;}
 fn i8at(b:u32,o:u32)->i32{let u=u8at(b,o);return select(i32(u),i32(u)-256,u>=128u);}
 @compute @workgroup_size(256)
@@ -14345,7 +14379,7 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    }
   }workgroupBarrier();
  }
- for(var m=0u;m<4u;m++){let s=subgroupAdd(acc[m]);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
+ for(var m=0u;m<4u;m++){let s=reduce32(acc[m],tid);if(lane==0u&&col<N&&m0+m<M){Y[(m0+m)*N+col]=s+B[col];}}
 }
 )WGSL";
 
@@ -14495,8 +14529,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 // [quant_kq] q6k_matmul_wide
 static const char* WGSL_Q6K_MATMUL_WIDE = R"WGSL(
-enable subgroups;
-
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<u32>;
 @group(0) @binding(2) var<storage, read> Bias: array<f32>;
@@ -14504,6 +14536,16 @@ enable subgroups;
 @group(0) @binding(4) var<storage, read> P: array<u32>;
 
 var<workgroup> sx: array<f32, 256>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    sx[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) { sx[tid] += sx[tid + offset]; }
+        workgroupBarrier();
+    }
+    return sx[(tid / 32u) * 32u];
+}
 
 fn u8_at(base_byte: u32, off: u32) -> u32 {
     let a = base_byte + off;
@@ -14549,7 +14591,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         workgroupBarrier();
     }
     for(var c=0u;c<2u;c++){
-        let col=col0+c;let sum=subgroupAdd(acc[c]);
+        let col=col0+c;let sum=reduce32(acc[c],tid);
         if(lane==0u&&col<N){Y[wid.x*N+col+yo]=sum+Bias[col];}
     }
 }
@@ -16215,7 +16257,8 @@ enable subgroups;
 @group(0) @binding(4) var<storage,read_write>Y:array<f32>;
 @group(0) @binding(5) var<storage,read>P:array<u32>;
 const ROWS:u32=4u;const COLS:u32=4u;const BK:u32=256u;
-var<workgroup>xq:array<u32,256>;var<workgroup>xs:array<f32,32>;
+var<workgroup>xq:array<u32,256>;var<workgroup>xs:array<f32,32>;var<workgroup>reduce_scratch:array<f32,256>;
+fn reduce32(v:f32,tid:u32)->f32{reduce_scratch[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){reduce_scratch[tid]+=reduce_scratch[tid+off];}workgroupBarrier();}return reduce_scratch[(tid/32u)*32u];}
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec3<u32>){
  let K=P[0];let N=P[1];let M=P[2];let tid=lid.x;let warp=tid/32u;let lane=tid&31u;let row0=wid.x*ROWS;
@@ -16230,7 +16273,7 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
   for(var c=0u;c<COLS;c++){if(valid[c]){let col=cols[c];let off=col*words+kb/4u+lane*2u;let w0=W[off];let w1=W[off+1u];let si=col*blocks+wb;let sp=unpack2x16float(S[si/2u]);let ws=select(sp.x,sp.y,(si&1u)!=0u);
     for(var r=0u;r<ROWS;r++){let base=r*64u+lane*2u;let d=dot4I8Packed(xq[base],w0)+dot4I8Packed(xq[base+1u],w1);acc[c*ROWS+r]+=f32(d)*ws*xs[r*8u+xb];}}}workgroupBarrier();}
  for(var c=0u;c<COLS;c++){
-  for(var r=0u;r<ROWS;r++){let sum=subgroupAdd(acc[c*ROWS+r]);if(lane==0u&&valid[c]){let row=row0+r;if(row<M){Y[row*N+cols[c]]=sum+Bias[cols[c]];}}}
+  for(var r=0u;r<ROWS;r++){let sum=reduce32(acc[c*ROWS+r],tid);if(lane==0u&&valid[c]){let row=row0+r;if(row<M){Y[row*N+cols[c]]=sum+Bias[cols[c]];}}}
  }
 }
 )WGSL";
@@ -19988,8 +20031,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // [ssm] qwen35_conv_scan_split_l2
 static const char* WGSL_QWEN35_CONV_SCAN_SPLIT_L2 = R"WGSL(
-enable subgroups;
-
 // Fused Qwen 3.5 prefill convolution scan, SiLU, Q/K split+L2 norm.
 // Grid: (3, max(nk,nv), 1). Each workgroup scans T in causal order.
 @group(0) @binding(0) var<storage,read_write> State:array<f32>;
@@ -20000,7 +20041,8 @@ enable subgroups;
 @group(0) @binding(5) var<storage,read_write> K:array<f32>;
 @group(0) @binding(6) var<storage,read_write> V:array<f32>;
 @group(0) @binding(7) var<storage,read> P:array<u32>;
-var<workgroup>sums:array<f32,4>;
+var<workgroup>sums:array<f32,128>;
+fn reduce32(v:f32,tid:u32)->f32{sums[tid]=v;workgroupBarrier();for(var off=16u;off>0u;off>>=1u){if((tid&31u)<off){sums[tid]+=sums[tid+off];}workgroupBarrier();}return sums[(tid/32u)*32u];}
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec3<u32>){
  let nk=P[0];let nv=P[1];let dk=P[2];let dv=P[3];let convK=P[4];let eps=bitcast<f32>(P[5]);let T=P[6];
@@ -20009,7 +20051,7 @@ fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec
  for(var t=0u;t<T;t++){
   var a=Bias[c];for(var j=0u;j+1u<convK;j++){let old=State[sb+j+1u];State[sb+j]=old;a+=CW[sb+j]*old;}
   let newest=X[t*channels+c];State[sb+convK-1u]=newest;a+=CW[sb+convK-1u]*newest;let value=a/(1.0+exp(-a));
-  if(kind==2u){V[(t*nv+h)*dv+d]=value;}else{let ss=subgroupAdd(value*value);if((d&31u)==0u){sums[d/32u]=ss;}workgroupBarrier();let inv=1.0/max(sqrt(sums[0]+sums[1]+sums[2]+sums[3]),eps);let out=(t*nk+h)*dk+d;if(kind==0u){Q[out]=value*inv;}else{K[out]=value*inv;}workgroupBarrier();}
+  if(kind==2u){V[(t*nv+h)*dv+d]=value;}else{let ss=reduce32(value*value,d);let inv=1.0/max(sqrt(sums[0]+sums[32]+sums[64]+sums[96]),eps);let out=(t*nk+h)*dk+d;if(kind==0u){Q[out]=value*inv;}else{K[out]=value*inv;}workgroupBarrier();}
  }
 }
 )WGSL";
@@ -20231,8 +20273,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 // [ssm] qwen35_split_qkv_l2_batched
 static const char* WGSL_QWEN35_SPLIT_QKV_L2_BATCHED = R"WGSL(
-enable subgroups;
-
 // Batched split and per-head L2 normalization. Grid: (3, max(nk,nv), T).
 @group(0) @binding(0) var<storage, read> C: array<f32>;
 @group(0) @binding(1) var<storage, read_write> Q: array<f32>;
@@ -20240,7 +20280,17 @@ enable subgroups;
 @group(0) @binding(3) var<storage, read_write> V: array<f32>;
 @group(0) @binding(4) var<storage, read> P: array<u32>;
 
-var<workgroup> sums: array<f32, 4>;
+var<workgroup> sums: array<f32, 128>;
+
+fn reduce32(value: f32, tid: u32) -> f32 {
+    sums[tid] = value;
+    workgroupBarrier();
+    for (var offset = 16u; offset > 0u; offset >>= 1u) {
+        if ((tid & 31u) < offset) { sums[tid] += sums[tid + offset]; }
+        workgroupBarrier();
+    }
+    return sums[(tid / 32u) * 32u];
+}
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -20257,10 +20307,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     if (h >= nk) { return; }
     let src=t*channels+kind*qsize+h*dk;
     let x=select(0.0,C[src+d],d<dk);
-    let ss=subgroupAdd(x*x);
-    if ((d&31u)==0u) { sums[d/32u]=ss; }
-    workgroupBarrier();
-    let inv=1.0/max(sqrt(sums[0]+sums[1]+sums[2]+sums[3]),eps);
+    let ss=reduce32(x*x,d);
+    let inv=1.0/max(sqrt(sums[0]+sums[32]+sums[64]+sums[96]),eps);
     if (d < dk) {
         let dst=(t*nk+h)*dk+d;
         if (kind==0u) { Q[dst]=x*inv; } else { K[dst]=x*inv; }
