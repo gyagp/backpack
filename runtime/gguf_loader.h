@@ -116,6 +116,17 @@ struct KQuantPacked {
 /// raw_data: pointer to N rows of Q4_K blocks; K = elements per row.
 KQuantPacked pack_q4k(const void* raw_data, uint32_t N, uint32_t K);
 
+// ORT-style dense Q4_K layout used by large DP4A prefill tiles. Eight
+// unsigned nibbles are stored per u32 in logical [N,K] order. Each 32-value
+// group has an exact affine pair {d * scale, dmin * min}.
+struct Q4KDensePacked {
+    std::vector<uint32_t> weights;
+    std::vector<float> scalesMins;
+    uint32_t N, K;
+};
+
+Q4KDensePacked repack_q4k_dense(const void* raw_data, uint32_t N, uint32_t K);
+
 /// Pack Q5_K raw data (176-byte blocks) for GPU upload.
 KQuantPacked pack_q5k(const void* raw_data, uint32_t N, uint32_t K);
 

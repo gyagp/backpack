@@ -2010,11 +2010,10 @@ TEST(q4k_ort_tile64_reference) {
     std::string mm=q4kOrtRepackedTileTestSource();if(mm.empty())return{false,"cannot adapt ORT tile"};
     const int M=64,N=64,K=256,NB=1;Rng rng(0x4A64);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*144);
     for(int n=0;n<N;n++){uint8_t*p=raw.data()+n*144;uint16_t d=f32ToF16(.02f+.0002f*n),dm=f32ToF16(.01f+.0001f*n);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+j*17);}
-    auto pk=pack_q4k(raw.data(),N,K);std::vector<float>dq(N*K),xq(M*K),expected(M*N),sm(N*(K/32)*2);std::vector<uint32_t>dense(N*K/8);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);
-    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){const uint8_t*blk=raw.data()+(n*NB+b)*144;float d=f16ToF32(*(const uint16_t*)blk),dm=f16ToF32(*(const uint16_t*)(blk+2));for(int sb=0;sb<8;sb++){int sc,mn;if(sb<4){sc=blk[4+sb]&63;mn=blk[8+sb]&63;}else{int j=sb-4;sc=(blk[12+j]&15)|((blk[4+j]>>2)&48);mn=(blk[12+j]>>4)|((blk[8+j]>>2)&48);}int gi=n*(K/32)+b*8+sb;sm[gi*2]=d*sc;sm[gi*2+1]=dm*mn;for(int i=0;i<32;i++){int k=b*256+sb*32+i;int q=((sb&1)?blk[16+(sb/2)*32+i]>>4:blk[16+(sb/2)*32+i])&15;int ni=n*K+k;dense[ni/8]|=uint32_t(q)<<(4*(ni&7));}}}
+    auto pk=pack_q4k(raw.data(),N,K);auto dense=repack_q4k_dense(raw.data(),N,K);std::vector<float>dq(N*K),xq(M*K),expected(M*N);dequant_kquant(raw.data(),dq.data(),N,K,GGUF_TYPE_Q4_K);
     for(int m=0;m<M;m++)for(int b=0;b<K/32;b++){float amax=0;for(int j=0;j<32;j++)amax=std::max(amax,std::abs(x[m*K+b*32+j]));float sc=amax/127.0f;for(int j=0;j<32;j++){int q=sc==0?0:std::max(-127,std::min(127,(int)std::round(x[m*K+b*32+j]/sc)));xq[m*K+b*32+j]=q*sc;}}
     for(int m=0;m<M;m++)for(int n=0;n<N;n++)for(int k=0;k<K;k++)expected[m*N+n]+=xq[m*K+k]*dq[n*K+k];
-    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bs=makeBuffer(gpu,"XS",nullptr,M*K/32),bw=makeBufferU32(gpu,"W",dense.data(),(int)dense.size()),bsm=makeBuffer(gpu,"SM",sm.data(),(int)sm.size()),by=makeBuffer(gpu,"Y",nullptr,M*N),qp=makeParams(gpu,"QP",{K,N,M,NB,pk.rowStrideWords});
+    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bs=makeBuffer(gpu,"XS",nullptr,M*K/32),bw=makeBufferU32(gpu,"W",dense.weights.data(),(int)dense.weights.size()),bsm=makeBuffer(gpu,"SM",dense.scalesMins.data(),(int)dense.scalesMins.size()),by=makeBuffer(gpu,"Y",nullptr,M*N),qp=makeParams(gpu,"QP",{K,N,M,NB,pk.rowStrideWords});
     dispatchAndReadback(gpu,WGSL_Q8_QUANTIZE_BATCHED_DP4A,{{0,bx},{1,bq},{2,bs},{3,qp}},1,M,1,bq,M*K,4);
     auto p=makeParams(gpu,"P",{1,M,N,K,K/8,K/16,1,1,pk.rowStrideWords,0});
     auto r=dispatchAndReadback(gpu,mm,{{0,bq},{1,bs},{2,bw},{3,bsm},{4,by},{5,p}},1,1,1,by,M*N*4,6);

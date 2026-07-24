@@ -356,6 +356,8 @@ Q8Repacked repack_q8_0(const void* raw_data, uint32_t N, uint32_t K) {
 
 // ─── K-quant packing ────────────────────────────────────────────────────────
 
+static float kq_fp16_to_f32(uint16_t h);
+
 KQuantPacked pack_q4k(const void* raw_data, uint32_t N, uint32_t K) {
     KQuantPacked result;
     result.N = N;
@@ -374,6 +376,51 @@ KQuantPacked pack_q4k(const void* raw_data, uint32_t N, uint32_t K) {
         const uint8_t* rowSrc = src + row * rowBytes;
         uint32_t* rowDst = result.data.data() + row * result.rowStrideWords;
         memcpy(rowDst, rowSrc, rowBytes);
+    }
+    return result;
+}
+
+Q4KDensePacked repack_q4k_dense(const void* raw_data, uint32_t N, uint32_t K) {
+    Q4KDensePacked result;
+    result.N = N;
+    result.K = K;
+    result.weights.assign(((uint64_t)N * K + 7) / 8, 0);
+    result.scalesMins.resize((uint64_t)N * ((K + 31) / 32) * 2);
+
+    const uint32_t nBlocks = (K + 255) / 256;
+    const auto* src = reinterpret_cast<const uint8_t*>(raw_data);
+    for (uint32_t row = 0; row < N; ++row) {
+        for (uint32_t block = 0; block < nBlocks; ++block) {
+            const uint8_t* p = src + ((uint64_t)row * nBlocks + block) * 144;
+            uint16_t dh, dmh;
+            memcpy(&dh, p, sizeof(dh));
+            memcpy(&dmh, p + 2, sizeof(dmh));
+            const float d = kq_fp16_to_f32(dh);
+            const float dmin = kq_fp16_to_f32(dmh);
+            for (uint32_t sb = 0; sb < 8; ++sb) {
+                uint32_t scale, min;
+                if (sb < 4) {
+                    scale = p[4 + sb] & 63;
+                    min = p[8 + sb] & 63;
+                } else {
+                    const uint32_t j = sb - 4;
+                    scale = (p[12 + j] & 15) | ((p[4 + j] >> 2) & 48);
+                    min = (p[12 + j] >> 4) | ((p[8 + j] >> 2) & 48);
+                }
+                const uint32_t group = block * 8 + sb;
+                const uint64_t sm = ((uint64_t)row * ((K + 31) / 32) + group) * 2;
+                result.scalesMins[sm] = d * (float)scale;
+                result.scalesMins[sm + 1] = dmin * (float)min;
+                for (uint32_t i = 0; i < 32; ++i) {
+                    const uint32_t k = block * 256 + sb * 32 + i;
+                    if (k >= K) break;
+                    const uint8_t packed = p[16 + (sb / 2) * 32 + i];
+                    const uint32_t q = (sb & 1) ? packed >> 4 : packed & 15;
+                    const uint64_t index = (uint64_t)row * K + k;
+                    result.weights[index / 8] |= q << (4 * (index & 7));
+                }
+            }
+        }
     }
     return result;
 }
