@@ -148,6 +148,70 @@ class FrameworkTest(unittest.TestCase):
         result = PolicyEngine(self.store).evaluate(self.task["id"])
         self.assertEqual("reject", result["aggregate_verdict"])
 
+    def test_missing_held_back_correctness_blocks_candidate(self) -> None:
+        task = self.store.create_task({
+            "title": "Layered validation", "hypothesis": "The candidate is lossless",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s"],
+                         "checks": ["exact-output", "held-back-prompt", "held-back-shape"]},
+            "device_policy": {"required": [self.machine["id"]]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "decode_tok_s"}
+        self.store.add_evidence({**common, "variant": "base", "samples": [100],
+                                 "commit_sha": "base", "correctness": {"passed": True}}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [110],
+                                 "commit_sha": "candidate",
+                                 "correctness": {"passed": True, "checks": {
+                                     "exact-output": {"passed": True}}}}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("blocked", result["aggregate_verdict"])
+        self.assertEqual(["held-back-prompt", "held-back-shape"],
+                         result["evaluations"][0]["details"]["missing_checks"])
+
+    def test_failed_layer_parity_rejects_fast_candidate(self) -> None:
+        task = self.store.create_task({
+            "title": "Layer parity", "hypothesis": "The candidate is lossless",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s"], "checks": ["layer-parity"]},
+            "device_policy": {"required": [self.machine["id"]]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "decode_tok_s"}
+        self.store.add_evidence({**common, "variant": "base", "samples": [100],
+                                 "commit_sha": "base", "correctness": {"passed": True}}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [140],
+                                 "commit_sha": "candidate", "correctness": {"passed": True,
+                                     "checks": {"layer-parity": "failed"}}}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("reject", result["aggregate_verdict"])
+        self.assertEqual(["layer-parity"], result["evaluations"][0]["details"]["failed_checks"])
+
+    def test_layered_correctness_accepts_complete_lossless_evidence(self) -> None:
+        task = self.store.create_task({
+            "title": "Held-back pass", "hypothesis": "The candidate is lossless",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s"],
+                         "correctness_checks": ["exact-output", "held-back-prompt"]},
+            "device_policy": {"required": [self.machine["id"]]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "decode_tok_s"}
+        self.store.add_evidence({**common, "variant": "base", "samples": [100],
+                                 "commit_sha": "base", "correctness": {"passed": True}}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [110],
+                                 "commit_sha": "candidate", "correctness": {"passed": True,
+                                     "checks": {"exact-output": True,
+                                                "held-back-prompt": {"status": "pass"}}}}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("accept", result["aggregate_verdict"])
+
     def test_missing_evidence_blocks(self) -> None:
         result = PolicyEngine(self.store).evaluate(self.task["id"])
         self.assertEqual("blocked", result["aggregate_verdict"])
