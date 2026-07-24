@@ -5443,7 +5443,12 @@ void ModelRunner::initQwen35PrefillResources() {
     const uint64_t maxK=std::max<uint64_t>({E,im,2u*qdim,cfg.ssmInnerSize});
     qwen35Pf.kqActQ8=gpu->createBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
     qwen35Pf.kqActScale=mk("qpf_kq_act_scales",(uint64_t)C*((maxK+31u)/32u));
-    if(gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+    // Intel Xe2 also benefits from the ORT 64x64 DP4A tile, but keep its
+    // Q4_K layout disposable: retaining a second copy regresses decode from
+    // working-set pressure. This path uses subgroup shuffles, not matrices.
+    const bool ortQ4Adapter=gpu->adapterName.find("NVIDIA")!=std::string::npos||
+        gpu->adapterName.find("Intel")!=std::string::npos;
+    if(ortQ4Adapter&&
        std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr){
         uint64_t maxWeightElems=0;
         for(const auto& pl:cfg.perLayer){
