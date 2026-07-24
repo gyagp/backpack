@@ -575,6 +575,9 @@ class FrameworkTest(unittest.TestCase):
                                                         "result": {"decode_tok_s": 42}}, "agent")
         self.assertEqual(42, completed["result"]["decode_tok_s"])
         self.assertIsNotNone(completed["completed_at"])
+        retried = self.store.update_run(run["id"], {"status": "pending", "progress": 0}, "scheduler")
+        self.assertIsNone(retried["started_at"])
+        self.assertIsNone(retried["completed_at"])
 
     def test_stale_benchmark_run_times_out_without_retry(self) -> None:
         task = self.store.create_task({"title": "Timed benchmark", "kind": "benchmark",

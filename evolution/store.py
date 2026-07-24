@@ -761,8 +761,13 @@ class Store:
             status = "pending"
             data = {**data, "phase": f"automatic repair/retry {prior_failures + 1}/2", "progress": 0}
         now = utc_now()
-        started = run.get("started_at") or (now if status == "running" else None)
-        completed = now if status in {"completed", "failed", "cancelled"} else run.get("completed_at")
+        if status == "pending":
+            started, completed = None, None
+        elif status == "running":
+            started, completed = run.get("started_at") or now, None
+        else:
+            started = run.get("started_at")
+            completed = now if status in {"completed", "failed", "cancelled"} else None
         progress = int(data.get("progress", 100 if status == "completed" else run["progress"]))
         with self._lock, self._db:
             self._db.execute("""UPDATE task_runs SET status=?,phase=?,progress=?,result_json=?,error=?,
