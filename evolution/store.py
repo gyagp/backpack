@@ -605,7 +605,9 @@ class Store:
                     manifest = {**manifest, "conformance_spec": model.get("conformance_spec", {})}
                 if argv and argv[0] == "gitignore/runtime/build/backpack_llm.exe":
                     manifest = {**manifest, "argv": [r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe", *argv[1:]]}
-                elif argv and argv[0] == r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe":
+                elif argv and (argv[0] == r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe" or
+                               (Path(argv[0]).name.lower() == "backpack_llm.exe" and
+                                str(Path(argv[0]).parent).lower().startswith(str(BACKPACK_BACKUP_ROOT).lower()))):
                     backed_up = latest_backpack_executable()
                     if backed_up:
                         manifest = {**manifest, "argv": [str(backed_up), *argv[1:]],
