@@ -1088,7 +1088,23 @@ function digestCalendar(items) {
 let selectedDigestDate = null;
 function renderDigest(items, tasks = []) {
   const taskById = new Map(tasks.map((task) => [task.id, task]));
-  const acceptedItems = items.filter((item) => {
+  const measuredTaskIds = new Set(items.map((item) => item.task_id).filter(Boolean)),
+    acceptedTaskItems = tasks
+      .filter((task) =>
+        !measuredTaskIds.has(task.id) &&
+        ["integrated", "observing"].includes(task.state) &&
+        ["accept", "accepted"].includes(task.aggregate_verdict),
+      )
+      .map((task) => ({
+        id: `digest-task-${task.id}`,
+        task_id: task.id,
+        title: task.title,
+        summary: task.verdict_reason || task.hypothesis || "Accepted task completed.",
+        commit_sha: task.candidate_sha,
+        created_at: task.done_at || task.updated_at || task.created_at,
+        impact: { key: "unquantified", name: "Accepted progress", rank: 3 },
+      })),
+    acceptedItems = [...items, ...acceptedTaskItems].filter((item) => {
     if (["measured_regression", "serious_regression", "critical_regression"].includes(item.impact?.key))
       return false;
     const task = taskById.get(item.task_id);
