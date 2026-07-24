@@ -1616,8 +1616,9 @@ void GraphExecutor::Execute(
             ctx.shapeCachePopulating_ = false;
             ctx.tensorPlanValid_ = true;
 
-            fprintf(stderr, "  [warm-exec] shape cache: %zu entries, tensor plan: %zu buffers\n",
-                    ctx.nodeShapeCache_.size(), ctx.tensorPlan_.size());
+            if (std::getenv("BP_LOG_WARM_EXEC"))
+                fprintf(stderr, "  [warm-exec] shape cache: %zu entries, tensor plan: %zu buffers\n",
+                        ctx.nodeShapeCache_.size(), ctx.tensorPlan_.size());
 
             // Don't release any buffers — keep them for reuse
             for (auto it = ctx.tensorStore_.begin(); it != ctx.tensorStore_.end(); ) {
