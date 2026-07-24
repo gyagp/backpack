@@ -1967,6 +1967,27 @@ TEST(q4k_matmul_reference) {
     auto r=dispatchAndReadback(gpu,wgsl,{{0,bx},{1,bw},{2,bb},{3,by},{4,p}},1,1,1,by,N*4,5);return assertClose((const float*)r.data(),expected.data(),N,2e-4f,2e-4f);
 }
 
+TEST(q4k_ort_dense_layout_reference) {
+    // Validate the exact Q4_K -> ORT dense-nibble mapping independently of
+    // the large 64x64 matmul tile. This catches byte-order/layout mistakes
+    // without risking a long-running end-to-end shader.
+    const char* wgsl=R"WGSL(
+@group(0) @binding(0)var<storage,read>W:array<u32>;
+@group(0) @binding(1)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(2)var<storage,read>P:array<u32>;
+fn pair(a:u32,b:u32,high:bool)->u32{let mask=0x0F0F0F0Fu;let x=select(a&mask,(a>>4u)&mask,high);let z=select(b&mask,(b>>4u)&mask,high);let px=(x&15u)|((x>>4u)&240u)|((x>>8u)&0xF00u)|((x>>12u)&0xF000u);let pz=(z&15u)|((z>>4u)&240u)|((z>>8u)&0xF00u)|((z>>12u)&0xF000u);return px|(pz<<16u);}
+fn nibble(v:u32,i:u32)->u32{return(v>>((i&7u)*4u))&15u;}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id)gid:vec3<u32>){let flat=gid.x;let N=P[0];let K=P[1];let rs=P[2];if(flat>=N*K){return;}let n=flat/K;let k=flat%K;let block=k/256u;let sb=(k%256u)/32u;let in32=k&31u;let half=in32/16u;let j=in32&15u;let base=n*rs+block*36u;let qbase=base+4u+(sb/2u)*8u+half*4u;let d0=pair(W[qbase],W[qbase+1u],(sb&1u)!=0u);let d1=pair(W[qbase+2u],W[qbase+3u],(sb&1u)!=0u);let q=select(nibble(d0,j),nibble(d1,j-8u),j>=8u);let dm=unpack2x16float(W[base]);let shift=(sb&3u)*8u;let dv=(W[base+1u]>>shift)&255u;let mv=(W[base+2u]>>shift)&255u;var sc:u32;var mn:u32;if(sb<4u){sc=dv&63u;mn=mv&63u;}else{let md=(W[base+3u]>>shift)&255u;sc=(md&15u)|((dv>>2u)&48u);mn=(md>>4u)|((mv>>2u)&48u);}Y[flat]=dm.x*f32(sc)*f32(q)-dm.y*f32(mn);}
+)WGSL";
+    const int N=67,K=512,NB=K/256;std::vector<uint8_t>raw(N*NB*144);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*144;uint16_t d=f32ToF16(.02f+.001f*n),dm=f32ToF16(.01f+.0002f*b);memcpy(p,&d,2);memcpy(p+2,&dm,2);for(int j=4;j<144;j++)p[j]=uint8_t(n*31+b*13+j*17);}
+    auto pk=pack_q4k(raw.data(),N,K);std::vector<float>expected(N*K);dequant_kquant(raw.data(),expected.data(),N,K,GGUF_TYPE_Q4_K);
+    auto bw=makeBufferU32(gpu,"W",pk.data.data(),(int)pk.data.size()),by=makeBuffer(gpu,"Y",nullptr,N*K),p=makeParams(gpu,"P",{N,K,pk.rowStrideWords});
+    auto r=dispatchAndReadback(gpu,wgsl,{{0,bw},{1,by},{2,p}},ceilDiv(N*K,256),1,1,by,N*K*4,3);
+    return assertClose((const float*)r.data(),expected.data(),N*K,1e-6f,1e-6f);
+}
+
 TEST(q4k_matmul_dp4a_reference) {
     auto wgsl=loadWgsl("quant_kq","q4k_matmul_dp4a");if(wgsl.empty())return{false,"cannot load kernel"};
     const int N=8,K=512,NB=K/256;Rng rng(0x44D4);auto x=rng.randnVec(K);std::vector<uint8_t>raw(N*NB*144);
