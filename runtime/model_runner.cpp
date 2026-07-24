@@ -185,6 +185,28 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
 )WGSL";
 }
 
+std::string q4PrequantBatchedNvidiaSource() {
+    // NVIDIA exposes wave32 for this D3D12 shader. llama.cpp's Vulkan MMQ
+    // kernels use the native subgroup reduction instead of six
+    // workgroup-memory barriers for every output row.
+    std::string source(q4PrequantBatchedSource());
+    const std::string requirement = "requires packed_4x8_integer_dot_product;";
+    source.replace(source.find(requirement), requirement.size(),
+                   requirement + "\nenable subgroups;");
+    const auto scratch = source.find("var<workgroup>reduce_scratch:array<f32,256>;");
+    if (scratch != std::string::npos)
+        source.erase(scratch, std::strlen("var<workgroup>reduce_scratch:array<f32,256>;"));
+    const auto begin = source.find("fn reduce32(");
+    const auto end = source.find("@compute", begin);
+    if (begin == std::string::npos || end == std::string::npos) {
+        fprintf(stderr, "NVIDIA Gemma Q4 reduction transform failed\n");
+        std::abort();
+    }
+    source.replace(begin, end - begin,
+                   "fn reduce32(v:f32,tid:u32)->f32{return subgroupAdd(v);}\n");
+    return source;
+}
+
 const char* q4PrequantBatchedAmdSource() {
     // AMD D3D12 exposes 64-lane subgroups.  Let one physical wave own one
     // output column and reuse its Q4 word across eight prompt rows.  A
@@ -5736,6 +5758,11 @@ void ModelRunner::initGemmaPrefillResources() {
         (void)getKernel("q8_quantize_batched_dp4a");
         (void)gpu->getOrCreatePipeline("q4_prequant_batched",
             q4PrequantBatchedSource(), 6);
+        if (gpu->adapterName.find("NVIDIA") != std::string::npos &&
+            !std::getenv("BP_GEMMA_DISABLE_NVIDIA_SUBGROUP_REDUCE")) {
+            (void)gpu->getOrCreatePipeline("q4_prequant_batched_nvidia_subgroup",
+                q4PrequantBatchedNvidiaSource(), 6);
+        }
         if (gpu->adapterName.find("AMD") != std::string::npos) {
             (void)gpu->getOrCreatePipeline("q4_prequant_batched_amd",
                 q4PrequantBatchedAmdSource(), 6);
@@ -7495,9 +7522,17 @@ int32_t ModelRunner::prefillGemmaBatched(
         const CompiledPipeline* q4prequant = prequantQ4
             ? &gpu->getOrCreatePipeline(
                 gpu->adapterName.find("AMD") != std::string::npos
-                    ? "q4_prequant_batched_amd" : "q4_prequant_batched",
+                    ? "q4_prequant_batched_amd"
+                    : (gpu->adapterName.find("NVIDIA") != std::string::npos &&
+                       !std::getenv("BP_GEMMA_DISABLE_NVIDIA_SUBGROUP_REDUCE")
+                        ? "q4_prequant_batched_nvidia_subgroup"
+                        : "q4_prequant_batched"),
                 gpu->adapterName.find("AMD") != std::string::npos
-                    ? q4PrequantBatchedAmdSource() : q4PrequantBatchedSource(), 6)
+                    ? std::string(q4PrequantBatchedAmdSource())
+                    : (gpu->adapterName.find("NVIDIA") != std::string::npos &&
+                       !std::getenv("BP_GEMMA_DISABLE_NVIDIA_SUBGROUP_REDUCE")
+                        ? q4PrequantBatchedNvidiaSource()
+                        : std::string(q4PrequantBatchedSource())), 6)
             : nullptr;
         const uint32_t q4PrequantCols =
             gpu->adapterName.find("AMD") != std::string::npos ? 4u : 8u;
