@@ -499,6 +499,8 @@ class FrameworkTest(unittest.TestCase):
         self.assertTrue(any(item["framework"] == "backpack" for item in runtimes))
         self.assertTrue(any(item["framework"] == "llamacpp" for item in runtimes))
         self.assertTrue(all(len(task["manifest"]["runtimes"]) == 1 for task in perf))
+        self.assertTrue(all(task["origin"]["automation_key"].endswith(
+            ":" + task["manifest"]["runtimes"][0]["format"]) for task in perf))
         self.assertTrue(all(task["manifest"]["prompt_tokens"] == 512 for task in perf))
         self.assertTrue(all(task["manifest"]["generated_tokens"] == 128 for task in perf))
         self.store.ensure_runnable_automatic_tasks()

@@ -1288,14 +1288,19 @@ class Store:
                 machine = cell["machine"]
                 for runtime in missing:
                     key = (f"performance:{model['id']}:{machine['id']}:"
-                           f"{runtime['framework']}:{runtime['backend']}")
-                    duplicate_perf = any(t.get("origin", {}).get("automation_key") == key
+                           f"{runtime['framework']}:{runtime['backend']}:{runtime['format']}")
+                    legacy_key = (f"performance:{model['id']}:{machine['id']}:"
+                                  f"{runtime['framework']}:{runtime['backend']}")
+                    duplicate_perf = any(
+                                         (t.get("origin", {}).get("automation_key") == key or
+                                          (t.get("origin", {}).get("automation_key") == legacy_key and
+                                           next(iter(t.get("manifest", {}).get("runtimes") or [{}]), {}).get("format") == runtime["format"]))
                                          and t["state"] not in {"integrated", "rejected", "failed", "reverted"}
                                          for t in open_tasks)
                     if duplicate_perf:
                         continue
                     task = self.create_task({
-                        "title": (f"Collect {model['name']} {runtime['framework']}/{runtime['backend']} "
+                        "title": (f"Collect {model['name']} {runtime['framework']}/{runtime['backend']}/{runtime['format']} "
                                   f"performance on {machine['name']}"), "kind": "benchmark",
                         "hypothesis": "Prefill and decode throughput must be measured independently.",
                         "origin": {"type": "automatic", "automation_key": key, "model_id": model["id"],
