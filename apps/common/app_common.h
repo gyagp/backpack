@@ -99,6 +99,14 @@ inline std::string applyQwenUserTemplate(const std::string& message) {
            "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
+inline std::string applyGemma4SystemTemplate() {
+    return "<|turn>system\nYou are a helpful AI assistant.<turn|>\n";
+}
+
+inline std::string applyGemma4UserTemplate(const std::string& message) {
+    return "<|turn>user\n" + message + "<turn|>\n<|turn>model\n";
+}
+
 // ─── fp16 conversion ────────────────────────────────────────────────────────
 
 inline float fp16ToFloat(uint16_t h) {

@@ -1382,21 +1382,22 @@ struct StandardState {
             fprintf(stderr, "\n");
         }
         int32_t next;
+        const uint32_t startPos = pos;
         bool pooledPrefill = runner.pleGpuPreprocess || runner.cfg.arch == "qwen35";
         bool qwenBatched = runner.cfg.arch == "qwen35" && n > 16 &&
                            runner.qwen35FastPrefill;
         if (qwenBatched && !std::getenv("BP_SYNC_PREFILL")) {
-            next = runner.prefillBatched(tokens, n, 0);
+            next = runner.prefillBatched(tokens, n, startPos);
         } else if (pooledPrefill && !std::getenv("BP_SYNC_PREFILL")) {
-            next = runner.prefillPooledKnown(tokens, n, 0);
+            next = runner.prefillPooledKnown(tokens, n, startPos);
         } else {
             std::vector<float> logits;
-            for (uint32_t i = 0; i < n; i++) logits = runner.decode(tokens[i], i);
+            for (uint32_t i = 0; i < n; i++) logits = runner.decode(tokens[i], startPos + i);
             DumpTopLogits("prefill", logits);
             next = ModelRunner::argmax(logits);
         }
         runner.seedDecodeTokenInputs(next);
-        pos = n;
+        pos += n;
         return next;
     }
 

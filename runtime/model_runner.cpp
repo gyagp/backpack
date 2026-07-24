@@ -3525,6 +3525,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Sized to max per-layer dimensions for variable-dim models (Gemma 4).
     uint32_t maxQkvOutBuf = qkvOut;
     uint32_t maxQDimBuf = qDim;
+    uint32_t maxHeadDimBuf = cfg.headDim;
     uint32_t maxIMBuf = cfg.intermediateSize;
     if (cfg.arch == "qwen35" && cfg.ssmInnerSize > 0) {
         uint32_t ssmConvChannels = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
@@ -3536,6 +3537,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uint32_t plQkvOut = pl.qDim + 2 * pl.kvDim;
         if (plQkvOut > maxQkvOutBuf) maxQkvOutBuf = plQkvOut;
         if (pl.qDim > maxQDimBuf) maxQDimBuf = pl.qDim;
+        if (pl.headDim > maxHeadDimBuf) maxHeadDimBuf = pl.headDim;
         if (pl.intermediateSize > maxIMBuf) maxIMBuf = pl.intermediateSize;
     }
     xBuf          = gpu->createBuffer("x", cfg.nEmbd * 4);
@@ -3654,7 +3656,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     rstdBuf       = gpu->createBuffer("rstd", 16);
     logitsBuf     = gpu->createBuffer("logits", cfg.nVocab * 4);
     attnPartialsBuf = gpu->createBuffer("attn_partials",
-        cfg.nHead * maxChunks * (cfg.headDim + 2) * 4);
+        cfg.nHead * maxChunks * (maxHeadDimBuf + 2) * 4);
 
     // Single set of dynamic params (writeBuffer is queue-sequenced)
     fusedRopeParamsBuf = gpu->createBuffer("p_frope", 32);

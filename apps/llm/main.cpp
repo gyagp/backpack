@@ -215,9 +215,12 @@ int main(int argc, char* argv[]) {
     std::string finalPrompt;
     bool chat = !chatMessage.empty();
     bool qwenOnnxChat = false;
+    bool gemma4OnnxChat = false;
     if (chat) {
         qwenOnnxChat = (cfg.format == "onnx_generic" || cfg.format == "onnx") &&
             cfg.arch.find("qwen3") != std::string::npos;
+        gemma4OnnxChat = (cfg.format == "onnx_generic" || cfg.format == "onnx") &&
+            cfg.arch == "gemma4";
         if (qwenOnnxChat) {
             // ORT GenAI advances Qwen's recurrent state with the system turn
             // before appending the user ChatML turn. Preserve that ordering.
@@ -226,6 +229,15 @@ int main(int argc, char* argv[]) {
             if (!systemTokens.empty())
                 (void)session.Prefill(systemTokens.data(), (uint32_t)systemTokens.size());
             finalPrompt = app::applyQwenUserTemplate(chatMessage);
+        } else if (gemma4OnnxChat) {
+            // ORT GenAI applies Gemma 4's system and user turns as separate
+            // generator appends. Each append starts with the tokenizer's BOS;
+            // preserving that boundary is required for matching logits.
+            session.Reset();
+            auto systemTokens = session.Tokenize(app::applyGemma4SystemTemplate());
+            if (!systemTokens.empty())
+                (void)session.Prefill(systemTokens.data(), (uint32_t)systemTokens.size());
+            finalPrompt = app::applyGemma4UserTemplate(chatMessage);
         } else {
             finalPrompt = app::applyChatTemplate(chatMessage, cfg.arch);
         }
@@ -257,7 +269,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s", text.c_str()); fflush(stderr);
             tokenCount++;
             return true;
-        }, !qwenOnnxChat);
+        }, !(qwenOnnxChat || gemma4OnnxChat));
 
     auto genMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - genStart).count();
