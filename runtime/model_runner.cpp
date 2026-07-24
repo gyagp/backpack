@@ -136,6 +136,32 @@ std::string kqGlobalActivationSource(const char* source) {
     return result;
 }
 
+const char* q4kRepackOrtDenseSource() {
+    return R"WGSL(@group(0) @binding(0)var<storage,read>Raw:array<u32>;
+@group(0) @binding(1)var<storage,read_write>Dense:array<u32>;
+@group(0) @binding(2)var<storage,read_write>ScaleMin:array<f32>;
+@group(0) @binding(3)var<storage,read>P:array<u32>;
+fn pack8(p0:u32,p1:u32,high:bool)->u32{var r=0u;for(var i=0u;i<4u;i++){let b=(p0>>(i*8u))&255u;let q=select(b&15u,b>>4u,high);r|=q<<(i*4u);}for(var i=0u;i<4u;i++){let b=(p1>>(i*8u))&255u;let q=select(b&15u,b>>4u,high);r|=q<<((i+4u)*4u);}return r;}
+@compute @workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let K=P[0];let N=P[1];let nb=P[2];let rs=P[3];let groups=K/32u;let g=gid.x;if(g>=N*groups){return;}let row=g/groups;let gr=g%groups;let block=gr/8u;let sb=gr&7u;if(block>=nb){return;}let base=row*rs+block*36u;let qb=base+4u+(sb/2u)*8u;let high=(sb&1u)!=0u;for(var part=0u;part<4u;part++){Dense[g*4u+part]=pack8(Raw[qb+part*2u],Raw[qb+part*2u+1u],high);}let dm=unpack2x16float(Raw[base]);let sh=(sb&3u)*8u;let dv=(Raw[base+1u]>>sh)&255u;let mv=(Raw[base+2u]>>sh)&255u;var sc:u32;var mn:u32;if(sb<4u){sc=dv&63u;mn=mv&63u;}else{let hi=(Raw[base+3u]>>sh)&255u;sc=(hi&15u)|((dv>>2u)&48u);mn=(hi>>4u)|((mv>>2u)&48u);}ScaleMin[g*2u]=dm.x*f32(sc);ScaleMin[g*2u+1u]=dm.y*f32(mn);}
+)WGSL";
+}
+
+std::string q4kOrtRepackedTileSource() {
+    std::string s(WGSL_ORT_DP4A_MATMUL_EXACT);
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    auto cut=[&](const std::string&begin,const std::string&end,const std::string&to){auto a=s.find(begin),b=s.find(end,a);if(a==std::string::npos||b==std::string::npos){fprintf(stderr,"ORT Q4_K tile transform failed\n");std::abort();}s.replace(a,b-a,to);};
+    all("enable f16;\n","");all("scales_a: array<f16>","scales_a: array<f32>");all("scales_b: array<f16>","scales_b: array<vec2<f32>>");
+    all("output: array<vec4<f16>>","output: array<vec4<f32>>");all("alias output_element_t = f16;","alias output_element_t = f32;");all("var<uniform> uniforms: Uniforms;","var<storage, read> uniforms: Uniforms;");
+    all("var<workgroup> scale_A : array<output_element_t, tile_size>;","var<workgroup> scale_A : array<vec2<output_element_t>, tile_size>;");all("var<workgroup> scale_B : array<output_element_t, tile_size>;","var<workgroup> scale_B : array<vec2<output_element_t>, tile_size>;");
+    all("var own_scale_a: output_element_t","var own_scale_a: vec2<output_element_t>");all("var own_scale_b: output_element_t","var own_scale_b: vec2<output_element_t>");
+    all("SDP8AI(a1:vec4<u32>, b1:vec4<u32>, a2:vec4<u32>, b2:vec4<u32>, scale:output_element_t)","SDP8AI(a1:vec4<u32>, b1:vec4<u32>, a2:vec4<u32>, b2:vec4<u32>, scale:vec2<output_element_t>)");all("return output_element_t(mul_precision(local_sum) * mul_precision(scale));","return output_element_t(mul_precision(local_sum) * mul_precision(scale.x) - mul_precision(scale.y));");
+    const std::string loaders=R"WGSL(fn sumPacked(v:vec4<u32>)->i32{return dot4I8Packed(v.x,0x01010101u)+dot4I8Packed(v.y,0x01010101u)+dot4I8Packed(v.z,0x01010101u)+dot4I8Packed(v.w,0x01010101u);}
+fn loadSHMA(batch:u32,a_global_base:u32,kidx_v:u32,row:u32,col:u32){let ar=a_global_base+row;if(ar>=uniforms.M){return;}let off=ar*uniforms.K16+kidx_v;tile_A[col][row]=input_a[off+col];if(col==0u){let a0=input_a[off];let a1=input_a[off+1u];let xs=scales_a[ar*(uniforms.K/32u)+kidx_v/2u];scale_A[row]=vec2<f32>(xs,xs*f32(sumPacked(a0)+sumPacked(a1)));}}
+fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);if(col==0u){scale_B[row]=scales_b[br*(uniforms.K/32u)+kidx_v/2u];}}
+
+)WGSL";cut("fn loadSHMA(","@compute @workgroup_size",loaders);return s;
+}
+
 std::string q4ZpBatchedRows8Source() {
     std::string result=getEmbeddedKernels().at("matmul_q4_zp_batched_dp4a").source;
     auto replace=[&](const std::string& from,const std::string& to){
@@ -5388,7 +5414,19 @@ void ModelRunner::initQwen35PrefillResources() {
     const uint64_t maxK=std::max<uint64_t>({E,im,2u*qdim,cfg.ssmInnerSize});
     qwen35Pf.kqActQ8=gpu->createBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
     qwen35Pf.kqActScale=mk("qpf_kq_act_scales",(uint64_t)C*((maxK+31u)/32u));
-    qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",128u*1024u,
+    if(gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+       std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr){
+        uint64_t maxWeightElems=0;
+        for(const auto& pl:cfg.perLayer){
+            maxWeightElems=std::max(maxWeightElems,(uint64_t)2u*pl.intermediateSize*E);
+            maxWeightElems=std::max(maxWeightElems,(uint64_t)E*pl.intermediateSize);
+        }
+        qwen35Pf.q4DenseScratch=gpu->createBuffer("qpf_q4_dense_scratch",std::max<uint64_t>(4,(maxWeightElems+1)/2));
+        qwen35Pf.q4ScaleMinScratch=gpu->createBuffer("qpf_q4_sm_scratch",std::max<uint64_t>(4,(maxWeightElems/32)*8));
+        (void)gpu->getOrCreatePipeline("q4k_repack_ort_dense",q4kRepackOrtDenseSource(),4);
+        (void)gpu->getOrCreatePipeline("q4k_ort_dense_tile64",q4kOrtRepackedTileSource(),6);
+    }
+    qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",256u*1024u,
         BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
     (void)getKernel("q4k_matmul_batched4");
@@ -6917,8 +6955,26 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool portableAmdKq=gpu->adapterName.find("AMD")!=std::string::npos;
         const bool sharedKq=gpu->adapterName.find("Intel")==std::string::npos&&
             std::getenv("BP_QWEN_DISABLE_SHARED_KQ")==nullptr;
+        const bool useOrtQ4Tile=qwen35Pf.q4DenseScratch.handle&&M>=64;
+        const CompiledPipeline* q4Repack=useOrtQ4Tile
+            ?&gpu->getOrCreatePipeline("q4k_repack_ort_dense",q4kRepackOrtDenseSource(),4):nullptr;
+        const CompiledPipeline* ortQ4Tile=useOrtQ4Tile
+            ?&gpu->getOrCreatePipeline("q4k_ort_dense_tile64",q4kOrtRepackedTileSource(),6):nullptr;
         auto mmk=[&](GPUBuffer x,GPUBuffer w,GGUFType t,uint32_t nb,uint32_t rs,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){
-            if(t==GGUF_TYPE_Q4_K&&packedQ4Prefill){
+            if(t==GGUF_TYPE_Q4_K&&q4Repack&&ortQ4Tile){
+                auto qp=mkp(n+"_ort_quant_p",{K,N,M,nb,rs});
+                auto&quant=getKernel("q8_quantize_batched_dp4a");
+                add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,qp}},(K+255)/256,M,1,n+"_quant");
+                auto rp=mkp(n+"_ort_repack_p",{K,N,nb,rs});
+                add(*q4Repack,{{0,w},{1,qwen35Pf.q4DenseScratch},{2,qwen35Pf.q4ScaleMinScratch},{3,rp}},
+                    (N*(K/32u)+255u)/256u,1,1,n+"_repack");
+                const uint32_t mt=(M+63)/64,nt=(N+63)/64;
+                auto p=mkp(n+"_ort_p",{1,M,N,K,K/8,K/16,mt,nt,0,0});
+                add(*ortQ4Tile,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},
+                    {2,qwen35Pf.q4DenseScratch},{3,qwen35Pf.q4ScaleMinScratch},{4,y},{5,p}},
+                    mt*nt,1,1,n+"_ort64");
+            }
+            else if(t==GGUF_TYPE_Q4_K&&packedQ4Prefill){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
