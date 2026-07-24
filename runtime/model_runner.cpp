@@ -18,7 +18,7 @@
 
 namespace {
 
-std::string deltaNetValueMajorSource(const char* source) {
+std::string deltaNetValueMajorSource(const std::string& source) {
     std::string result(source);
     auto replace = [&](const std::string& from, const std::string& to) {
         size_t pos = 0;
@@ -29,6 +29,55 @@ std::string deltaNetValueMajorSource(const char* source) {
     };
     replace("ki * dv + vi", "vi * dk + ki");
     replace("ki*dv+vi", "vi*dk+ki");
+    return result;
+}
+
+std::string deltaNetRepeatedHeadSource(const char* source) {
+    // llama.cpp materializes Q/K head sharing for GGUF with ggml_repeat_4d:
+    // [k0..k15] becomes [k0..k15,k0..k15]. ONNX exports group heads as
+    // [k0,k0,k1,k1,...], so its existing quotient mapping remains correct.
+    std::string result(source);
+    auto replace = [&](const std::string& from, const std::string& to) {
+        size_t pos = 0;
+        while ((pos = result.find(from, pos)) != std::string::npos) {
+            result.replace(pos, from.size(), to);
+            pos += to.size();
+        }
+    };
+    replace("head / max(1u, nv / nk)", "head % nk");
+    replace("head/max(1u,nv/nk)", "head%nk");
+    return result;
+}
+
+std::string deltaNetPortableScanReductionSource(const std::string& source) {
+    // The scan shaders split 256 threads into two logical 128-thread tiles.
+    // subgroupAdd cannot implement those tiles when the adapter uses wave64:
+    // each assumed 32-lane partial is then counted twice. Reduce explicitly in
+    // workgroup memory so the result is independent of subgroup size.
+    std::string result(source);
+    const std::string enable = "enable subgroups;";
+    if (auto pos = result.find(enable); pos != std::string::npos)
+        result.erase(pos, enable.size());
+    const auto begin = result.find("var<workgroup>");
+    const auto end = begin == std::string::npos ? std::string::npos
+                                                : result.find("@compute", begin);
+    if (begin == std::string::npos || end == std::string::npos)
+        return result;
+    static const char* portable = R"WGSL(var<workgroup> reduce_scratch: array<f32, 256>;
+fn reduce128(x: f32, lane128: u32, pair: u32) -> f32 {
+    let tid = pair * 128u + lane128;
+    reduce_scratch[tid] = x;
+    workgroupBarrier();
+    for (var offset = 64u; offset > 0u; offset = offset / 2u) {
+        if (lane128 < offset) {
+            reduce_scratch[tid] += reduce_scratch[tid + offset];
+        }
+        workgroupBarrier();
+    }
+    return reduce_scratch[pair * 128u];
+}
+)WGSL";
+    result.replace(begin, end - begin, portable);
     return result;
 }
 
@@ -3614,28 +3663,45 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             }
             }
             {
-                const bool amdValueMajorState = isAmdAdapter &&
-                    (cfg.ssmTimeStepRank == 16u || cfg.ssmTimeStepRank == 32u);
                 const bool nvidiaValueMajorState = isNvidiaAdapter &&
                     (cfg.ssmTimeStepRank == 16u || cfg.ssmTimeStepRank == 32u) &&
                     (qwen35VulkanDecode || qwen35SubgroupSuite);
-                const auto& plDelta = amdValueMajorState
-                    ? gpu->getOrCreatePipeline("delta_net_decode_value_major",
-                        deltaNetValueMajorSource(WGSL_DELTA_NET_DECODE), 8)
-                    : nvidiaValueMajorState
-                    ? gpu->getOrCreatePipeline("delta_net_decode_x2_value_major",
-                        deltaNetValueMajorSource(WGSL_DELTA_NET_DECODE_X2), 8)
-                    : (qwen35VulkanDecode || qwen35SubgroupSuite)
-                        ? getKernel("delta_net_decode_x2") : getKernel("delta_net_decode");
+                const bool repeatedGgufHeads = modelFormat != "onnx" &&
+                    cfg.ssmTimeStepRank > cfg.ssmGroupCount;
+                auto deltaSource = [&](const char* source, bool valueMajor) {
+                    std::string result = repeatedGgufHeads
+                        ? deltaNetRepeatedHeadSource(source) : std::string(source);
+                    return valueMajor ? deltaNetValueMajorSource(result) : result;
+                };
+                // AMD commonly exposes wave64 subgroups. The scalar kernel's
+                // four 32-lane subgroup reduction is only valid for wave32;
+                // x2 uses explicit workgroup-memory reductions and is portable.
+                const bool useX2 = isAmdAdapter || qwen35VulkanDecode || qwen35SubgroupSuite;
+                const bool valueMajor = nvidiaValueMajorState;
+                const CompiledPipeline* plDelta = nullptr;
+                if (repeatedGgufHeads) {
+                    const std::string name = std::string("delta_net_decode_gguf_repeat") +
+                        (useX2 ? "_x2" : "") + (valueMajor ? "_value_major" : "");
+                    plDelta = &gpu->getOrCreatePipeline(name,
+                        deltaSource(useX2 ? WGSL_DELTA_NET_DECODE_X2
+                                          : WGSL_DELTA_NET_DECODE,
+                                    valueMajor), 8);
+                } else if (nvidiaValueMajorState) {
+                    plDelta = &gpu->getOrCreatePipeline("delta_net_decode_x2_value_major",
+                        deltaNetValueMajorSource(WGSL_DELTA_NET_DECODE_X2), 8);
+                } else {
+                    plDelta = &(useX2 ? getKernel("delta_net_decode_x2")
+                                      : getKernel("delta_net_decode"));
+                }
                 auto p = mkP32("p_ssm_delta_L"+std::to_string(i),
                                {cfg.ssmTimeStepRank, cfg.ssmGroupCount, cfg.ssmStateSize, headV});
-                auto bg = makeBG(plDelta, {
+                auto bg = makeBG(*plDelta, {
                     {0, q35SsmQBuf}, {1, q35SsmKBuf}, {2, q35SsmVBuf},
                     {3, q35SsmBetaBuf}, {4, q35SsmGateBuf}, {5, ssmHState[i]},
                     {6, q35SsmYBuf}, {7, p}});
-                const uint32_t deltaY = (qwen35VulkanDecode || qwen35SubgroupSuite)
+                const uint32_t deltaY = useX2
                     ? ((headV + 1u) / 2u) : headV;
-                allDecodeDispatches.push_back({plDelta.pipeline, bg,
+                allDecodeDispatches.push_back({plDelta->pipeline, bg,
                     cfg.ssmTimeStepRank, deltaY, 1, L+"ssm_delta"});
             }
             {
@@ -6762,19 +6828,39 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool exactSingle=preciseQ8&&M==1;
         auto&splitSsmKernel=getKernel(exactSingle?"qwen35_split_qkv_l2":"qwen35_split_qkv_l2_batched");
         const bool valueMajorPrefill=
-            (gpu->adapterName.find("NVIDIA")!=std::string::npos&&cfg.ssmTimeStepRank==32u)||
-            (gpu->adapterName.find("AMD")!=std::string::npos&&
-             (cfg.ssmTimeStepRank==16u||cfg.ssmTimeStepRank==32u));
+            gpu->adapterName.find("NVIDIA")!=std::string::npos&&cfg.ssmTimeStepRank==32u;
         // Intel rank-32 (Qwen 4B) loses occupancy with two resident state
         // columns per lane; retain x2 there while rank-16 and other vendors
         // benefit or remain neutral.
         const bool intelRank32=gpu->adapterName.find("Intel")!=std::string::npos&&
             cfg.ssmTimeStepRank==32u;
         const bool deltaX4=!intelRank32&&std::getenv("BP_QWEN_DISABLE_DELTA_X4")==nullptr;
-        const auto&deltaKernel=exactSingle?getKernel("delta_net_decode"):valueMajorPrefill
-            ? gpu->getOrCreatePipeline(deltaX4?"delta_net_scan_x4_value_major":"delta_net_scan_x2_value_major",
-                deltaNetValueMajorSource(deltaX4?WGSL_DELTA_NET_SCAN_X4:WGSL_DELTA_NET_SCAN_X2),8)
-            : getKernel(deltaX4?"delta_net_scan_x4":"delta_net_scan_x2");
+        const bool repeatedGgufHeads=modelFormat!="onnx"&&
+            cfg.ssmTimeStepRank>cfg.ssmGroupCount;
+        const bool portableAmdScan=gpu->adapterName.find("AMD")!=std::string::npos&&!exactSingle;
+        const CompiledPipeline* deltaKernel=nullptr;
+        if(repeatedGgufHeads){
+            const char*base=exactSingle?WGSL_DELTA_NET_DECODE:
+                (deltaX4?WGSL_DELTA_NET_SCAN_X4:WGSL_DELTA_NET_SCAN_X2);
+            std::string source=deltaNetRepeatedHeadSource(base);
+            if(valueMajorPrefill)source=deltaNetValueMajorSource(source);
+            if(portableAmdScan)source=deltaNetPortableScanReductionSource(source);
+            std::string name=exactSingle?"delta_net_decode_gguf_repeat":
+                (deltaX4?"delta_net_scan_x4_gguf_repeat":"delta_net_scan_x2_gguf_repeat");
+            if(valueMajorPrefill)name+="_value_major";
+            if(portableAmdScan)name+="_portable";
+            deltaKernel=&gpu->getOrCreatePipeline(name,source,8);
+        }else if(exactSingle)deltaKernel=&getKernel("delta_net_decode");
+        else if(valueMajorPrefill||portableAmdScan){
+            std::string source=deltaX4?WGSL_DELTA_NET_SCAN_X4:WGSL_DELTA_NET_SCAN_X2;
+            if(valueMajorPrefill)source=deltaNetValueMajorSource(source);
+            if(portableAmdScan)source=deltaNetPortableScanReductionSource(source);
+            std::string name=deltaX4?"delta_net_scan_x4":"delta_net_scan_x2";
+            if(valueMajorPrefill)name+="_value_major";
+            if(portableAmdScan)name+="_portable";
+            deltaKernel=&gpu->getOrCreatePipeline(name,source,8);
+        }
+        else deltaKernel=&getKernel(deltaX4?"delta_net_scan_x4":"delta_net_scan_x2");
         auto&normGateKernel=getKernel(exactSingle?"qwen35_norm_gated":"qwen35_norm_gated_batched");
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},preciseQ8?M:(M+3)/4,preciseQ8?(N+7)/8:(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
@@ -6850,7 +6936,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
                 add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
                 auto dp=mkp(L+"delta_p",{R,cfg.ssmGroupCount,cfg.ssmStateSize,DV,M});
-                add(deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,exactSingle?DV:(DV+(deltaX4?3u:1u))/(deltaX4?4u:2u),1,L+"delta");
+                add(*deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,exactSingle?DV:(DV+(deltaX4?3u:1u))/(deltaX4?4u:2u),1,L+"delta");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u delta built\n",li);fflush(stderr);}
                 auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
                 add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,exactSingle?1:M,1,L+"normgate");

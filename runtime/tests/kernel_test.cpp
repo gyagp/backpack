@@ -47,6 +47,38 @@ static WGPUBackendType g_backend = WGPUBackendType_Vulkan;
 
 static int ceilDiv(int a, int b) { return (a + b - 1) / b; }
 
+static std::string useRepeatedQkHeadLayout(const char* source) {
+    std::string result(source);
+    auto replaceAll=[&](const std::string& grouped,const std::string& repeated){
+        size_t pos=0;while((pos=result.find(grouped,pos))!=std::string::npos){
+            result.replace(pos,grouped.size(),repeated);pos+=repeated.size();
+        }
+    };
+    replaceAll("head / max(1u, nv / nk)","head % nk");
+    replaceAll("head/max(1u,nv/nk)","head%nk");
+    return result;
+}
+
+static std::string usePortableDeltaScanReduction(const std::string& source) {
+    std::string result(source);
+    if(auto pos=result.find("enable subgroups;");pos!=std::string::npos)
+        result.erase(pos,strlen("enable subgroups;"));
+    const auto begin=result.find("var<workgroup>");
+    const auto end=begin==std::string::npos?std::string::npos:result.find("@compute",begin);
+    if(begin==std::string::npos||end==std::string::npos)return result;
+    static const char* portable=R"WGSL(var<workgroup> reduce_scratch: array<f32, 256>;
+fn reduce128(x:f32,lane128:u32,pair:u32)->f32 {
+    let tid=pair*128u+lane128; reduce_scratch[tid]=x; workgroupBarrier();
+    for(var offset=64u;offset>0u;offset=offset/2u){
+        if(lane128<offset){reduce_scratch[tid]+=reduce_scratch[tid+offset];}
+        workgroupBarrier();
+    }
+    return reduce_scratch[pair*128u];
+}
+)WGSL";
+    result.replace(begin,end-begin,portable);return result;
+}
+
 static uint32_t f32AsU32(float x) {
     uint32_t u;
     memcpy(&u, &x, 4);
@@ -1553,6 +1585,8 @@ TEST(qwen35_conv_scan_silu) {
 TEST(delta_net_scan_x2) {
     auto wgsl=loadWgsl("ssm","delta_net_scan_x2");
     if(wgsl.empty()) return {false,"cannot load kernel"};
+    if(gpu.adapterName.find("AMD")!=std::string::npos)
+        wgsl=usePortableDeltaScanReduction(wgsl);
     // Exercise grouped Q/K sharing: consecutive V heads share one Q/K head.
     const int T=3,NV=2,NK=1,DK=128,DV=2; Rng rng(654);
     auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV);
@@ -1575,8 +1609,52 @@ TEST(delta_net_scan_x2) {
     return assertClose((const float*)result.data(),expected.data(),T*NV*DV,3e-4f,3e-4f);
 }
 
+TEST(delta_net_scan_x2_repeated_heads) {
+    // GGUF/llama.cpp repeats Q/K heads as [k0,k1,k0,k1], unlike the ONNX
+    // grouped layout [k0,k0,k1,k1]. NV=4,NK=2 distinguishes both mappings.
+    auto wgsl=useRepeatedQkHeadLayout(WGSL_DELTA_NET_SCAN_X2);
+    if(gpu.adapterName.find("AMD")!=std::string::npos)
+        wgsl=usePortableDeltaScanReduction(wgsl);
+    const int T=3,NV=4,NK=2,DK=128,DV=2; Rng rng(656);
+    auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV);
+    auto beta=rng.randnVec(T*NV),gate=rng.randnVec(T*NV),state=rng.randnVec(NV*DK*DV);
+    for(float&b:beta)b=1/(1+std::exp(-b));for(float&g:gate)g=-std::abs(g)*.1f;
+    auto ref=state;std::vector<float>expected(T*NV*DV);float qs=1/std::sqrt(float(DK));
+    for(int t=0;t<T;t++)for(int h=0;h<NV;h++)for(int vi=0;vi<DV;vi++){
+        int kh=h%NK,sb=h*DK*DV;float gh=std::exp(gate[t*NV+h]),pred=0;
+        for(int d=0;d<DK;d++)pred+=gh*ref[sb+d*DV+vi]*k[(t*NK+kh)*DK+d];
+        float delta=(v[(t*NV+h)*DV+vi]-pred)*beta[t*NV+h],out=0;
+        for(int d=0;d<DK;d++){float sn=gh*ref[sb+d*DV+vi]+k[(t*NK+kh)*DK+d]*delta;ref[sb+d*DV+vi]=sn;out+=sn*q[(t*NK+kh)*DK+d]*qs;}
+        expected[(t*NV+h)*DV+vi]=out;
+    }
+    auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size()),bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size()),bg=makeBuffer(gpu,"G",gate.data(),gate.size()),bs=makeBuffer(gpu,"S",state.data(),state.size()),by=makeBuffer(gpu,"Y",nullptr,T*NV*DV),p=makeParams(gpu,"P",{NV,NK,DK,DV,T});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},NV,ceilDiv(DV,2),1,by,T*NV*DV*4,8);
+    return assertClose((const float*)result.data(),expected.data(),expected.size(),3e-4f,3e-4f);
+}
+
+TEST(delta_net_decode_x2_repeated_heads) {
+    // This explicit shared-memory reduction is the portable AMD wave64 path.
+    auto wgsl=useRepeatedQkHeadLayout(WGSL_DELTA_NET_DECODE_X2);
+    const int NV=4,NK=2,DK=128,DV=2; Rng rng(657);
+    auto q=rng.randnVec(NK*DK),k=rng.randnVec(NK*DK),v=rng.randnVec(NV*DV);
+    auto beta=rng.randnVec(NV),gate=rng.randnVec(NV),state=rng.randnVec(NV*DK*DV);
+    for(float&b:beta)b=1/(1+std::exp(-b));for(float&g:gate)g=-std::abs(g)*.1f;
+    auto ref=state;std::vector<float>expected(NV*DV);float qs=1/std::sqrt(float(DK));
+    for(int h=0;h<NV;h++)for(int vi=0;vi<DV;vi++){
+        int kh=h%NK,sb=h*DK*DV;float gh=std::exp(gate[h]),pred=0;
+        for(int d=0;d<DK;d++)pred+=gh*ref[sb+d*DV+vi]*k[kh*DK+d];
+        float delta=(v[h*DV+vi]-pred)*beta[h],out=0;
+        for(int d=0;d<DK;d++){float sn=gh*ref[sb+d*DV+vi]+k[kh*DK+d]*delta;ref[sb+d*DV+vi]=sn;out+=sn*q[kh*DK+d]*qs;}
+        expected[h*DV+vi]=out;
+    }
+    auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size()),bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size()),bg=makeBuffer(gpu,"G",gate.data(),gate.size()),bs=makeBuffer(gpu,"S",state.data(),state.size()),by=makeBuffer(gpu,"Y",nullptr,NV*DV),p=makeParams(gpu,"P",{NV,NK,DK,DV});
+    auto result=dispatchAndReadback(gpu,wgsl,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},NV,ceilDiv(DV,2),1,by,NV*DV*4,8);
+    return assertClose((const float*)result.data(),expected.data(),expected.size(),3e-4f,3e-4f);
+}
+
 TEST(delta_net_scan_x4) {
     std::string wgsl=WGSL_DELTA_NET_SCAN_X4;const int T=3,NV=1,NK=1,DK=128,DV=5;Rng rng(655);
+    if(gpu.adapterName.find("AMD")!=std::string::npos)wgsl=usePortableDeltaScanReduction(wgsl);
     auto q=rng.randnVec(T*NK*DK),k=rng.randnVec(T*NK*DK),v=rng.randnVec(T*NV*DV),beta=rng.randnVec(T*NV),gate=rng.randnVec(T*NV),state=rng.randnVec(NV*DK*DV);
     for(float&b:beta)b=1.0f/(1.0f+std::exp(-b));for(float&g:gate)g=-std::abs(g)*.1f;auto ref=state;std::vector<float>expected(T*NV*DV);float qs=1/std::sqrt(float(DK));
     for(int t=0;t<T;t++)for(int vi=0;vi<DV;vi++){float gh=std::exp(gate[t]),pred=0;for(int d=0;d<DK;d++)pred+=gh*ref[d*DV+vi]*k[t*DK+d];float delta=(v[t*DV+vi]-pred)*beta[t],out=0;for(int d=0;d<DK;d++){float sn=gh*ref[d*DV+vi]+k[t*DK+d]*delta;ref[d*DV+vi]=sn;out+=sn*q[t*DK+d]*qs;}expected[t*DV+vi]=out;}

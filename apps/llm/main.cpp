@@ -98,9 +98,10 @@ int main(int argc, char* argv[]) {
 
     // Interactive generation is a manual correctness surface.  Qwen 3.5's
     // batched GGUF prefill is still under conformance investigation, whereas
-    // the serial path produces stable text.  Benchmarks explicitly retain
-    // the optimized path; --fast-prefill permits deliberate manual testing.
-    if (!benchmark && !fastPrefill) {
+    // the serial path produces stable text. Performance evidence must use the
+    // conformant path too; --fast-prefill permits a deliberate experiment but
+    // must not silently contaminate the default benchmark history.
+    if (!fastPrefill) {
 #ifdef _WIN32
         _putenv_s("BP_QWEN35_SERIAL_PREFILL", "1");
 #else
