@@ -7439,7 +7439,12 @@ int32_t ModelRunner::prefillGemmaBatched(
             memcpy(&resultToken,bytes.data(),4);
         } else {
             auto buildEnd = PrefillClock::now();
-            gpu->submitOnly(ds,!passPerDispatch);
+            // Bind groups and per-dispatch parameter buffers are released and
+            // the shared scratch arena is reused below.  A multi-chunk prompt
+            // must therefore finish this chunk before cleanup; submitting it
+            // asynchronously caused use-after-release heap corruption as soon
+            // as Gemma exceeded the 128-token chunk capacity.
+            (void)gpu->submitAndReadback(ds,gemmaPf.x,4,true);
             auto submitEnd = PrefillClock::now();
             buildMs += std::chrono::duration<double, std::milli>(buildEnd-buildStart).count();
             submitMs += std::chrono::duration<double, std::milli>(submitEnd-buildEnd).count();
