@@ -1200,9 +1200,20 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     if (cfg.arch == "gemma4") {
         uint32_t maxHd = 0;
         for (const auto& pl : cfg.perLayer) maxHd = std::max(maxHd, pl.headDim);
+        uint32_t swaHd = 0;
         for (uint32_t i = 0; i < cfg.nLayer; i++)
             cfg.layerAttnTypes[i] = cfg.perLayer[i].headDim == maxHd
                 ? AttnLayerType::Global : AttnLayerType::SlidingWindow;
+        for (uint32_t i = 0; i < cfg.nLayer; i++)
+            if (cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow)
+                swaHd = std::max(swaHd, cfg.perLayer[i].headDim);
+
+        // The export exposes one decoder-level rotary dimension derived from
+        // the 256-wide sliding layers, while its global GQA cache is 256
+        // half-dimensions (a full 512-dimensional rotation).  Preserve the
+        // full per-layer head width for both attention families.
+        ropeFreqRotaryDim = maxHd;
+        swaRotaryDim = swaHd;
 
         // Gemma 4 exports K/V projections only for the first cache-owning
         // layers.  Later Q-only layers reuse the final local/global cache.
