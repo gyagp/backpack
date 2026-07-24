@@ -104,5 +104,75 @@
       {"title": "Exercise ragged prefill and paged KV decode shape matrix", "kind": "correctness", "hypothesis": "A batch/sequence/context-length matrix with explicit KV page lifecycle will expose decode-state and boundary errors across NVIDIA, AMD, and Intel before recording throughput.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "checks": ["ragged-prefill", "paged-kv-lifecycle", "decode-context-boundaries"], "metrics": ["prefill_tok_s", "decode_tok_s"], "source_revision": "modular@41222c77ed08"}},
       {"title": "Create revision-linked portable WGSL autotuning grids", "kind": "optimization", "hypothesis": "Reproducible per-device grids for tile size, workgroup size, vector width, and dispatch batching can select portable winners after conformance passes.", "manifest": {"models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"], "parameters": ["tile-size", "workgroup-size", "vector-width", "dispatch-batching"], "exclusions": ["subgroup-matrix", "cuda-graph"], "metrics": ["gpu_time_ms", "prefill_tok_s", "decode_tok_s"], "source_revision": "modular@41222c77ed08"}}
     ]
+  },
+  {
+    "id": "study-gemma-collab-lessons-62457ffc",
+    "source": "Gemma Agent Collaboration",
+    "title": "Long-horizon collaboration, anti-collapse, and lossless evidence study",
+    "revision": "62457ffcc1ff505ab5ca6b22a43296294c9d3f39 (2026-06-23)",
+    "status": "completed",
+    "summary": "Studied the six-day, 100+ agent Gemma 4 challenge and its collaboration architecture. The transferable lesson is to make Backpack's persistent experiment memory, independent validation, idea diversity, and artifact lineage first-class. The challenge's fastest 491.8 TPS result was lossy, while the fastest lossless result reached 315 TPS, demonstrating that a speed leaderboard without layered correctness and private validation can reward the wrong change.",
+    "scope": [
+      "central workspace and constrained backend APIs",
+      "message board, inboxes, task forces, artifacts, and leaderboard",
+      "public/private performance evaluation and downstream quality gates",
+      "emergent collaboration, self-policing, agent collapse, channels, threads, and tracing",
+      "lossless onegraph speculative-decoding optimization"
+    ],
+    "findings": [
+      "Persistent failed-attempt records prevent later agents from repeating neutral or regressive experiments; summaries should include hypothesis, exact revision, environment, raw artifacts, and rejection reason.",
+      "A single conformance signal can be gamed or miss semantic damage. Candidate milestones need layered validation: exact output, intermediate or layer parity where available, cared workloads, and a held-back validation case before integration.",
+      "Agents collapsed onto early popular ideas after reading one large message stream. Backpack should reserve device capacity for novel optimization families and measure idea similarity before queueing duplicates.",
+      "Topic channels and threads map naturally to task lineage: every study finding, experiment branch, evidence set, debate, decision, milestone, and later regression should remain connected to one task graph.",
+      "Compute-poor work such as upstream study, profiling analysis, and artifact review can proceed independently while device workers run experiments; scheduling should distinguish research, implementation, validation, and benchmarking roles.",
+      "The lossless onegraph result supports Backpack's current direction of shape-specialized command replay and graph-side speculative-decoding loops, but it is architecture-specific and must be revalidated for Gemma 4 E2B IT QAT and Windows WebGPU."
+    ],
+    "references": [
+      "https://huggingface.co/spaces/agent-collaborations/gemma-collab-lessons",
+      "app/src/content/article.mdx",
+      "https://github.com/huggingface/agent-collabs"
+    ],
+    "task_proposals": [
+      {
+        "title": "Add held-back validation and layered conformance to milestone admission",
+        "kind": "correctness",
+        "hypothesis": "Requiring exact output, available intermediate parity, and a held-back prompt or shape before integration will catch reward-hacking and workload-specific semantic regressions missed by a single pass flag.",
+        "manifest": {
+          "models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"],
+          "checks": ["exact-output", "intermediate-parity", "held-back-prompt", "held-back-shape"],
+          "policy": "no milestone without all applicable lossless gates"
+        }
+      },
+      {
+        "title": "Build experiment lineage and reusable failure-memory records",
+        "kind": "correctness",
+        "hypothesis": "Linking each idea to its study source, branch, revisions, raw evidence, decision, and rejection reason will prevent duplicate experiments and let future agents reuse negative knowledge.",
+        "manifest": {
+          "records": ["source-finding", "hypothesis", "branch", "base-revision", "candidate-revision", "environment", "artifacts", "decision", "rejection-reason"],
+          "checks": ["duplicate-hypothesis-detection", "rejected-idea-retrieval"]
+        }
+      },
+      {
+        "title": "Introduce diversity-aware task scheduling with an exploration budget",
+        "kind": "optimization",
+        "hypothesis": "Reserving parallel device capacity for distinct optimization families and down-ranking semantically duplicate tasks will reduce agent collapse and discover gains outside the currently dominant tiling path.",
+        "manifest": {
+          "families": ["kernel", "command-submission", "memory-residency", "graph-replay", "quantization", "speculative-decoding", "algorithmic"],
+          "metrics": ["novel-families-tested", "duplicate-tasks-avoided", "accepted-gain-percent"],
+          "constraints": ["conformance-first", "no-required-device-regression"]
+        }
+      },
+      {
+        "title": "Evaluate single-replay Gemma speculative decoding on portable WebGPU",
+        "kind": "optimization",
+        "hypothesis": "If Gemma 4 E2B IT QAT's drafter dependencies permit it, folding drafter setup and repeated draft steps into a shape-specialized replay plan can reduce CPU submission overhead without changing accepted tokens or logits.",
+        "manifest": {
+          "models": ["gemma-4-e2b-it-qat"],
+          "checks": ["draft-logit-parity", "accepted-token-parity", "fallback-parity"],
+          "metrics": ["prefill_tok_s", "decode_tok_s", "cpu_submit_ms", "dispatch_count"],
+          "exclusions": ["subgroup-matrix"]
+        }
+      }
+    ]
   }
 ]
