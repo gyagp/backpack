@@ -5679,9 +5679,10 @@ void ModelRunner::initQwen35PrefillResources() {
     qwen35Pf.av=mk("qpf_av",(uint64_t)C*kvdim);qwen35Pf.qrot=mk("qpf_qrot",(uint64_t)C*qdim);
     qwen35Pf.attn=mk("qpf_attn",(uint64_t)C*qdim);qwen35Pf.aout=mk("qpf_aout",(uint64_t)C*qdim);
     const uint64_t maxK=std::max<uint64_t>({E,im,2u*qdim,cfg.ssmInnerSize});
+    // Keep the same buffer and pipeline layout for candidate and fallback;
+    // BP_Q6K_DISABLE_BATCHED_PREFILL only changes dispatch selection.
     const bool enableNvidiaQ6Batched=
-        gpu->adapterName.find("NVIDIA")!=std::string::npos&&
-        std::getenv("BP_Q6K_DISABLE_BATCHED_PREFILL")==nullptr;
+        gpu->adapterName.find("NVIDIA")!=std::string::npos;
     qwen35Pf.kqActQ8=gpu->createBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
     // Q6_K prefill uses one activation scale per packed i8 word to preserve
     // recurrent continuation parity; Q4_K/Q5_K continue to consume the prefix
@@ -7320,7 +7321,12 @@ int32_t ModelRunner::prefillQwen35Batched(
             (!intelRowsEnv||std::strcmp(intelRowsEnv,"8")!=0);
         const bool packedQ4Prefill=std::getenv("BP_Q4K_DISABLE_PACKED_PREFILL")==nullptr;
         const bool packedQ5Prefill=std::getenv("BP_Q5K_DISABLE_PACKED_PREFILL")==nullptr;
+        // Keep activation-quantized Q6_K atomic at the request level. If a
+        // prefill has a tail, quantizing an earlier full chunk can perturb the
+        // recurrent state observed by that tail, even when the tail itself
+        // uses the float-activation fallback.
         const bool batchedQ6Prefill=gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+            T%qwen35Pf.capacity==0&&
             std::getenv("BP_Q6K_DISABLE_BATCHED_PREFILL")==nullptr;
         const bool sharedKq=gpu->adapterName.find("Intel")==std::string::npos&&
             std::getenv("BP_QWEN_DISABLE_SHARED_KQ")==nullptr;
@@ -7387,7 +7393,8 @@ int32_t ModelRunner::prefillQwen35Batched(
                     gpu->getOrCreatePipeline("q5k_matmul_prequant_batched_dp4a_global",kqGlobalActivationSource(WGSL_Q5K_MATMUL_PREQUANT_BATCHED_DP4A),6);
                 add(kp,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,w},{3,bias},{4,y},{5,p}},(M+7)/8,(N+7)/8,1,n);
             }
-            else if(t==GGUF_TYPE_Q6_K&&batchedQ6Prefill&&M>=8&&endsWith("/down")){
+            // Every chunk is full when the request-level gate above is true.
+            else if(t==GGUF_TYPE_Q6_K&&batchedQ6Prefill&&M==qwen35Pf.capacity&&endsWith("/down")){
                 auto p=mkp(n+"_packed_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a_q6");
                 add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,p}},(K+255)/256,M,1,n+"_quant");
