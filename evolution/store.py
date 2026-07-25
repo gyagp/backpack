@@ -184,6 +184,30 @@ class Store:
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
             self._cancel_terminal_task_runs()
+        self._backfill_learning_memory()
+
+    def _backfill_learning_memory(self) -> None:
+        """Migrate existing studies into cursors and hypothesis memory exactly once."""
+        for study in self.list_learning_studies():
+            checked = study.get("completed_at") or study.get("started_at") or study.get("created_at") or utc_now()
+            with self._lock, self._db:
+                self._db.execute("""INSERT OR IGNORE INTO learning_cursors
+                  (source,revision,study_id,status,last_checked_at,updated_at) VALUES(?,?,?,?,?,?)""", (
+                    study["source"], study.get("revision"), study["id"], study["status"], checked, utc_now()))
+            for index, finding in enumerate(study.get("findings") or []):
+                title, content = f"{study['source']} finding {index + 1}", str(finding)
+                fingerprint = memory_fingerprint("upstream", study["source"], "hypothesis", title, content)
+                exists = self._db.execute("""SELECT 1 FROM memory_records
+                  WHERE scope='upstream' AND scope_id=? AND fingerprint=?""",
+                  (study["source"], fingerprint)).fetchone()
+                if not exists:
+                    self.upsert_memory({
+                        "scope": "upstream", "scope_id": study["source"], "kind": "hypothesis",
+                        "title": title, "content": content, "importance": 55, "confidence": 0.4,
+                        "source_evidence": study.get("references") or [],
+                        "created_revision": study.get("revision"),
+                        "tags": ["evolution", study["id"]],
+                    }, "memory-migration")
 
     def _cancel_terminal_task_runs(self, task_id: str | None = None) -> int:
         """Reconcile non-terminal runs whose owning task has already ended."""

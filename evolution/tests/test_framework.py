@@ -173,6 +173,27 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual([self.machine["id"]], delegated["device_policy"]["machine_ids"])
         self.assertEqual(1, len(delegated["runs"]))
 
+    def test_existing_learning_studies_are_backfilled_idempotently(self) -> None:
+        path = Path(self.tmp.name) / "legacy.db"
+        legacy = Store(path)
+        legacy.add_learning_study({
+            "id": "legacy-study", "source": "llama.cpp", "title": "Legacy study",
+            "revision": "r1", "status": "completed", "summary": "A finding",
+            "findings": ["Reuse quantized activations."], "references": ["src/mmq.cu:1"],
+        }, "test")
+        with legacy._db:
+            legacy._db.execute("DELETE FROM learning_cursors")
+            legacy._db.execute("DELETE FROM memory_records")
+        legacy.close()
+        migrated = Store(path)
+        self.assertEqual(1, len(migrated.list_learning_cursors()))
+        self.assertEqual(1, len(migrated.list_memory({"scope": "upstream"})))
+        migrated.close()
+        reopened = Store(path)
+        self.assertEqual(1, len(reopened.list_learning_cursors()))
+        self.assertEqual(1, len(reopened.list_memory({"scope": "upstream"})))
+        reopened.close()
+
     def test_agent_uses_synchronized_base_for_repository_commands(self) -> None:
         repo = Path(self.tmp.name) / "repo"
         base = repo / "gitignore" / "evolution" / "worktrees" / "base-abc"
