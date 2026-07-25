@@ -5707,7 +5707,8 @@ void ModelRunner::initQwen35PrefillResources() {
         (void)gpu->getOrCreatePipeline("q4k_repack_ort_dense",q4kRepackOrtDenseSource(),4);
         (void)gpu->getOrCreatePipeline("q4k_ort_dense_tile64",q4kOrtRepackedTileSource(),6);
     }
-    if(gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+    if((gpu->adapterName.find("NVIDIA")!=std::string::npos||
+        gpu->adapterName.find("Intel")!=std::string::npos)&&
        std::getenv("BP_Q5K_DISABLE_PROJECTION_DENSE_TILE")==nullptr){
         uint64_t maxProjectionElems=(uint64_t)
             (cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize)*E;
