@@ -2315,9 +2315,12 @@ function performanceBenchmarkSignature(row) {
       row.metrics?.generation_length,
     ),
     capture = performanceGraphCapture(row),
-    needsCapture = ["onnx", "ort"].includes(
-      String(row.format || "").toLowerCase(),
-    );
+    // Graph capture is an ORT execution option. Backpack/ONNX has no such
+    // result field, so requiring it here incorrectly erased valid Backpack
+    // measurements from the Status comparison table.
+    needsCapture =
+      row.framework === "ort" &&
+      ["onnx", "ort"].includes(String(row.format || "").toLowerCase());
   if (prompt == null || generated == null || (needsCapture && capture == null))
     return null;
   return { prompt, generated, capture: capture || "not_applicable" };
