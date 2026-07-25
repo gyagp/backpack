@@ -165,6 +165,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.server.store.activity(int((query.get("limit") or [40])[0])))
             if path == "/api/tasks":
                 return self._send_json(self.server.store.list_tasks())
+            match = re.fullmatch(r"/api/tasks/([^/]+)/context", path)
+            if match:
+                query = parse_qs(urlparse(self.path).query)
+                return self._send_json(self.server.store.task_context(
+                    match.group(1), role=(query.get("role") or ["task_worker"])[0],
+                    device=(query.get("device") or [""])[0],
+                    goal=(query.get("goal") or [""])[0],
+                    max_tokens=int((query.get("max_tokens") or [8000])[0])))
             match = re.fullmatch(r"/api/tasks/([^/]+)", path)
             if match:
                 task = self.server.store.task_detail(match.group(1))
@@ -192,6 +200,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.server.store.confirmed_regressions())
             if path == "/api/studies":
                 return self._send_json(self.server.store.list_learning_studies())
+            if path == "/api/studies/cursors":
+                return self._send_json(self.server.store.list_learning_cursors())
+            if path == "/api/memory":
+                query = parse_qs(urlparse(self.path).query)
+                return self._send_json(self.server.store.list_memory(
+                    {key: values[0] for key, values in query.items() if values}))
+            if path == "/api/memory/status":
+                return self._send_json(self.server.store.memory_status())
+            if path == "/api/agent-sessions":
+                query = parse_qs(urlparse(self.path).query)
+                return self._send_json(self.server.store.list_agent_sessions(
+                    (query.get("task_id") or [None])[0]))
             if path == "/api/runs":
                 return self._send_json(self.server.store.list_runs())
             if path == "/api/milestones":
@@ -248,6 +268,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.store.set_candidate(match.group(1), body.get("base_sha", ""), body.get("candidate_sha", ""), actor)
                 self.server.events.publish("task-updated", result)
                 return self._send_json(result)
+            match = re.fullmatch(r"/api/tasks/([^/]+)/delegate", path)
+            if match:
+                result = self.server.store.delegate_task(match.group(1), body, actor)
+                self.server.events.publish("task-delegated", {"task_id": match.group(1)})
+                return self._send_json(result)
             if path == "/api/evidence":
                 result = self.server.store.add_evidence(body, actor)
                 self.server.events.publish("evidence-added", {"task_id": result["task_id"], "id": result["id"]})
@@ -285,6 +310,24 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.store.add_learning_study(body, actor)
                 self.server.events.publish("study-completed", result)
                 return self._send_json(result, HTTPStatus.CREATED)
+            if path == "/api/memory":
+                result = self.server.store.upsert_memory(body, actor)
+                self.server.events.publish("memory-updated", result)
+                return self._send_json(result, HTTPStatus.CREATED)
+            if path == "/api/memory/compact":
+                result = self.server.store.compact_memory(actor)
+                self.server.events.publish("memory-compacted", result)
+                return self._send_json(result)
+            if path == "/api/agent-sessions":
+                result = self.server.store.start_agent_session(body, actor)
+                self.server.events.publish("agent-session-started", {
+                    key: value for key, value in result.items() if key != "context"})
+                return self._send_json(result, HTTPStatus.CREATED)
+            match = re.fullmatch(r"/api/agent-sessions/([^/]+)/finish", path)
+            if match:
+                result = self.server.store.finish_agent_session(match.group(1), body, actor)
+                self.server.events.publish("agent-session-finished", result)
+                return self._send_json(result)
             match = re.fullmatch(r"/api/tasks/([^/]+)/evaluate", path)
             if match:
                 result = self.server.policy.evaluate(match.group(1))

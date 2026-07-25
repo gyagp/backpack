@@ -120,9 +120,14 @@ will show the resulting device matrix.
 | `GET` | `/api/status` | Overview counts |
 | `GET`, `POST` | `/api/tasks` | List/create tasks |
 | `GET` | `/api/tasks/:id` | Task, evidence, evaluations, decisions, audit |
+| `GET` | `/api/tasks/:id/context` | Build a deterministic bounded agent context |
+| `POST` | `/api/tasks/:id/delegate` | Delegate one task to a bounded leaf-agent role |
 | `POST` | `/api/tasks/:id/transition` | Guarded lifecycle transition |
 | `POST` | `/api/tasks/:id/candidate` | Freeze base and candidate SHAs |
 | `POST` | `/api/tasks/:id/evaluate` | Run the policy engine |
+| `GET`, `POST` | `/api/memory` | Query or reinforce structured memory records |
+| `GET` | `/api/memory/status` | Memory, context-budget, and learning-cursor summary |
+| `GET`, `POST` | `/api/agent-sessions` | Inspect or start delegated agent sessions |
 | `POST` | `/api/machines/register` | Register or heartbeat a machine |
 | `POST` | `/api/machines/configure` | Add an expected offline fleet member |
 | `GET` | `/api/machines` | Device pool |

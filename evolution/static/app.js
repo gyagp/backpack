@@ -155,6 +155,7 @@ async function refresh() {
     studies,
     observations,
     goal,
+    memoryStatus,
   ] = await Promise.all([
     api("/api/status"),
     api("/api/tasks"),
@@ -168,6 +169,7 @@ async function refresh() {
     api("/api/studies"),
     api("/api/observations"),
     api("/api/goal"),
+    api("/api/memory/status"),
   ]);
   const states = status.tasks || {};
   $("#stats").innerHTML = [
@@ -210,6 +212,7 @@ async function refresh() {
   renderDigest(history, enriched);
   renderStudies(studies, tasks);
   renderStudyFeedback(studies, tasks, history);
+  renderAgentMemory(memoryStatus, tasks);
   renderDevices(machines);
   renderActivity(activity);
   renderGoal(goal);
@@ -1214,6 +1217,24 @@ function updateTaskTabs(tasks) {
     );
   select(activeTaskTab);
 }
+function renderAgentMemory(status, tasks) {
+  const memory = status?.memory || {},
+    sessions = status?.sessions || {},
+    recent = sessions.recent || [],
+    taskById = new Map((tasks || []).map((task) => [task.id, task])),
+    cursors = status?.learning_cursors || [],
+    active = sessions.by_status?.running || 0;
+  $("#agent-memory").innerHTML = `<div class="agent-memory-grid">
+    <div class="agent-memory-stat"><b>${memory.by_state?.active || 0}</b><span>Active memory records</span></div>
+    <div class="agent-memory-stat"><b>${active}</b><span>Active leaf agents</span></div>
+    <div class="agent-memory-stat"><b>${Math.round(sessions.average_context_tokens || 0).toLocaleString()}</b><span>Average context tokens</span></div>
+    <div class="agent-memory-stat"><b>${cursors.length}</b><span>Upstream source cursors</span></div>
+  </div><div class="agent-memory-layout"><section><h3>Recent bounded sessions</h3>${recent.length ? `<div class="table-wrap"><table class="agent-session-table"><thead><tr><th>Role / task</th><th>Status</th><th>Context</th><th>Started</th></tr></thead><tbody>${recent.map((session) => {
+    const task = taskById.get(session.task_id);
+    return `<tr><td><strong>${esc(session.role.replaceAll("_", " "))}</strong><div class="meta">${esc(task ? `${taskLabel(task)} · ${task.title}` : session.objective || "unscoped")}</div></td><td>${badge(session.status)}</td><td class="mono">${Number(session.context_tokens || 0).toLocaleString()} / ${Number(session.context_budget || 0).toLocaleString()}</td><td>${esc(shortDate(session.started_at))}</td></tr>`;
+  }).join("")}</tbody></table></div>` : '<div class="empty compact">No delegated agent sessions yet.</div>'}</section><section><h3>Learning cursors</h3>${cursors.length ? cursors.map((cursor) => `<div class="learning-cursor"><strong>${esc(cursor.source)}</strong><span>${esc(cursor.revision || "revision pending")} · checked ${esc(shortDate(cursor.last_checked_at))}</span></div>`).join("") : '<div class="empty compact">No upstream cursor recorded.</div>'}</section></div>`;
+}
+
 function renderStudies(studies, tasks) {
   const taskById = new Map(tasks.map((t) => [t.id, t]));
   $("#study-count").textContent =

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .domain import DomainError, json_text, parse_json, require, utc_now, validate_transition
+from .memory import (ContextBudget, VALID_KINDS, VALID_ROLES, VALID_SCOPES,
+                     build_context_packet, memory_fingerprint, normalize_text)
 
 STATUS_PROMPT_TOKENS = 512
 STATUS_GENERATED_TOKENS = 128
@@ -107,9 +109,36 @@ CREATE TABLE IF NOT EXISTS learning_studies (
   references_json TEXT NOT NULL, generated_tasks_json TEXT NOT NULL,
   started_at TEXT NOT NULL, completed_at TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS memory_records (
+  id TEXT PRIMARY KEY, scope TEXT NOT NULL, scope_id TEXT NOT NULL,
+  kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+  tags_json TEXT NOT NULL, importance INTEGER NOT NULL, confidence REAL NOT NULL,
+  state TEXT NOT NULL, fingerprint TEXT NOT NULL,
+  source_task_id TEXT, source_run_id TEXT, source_evidence_json TEXT NOT NULL,
+  created_revision TEXT, last_verified_revision TEXT, supersedes_id TEXT,
+  use_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
+  failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL, last_used_at TEXT,
+  UNIQUE(scope,scope_id,fingerprint)
+);
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  id TEXT PRIMARY KEY, role TEXT NOT NULL, task_id TEXT, run_id TEXT,
+  machine_id TEXT, parent_session_id TEXT, status TEXT NOT NULL,
+  objective TEXT NOT NULL, context_budget INTEGER NOT NULL,
+  context_tokens INTEGER NOT NULL, context_digest TEXT NOT NULL,
+  memory_ids_json TEXT NOT NULL, result_summary TEXT,
+  artifact_path TEXT, started_at TEXT NOT NULL, completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS learning_cursors (
+  source TEXT PRIMARY KEY, revision TEXT, study_id TEXT,
+  status TEXT NOT NULL, last_checked_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS evidence_task_idx ON evidence(task_id);
 CREATE INDEX IF NOT EXISTS evaluation_task_idx ON evaluations(task_id);
 CREATE INDEX IF NOT EXISTS audit_entity_idx ON audit_events(entity_type, entity_id, id);
+CREATE INDEX IF NOT EXISTS memory_scope_idx ON memory_records(scope,scope_id,state,importance);
+CREATE INDEX IF NOT EXISTS memory_task_idx ON memory_records(source_task_id,state);
+CREATE INDEX IF NOT EXISTS agent_session_task_idx ON agent_sessions(task_id,started_at);
 """
 
 
@@ -127,6 +156,8 @@ JSON_FIELDS = {
     "result_json": "result",
     "scope_json": "scope", "findings_json": "findings",
     "references_json": "references", "generated_tasks_json": "generated_tasks",
+    "tags_json": "tags", "source_evidence_json": "source_evidence",
+    "memory_ids_json": "memory_ids",
 }
 
 
@@ -291,6 +322,42 @@ class Store:
             self.audit("task", task_id, "transition", actor, {"from": task["state"], "to": target, "reason": reason})
             if cancelled:
                 self.audit("task", task_id, "terminal_runs_cancelled", "scheduler", {"count": cancelled})
+        if target in {"integrated", "rejected", "failed", "reverted"}:
+            disposition = "accepted" if target == "integrated" else target
+            self.upsert_memory({
+                "scope": "task", "scope_id": task_id, "kind": "outcome",
+                "title": f"{task['title']} — {disposition}",
+                "content": reason or task.get("verdict_reason") or
+                           f"Task ended as {target}; consult linked evidence before reusing the result.",
+                "importance": 90 if target == "integrated" else 75,
+                "confidence": 1.0 if target in {"integrated", "rejected", "reverted"} else 0.7,
+                "source_task_id": task_id, "created_revision": task.get("candidate_sha") or task.get("base_sha"),
+                "last_verified_revision": task.get("candidate_sha") if target == "integrated" else None,
+                "tags": [target, task.get("kind")],
+            }, actor)
+            origin = task.get("origin") or {}
+            study_id = str(origin.get("study_id") or "")
+            if study_id:
+                with self._lock, self._db:
+                    counter = "success_count" if target == "integrated" else "failure_count"
+                    self._db.execute(f"""UPDATE memory_records SET {counter}={counter}+1,
+                      last_used_at=?,updated_at=? WHERE scope='upstream' AND tags_json LIKE ?""",
+                      (utc_now(), utc_now(), f'%"{study_id}"%'))
+                if target == "integrated":
+                    source = origin.get("source")
+                    source_name = str(source.get("project") or source.get("name") or source.get("type")) \
+                        if isinstance(source, dict) else str(source or "evolution")
+                    evidence_ids = [item["id"] for item in self.list_evidence(task_id)]
+                    self.upsert_memory({
+                        "scope": "upstream", "scope_id": source_name,
+                        "kind": "validated_finding", "title": task["title"],
+                        "content": reason or task.get("verdict_reason") or task["hypothesis"],
+                        "importance": 85, "confidence": 0.95, "source_task_id": task_id,
+                        "source_evidence": evidence_ids, "created_revision": task.get("candidate_sha"),
+                        "last_verified_revision": task.get("candidate_sha"),
+                        "tags": ["evolution-feedback", study_id, "integrated"],
+                    }, actor)
+            self.compact_memory(actor)
         return self.get_task(task_id)  # type: ignore[return-value]
 
     def has_conformance_gaps(self) -> bool:
@@ -311,6 +378,41 @@ class Store:
                              (require(base_sha, "base_sha"), require(candidate_sha, "candidate_sha"), utc_now(), task_id))
             self.audit("task", task_id, "candidate_set", actor, {"base_sha": base_sha, "candidate_sha": candidate_sha})
         return self.get_task(task_id)  # type: ignore[return-value]
+
+    def delegate_task(self, task_id: str, data: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Materialize one fresh bounded leaf-agent attempt selected by the technical director."""
+        task = self.get_task(task_id)
+        if not task:
+            raise DomainError("task not found")
+        if task["state"] in {"integrated", "rejected", "failed", "reverted"}:
+            raise DomainError("terminal task cannot be delegated")
+        role = str(data.get("role") or "task_worker")
+        if role not in {"task_worker", "upstream_learner", "reviewer"}:
+            raise DomainError("delegated role must be task_worker, upstream_learner, or reviewer")
+        budget = int(data.get("context_budget") or (6000 if role == "upstream_learner" else 8000))
+        if not 1000 <= budget <= 32000:
+            raise DomainError("context_budget must be between 1000 and 32000")
+        machine_id = str(data.get("machine_id") or "") or None
+        if machine_id and not self.get_machine(machine_id):
+            raise DomainError("delegation machine not found")
+        manifest = {**task.get("manifest", {}), "adapter": "codex", "agent_role": role,
+                    "agent_context_tokens": budget, "agent_output_tokens": int(data.get("output_budget") or 2000),
+                    "agent_max_attempts": int(data.get("max_attempts") or 1),
+                    "initial_context": normalize_text(data.get("initial_context"), 4000)}
+        policy = dict(task.get("device_policy") or {})
+        if machine_id:
+            policy["machine_ids"] = [machine_id]
+        with self._lock, self._db:
+            self._db.execute("UPDATE tasks SET manifest_json=?,device_policy_json=?,updated_at=? WHERE id=?",
+                             (json_text(manifest), json_text(policy), utc_now(), task_id))
+            if machine_id:
+                self._db.execute("""UPDATE task_runs SET status='cancelled',phase='delegated elsewhere',
+                  progress=100,completed_at=?,updated_at=? WHERE task_id=? AND machine_id<>?
+                  AND status IN ('pending','blocked')""", (utc_now(), utc_now(), task_id, machine_id))
+            self.audit("task", task_id, "delegated", actor,
+                       {"role": role, "machine_id": machine_id, "context_budget": budget})
+        self.ensure_task_runs()
+        return self.task_detail(task_id)  # type: ignore[return-value]
 
     def register_machine(self, data: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -390,6 +492,179 @@ class Store:
     def list_learning_studies(self) -> list[dict[str, Any]]:
         return self._all("SELECT * FROM learning_studies ORDER BY COALESCE(completed_at,started_at) DESC")
 
+    def list_learning_cursors(self) -> list[dict[str, Any]]:
+        return self._all("SELECT * FROM learning_cursors ORDER BY source")
+
+    def upsert_memory(self, data: dict[str, Any], actor: str = "orchestrator") -> dict[str, Any]:
+        """Persist a compact fact. Exact duplicates reinforce one record, never inflate context."""
+        scope = str(data.get("scope") or "project")
+        scope_id = str(data.get("scope_id") or "backpack")
+        kind = str(data.get("kind") or "note")
+        if scope not in VALID_SCOPES:
+            raise DomainError(f"invalid memory scope: {scope}")
+        if kind not in VALID_KINDS:
+            raise DomainError(f"invalid memory kind: {kind}")
+        title = normalize_text(require(data.get("title"), "title"), 500)
+        content = normalize_text(require(data.get("content"), "content"), 16_000)
+        importance = int(data.get("importance", 50))
+        confidence = float(data.get("confidence", 0.5))
+        if not 0 <= importance <= 100 or not 0 <= confidence <= 1:
+            raise DomainError("memory importance must be 0..100 and confidence must be 0..1")
+        state = str(data.get("state") or "active")
+        if state not in {"active", "superseded", "archived"}:
+            raise DomainError("memory state must be active, superseded, or archived")
+        fingerprint = memory_fingerprint(scope, scope_id, kind, title, content)
+        now, memory_id = utc_now(), str(data.get("id") or f"mem-{uuid.uuid4().hex[:12]}")
+        with self._lock, self._db:
+            existing = self._row(self._db.execute(
+                "SELECT * FROM memory_records WHERE scope=? AND scope_id=? AND fingerprint=?",
+                (scope, scope_id, fingerprint)).fetchone())
+            if existing:
+                self._db.execute("""UPDATE memory_records SET importance=MAX(importance,?),
+                  confidence=MAX(confidence,?),state=?,updated_at=?,last_verified_revision=COALESCE(?,last_verified_revision)
+                  WHERE id=?""", (importance, confidence, state, now,
+                                    data.get("last_verified_revision"), existing["id"]))
+                self.audit("memory", existing["id"], "reinforced", actor,
+                           {"source_task_id": data.get("source_task_id")})
+                return self.get_memory(existing["id"])  # type: ignore[return-value]
+            supersedes = data.get("supersedes_id")
+            if supersedes:
+                self._db.execute("UPDATE memory_records SET state='superseded',updated_at=? WHERE id=?",
+                                 (now, supersedes))
+            self._db.execute("""INSERT INTO memory_records(
+              id,scope,scope_id,kind,title,content,tags_json,importance,confidence,state,fingerprint,
+              source_task_id,source_run_id,source_evidence_json,created_revision,last_verified_revision,
+              supersedes_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                memory_id, scope, scope_id, kind, title, content, json_text(data.get("tags") or []),
+                importance, confidence, state, fingerprint, data.get("source_task_id"),
+                data.get("source_run_id"), json_text(data.get("source_evidence") or []),
+                data.get("created_revision"), data.get("last_verified_revision"), supersedes, now, now))
+            self.audit("memory", memory_id, "created", actor,
+                       {"scope": scope, "scope_id": scope_id, "kind": kind})
+        return self.get_memory(memory_id)  # type: ignore[return-value]
+
+    def get_memory(self, memory_id: str) -> dict[str, Any] | None:
+        return self._row(self._db.execute("SELECT * FROM memory_records WHERE id=?", (memory_id,)).fetchone())
+
+    def list_memory(self, filters: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        filters = filters or {}
+        clauses, values = [], []
+        for field in ("scope", "scope_id", "kind", "state", "source_task_id"):
+            if filters.get(field):
+                clauses.append(f"{field}=?"); values.append(filters[field])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return self._all(f"""SELECT * FROM memory_records{where}
+          ORDER BY CASE state WHEN 'active' THEN 0 WHEN 'superseded' THEN 1 ELSE 2 END,
+                   importance DESC,updated_at DESC""", values)
+
+    def memory_status(self) -> dict[str, Any]:
+        def counts(field: str, table: str = "memory_records") -> dict[str, int]:
+            return {str(row[0]): int(row[1]) for row in
+                    self._db.execute(f"SELECT {field},COUNT(*) FROM {table} GROUP BY {field}").fetchall()}
+        context = self._db.execute("""SELECT COUNT(*),COALESCE(SUM(context_tokens),0),
+          COALESCE(AVG(context_tokens),0),COALESCE(MAX(context_tokens),0) FROM agent_sessions""").fetchone()
+        return {
+            "memory": {"total": sum(counts("state").values()), "by_state": counts("state"),
+                       "by_kind": counts("kind"), "by_scope": counts("scope")},
+            "sessions": {"total": int(context[0]), "context_tokens": int(context[1]),
+                         "average_context_tokens": round(float(context[2]), 1),
+                         "max_context_tokens": int(context[3]), "by_status": counts("status", "agent_sessions"),
+                         "recent": self._all("SELECT * FROM agent_sessions ORDER BY started_at DESC LIMIT 20")},
+            "learning_cursors": self.list_learning_cursors(),
+        }
+
+    def task_context(self, task_id: str, *, role: str = "task_worker", device: str = "",
+                     failure: str = "", goal: str = "", max_tokens: int = 8_000) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if not task:
+            raise DomainError("task not found")
+        if not 1_000 <= max_tokens <= 32_000:
+            raise DomainError("context max_tokens must be between 1000 and 32000")
+        memory = self.list_memory({"state": "active"})
+        models = {str(value) for value in (task.get("manifest", {}).get("models") or [])}
+        source = str(task.get("origin", {}).get("source") or "").lower()
+        relevant = [item for item in memory if item["scope"] == "project" or
+                    (item["scope"] == "task" and item["scope_id"] == task_id) or
+                    item.get("source_task_id") == task_id or
+                    (item["scope"] == "model" and item["scope_id"] in models) or
+                    (item["scope"] == "device" and item["scope_id"].lower() == device.lower()) or
+                    (item["scope"] == "upstream" and
+                     (role == "upstream_learner" or item["scope_id"].lower() in source))]
+        return build_context_packet(task, relevant, role=role, device=device, failure=failure,
+                                    goal=goal, budget=ContextBudget(max_tokens=max_tokens))
+
+    def start_agent_session(self, data: dict[str, Any], actor: str = "orchestrator") -> dict[str, Any]:
+        role = str(data.get("role") or "task_worker")
+        if role not in VALID_ROLES:
+            raise DomainError(f"invalid agent role: {role}")
+        task_id = str(data.get("task_id") or "") or None
+        context = self.task_context(task_id, role=role, device=str(data.get("device") or ""),
+                                    failure=str(data.get("failure") or ""),
+                                    goal=str(data.get("goal") or ""),
+                                    max_tokens=int(data.get("context_budget") or 8_000)) if task_id else {
+            "digest": "", "estimated_tokens": 0, "max_tokens": int(data.get("context_budget") or 8_000),
+            "memory_ids": [], "rendered": "", "packet": {}}
+        session_id, now = str(data.get("id") or f"session-{uuid.uuid4().hex[:12]}"), utc_now()
+        with self._lock, self._db:
+            self._db.execute("""INSERT INTO agent_sessions(
+              id,role,task_id,run_id,machine_id,parent_session_id,status,objective,
+              context_budget,context_tokens,context_digest,memory_ids_json,started_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                session_id, role, task_id, data.get("run_id"), data.get("machine_id"),
+                data.get("parent_session_id"), "running", normalize_text(data.get("objective") or
+                (context.get("packet") or {}).get("objective"), 2_000), context["max_tokens"],
+                context["estimated_tokens"], context["digest"], json_text(context["memory_ids"]), now))
+            if context["memory_ids"]:
+                marks = ",".join("?" for _ in context["memory_ids"])
+                self._db.execute(f"""UPDATE memory_records SET use_count=use_count+1,last_used_at=?
+                  WHERE id IN ({marks})""", [now, *context["memory_ids"]])
+            self.audit("agent_session", session_id, "started", actor,
+                       {"role": role, "task_id": task_id, "context_tokens": context["estimated_tokens"]})
+        return {**self.get_agent_session(session_id), "context": context}  # type: ignore[arg-type]
+
+    def get_agent_session(self, session_id: str) -> dict[str, Any] | None:
+        return self._row(self._db.execute("SELECT * FROM agent_sessions WHERE id=?", (session_id,)).fetchone())
+
+    def list_agent_sessions(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        if task_id:
+            return self._all("SELECT * FROM agent_sessions WHERE task_id=? ORDER BY started_at DESC", (task_id,))
+        return self._all("SELECT * FROM agent_sessions ORDER BY started_at DESC")
+
+    def finish_agent_session(self, session_id: str, data: dict[str, Any], actor: str) -> dict[str, Any]:
+        session = self.get_agent_session(session_id)
+        if not session:
+            raise DomainError("agent session not found")
+        status = str(data.get("status") or "completed")
+        if status not in {"completed", "failed", "cancelled"}:
+            raise DomainError("terminal agent status must be completed, failed, or cancelled")
+        summary = normalize_text(data.get("result_summary"), 8_000)
+        with self._lock, self._db:
+            self._db.execute("""UPDATE agent_sessions SET status=?,result_summary=?,artifact_path=?,completed_at=?
+              WHERE id=?""", (status, summary, data.get("artifact_path"), utc_now(), session_id))
+            ids = session.get("memory_ids") or []
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                counter = "success_count" if status == "completed" else "failure_count"
+                self._db.execute(f"UPDATE memory_records SET {counter}={counter}+1 WHERE id IN ({marks})", ids)
+            self.audit("agent_session", session_id, "finished", actor, {"status": status})
+        return self.get_agent_session(session_id)  # type: ignore[return-value]
+
+    def compact_memory(self, actor: str = "orchestrator") -> dict[str, int]:
+        """Archive only low-value transient task memory; verified facts and evidence remain durable."""
+        with self._lock, self._db:
+            rows = self._db.execute("""SELECT m.id FROM memory_records m JOIN tasks t
+              ON t.id=m.scope_id AND m.scope='task'
+              WHERE t.state IN ('integrated','rejected','failed','reverted')
+                AND m.kind IN ('note','hypothesis','handoff') AND m.importance<50
+                AND m.success_count=0""").fetchall()
+            ids = [row[0] for row in rows]
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                self._db.execute(f"UPDATE memory_records SET state='archived',updated_at=? WHERE id IN ({marks})",
+                                 [utc_now(), *ids])
+            self.audit("memory", "collection", "compacted", actor, {"archived": len(ids)})
+        return {"archived": len(ids), "deleted": 0}
+
     def add_learning_study(self, data: dict[str, Any], actor: str) -> dict[str, Any]:
         study_id = data.get("id") or f"study-{uuid.uuid4().hex[:12]}"
         superseded = [str(value) for value in data.get("supersedes") or [] if value]
@@ -430,6 +705,20 @@ class Store:
             ))
             self.audit("study", study_id, "study_completed" if status == "completed" else "study_updated",
                        actor, {"source": data.get("source"), "generated_tasks": generated})
+            self._db.execute("""INSERT INTO learning_cursors VALUES(?,?,?,?,?,?)
+              ON CONFLICT(source) DO UPDATE SET revision=excluded.revision,study_id=excluded.study_id,
+              status=excluded.status,last_checked_at=excluded.last_checked_at,updated_at=excluded.updated_at""", (
+                str(data.get("source")), data.get("revision"), study_id, status,
+                data.get("completed_at") or now, now))
+        if status == "completed":
+            references = list(data.get("references") or [])
+            for index, finding in enumerate(data.get("findings") or []):
+                self.upsert_memory({
+                    "scope": "upstream", "scope_id": str(data.get("source")), "kind": "hypothesis",
+                    "title": f"{data.get('source')} finding {index + 1}", "content": str(finding),
+                    "importance": 55, "confidence": 0.4, "source_evidence": references,
+                    "created_revision": data.get("revision"), "tags": ["evolution", study_id],
+                }, actor)
         self.ensure_task_runs()
         self.ensure_runnable_automatic_tasks()
         return self._row(self._db.execute("SELECT * FROM learning_studies WHERE id=?", (study_id,)).fetchone())  # type: ignore[return-value]
@@ -526,6 +815,9 @@ class Store:
         task["decisions"] = self._all("SELECT * FROM decisions WHERE task_id=? ORDER BY created_at DESC", (task_id,))
         task["audit"] = self._all("SELECT * FROM audit_events WHERE entity_type='task' AND entity_id=? ORDER BY id", (task_id,))
         task["runs"] = self.list_runs(task_id)
+        task["memory"] = self._all("""SELECT * FROM memory_records
+          WHERE scope='task' AND scope_id=? ORDER BY importance DESC,updated_at DESC""", (task_id,))
+        task["agent_sessions"] = self.list_agent_sessions(task_id)
         return task
 
     def delete_task(self, task_id: str, actor: str) -> bool:

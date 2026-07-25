@@ -194,6 +194,19 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
     task, run_id = run["task"], run["id"]
     manifest = task.get("manifest") or {}
     adapter = manifest.get("adapter")
+    if adapter == "codex":
+        request_json(server + f"/api/runs/{run_id}", "POST",
+                     {"status": "running", "phase": "delegated agent", "progress": 10}, name)
+        empty = subprocess.CompletedProcess([], 1, "", str(manifest.get("initial_context") or ""))
+        repair = codex_repair(server, task, run, repo, name, empty,
+                              role=str(manifest.get("agent_role") or "task_worker"))
+        succeeded = bool(repair and repair.get("status") == "completed")
+        request_json(server + f"/api/runs/{run_id}", "POST", {
+            "status": "completed" if succeeded else "failed", "phase": "agent finished",
+            "progress": 100, "result": {"agent_attempt": repair or {}},
+            "error": None if succeeded else (repair or {}).get("error", "delegated agent failed"),
+        }, name)
+        return
     if adapter != "argv":
         raise RuntimeError(f"unsupported task adapter: {adapter or 'none'}")
     argv = manifest.get("argv")
@@ -259,7 +272,7 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
     if status == "failed":
         prior_attempts = int((run.get("result") or {}).get("codex_repair_attempts", 0))
         if prior_attempts < 1:
-            repair = codex_repair(task, run, repo, name, completed)
+            repair = codex_repair(server, task, run, repo, name, completed)
             if repair:
                 result["codex_repair"] = repair
                 result["codex_repair_attempts"] = prior_attempts + 1
@@ -370,8 +383,8 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                   "error": error}, name)
 
 
-def codex_repair(task: dict[str, Any], run: dict[str, Any], repo: Path, name: str,
-                 completed: subprocess.CompletedProcess[str]) -> dict[str, Any] | None:
+def codex_repair(server: str, task: dict[str, Any], run: dict[str, Any], repo: Path, name: str,
+                 completed: subprocess.CompletedProcess[str], role: str = "task_worker") -> dict[str, Any] | None:
     codex = _command_output(["where.exe", "codex"]).splitlines()
     if not codex:
         return {"status": "cli_missing", "error": f"Codex CLI is not installed on {name}"}
@@ -392,15 +405,27 @@ def codex_repair(task: dict[str, Any], run: dict[str, Any], repo: Path, name: st
             return {"status": "worktree_failed", "branch": branch,
                     "error": (add.stderr or add.stdout)[-4000:]}
     failure = (completed.stderr + "\n" + completed.stdout)[-16000:]
-    prompt = f"""Goal: unblock Backpack task {task_id} on device {name}.
+    session: dict[str, Any] = {}
+    try:
+        session = request_json(server + "/api/agent-sessions", "POST", {
+            "role": role, "task_id": task_id, "run_id": run.get("id"),
+            "machine_id": run.get("machine_id"), "device": name,
+            "objective": str(task.get("hypothesis") or task.get("title") or task_id), "failure": failure,
+            "context_budget": int((task.get("manifest") or {}).get("agent_context_tokens", 8000)),
+        }, name)
+    except (OSError, RuntimeError, ValueError):
+        # Memory retrieval is advisory; an unavailable server must not prevent local repair.
+        session = {}
+    prompt = (session.get("context") or {}).get("rendered") or f"""Role: task_worker
+Goal: unblock Backpack task {task_id} on device {name}.
 Task: {task.get('title', '')}
 Hypothesis: {task.get('hypothesis', '')}
 Failure log:
 {failure}
 
-Reproduce the failure in this isolated worktree, identify the root cause, implement the smallest portable fix,
-and run focused validation. Preserve conformance-first policy and do not use Windows WebGPU subgroup matrices.
-Do not merge or push. Summarize changed files, tests, remaining risk, and whether the task is ready to retry.
+Work only in this isolated worktree. Identify the root cause, implement a portable fix, and run focused
+validation. Preserve conformance-first policy and the 2% regression gate. Do not merge or push. Return a
+compact handoff with changed files, exact tests, evidence, risks, and reusable findings.
 """
     repair = subprocess.run([codex[0], "exec", "--sandbox", "workspace-write", "--json", prompt],
                             cwd=worktree, text=True, encoding="utf-8", errors="replace",
@@ -415,8 +440,24 @@ Do not merge or push. Summarize changed files, tests, remaining risk, and whethe
                                    capture_output=True, timeout=120, shell=False)
         if committed.returncode == 0:
             commit = _command_output(["git", "-C", str(worktree), "rev-parse", "HEAD"])
+    session_id = session.get("id")
+    artifact_dir = repo / "gitignore" / "evolution" / "agent-sessions"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / f"{session_id or task_id + '-' + safe_name}.jsonl"
+    artifact_path.write_text(repair.stdout + ("\n" + repair.stderr if repair.stderr else ""),
+                             encoding="utf-8", errors="replace")
+    if session_id:
+        try:
+            request_json(server + f"/api/agent-sessions/{session_id}/finish", "POST", {
+                "status": "completed" if repair.returncode == 0 else "failed",
+                "result_summary": (repair.stdout or repair.stderr)[-4000:],
+                "artifact_path": str(artifact_path),
+            }, name)
+        except (OSError, RuntimeError, ValueError):
+            pass
     return {"status": "completed" if repair.returncode == 0 else "failed", "branch": branch,
             "worktree": str(worktree), "candidate_sha": commit, "changed": bool(changed),
+            "agent_session_id": session_id, "context_digest": (session.get("context") or {}).get("digest"),
             "exit_code": repair.returncode, "stdout_tail": repair.stdout[-12000:],
             "stderr_tail": repair.stderr[-12000:]}
 
@@ -487,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     sync_base(args.server, args.repo, worktrees)
                     run = request_json(args.server + "/api/runs/claim", "POST",
-                                       {"machine": args.name, "capabilities": ["argv"]}, args.name)
+                                       {"machine": args.name, "capabilities": ["argv", "codex"]}, args.name)
                     if run:
                         try:
                             execute_run(args.server, args.name, run, args.repo)

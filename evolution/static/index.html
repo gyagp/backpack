@@ -30,6 +30,7 @@
   <style>.study-check{margin:3px 0 8px;color:var(--muted);font:600 10px Consolas,monospace}.study-feedback-summary{margin:9px 0;padding:8px 10px;border-left:3px solid var(--accent);border-radius:0 6px 6px 0;background:var(--accent-soft);font-size:11px}.study-task-outcome{display:flex;align-items:center;gap:5px;margin-left:auto}.study-task-outcome .history-impact-badge{font-size:9px;padding:3px 6px}.study-task-link{gap:10px}.study-task-link>span:first-child{display:grid;flex:1;gap:3px;text-align:left}.study-task-link small{color:var(--muted);font-weight:500}</style>
   <style>.digest-day-detail{margin-top:18px;padding-top:18px;border-top:1px solid var(--border)}.digest-detail-item{padding:14px 0;border-bottom:1px solid var(--border)}.digest-detail-item header{display:flex;align-items:center;justify-content:space-between;gap:12px}.digest-detail-item p{line-height:1.5}.digest-square.selected{outline:2px solid #3730a3;outline-offset:2px}</style>
   <style>.status-perf-profile{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;margin:0 0 12px;padding:10px 12px;border:1px solid #c7d2fe;border-radius:9px;background:#eef2ff;color:#3730a3;font-size:12px}.status-perf-profile strong{font-size:13px}</style>
+  <style>.agent-memory-grid{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px;margin-bottom:16px}.agent-memory-stat{padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}.agent-memory-stat b{display:block;font-size:22px}.agent-memory-stat span{color:var(--muted);font-size:11px}.agent-memory-layout{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr);gap:16px}.agent-session-table{width:100%;font-size:11px}.agent-session-table td,.agent-session-table th{padding:7px}.learning-cursor{padding:9px 0;border-bottom:1px solid var(--border)}.learning-cursor:last-child{border:0}.learning-cursor strong,.learning-cursor span{display:block}.learning-cursor span{margin-top:3px;color:var(--muted);font:10px Consolas,monospace}@media(max-width:900px){.agent-memory-grid{grid-template-columns:1fr 1fr}.agent-memory-layout{grid-template-columns:1fr}}</style>
 </head>
 <body>
 <div id="app">
@@ -59,6 +60,7 @@
 
       <section id="evolution-tab" class="tab-page hidden">
         <div class="page-header"><div><h1>Evolution</h1><p>Completed upstream and experience studies that generate new conformance and performance tasks.</p></div><span id="study-count"></span></div>
+        <section class="card"><div class="card-header"><div><h2>Agent memory</h2><p>Bounded task contexts, leaf-agent sessions, and durable result-derived knowledge.</p></div></div><div id="agent-memory"></div></section>
         <section class="card"><div id="studies"></div></section>
       </section>
 

@@ -82,6 +82,97 @@ class FrameworkTest(unittest.TestCase):
         with self.assertRaises(DomainError):
             write_goal("   ", path)
 
+    def test_memory_is_deduplicated_and_task_context_is_bounded(self) -> None:
+        first = self.store.upsert_memory({
+            "scope": "project", "scope_id": "backpack", "kind": "constraint",
+            "title": "Conformance first", "content": "Do not publish performance before correctness.",
+            "importance": 90, "confidence": 1,
+        }, "test")
+        second = self.store.upsert_memory({
+            "scope": "project", "scope_id": "backpack", "kind": "constraint",
+            "title": "Conformance first", "content": "Do not publish performance before correctness.",
+            "importance": 95, "confidence": 1,
+        }, "test")
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(1, len(self.store.list_memory()))
+        packet = self.store.task_context(self.task["id"], max_tokens=1000)
+        again = self.store.task_context(self.task["id"], max_tokens=1000)
+        self.assertLessEqual(packet["estimated_tokens"], 1000)
+        self.assertEqual(packet["digest"], again["digest"])
+        self.assertEqual([first["id"]], packet["memory_ids"])
+        oversized = self.store.task_context(self.task["id"], failure="x" * 50_000, max_tokens=1000)
+        self.assertLessEqual(oversized["estimated_tokens"], 1000)
+        self.assertIn("[truncated]", oversized["packet"]["current_failure"])
+
+    def test_agent_session_records_lineage_budget_and_memory_feedback(self) -> None:
+        memory = self.store.upsert_memory({
+            "scope": "project", "scope_id": "backpack", "kind": "procedure",
+            "title": "Paired benchmark", "content": "Benchmark base and candidate with 512/128.",
+            "importance": 90, "confidence": 1,
+        }, "test")
+        started = self.store.start_agent_session({
+            "task_id": self.task["id"], "role": "task_worker", "context_budget": 2000,
+            "parent_session_id": "director-1", "objective": "Implement one atomic experiment",
+        }, "test")
+        self.assertEqual("running", started["status"])
+        self.assertEqual("director-1", started["parent_session_id"])
+        self.assertLessEqual(started["context_tokens"], started["context_budget"])
+        finished = self.store.finish_agent_session(started["id"], {
+            "status": "completed", "result_summary": "Validated exact output and benchmarked.",
+            "artifact_path": "gitignore/logs/session.jsonl",
+        }, "test")
+        self.assertEqual("completed", finished["status"])
+        self.assertEqual(1, self.store.get_memory(memory["id"])["success_count"])
+
+    def test_terminal_task_promotes_outcome_and_compacts_low_value_working_memory(self) -> None:
+        self.store.upsert_memory({
+            "scope": "task", "scope_id": self.task["id"], "kind": "note",
+            "title": "Scratch", "content": "Transient exploration", "importance": 10,
+            "source_task_id": self.task["id"],
+        }, "test")
+        self.store.transition_task(self.task["id"], "rejected", "test", "Candidate regressed decode by 4%")
+        records = self.store.list_memory({"scope_id": self.task["id"]})
+        outcome = next(item for item in records if item["kind"] == "outcome")
+        scratch = next(item for item in records if item["kind"] == "note")
+        self.assertIn("regressed decode", outcome["content"])
+        self.assertEqual("archived", scratch["state"])
+
+    def test_learning_study_updates_cursor_and_creates_unverified_hypothesis_memory(self) -> None:
+        study = self.store.add_learning_study({
+            "id": "study-ort-1", "source": "ORT WebGPU", "title": "Study packed matmul",
+            "revision": "abc123", "status": "completed", "summary": "Found a packing strategy",
+            "findings": ["Prepack immutable weights by output tile."],
+            "references": ["onnxruntime/core/providers/webgpu/matmul.cc:42"],
+            "task_proposals": [{"title": "Test immutable weight prepacking", "kind": "correctness",
+                                "hypothesis": "Prepacking preserves exact output."}],
+        }, "test")
+        cursor = next(item for item in self.store.list_learning_cursors()
+                      if item["source"] == "ORT WebGPU")
+        memory = next(item for item in self.store.list_memory({"scope": "upstream"})
+                      if item["scope_id"] == "ORT WebGPU")
+        self.assertEqual(study["id"], cursor["study_id"])
+        self.assertEqual("abc123", cursor["revision"])
+        self.assertEqual("hypothesis", memory["kind"])
+        self.assertEqual(0.4, memory["confidence"])
+        generated = study["generated_tasks"][0]
+        for state in ("triaged", "implementing", "candidate_ready", "validating", "evaluating",
+                      "ready_to_merge", "integrating", "integrated"):
+            self.store.transition_task(generated, state, "test", "Exact output passed")
+        feedback = [item for item in self.store.list_memory({"scope": "upstream"})
+                    if item["kind"] == "validated_finding"]
+        self.assertEqual(1, len(feedback))
+        self.assertEqual(generated, feedback[0]["source_task_id"])
+
+    def test_director_delegates_one_bounded_leaf_agent(self) -> None:
+        delegated = self.store.delegate_task(self.task["id"], {
+            "role": "task_worker", "machine_id": self.machine["id"],
+            "context_budget": 4000, "output_budget": 1000,
+        }, "director")
+        self.assertEqual("codex", delegated["manifest"]["adapter"])
+        self.assertEqual("task_worker", delegated["manifest"]["agent_role"])
+        self.assertEqual([self.machine["id"]], delegated["device_policy"]["machine_ids"])
+        self.assertEqual(1, len(delegated["runs"]))
+
     def test_agent_uses_synchronized_base_for_repository_commands(self) -> None:
         repo = Path(self.tmp.name) / "repo"
         base = repo / "gitignore" / "evolution" / "worktrees" / "base-abc"
