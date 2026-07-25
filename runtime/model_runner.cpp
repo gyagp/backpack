@@ -138,6 +138,24 @@ fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+r
 )WGSL";cut("fn loadSHMA(","@compute @workgroup_size",loaders);return s;
 }
 
+std::string q4kPackedOrtTileSource() {
+    // Keep the ORT 64x64 compute tile, but decode GGUF Q4_K blocks while the
+    // tile is loaded instead of materializing the dense nibble/scale layout.
+    // The two read bindings alias the same packed weight buffer: binding 2
+    // supplies quants and binding 3 supplies the affine block headers.
+    std::string s=q4kOrtRepackedTileSource();
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    all("input_b: array<vec2<u32>>","input_b: array<u32>");
+    all("scales_b: array<vec2<f32>>","packed_headers: array<u32>");
+    const std::string loader=R"WGSL(fn unpackQ4KWord(p:u32,high:bool)->u32{return select(p&0x0f0f0f0fu,(p>>4u)&0x0f0f0f0fu,high);}
+fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let gr=kidx_v/2u;let block=gr/8u;let sb=gr&7u;if(block>=uniforms.zero_blocks_per_col){return;}let base=br*uniforms.weight_idx+block*36u;let qb=base+4u+(sb/2u)*8u+col*4u;let high=(sb&1u)!=0u;tile_B[col][row]=vec4<u32>(unpackQ4KWord(input_b[qb],high),unpackQ4KWord(input_b[qb+1u],high),unpackQ4KWord(input_b[qb+2u],high),unpackQ4KWord(input_b[qb+3u],high));if(col==0u){let dm=unpack2x16float(packed_headers[base]);let sh=(sb&3u)*8u;let dv=(packed_headers[base+1u]>>sh)&255u;let mv=(packed_headers[base+2u]>>sh)&255u;var sc:u32;var mn:u32;if(sb<4u){sc=dv&63u;mn=mv&63u;}else{let hi=(packed_headers[base+3u]>>sh)&255u;sc=(hi&15u)|((dv>>2u)&48u);mn=(hi>>4u)|((mv>>2u)&48u);}scale_B[row]=vec2<f32>(dm.x*f32(sc),dm.y*f32(mn));}}
+
+)WGSL";
+    auto a=s.find("fn loadSHMB("),b=s.find("@compute @workgroup_size",a);
+    if(a==std::string::npos||b==std::string::npos){fprintf(stderr,"Packed Q4_K ORT tile transform failed\n");std::abort();}
+    s.replace(a,b-a,loader);return s;
+}
+
 const char* q4PrequantBatchedSource() {
     // llama.cpp's Vulkan MMQ path quantizes each activation row once and then
     // reuses it across the output-column tile.  Gemma's older Q4_0 kernel
@@ -5696,7 +5714,12 @@ void ModelRunner::initQwen35PrefillResources() {
     const bool ortTileAdapter=gpu->adapterName.find("NVIDIA")!=std::string::npos||
         gpu->adapterName.find("AMD")!=std::string::npos||
         gpu->adapterName.find("Intel")!=std::string::npos;
-    if(ortTileAdapter&&std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr){
+    const bool intelDirectTile=gpu->adapterName.find("Intel")!=std::string::npos&&
+        std::getenv("BP_Q4K_DISABLE_DIRECT_TILE")==nullptr&&
+        std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr;
+    if(intelDirectTile){
+        (void)gpu->getOrCreatePipeline("q4k_packed_ort_tile64",q4kPackedOrtTileSource(),6);
+    }else if(ortTileAdapter&&std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr){
         uint64_t maxWeightElems=0;
         for(const auto& pl:cfg.perLayer){
             maxWeightElems=std::max(maxWeightElems,(uint64_t)2u*pl.intermediateSize*E);
@@ -7335,7 +7358,13 @@ int32_t ModelRunner::prefillQwen35Batched(
             std::getenv("BP_Q6K_DISABLE_BATCHED_PREFILL")==nullptr;
         const bool sharedKq=gpu->adapterName.find("Intel")==std::string::npos&&
             std::getenv("BP_QWEN_DISABLE_SHARED_KQ")==nullptr;
+        const bool useIntelDirectTile=gpu->adapterName.find("Intel")!=std::string::npos&&
+            std::getenv("BP_Q4K_DISABLE_DIRECT_TILE")==nullptr&&
+            std::getenv("BP_Q4K_DISABLE_ORT_TILE")==nullptr&&
+            (M>=64||std::getenv("BP_Q4K_FORCE_DIRECT_TILE")!=nullptr);
         const bool useOrtQ4Tile=qwen35Pf.q4DenseScratch.handle&&M>=64;
+        const CompiledPipeline* packedOrtQ4Tile=useIntelDirectTile
+            ?&gpu->getOrCreatePipeline("q4k_packed_ort_tile64",q4kPackedOrtTileSource(),6):nullptr;
         const CompiledPipeline* q4Repack=useOrtQ4Tile
             ?&gpu->getOrCreatePipeline("q4k_repack_ort_dense",q4kRepackOrtDenseSource(),4):nullptr;
         const CompiledPipeline* ortQ4Tile=useOrtQ4Tile
@@ -7359,6 +7388,15 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto p=mkp(n+"_q5_ort_p",{1,M,N,K,K/8,K/16,mt,nt,0,0});
                 add(tile,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,qwen35Pf.q5ProjectionDenseScratch},
                     {3,qwen35Pf.q5ProjectionScaleMinScratch},{4,y},{5,p}},mt*nt,1,1,n+"_q5_ort64");
+            }
+            else if(t==GGUF_TYPE_Q4_K&&packedOrtQ4Tile){
+                auto qp=mkp(n+"_direct_quant_p",{K,N,M,nb,rs});
+                auto&quant=getKernel("q8_quantize_batched_dp4a");
+                add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,qp}},(K+255)/256,M,1,n+"_quant");
+                const uint32_t mt=(M+63)/64,nt=(N+63)/64;
+                auto p=mkp(n+"_direct_p",{1,M,N,K,K/8,K/16,mt,nt,nb,rs});
+                add(*packedOrtQ4Tile,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},
+                    {2,w},{3,w},{4,y},{5,p}},mt*nt,1,1,n+"_direct64");
             }
             else if(t==GGUF_TYPE_Q4_K&&dense.handle&&scaleMin.handle&&ortQ4Tile){
                 auto qp=mkp(n+"_ort_quant_p",{K,N,M,nb,rs});
