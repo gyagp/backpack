@@ -90,6 +90,11 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
 
 ## Continuous evolution
 
+- Every day, measure the latest llama.cpp/Vulkan release and the latest built
+  ORT/ORT GenAI WebGPU revision on all cared models and applicable cared
+  devices. Run deterministic conformance first, then record standardized
+  512-input/128-output prefill and decode TPS with runtime revisions, dates,
+  graph-capture mode, commands, and artifacts.
 - Study upstream ONNX Runtime, ONNX Runtime GenAI, llama.cpp, Modular, and the
   accumulated experience in `docs/` regularly.
 - Record each study date and its concrete potential tasks. Split ideas into
