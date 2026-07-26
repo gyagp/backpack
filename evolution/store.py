@@ -1328,7 +1328,7 @@ class Store:
         return self._row(self._db.execute("SELECT * FROM observations WHERE id=?", (observation_id,)).fetchone())  # type: ignore[return-value]
 
     @staticmethod
-    def _graph_capture(data: dict[str, Any], fmt: str) -> str | None:
+    def _graph_capture(data: dict[str, Any], framework: str, fmt: str) -> str | None:
         metrics = data.get("metrics") or {}
         details = data.get("conformance_details") or {}
         value = metrics.get("graph_capture", details.get("graph_capture"))
@@ -1342,7 +1342,11 @@ class Store:
                 return "disabled"
             if value in {"not applicable", "n/a", "na"}:
                 return "not_applicable"
-        return None if str(fmt).lower() in {"onnx", "ort"} else "not_applicable"
+        # Graph capture is an ORT execution option.  Backpack can consume an
+        # ONNX/ORT model too, but a missing capture field must not split those
+        # observations into a different regression-protection series.
+        return None if (framework == "ort" and str(fmt).lower() in {"onnx", "ort"}) \
+            else "not_applicable"
 
     def _observation_validity(self, data: dict[str, Any], model_id: str, machine_id: str,
                               framework: str, fmt: str, backend: str) -> tuple[str, str | None]:
@@ -1355,7 +1359,7 @@ class Store:
                                 metrics.get("generation_tokens", metrics.get("generation_length"))))
         if prompt != STATUS_PROMPT_TOKENS or generated != STATUS_GENERATED_TOKENS:
             return "valid", None
-        capture = self._graph_capture(data, fmt)
+        capture = self._graph_capture(data, framework, fmt)
         if capture is None:
             return "valid", None
         performance = {key: metrics.get(key) for key in ("prefill_tok_s", "decode_tok_s")}
@@ -1369,7 +1373,7 @@ class Store:
                       if (row.get("metrics", {}).get("prompt_tokens", row.get("metrics", {}).get("prompt_length")) == prompt
                           and row.get("metrics", {}).get("generated_tokens", row.get("metrics", {}).get("decode_tokens",
                               row.get("metrics", {}).get("generation_tokens", row.get("metrics", {}).get("generation_length")))) == generated
-                          and self._graph_capture(row, fmt) == capture
+                          and self._graph_capture(row, framework, fmt) == capture
                           and row.get("conformance") == "pass")]
         if not comparable:
             return "valid", None

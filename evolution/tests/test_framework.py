@@ -539,6 +539,21 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("valid", shape["validity"])
         self.assertEqual("valid", capture["validity"])
 
+    def test_backpack_ort_regression_guard_does_not_require_graph_capture(self) -> None:
+        model = self.store.upsert_model({"id": "backpack-ort-guard", "name": "Backpack ORT Guard",
+                                         "files": {"ort": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "ort", "backend": "webgpu",
+                  "conformance": "pass"}
+        self.store.add_observation({**common, "id": "backpack-ort-base", "metrics": {
+            "prefill_tok_s": 100, "decode_tok_s": 20, "prompt_tokens": 512,
+            "generated_tokens": 128}}, "test")
+        result = self.store.add_observation({**common, "id": "backpack-ort-drop", "metrics": {
+            "prefill_tok_s": 100, "decode_tok_s": 19.5, "prompt_tokens": 512,
+            "generated_tokens": 128, "graph_capture": "not_applicable"}}, "test")
+        self.assertEqual("quarantined", result["validity"])
+        self.assertIn("decode_tok_s", result["validity_reason"])
+
     def test_confirmed_regression_remains_auditable_but_not_in_status(self) -> None:
         model = self.store.upsert_model({"id": "confirmed-guard", "name": "Confirmed", "files": {"gguf": {}}})
         common = {"model_id": model["id"], "machine_id": self.machine["id"],
