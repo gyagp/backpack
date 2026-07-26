@@ -558,6 +558,10 @@ class FrameworkTest(unittest.TestCase):
         self.store.add_observation({**common, "conformance": "not_applicable", "revision": "b10069",
                                     "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20,
                                                 "prompt_tokens": 512, "generated_tokens": 128}}, "test")
+        self.store.add_observation({**common, "conformance": "not_applicable",
+                                    "revision": "b10069-experimental-kernel",
+                                    "metrics": {"prefill_tok_s": 200, "decode_tok_s": 40,
+                                                "prompt_tokens": 512, "generated_tokens": 128}}, "test")
         self.store.add_observation({**common, "conformance": "not_applicable", "revision": "b10069",
                                     "metrics": {"prefill_tok_s": 777, "decode_tok_s": 777,
                                                 "prompt_tokens": 128, "generated_tokens": 64}}, "test")

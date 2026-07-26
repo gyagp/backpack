@@ -1683,7 +1683,10 @@ class Store:
                     passed = passed[:-len(suffix)]
             metric = re.sub(r"-(?:19|20)\d{6}$", "", metric)
             passed = re.sub(r"-(?:19|20)\d{6}$", "", passed)
-            return metric == passed or metric.startswith(passed + "-") or passed.startswith(metric + "-")
+            # Only known benchmark/date adornments are removed above.  An
+            # arbitrary suffix denotes a different build or experiment and
+            # must not borrow conformance from its base revision.
+            return metric == passed
 
         observations = []
 

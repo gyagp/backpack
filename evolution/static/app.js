@@ -2256,9 +2256,9 @@ function compatiblePerformanceRevision(a, b) {
       .replace(/-+$/, "");
   a = clean(a);
   b = clean(b);
-  return (
-    !!a && !!b && (a === b || a.startsWith(b + "-") || b.startsWith(a + "-"))
-  );
+  // Unknown suffixes identify a different build/experiment. Only the known
+  // benchmark/date decorations removed above may share conformance evidence.
+  return !!a && !!b && a === b;
 }
 function validPerformanceObservations(items) {
   const groups = new Map();
