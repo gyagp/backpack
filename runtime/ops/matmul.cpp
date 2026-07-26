@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <stdexcept>
 #include <vector>
 
 static float fp16ToFloat(uint16_t h) {
@@ -384,8 +385,60 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             ex.getGpu()->supportsSubgroups;
         const bool useDp4aDecode = useSubgroupDecode && (K % 256u) == 0u &&
             ex.getGpu()->adapterName.find("Intel") == std::string::npos;
+        const bool fuseGreedyArgmax = useSubgroupDecode && M == 1 &&
+            N >= 65536u && n.name.find("lm_head") != std::string::npos &&
+            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+            std::getenv("BP_ONNX_DISABLE_FUSED_LMHEAD_ARGMAX") == nullptr;
         const CompiledPipeline* pipelinePtr = nullptr;
-        if (useDp4aDecode) {
+        if (fuseGreedyArgmax) {
+            const char* base = useDp4aDecode ? WGSL_MATMUL_Q8_BLOCK32_DP4A
+                                             : WGSL_MATMUL_Q8_BLOCK32_SUBGROUP;
+            const std::string pipelineName = useDp4aDecode
+                ? "matmul_q8_block32_dp4a_argmax"
+                : "matmul_q8_block32_subgroup_argmax";
+            pipelinePtr = &ex.GetPipelineT(pipelineName, 6, [base]() {
+                std::string source(base);
+                const std::string binding =
+                    "@group(0) @binding(4) var<uniform> p: Params;";
+                const std::string argmaxDecl = binding +
+                    "\n@group(0) @binding(5) var<storage, read_write> ArgmaxPartials: array<u32>;"
+                    "\nvar<workgroup> argmax_values: array<f32, 8>;"
+                    "\nvar<workgroup> argmax_indices: array<u32, 8>;";
+                auto bindingPos = source.find(binding);
+                if (bindingPos == std::string::npos)
+                    throw std::runtime_error("fused LM-head argmax binding marker missing");
+                source.replace(bindingPos, binding.size(), argmaxDecl);
+                const std::string write =
+                    "if (lane == 0u && valid) { Y[n] = acc; }";
+                const std::string fused = R"WGSL(
+if (lane == 0u) {
+    if (valid) { Y[n] = acc; }
+    argmax_values[logical_warp] = select(-3.402823466e+38, acc, valid);
+    argmax_indices[logical_warp] = n;
+}
+workgroupBarrier();
+if (lid.x == 0u) {
+    var best_value = argmax_values[0];
+    var best_index = argmax_indices[0];
+    for (var w = 1u; w < 8u; w++) {
+        let value = argmax_values[w];
+        let index = argmax_indices[w];
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    ArgmaxPartials[wid.x * 2u] = bitcast<u32>(best_value);
+    ArgmaxPartials[wid.x * 2u + 1u] = best_index;
+}
+)WGSL";
+                auto writePos = source.find(write);
+                if (writePos == std::string::npos)
+                    throw std::runtime_error("fused LM-head argmax write marker missing");
+                source.replace(writePos, write.size(), fused);
+                return source;
+            });
+        } else if (useDp4aDecode) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_dp4a", 5,
                 []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_DP4A); });
         } else if (useSubgroupDecode) {
@@ -395,13 +448,51 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             pipelinePtr = &ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
         }
         auto& pipeline = *pipelinePtr;
-        auto group = ex.MakeBindGroup(pipeline, {
-            {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
-            {3, out[0]->buffer}, {4, paramBuf}});
+        const uint32_t numWg = (N + 7) / 8;
+        if (fuseGreedyArgmax &&
+            (!ex.exec.fusedLmHeadArgmaxPartials_.handle ||
+             ex.exec.fusedLmHeadArgmaxPartials_.size < uint64_t(numWg) * 8u)) {
+            if (ex.exec.fusedLmHeadArgmaxPartials_.handle)
+                ex.getGpu()->releaseBuffer(ex.exec.fusedLmHeadArgmaxPartials_);
+            ex.exec.fusedLmHeadArgmaxPartials_ = ex.getGpu()->createBuffer(
+                "fused_lmhead_argmax_partials", uint64_t(numWg) * 8u);
+        }
+        if (fuseGreedyArgmax && !ex.exec.fusedLmHeadArgmaxResult_.handle)
+            ex.exec.fusedLmHeadArgmaxResult_ = ex.getGpu()->createBuffer(
+                "fused_lmhead_argmax_result", 4);
+        auto group = fuseGreedyArgmax
+            ? ex.MakeBindGroup(pipeline, {
+                {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+                {3, out[0]->buffer}, {4, paramBuf},
+                {5, ex.exec.fusedLmHeadArgmaxPartials_}})
+            : ex.MakeBindGroup(pipeline, {
+                {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
+                {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pipeline.pipeline, group,
-                         useSubgroupDecode ? (N + 7) / 8 : (N + 3) / 4,
+                         useSubgroupDecode ? numWg : (N + 3) / 4,
                          static_cast<uint32_t>(M), 1,
+                         fuseGreedyArgmax ? "matmul_q8_block32_fused_argmax" :
                          useSubgroupDecode ? "matmul_q8_block32_subgroup" : "matmul_q8_block32");
+        if (fuseGreedyArgmax) {
+            uint32_t reduceParams[4] = {numWg, 0, 0, 0};
+            auto reduceParamBuf = ex.getParamBuffer(16);
+            ex.getGpu()->writeBuffer(reduceParamBuf, reduceParams, 16);
+            auto& reduce = ex.GetPipelineT("fused_lmhead_argmax_reduce", 3,
+                []() { return std::string(WGSL_ARGMAX_REDUCE); });
+            auto reduceGroup = ex.MakeBindGroup(reduce, {
+                {0, ex.exec.fusedLmHeadArgmaxPartials_},
+                {1, ex.exec.fusedLmHeadArgmaxResult_}, {2, reduceParamBuf}});
+            ex.QueueDispatch(reduce.pipeline, reduceGroup, 1, 1, 1,
+                             "fused_lmhead_argmax_reduce");
+            ex.exec.fusedLmHeadArgmaxAvailable_ = true;
+            static bool reported = false;
+            if (!reported) {
+                fprintf(stderr,
+                    "  [greedy argmax] fused LM-head phase one enabled (%u partials; set BP_ONNX_DISABLE_FUSED_LMHEAD_ARGMAX=1 to disable)\n",
+                    numWg);
+                reported = true;
+            }
+        }
         return;
     }
 

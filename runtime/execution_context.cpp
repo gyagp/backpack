@@ -37,6 +37,15 @@ ExecutionContext::~ExecutionContext() {
     // Release captured bind groups
     ReleaseCaptured();
 
+    if (fusedLmHeadArgmaxResult_.handle) {
+        gpu->releaseBuffer(fusedLmHeadArgmaxResult_);
+        fusedLmHeadArgmaxResult_ = {};
+    }
+    if (fusedLmHeadArgmaxPartials_.handle) {
+        gpu->releaseBuffer(fusedLmHeadArgmaxPartials_);
+        fusedLmHeadArgmaxPartials_ = {};
+    }
+
     // Release param pool buffers
     for (int b = 0; b < PARAM_POOL_BUCKETS; b++) {
         for (auto& buf : paramPool_[b].buffers) {

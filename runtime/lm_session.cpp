@@ -252,6 +252,8 @@ struct GenericOnnxState {
     int qwenCapturedVariants = 0;
     int qwenActiveVariant = -1;
     int qwenNextReplayVariant = 0;
+    bool requestGpuGreedyToken = false;
+    int32_t lastGpuGreedyToken = -1;
 
     bool IsNvidiaQwenCapture() const {
         return arch == "qwen3_5_text" &&
@@ -884,14 +886,25 @@ struct GenericOnnxState {
                     cache->data + row * rowBytes, rowBytes);
             }
 
-            uint64_t logitBytes = (uint64_t)vocabSize * 4;
-            auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
-            execCtx.RequestReadback(logitsBuf, {rbHandle, logitBytes}, logitBytes);
+            const bool gpuGreedy = requestGpuGreedyToken &&
+                execCtx.fusedLmHeadArgmaxAvailable_ &&
+                execCtx.fusedLmHeadArgmaxResult_.handle;
+            uint64_t readbackBytes = gpuGreedy ? 4u : (uint64_t)vocabSize * 4;
+            GPUBuffer readbackSrc = gpuGreedy
+                ? execCtx.fusedLmHeadArgmaxResult_ : logitsBuf;
+            auto rbHandle = gpu->getOrCreateReadbackBuf(readbackBytes);
+            execCtx.RequestReadback(readbackSrc,
+                {rbHandle, readbackBytes}, readbackBytes);
             execCtx.ReplayDispatches();
 
-            std::vector<float> logits(vocabSize);
-            auto rb = gpu->mapReadbackBuffer(vocabSize * 4);
-            memcpy(logits.data(), rb.data(), vocabSize * 4);
+            std::vector<float> logits;
+            auto rb = gpu->mapReadbackBuffer(readbackBytes);
+            if (gpuGreedy) {
+                memcpy(&lastGpuGreedyToken, rb.data(), 4);
+            } else {
+                logits.resize(vocabSize);
+                memcpy(logits.data(), rb.data(), vocabSize * 4);
+            }
 
             for (size_t i = 0; i < convLayerIndices.size(); i++) {
                 std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
@@ -1047,6 +1060,15 @@ struct GenericOnnxState {
 
         // Normal Path
         return runExecutePath(tokenId);
+    }
+
+    int32_t RunStepGreedy(int64_t tokenId) {
+        requestGpuGreedyToken = true;
+        auto logits = RunStep(tokenId);
+        requestGpuGreedyToken = false;
+        if (!logits.empty())
+            return argmax(logits.data(), (int64_t)logits.size());
+        return lastGpuGreedyToken;
     }
 
     std::string CheckFastDecodeSupport() const {
@@ -1717,8 +1739,7 @@ int32_t LmSession::Decode() {
 
     if (impl_->backend == Impl::Backend::GenericOnnx) {
         auto* gen = impl_->gen_.get();
-        auto logits = gen->RunStep(impl_->lastToken);
-        int32_t next = argmax(logits.data(), (int64_t)logits.size());
+        int32_t next = gen->RunStepGreedy(impl_->lastToken);
         impl_->lastToken = next;
         return next;
     }
@@ -1897,8 +1918,7 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         // TTFT (first decode step)
         auto ttftStart = std::chrono::steady_clock::now();
         {
-            auto logits = gen->RunStep(tok);
-            tok = argmax(logits.data(), (int64_t)logits.size());
+            tok = gen->RunStepGreedy(tok);
             if (std::getenv("BP_DUMP_BENCH_TOKEN"))
                 fprintf(stderr, "  [benchmark-token] ttft=%d\n", tok);
         }
@@ -1911,19 +1931,16 @@ BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
         // two steps left capture work in the timed region while serial prefill
         // happened to complete it during the prompt loop.
         for (int i = 0; i < 2; i++) {
-            auto logits = gen->RunStep(tok);
-            tok = argmax(logits.data(), (int64_t)logits.size());
+            tok = gen->RunStepGreedy(tok);
         }
         for (int i = 0; gen->fastDecodeEnabled && !gen->fastDecodeCaptured && i < 4; i++) {
-            auto logits = gen->RunStep(tok);
-            tok = argmax(logits.data(), (int64_t)logits.size());
+            tok = gen->RunStepGreedy(tok);
         }
 
         // Timed decode
         auto dcStart = std::chrono::steady_clock::now();
         for (int i = 0; i < genTokens; i++) {
-            auto logits = gen->RunStep(tok);
-            tok = argmax(logits.data(), (int64_t)logits.size());
+            tok = gen->RunStepGreedy(tok);
         }
         auto dcEnd = std::chrono::steady_clock::now();
         result.decodeMs = std::chrono::duration<double, std::milli>(dcEnd - dcStart).count();

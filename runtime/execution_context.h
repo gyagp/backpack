@@ -199,6 +199,12 @@ struct ExecutionContext {
     uint32_t capturePosition_ = 0;
     std::vector<WGPUBuffer> replaySkipBuffers_;
 
+    // Optional greedy-only result produced by the decode LM-head dispatch.
+    // Full logits remain available; sampling paths never consume this buffer.
+    GPUBuffer fusedLmHeadArgmaxResult_;
+    GPUBuffer fusedLmHeadArgmaxPartials_;
+    bool fusedLmHeadArgmaxAvailable_ = false;
+
     struct ReplayScalarUpdate {
         WGPUBuffer handle;
         uint64_t offset;
