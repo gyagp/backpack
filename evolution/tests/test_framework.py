@@ -662,7 +662,7 @@ class FrameworkTest(unittest.TestCase):
                                          "files": {"gguf": {}}})
         common = {"model_id": model["id"], "machine_id": self.machine["id"],
                   "framework": "backpack", "format": "gguf", "backend": "webgpu"}
-        self.store.add_observation({**common, "id": "split-pass", "revision": "base",
+        self.store.add_observation({**common, "id": "split-pass", "revision": "base-20260726",
                                     "conformance": "pass", "metrics": {}}, "test")
         self.store.add_observation({**common, "id": "split-base", "revision": "base",
                                     "conformance": "not_applicable", "metrics": {

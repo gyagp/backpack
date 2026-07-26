@@ -1360,6 +1360,17 @@ class Store:
         return None if (framework == "ort" and str(fmt).lower() in {"onnx", "ort"}) \
             else "not_applicable"
 
+    @staticmethod
+    def _compatible_revision(a: Any, b: Any) -> bool:
+        def normalize(value: Any) -> str:
+            revision = str(value or "").lower().strip("-")
+            revision = re.sub(r"-(?:reuse[-_]generator)$", "", revision)
+            revision = re.sub(r"-(?:19|20)\d{6}$", "", revision)
+            return revision.strip("-")
+
+        left, right = normalize(a), normalize(b)
+        return bool(left and right and left == right)
+
     def _observation_validity(self, data: dict[str, Any], model_id: str, machine_id: str,
                               framework: str, fmt: str, backend: str) -> tuple[str, str | None]:
         """Quarantine unconfirmed, like-for-like regressions before they affect Status."""
@@ -1388,10 +1399,7 @@ class Store:
         def conformance_backed(row: dict[str, Any]) -> bool:
             if row.get("conformance") == "pass":
                 return True
-            revision = str(row.get("revision") or "").lower().strip()
-            if not revision:
-                return False
-            return any(revision == str(candidate or "").lower().strip()
+            return any(self._compatible_revision(row.get("revision"), candidate)
                        for candidate in passing_revisions)
 
         comparable = [row for row in rows
@@ -1669,25 +1677,6 @@ class Store:
         # Preserve the newest semantic result and the newest performance result
         # independently. A benchmark observation uses ``not_applicable`` for
         # conformance and must not overwrite an earlier pass/fail observation.
-        def compatible_revision(metric_revision: Any, pass_revision: Any) -> bool:
-            metric = str(metric_revision or "").lower().strip("-")
-            passed = str(pass_revision or "").lower().strip("-")
-            if not metric or not passed:
-                return False
-            # Benchmark-mode and date suffixes do not change runtime code.
-            suffixes = ("-reuse-generator", "-reuse_generator")
-            for suffix in suffixes:
-                if metric.endswith(suffix):
-                    metric = metric[:-len(suffix)]
-                if passed.endswith(suffix):
-                    passed = passed[:-len(suffix)]
-            metric = re.sub(r"-(?:19|20)\d{6}$", "", metric)
-            passed = re.sub(r"-(?:19|20)\d{6}$", "", passed)
-            # Only known benchmark/date adornments are removed above.  An
-            # arbitrary suffix denotes a different build or experiment and
-            # must not borrow conformance from its base revision.
-            return metric == passed
-
         observations = []
 
         def status_shape(item: dict[str, Any]) -> tuple[int, int] | None:
@@ -1715,7 +1704,7 @@ class Store:
                 status_shape(item) == (STATUS_PROMPT_TOKENS, STATUS_GENERATED_TOKENS)
                 and item.get("metrics") and (
                 item["conformance"] == "pass" or any(
-                    compatible_revision(item.get("revision"), passed.get("revision")) for passed in passes
+                    self._compatible_revision(item.get("revision"), passed.get("revision")) for passed in passes
                 ))), None)
             if metrics:
                 metrics = dict(metrics)
