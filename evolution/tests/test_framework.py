@@ -350,6 +350,34 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("reject", result["aggregate_verdict"])
         self.assertIn("protected metric regressed", result["reason"])
 
+    def test_non_overlapping_regression_rejects_before_cv_gate(self) -> None:
+        for metric, base, candidate in (
+            ("prefill_tok_s", [303.7, 303.5], [276.2, 235.3]),
+            ("gpu_time_ms", [10.0, 10.1], [12.0, 16.0]),
+        ):
+            task = self.store.create_task({
+                "title": f"Separated {metric}", "kind": "optimization",
+                "hypothesis": "A fully separated regression band is unsafe",
+                "base_sha": "base", "candidate_sha": "candidate",
+                "manifest": {"metrics": [metric]},
+                "device_policy": {"required": [self.machine["id"]]},
+                "decision_policy": {"protected_metrics": [metric]},
+            })
+            common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                      "metric": metric, "correctness": {"passed": True}}
+            self.store.add_evidence({**common, "variant": "base", "samples": base,
+                                     "commit_sha": "base"}, "test")
+            self.store.add_evidence({**common, "variant": "candidate", "samples": candidate,
+                                     "commit_sha": "candidate"}, "test")
+
+            result = PolicyEngine(self.store).evaluate(task["id"])
+
+            row = result["evaluations"][0]
+            self.assertEqual("reject", result["aggregate_verdict"])
+            self.assertEqual("negative", row["verdict"])
+            self.assertTrue(row["details"]["non_overlapping_regression"])
+            self.assertGreater(row["details"]["max_cv_percent"], 5)
+
     def test_lower_gpu_time_is_an_improvement(self) -> None:
         task = self.store.create_task({
             "title": "Reduce GPU time", "kind": "optimization",

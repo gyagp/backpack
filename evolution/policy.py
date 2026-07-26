@@ -180,7 +180,22 @@ class PolicyEngine:
                 else:
                     delta = math.inf if base_median == 0 else (candidate_median / base_median - 1.0) * 100.0
                 cv = max(_cv_percent(base_samples), _cv_percent(candidate_samples))
-                if cv > thresholds.max_cv_percent:
+                # Variability must not hide an unambiguous protected
+                # regression. If even the best candidate sample is worse than
+                # the worst base sample by the rejection threshold, the two
+                # measured bands do not overlap and more repetitions cannot
+                # turn this candidate into a safe milestone.
+                if lower_is_better:
+                    separated_delta = (math.inf if min(candidate_samples) == 0 else
+                                       (max(base_samples) / min(candidate_samples) - 1.0) * 100.0)
+                else:
+                    separated_delta = (math.inf if min(base_samples) == 0 else
+                                       (max(candidate_samples) / min(base_samples) - 1.0) * 100.0)
+                separated_regression = (metric in protected and
+                                        separated_delta < thresholds.negative_percent)
+                if separated_regression:
+                    verdict, why = "negative", "non-overlapping regression band exceeds threshold"
+                elif cv > thresholds.max_cv_percent:
                     verdict = "inconclusive"
                     why = "sample variability exceeds policy"
                 elif delta > thresholds.positive_percent:
@@ -194,6 +209,8 @@ class PolicyEngine:
                     "base_median": base_median, "candidate_median": candidate_median,
                     "delta_percent": delta,
                     "details": {"reason": why, "max_cv_percent": cv,
+                                "separated_delta_percent": separated_delta,
+                                "non_overlapping_regression": separated_regression,
                                 "protected": metric in protected,
                                 "direction": "lower_is_better" if lower_is_better else "higher_is_better"},
                 })
