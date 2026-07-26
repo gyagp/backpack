@@ -374,6 +374,31 @@ class FrameworkTest(unittest.TestCase):
         transitioned = self.store.transition_task(task["id"], "ready_to_merge", "test")
         self.assertEqual("ready_to_merge", transitioned["state"])
 
+    def test_unprotected_diagnostic_gain_cannot_authorize_neutral_throughput(self) -> None:
+        task = self.store.create_task({
+            "title": "Fewer dispatches without throughput gain", "kind": "optimization",
+            "hypothesis": "A diagnostic gain is useful evidence but not a product gain.",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s", "captured_dispatches"]},
+            "device_policy": {"required": [self.machine["id"]]},
+            "decision_policy": {"protected_metrics": ["decode_tok_s"]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "correctness": {"passed": True}}
+        for metric, base, candidate in (
+            ("decode_tok_s", [100, 100], [100.5, 100.5]),
+            ("captured_dispatches", [956, 956], [892, 892]),
+        ):
+            self.store.add_evidence({**common, "metric": metric, "variant": "base",
+                                     "samples": base, "commit_sha": "base"}, "test")
+            self.store.add_evidence({**common, "metric": metric, "variant": "candidate",
+                                     "samples": candidate, "commit_sha": "candidate"}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("debate", result["aggregate_verdict"])
+        self.assertEqual("all protected results are neutral", result["reason"])
+
     def test_merge_requires_every_protected_metric_on_every_required_device(self) -> None:
         second = self.store.register_machine({
             "name": "second-required", "fingerprint": {"gpu_vendor": "amd"},

@@ -218,6 +218,7 @@ class PolicyEngine:
 
         verdicts = {row["verdict"] for row in rows}
         protected_negative = any(r["verdict"] == "negative" and r["metric"] in protected for r in rows)
+        protected_positive = any(r["verdict"] == "positive" and r["metric"] in protected for r in rows)
         correctness_negative = any(r["details"].get("correctness_failed") for r in rows)
         if correctness_negative:
             aggregate, reason = "reject", "correctness failed on a required device"
@@ -225,10 +226,10 @@ class PolicyEngine:
             aggregate, reason = "reject", "a protected metric regressed on a required device"
         elif "inconclusive" in verdicts:
             aggregate, reason = "blocked", "required evidence is missing or too noisy"
-        elif "positive" in verdicts:
+        elif protected_positive:
             aggregate, reason = "accept", "all required results are positive or neutral"
         else:
-            aggregate, reason = "debate", "all required results are neutral"
+            aggregate, reason = "debate", "all protected results are neutral"
 
         self.store.replace_evaluations(task_id, rows, aggregate, reason)
         if aggregate == "debate" and not any(d["status"] == "pending" for d in self.store.list_decisions() if d["task_id"] == task_id):
