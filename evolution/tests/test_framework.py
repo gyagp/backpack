@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from evolution.agent import (argv_option, backpack_conformance_argv,
@@ -473,6 +474,94 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual({"prompt_tokens": 128, "generated_tokens": 64,
                           "graph_capture": "not_applicable"},
                          regressions[0]["benchmark_signature"])
+
+    def test_observation_regression_is_quarantined_and_does_not_replace_latest(self) -> None:
+        model = self.store.upsert_model({"id": "guarded", "name": "Guarded", "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "gguf", "backend": "webgpu",
+                  "conformance": "pass"}
+        baseline = self.store.add_observation({**common, "id": "guard-base", "revision": "base",
+            "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20,
+                        "prompt_tokens": 512, "generated_tokens": 128}}, "test")
+        regressed = self.store.add_observation({**common, "id": "guard-drop", "revision": "drop",
+            "metrics": {"prefill_tok_s": 94.9, "decode_tok_s": 20,
+                        "prompt_tokens": 512, "generated_tokens": 128}}, "test")
+        self.assertEqual("valid", baseline["validity"])
+        self.assertEqual("quarantined", regressed["validity"])
+        self.assertIn("prefill_tok_s", regressed["validity_reason"])
+        self.assertEqual("guard-base", self.store.latest_observations()[0]["id"])
+        self.assertEqual(["guard-base"], [row["id"] for row in self.store.list_observations({})])
+        self.assertEqual({"guard-base", "guard-drop"},
+                         {row["id"] for row in self.store.list_observations({"include_invalid": "true"})})
+
+    def test_regression_guard_requires_same_workload_and_graph_capture(self) -> None:
+        model = self.store.upsert_model({"id": "ort-guard", "name": "ORT Guard", "files": {"ort": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "ort", "format": "onnx", "backend": "webgpu",
+                  "conformance": "pass"}
+        self.store.add_observation({**common, "id": "ort-base", "metrics": {
+            "prefill_tok_s": 100, "decode_tok_s": 20, "prompt_tokens": 512,
+            "generated_tokens": 128, "graph_capture": True}}, "test")
+        shape = self.store.add_observation({**common, "id": "ort-shape", "metrics": {
+            "prefill_tok_s": 20, "decode_tok_s": 4, "prompt_tokens": 256,
+            "generated_tokens": 128, "graph_capture": True}}, "test")
+        capture = self.store.add_observation({**common, "id": "ort-capture", "metrics": {
+            "prefill_tok_s": 20, "decode_tok_s": 4, "prompt_tokens": 512,
+            "generated_tokens": 128, "graph_capture": False}}, "test")
+        self.assertEqual("valid", shape["validity"])
+        self.assertEqual("valid", capture["validity"])
+
+    def test_confirmed_regression_remains_visible(self) -> None:
+        model = self.store.upsert_model({"id": "confirmed-guard", "name": "Confirmed", "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
+                  "conformance": "pass"}
+        self.store.add_observation({**common, "id": "confirmed-base", "metrics": {
+            "prefill_tok_s": 100, "decode_tok_s": 20, "prompt_tokens": 512,
+            "generated_tokens": 128}}, "test")
+        result = self.store.add_observation({**common, "id": "confirmed-drop",
+            "confirmed_regression_evidence": {"repetitions": 5, "artifact": "paired.json"},
+            "metrics": {"prefill_tok_s": 90, "decode_tok_s": 18, "prompt_tokens": 512,
+                        "generated_tokens": 128}}, "test")
+        self.assertEqual("valid", result["validity"])
+        self.assertIn("confirmed regression", result["validity_reason"])
+        self.assertEqual("confirmed-drop", self.store.latest_observations()[0]["id"])
+
+    def test_invalidated_observation_is_auditable_but_not_latest(self) -> None:
+        model = self.store.upsert_model({"id": "invalidated", "name": "Invalidated", "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
+                  "conformance": "pass"}
+        self.store.add_observation({**common, "id": "keep", "metrics": {}}, "test")
+        self.store.add_observation({**common, "id": "discard", "metrics": {}}, "test")
+        invalid = self.store.invalidate_observation("discard", "wrong executable", "reviewer")
+        self.assertEqual("invalid", invalid["validity"])
+        self.assertEqual("wrong executable", invalid["validity_reason"])
+        self.assertEqual("reviewer", invalid["invalidated_by"])
+        self.assertEqual("keep", self.store.latest_observations()[0]["id"])
+        audit = self.store.list_observations({"include_invalid": "1"})
+        self.assertEqual(2, len(audit))
+        self.assertEqual("invalid", next(row for row in audit if row["id"] == "discard")["validity"])
+
+    def test_existing_observation_schema_is_migrated_in_place(self) -> None:
+        path = Path(self.tmp.name) / "legacy.db"
+        db = sqlite3.connect(path)
+        db.execute("""CREATE TABLE observations (
+          id TEXT PRIMARY KEY, model_id TEXT NOT NULL, machine_id TEXT NOT NULL,
+          framework TEXT NOT NULL, format TEXT NOT NULL, backend TEXT NOT NULL,
+          conformance TEXT NOT NULL, conformance_details_json TEXT NOT NULL,
+          metrics_json TEXT NOT NULL, revision TEXT, artifacts_json TEXT NOT NULL,
+          created_at TEXT NOT NULL)""")
+        db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "legacy", "model", "machine", "llamacpp", "gguf", "vulkan", "pass",
+            "{}", "{}", "legacy", "[]", "2026-01-01T00:00:00+00:00"))
+        db.commit()
+        db.close()
+        migrated = Store(path)
+        row = migrated.list_observations({"include_invalid": "true"})[0]
+        self.assertEqual("valid", row["validity"])
+        self.assertIsNone(row["validity_reason"])
+        migrated.close()
 
     def test_valid_latest_measurement_closes_automatic_task(self) -> None:
         model = self.store.upsert_model({"id": "measured", "name": "Measured", "files": {"gguf": {}}})

@@ -78,7 +78,9 @@ CREATE TABLE IF NOT EXISTS observations (
   machine_id TEXT NOT NULL REFERENCES machines(id), framework TEXT NOT NULL,
   format TEXT NOT NULL, backend TEXT NOT NULL, conformance TEXT NOT NULL,
   conformance_details_json TEXT NOT NULL, metrics_json TEXT NOT NULL,
-  revision TEXT, artifacts_json TEXT NOT NULL, created_at TEXT NOT NULL
+  revision TEXT, artifacts_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  validity TEXT NOT NULL DEFAULT 'valid', validity_reason TEXT,
+  invalidated_at TEXT, invalidated_by TEXT
 );
 CREATE TABLE IF NOT EXISTS optimization_history (
   id TEXT PRIMARY KEY, task_id TEXT REFERENCES tasks(id), title TEXT NOT NULL,
@@ -183,6 +185,16 @@ class Store:
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS tasks_number_idx ON tasks(task_number)")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
+            observation_columns = {row[1] for row in self._db.execute("PRAGMA table_info(observations)")}
+            for name, declaration in (
+                    ("validity", "TEXT NOT NULL DEFAULT 'valid'"),
+                    ("validity_reason", "TEXT"),
+                    ("invalidated_at", "TEXT"),
+                    ("invalidated_by", "TEXT")):
+                if name not in observation_columns:
+                    self._db.execute(f"ALTER TABLE observations ADD COLUMN {name} {declaration}")
+            self._db.execute("UPDATE observations SET validity='valid' WHERE validity IS NULL")
+            self._db.execute("CREATE INDEX IF NOT EXISTS observation_valid_latest_idx ON observations(validity,model_id,machine_id,framework,format,backend,created_at)")
             self._cancel_terminal_task_runs()
         self._backfill_learning_memory()
 
@@ -1292,22 +1304,112 @@ class Store:
         if framework in {"backpack", "ort"} and backend in {"d3d12", "webgpu-native", "webgpu"}:
             backend = "webgpu"
         with self._lock, self._db:
-            self._db.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            # Keep baseline selection and insertion in one critical section so
+            # simultaneous uploads cannot both bypass the newest valid sample.
+            validity, validity_reason = self._observation_validity(
+                data, model_id, machine_id, framework, data.get("format", "gguf"), backend)
+            self._db.execute("""INSERT OR IGNORE INTO observations
+              (id,model_id,machine_id,framework,format,backend,conformance,
+               conformance_details_json,metrics_json,revision,artifacts_json,created_at,
+               validity,validity_reason,invalidated_at,invalidated_by)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", (
                 observation_id, model_id, machine_id, framework, data.get("format", "gguf"),
                 backend, conformance,
                 json_text(data.get("conformance_details") or {}), json_text(data.get("metrics") or {}),
                 data.get("revision"), json_text(data.get("artifacts") or []), utc_now(),
+                validity, validity_reason,
             ))
             self.audit("model", model_id, "observation_added", actor,
-                       {"machine_id": machine_id, "framework": framework, "conformance": conformance})
+                       {"observation_id": observation_id, "machine_id": machine_id,
+                        "framework": framework, "conformance": conformance,
+                        "validity": validity, "validity_reason": validity_reason,
+                        "confirmed_regression_evidence": data.get("confirmed_regression_evidence")})
+        return self._row(self._db.execute("SELECT * FROM observations WHERE id=?", (observation_id,)).fetchone())  # type: ignore[return-value]
+
+    @staticmethod
+    def _graph_capture(data: dict[str, Any], fmt: str) -> str | None:
+        metrics = data.get("metrics") or {}
+        details = data.get("conformance_details") or {}
+        value = metrics.get("graph_capture", details.get("graph_capture"))
+        if isinstance(value, bool):
+            return "enabled" if value else "disabled"
+        if isinstance(value, str):
+            value = value.strip().lower().replace("_", " ")
+            if value in {"enabled", "enable", "on", "true", "yes"}:
+                return "enabled"
+            if value in {"disabled", "disable", "off", "false", "no"}:
+                return "disabled"
+            if value in {"not applicable", "n/a", "na"}:
+                return "not_applicable"
+        return None if str(fmt).lower() in {"onnx", "ort"} else "not_applicable"
+
+    def _observation_validity(self, data: dict[str, Any], model_id: str, machine_id: str,
+                              framework: str, fmt: str, backend: str) -> tuple[str, str | None]:
+        """Quarantine unconfirmed, like-for-like regressions before they affect Status."""
+        metrics = data.get("metrics") or {}
+        if data.get("conformance", "unknown") != "pass":
+            return "valid", None
+        prompt = metrics.get("prompt_tokens", metrics.get("prompt_length"))
+        generated = metrics.get("generated_tokens", metrics.get("decode_tokens",
+                                metrics.get("generation_tokens", metrics.get("generation_length"))))
+        if prompt != STATUS_PROMPT_TOKENS or generated != STATUS_GENERATED_TOKENS:
+            return "valid", None
+        capture = self._graph_capture(data, fmt)
+        if capture is None:
+            return "valid", None
+        performance = {key: metrics.get(key) for key in ("prefill_tok_s", "decode_tok_s")}
+        if not any(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   for value in performance.values()):
+            return "valid", None
+        rows = self._all("""SELECT * FROM observations
+          WHERE validity='valid' AND model_id=? AND machine_id=? AND framework=? AND format=? AND backend=?
+          ORDER BY created_at DESC,rowid DESC""", (model_id, machine_id, framework, fmt, backend))
+        baseline = next((row for row in rows
+                         if (row.get("metrics", {}).get("prompt_tokens", row.get("metrics", {}).get("prompt_length")) == prompt
+                             and row.get("metrics", {}).get("generated_tokens", row.get("metrics", {}).get("decode_tokens",
+                                 row.get("metrics", {}).get("generation_tokens", row.get("metrics", {}).get("generation_length")))) == generated
+                             and self._graph_capture(row, fmt) == capture
+                             and row.get("conformance") == "pass")), None)
+        if not baseline:
+            return "valid", None
+        drops = []
+        for metric, value in performance.items():
+            old = baseline.get("metrics", {}).get(metric)
+            if (isinstance(old, (int, float)) and not isinstance(old, bool) and old > 0
+                    and isinstance(value, (int, float)) and not isinstance(value, bool)):
+                delta = (float(value) / float(old) - 1.0) * 100.0
+                if delta <= -5.0:
+                    drops.append(f"{metric} {delta:.2f}% vs {baseline['id']}")
+        if not drops:
+            return "valid", None
+        evidence = data.get("confirmed_regression_evidence")
+        evidence_present = (isinstance(evidence, str) and bool(evidence.strip())) or \
+            (isinstance(evidence, (dict, list)) and bool(evidence))
+        if evidence_present:
+            return "valid", "confirmed regression: " + "; ".join(drops)
+        return "quarantined", "unconfirmed regression: " + "; ".join(drops)
+
+    def invalidate_observation(self, observation_id: str, reason: str, actor: str) -> dict[str, Any]:
+        reason = require(reason, "reason").strip()
+        row = self._row(self._db.execute("SELECT * FROM observations WHERE id=?", (observation_id,)).fetchone())
+        if not row:
+            raise DomainError("observation not found")
+        now = utc_now()
+        with self._lock, self._db:
+            self._db.execute("""UPDATE observations SET validity='invalid',validity_reason=?,
+              invalidated_at=?,invalidated_by=? WHERE id=?""", (reason, now, actor, observation_id))
+            self.audit("observation", observation_id, "invalidated", actor, {"reason": reason})
         return self._row(self._db.execute("SELECT * FROM observations WHERE id=?", (observation_id,)).fetchone())  # type: ignore[return-value]
 
     def latest_observations(self) -> list[dict[str, Any]]:
-        return self._all("""SELECT o.* FROM observations o JOIN (
-          SELECT model_id,machine_id,framework,format,backend,MAX(created_at) latest
-          FROM observations GROUP BY model_id,machine_id,framework,format,backend
-        ) x ON o.model_id=x.model_id AND o.machine_id=x.machine_id AND o.framework=x.framework
-          AND o.format=x.format AND o.backend=x.backend AND o.created_at=x.latest""")
+        return self._all("""SELECT o.* FROM observations o
+          WHERE o.validity='valid' AND NOT EXISTS (
+            SELECT 1 FROM observations newer
+            WHERE newer.validity='valid' AND newer.model_id=o.model_id
+              AND newer.machine_id=o.machine_id AND newer.framework=o.framework
+              AND newer.format=o.format AND newer.backend=o.backend
+              AND (newer.created_at>o.created_at OR
+                   (newer.created_at=o.created_at AND newer.rowid>o.rowid)))""")
 
     def reconcile_completed_tasks(self) -> int:
         """Close operational tasks only when their authoritative evidence is complete."""
@@ -1439,7 +1541,9 @@ class Store:
 
     def list_observations(self, filters: dict[str, str]) -> list[dict[str, Any]]:
         allowed = {"model_id", "machine_id", "framework", "format", "backend"}
-        where, values = [], []
+        include_invalid = str(filters.get("include_invalid", filters.get("include-invalid", ""))).lower() \
+            in {"1", "true", "yes"}
+        where, values = ([] if include_invalid else ["validity='valid'"]), []
         for key, value in filters.items():
             if key in allowed and value:
                 where.append(f"{key}=?")
@@ -1448,7 +1552,7 @@ class Store:
         return self._all(sql + " ORDER BY created_at DESC,id DESC", tuple(values))
 
     def confirmed_regressions(self, threshold_percent: float = 10.0) -> list[dict[str, Any]]:
-        rows = self._all("SELECT * FROM observations ORDER BY created_at,id")
+        rows = self._all("SELECT * FROM observations WHERE validity='valid' ORDER BY created_at,id")
         groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
 
         def first_number(values: list[Any]) -> int | None:

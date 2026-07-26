@@ -286,6 +286,12 @@ class Handler(BaseHTTPRequestHandler):
                 for task in created:
                     self.server.events.publish("task-created", task)
                 return self._send_json(result, HTTPStatus.CREATED)
+            match = re.fullmatch(r"/api/observations/([^/]+)/invalidate", path)
+            if match:
+                result = self.server.store.invalidate_observation(
+                    match.group(1), body.get("reason", ""), actor)
+                self.server.events.publish("observation-invalidated", result)
+                return self._send_json(result)
             if path == "/api/runs/claim":
                 result = self.server.store.claim_run(str(body.get("machine", "")),
                                                      body.get("capabilities") or [], actor)
