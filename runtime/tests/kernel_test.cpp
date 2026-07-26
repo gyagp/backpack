@@ -106,6 +106,29 @@ static std::string q5kOrtRepackedTileTestSource() {
     all(old,replacement);return s;
 }
 
+static std::string q6kOrtDenseTileTestSource() {
+    std::string s=q4kOrtRepackedTileTestSource();
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    all("input_b: array<vec2<u32>>","input_b: array<vec4<u32>>");
+    all("let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);","let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=v;");
+    all("let xs=scales_a[ar*(uniforms.K/32u)+kidx_v/2u];scale_A[row]=vec2<f32>(xs,xs*f32(sumPacked(a0)+sumPacked(a1)));","let xs=scales_a[ar*(uniforms.K/32u)+kidx_v/2u];scale_A[row]=vec2<f32>(xs,xs);");
+    all("return output_element_t(mul_precision(local_sum) * mul_precision(scale.x) - mul_precision(scale.y));","var first=dot4I8Packed(a1.x,b1.x)+dot4I8Packed(a1.y,b1.y)+dot4I8Packed(a1.z,b1.z)+dot4I8Packed(a1.w,b1.w);var second=dot4I8Packed(a2.x,b2.x)+dot4I8Packed(a2.y,b2.y)+dot4I8Packed(a2.z,b2.z)+dot4I8Packed(a2.w,b2.w);return output_element_t(mul_precision(first)*mul_precision(scale.x)+mul_precision(second)*mul_precision(scale.y));");
+    return s;
+}
+
+static std::string q6kPackedOrtTileTestSource() {
+    std::string s=q6kOrtDenseTileTestSource();
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    all("input_b: array<vec4<u32>>","input_b: array<u32>");all("scales_b: array<vec2<f32>>","packed_headers: array<u32>");
+    const std::string loader=R"WGSL(fn q6Byte(byteIndex:u32)->u32{return (input_b[byteIndex/4u]>>((byteIndex&3u)*8u))&255u;}fn q6HeaderByte(byteIndex:u32)->u32{return (packed_headers[byteIndex/4u]>>((byteIndex&3u)*8u))&255u;}
+fn q6Word(base:u32,seg:u32,part:u32,l0:u32)->u32{var result=0u;for(var i=0u;i<4u;i++){let l=l0+i;let qlb=q6Byte(base+seg*64u+(part&1u)*32u+l);let lo=(qlb>>select(0u,4u,part>=2u))&15u;let hi=(q6Byte(base+128u+seg*32u+l)>>(part*2u))&3u;let q=i32(lo|(hi<<4u))-32;result|=u32(q&255)<<(i*8u);}return result;}
+fn q6Scale(byteIndex:u32)->f32{let v=q6HeaderByte(byteIndex);return f32(select(i32(v),i32(v)-256,v>=128u));}
+fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let gr=kidx_v/2u;let block=gr/8u;let sb=gr&7u;if(block>=uniforms.zero_blocks_per_col){return;}let base=br*uniforms.weight_idx*4u+block*210u;let seg=sb/4u;let part=sb&3u;let l0=col*16u;tile_B[col][row]=vec4<u32>(q6Word(base,seg,part,l0),q6Word(base,seg,part,l0+4u),q6Word(base,seg,part,l0+8u),q6Word(base,seg,part,l0+12u));if(col==0u){let dh=q6HeaderByte(base+208u)|(q6HeaderByte(base+209u)<<8u);let d=unpack2x16float(dh).x;let si=base+192u+seg*8u+part*2u;scale_B[row]=vec2<f32>(d*q6Scale(si),d*q6Scale(si+1u));}}
+
+)WGSL";
+    auto a=s.find("fn loadSHMB("),b=s.find("@compute @workgroup_size",a);if(a==std::string::npos||b==std::string::npos)return{};s.replace(a,b-a,loader);return s;
+}
+
 static std::string q5kPackedWeightsDenseScalesTileTestSource() {
     std::string s=q5kOrtRepackedTileTestSource();
     auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
@@ -2146,6 +2169,18 @@ TEST(q5k_direct_tile_dense_path_differential) {
     auto wr=assertClose((const float*)weights.data(),(const float*)expected.data(),M*N,1e-6f,1e-6f);if(!wr.ok){wr.msg="direct weights: "+wr.msg;return wr;}
     auto scales=dispatchAndReadback(gpu,directS,{{0,bq},{1,bas},{2,bw},{3,br},{4,by2},{5,pp}},MT*NT,1,1,by2,M*N*4,6);auto sr=assertClose((const float*)scales.data(),(const float*)expected.data(),M*N,1e-6f,1e-6f);if(!sr.ok){sr.msg="direct scales: "+sr.msg;return sr;}
     auto both=dispatchAndReadback(gpu,combined,{{0,bq},{1,bas},{2,br},{3,br},{4,by3},{5,pp}},MT*NT,1,1,by3,M*N*4,6);auto cr=assertClose((const float*)both.data(),(const float*)expected.data(),M*N,1e-6f,1e-6f);if(!cr.ok)cr.msg="combined direct path: "+cr.msg;return cr;
+}
+
+TEST(q6k_compact_ort_tile_dense_path_differential) {
+    auto denseShader=q6kOrtDenseTileTestSource(),packedShader=q6kPackedOrtTileTestSource();if(denseShader.empty()||packedShader.empty())return{false,"cannot build Q6 differential shaders"};
+    const int M=128,N=192,K=768,NB=K/256,MT=M/64,NT=N/64;Rng rng(0x6A67);auto x=rng.randnVec(M*K);std::vector<uint8_t>raw(N*NB*210);
+    for(int n=0;n<N;n++)for(int b=0;b<NB;b++){uint8_t*p=raw.data()+(n*NB+b)*210;for(int j=0;j<208;j++)p[j]=uint8_t(n*29+b*23+j*19+5);uint16_t d=f32ToF16(.02f+.0002f*n+.0001f*b);memcpy(p+208,&d,2);}
+    auto pk=pack_q6k(raw.data(),N,K);auto dp=repack_q6k_dense(raw.data(),N,K);
+    auto bx=makeBuffer(gpu,"X",x.data(),M*K),bq=makeBufferU32(gpu,"XQ",nullptr,M*K/4),bas=makeBuffer(gpu,"XS",nullptr,M*K/32),br=makeBufferU32(gpu,"Raw",pk.data.data(),(int)pk.data.size()),bw=makeBufferU32(gpu,"W",dp.weights.data(),(int)dp.weights.size()),bws=makeBuffer(gpu,"WS",dp.scales.data(),(int)dp.scales.size()),by0=makeBuffer(gpu,"Y0",nullptr,M*N),by1=makeBuffer(gpu,"Y1",nullptr,M*N),qp=makeParams(gpu,"QP",{K,N,M,pk.nBlocks,pk.rowStrideWords});
+    dispatchAndReadback(gpu,WGSL_Q8_QUANTIZE_BATCHED_DP4A,{{0,bx},{1,bq},{2,bas},{3,qp}},K/256,M,1,bq,M*K,4);
+    auto pd=makeParams(gpu,"PD",{1,M,N,K,K/8,K/16,MT,NT,0,0});auto expected=dispatchAndReadback(gpu,denseShader,{{0,bq},{1,bas},{2,bw},{3,bws},{4,by0},{5,pd}},MT*NT,1,1,by0,M*N*4,6);
+    auto pp=makeParams(gpu,"PP",{1,M,N,K,K/8,K/16,MT,NT,pk.nBlocks,pk.rowStrideWords});auto actual=dispatchAndReadback(gpu,packedShader,{{0,bq},{1,bas},{2,br},{3,br},{4,by1},{5,pp}},MT*NT,1,1,by1,M*N*4,6);
+    auto r=assertClose((const float*)actual.data(),(const float*)expected.data(),M*N,1e-6f,1e-6f);if(!r.ok)r.msg="compact Q6: "+r.msg;return r;
 }
 
 TEST(ort_dp4a_tile64_upstream_reference) {
