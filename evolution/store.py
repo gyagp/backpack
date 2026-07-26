@@ -1887,7 +1887,13 @@ class Store:
                     # the performance impact classification.
                     if any(token in path_text for token in
                            ("decode", "prefill", "throughput", "overall", "impact", "latency")) or path_device:
-                        result.append((" / ".join(next_path), float(child)))
+                        measured = float(child)
+                        # Throughput and latency have opposite desirable signs.
+                        # Normalize all history deltas to "positive is better"
+                        # before applying the protected-regression gate.
+                        if "latency" in path_text:
+                            measured = -measured
+                        result.append((" / ".join(next_path), measured))
                 elif isinstance(child, dict):
                     result.extend(percent_values(child, device, vendor, single_device, next_path))
             return result
@@ -1927,7 +1933,16 @@ class Store:
             for device in sorted(devices):
                 machine = next(item for item in machines if item["name"] == device)
                 values = percent_values(record.get("gains", {}), device, vendor_for(machine), len(devices) == 1)
-                impact_value = sum(value for _, value in values) / len(values) if values else None
+                measured_values = [value for _, value in values]
+                # Never average a protected regression away with a gain in a
+                # different metric. The admission policy rejects any cared
+                # prefill/decode regression at 2%, so History and Digest must
+                # apply the same rule when describing an experiment.
+                impact_value = (min(measured_values)
+                                if any(value <= -PROTECTED_REGRESSION_PERCENT
+                                       for value in measured_values)
+                                else (sum(measured_values) / len(measured_values)
+                                      if measured_values else None))
                 metrics: dict[str, Any] = {}
                 for item in record.get("evidence", []):
                     if not isinstance(item, dict) or normalize_device(item.get("device")) != device:
@@ -1949,7 +1964,8 @@ class Store:
             quantified = [item["impact"]["value"] for item in impacts if item["impact"]["value"] is not None]
             # A material device regression takes precedence in the group label;
             # otherwise use the fleet mean to describe the milestone.
-            representative = min(quantified) if any(value <= -5 for value in quantified) else (
+            representative = min(quantified) if any(
+                value <= -PROTECTED_REGRESSION_PERCENT for value in quantified) else (
                 sum(quantified) / len(quantified) if quantified else None)
             record["impact"] = classify(representative)
         return records

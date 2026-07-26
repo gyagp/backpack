@@ -858,6 +858,33 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(108.5, item["device_impacts"][0]["metrics"]["decode_tok_s"])
         self.assertEqual("Strong improvement", item["device_impacts"][0]["impact"]["name"])
 
+    def test_history_does_not_average_away_a_protected_regression(self) -> None:
+        task = self.store.create_task({
+            "title": "Mixed performance result",
+            "kind": "optimization",
+            "hypothesis": "A gain in one metric must not hide a regression in another.",
+            "origin": {"type": "test"},
+            "device_policy": {"required": [self.machine["id"]]},
+        }, "test")
+        self.store.add_history({
+            "task_id": task["id"],
+            "title": "Mixed result",
+            "summary": "Prefill improved but decode regressed.",
+            "commit_sha": "deadbeef",
+            "gains": {self.machine["name"].replace("-", "_"): {
+                "prefill_percent": 27.3,
+                "decode_percent": -10.0,
+            }},
+            "evidence": [{"device": self.machine["name"]}],
+        }, "test")
+
+        item = next(row for row in self.store.list_history()
+                    if row["task_id"] == task["id"])
+        self.assertEqual("Serious regression", item["impact"]["name"])
+        self.assertEqual(-10.0, item["impact"]["value"])
+        self.assertEqual("Serious regression",
+                         item["device_impacts"][0]["impact"]["name"])
+
     def test_failed_milestone_does_not_replace_active_base(self) -> None:
         first = self.store.create_milestone(self.task["id"], "sha-one", "origin", "refs/heads/evolution/base")
         self.store.finish_milestone(first["id"], True)
