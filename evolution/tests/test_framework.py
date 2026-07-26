@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from evolution.agent import (argv_option, backpack_conformance_argv,
@@ -12,12 +13,42 @@ from evolution.agent import (argv_option, backpack_conformance_argv,
 from evolution.domain import DomainError, Thresholds
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
+from evolution.milestone import MilestonePublisher
 from evolution.store import Store, latest_backpack_executable
 from evolution.benchmark_llamacpp import (conformance_passed as llamacpp_conformance_passed,
                                           final_answer as llamacpp_final_answer)
 
 
 class FrameworkTest(unittest.TestCase):
+    def test_milestone_detects_candidate_cherry_pick_on_advanced_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            def git(*args: str) -> str:
+                result = subprocess.run(["git", "-C", str(repo), *args], check=True,
+                                        text=True, capture_output=True, shell=False)
+                return result.stdout.strip()
+            git("init")
+            git("config", "user.email", "test@example.com")
+            git("config", "user.name", "Test")
+            (repo / "base.txt").write_text("base\n", encoding="utf-8")
+            git("add", "base.txt")
+            git("commit", "-m", "base")
+            base = git("rev-parse", "HEAD")
+            git("switch", "-c", "candidate")
+            (repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            git("add", "candidate.txt")
+            git("commit", "-m", "candidate")
+            candidate = git("rev-parse", "HEAD")
+            git("switch", "-c", "advanced", base)
+            (repo / "advanced.txt").write_text("advanced\n", encoding="utf-8")
+            git("add", "advanced.txt")
+            git("commit", "-m", "advanced")
+            git("cherry-pick", candidate)
+            integrated = git("rev-parse", "HEAD")
+            publisher = MilestonePublisher(None, repo)  # type: ignore[arg-type]
+            self.assertTrue(publisher._contains_candidate_patch(integrated, candidate))
+            self.assertFalse(publisher._is_ancestor(candidate, integrated))
+
     def test_thresholds_support_legacy_root_values_and_nested_overrides(self) -> None:
         legacy = Thresholds.from_policy({
             "positive_percent": 3, "negative_percent": -1, "max_cv_percent": 4})

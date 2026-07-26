@@ -25,6 +25,24 @@ class MilestonePublisher:
             raise DomainError((result.stderr or result.stdout).strip())
         return result.stdout.strip()
 
+    def _is_ancestor(self, older: str, newer: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(self.repo), "merge-base", "--is-ancestor", older, newer],
+            text=True, capture_output=True, timeout=120, shell=False)
+        return result.returncode == 0
+
+    def _contains_candidate_patch(self, head: str, candidate: str) -> bool:
+        if self._is_ancestor(candidate, head):
+            return True
+        # Experiments are commonly cherry-picked onto a base that advanced
+        # while validation was running. ``git cherry`` recognizes the same
+        # patch without pretending that the unmeasured integration SHA was the
+        # measured candidate revision.
+        rows = self._git("cherry", head, candidate).splitlines()
+        return any(row.startswith("- ") and candidate.startswith(row[2:].strip())
+                   or row.startswith("- ") and row[2:].strip().startswith(candidate)
+                   for row in rows)
+
     def validate(self, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(task_id)
         if not task:
@@ -43,15 +61,27 @@ class MilestonePublisher:
 
     def publish(self, task_id: str) -> dict[str, Any]:
         task = self.validate(task_id)
-        sha = task["candidate_sha"]
-        milestone = self.store.create_milestone(task_id, sha, self.remote, self.remote_ref)
+        candidate = task["candidate_sha"]
         try:
             # Force-with-lease prevents silently overwriting a base advanced by another publisher.
             current = self._git("ls-remote", self.remote, self.remote_ref)
             lease = current.split()[0] if current else ""
+            head = self._git("rev-parse", "HEAD")
+            if lease and self._is_ancestor(lease, head) and \
+                    self._contains_candidate_patch(head, candidate):
+                publish_sha = head
+            elif (not lease or self._is_ancestor(lease, candidate)):
+                publish_sha = candidate
+            else:
+                raise DomainError(
+                    "milestone base advanced and the current branch does not contain the accepted candidate patch")
+            milestone = self.store.create_milestone(
+                task_id, publish_sha, self.remote, self.remote_ref)
             lease_arg = f"--force-with-lease={self.remote_ref}:{lease}"
-            self._git("push", lease_arg, self.remote, f"{sha}:{self.remote_ref}", timeout=300)
+            self._git("push", lease_arg, self.remote,
+                      f"{publish_sha}:{self.remote_ref}", timeout=300)
             return self.store.finish_milestone(milestone["id"], True)
         except Exception as exc:
-            self.store.finish_milestone(milestone["id"], False, str(exc))
+            if "milestone" in locals():
+                self.store.finish_milestone(milestone["id"], False, str(exc))
             raise
