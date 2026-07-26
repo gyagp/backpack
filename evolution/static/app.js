@@ -310,6 +310,10 @@ function expectedRuntimes(model) {
 function frameworkName(v) {
   return { backpack: "Backpack", llamacpp: "llama.cpp", ort: "ORT" }[v] || v;
 }
+function canonicalModelFormat(value) {
+  const format = String(value || "").toLowerCase();
+  return format === "onnx" ? "ort" : format;
+}
 function performanceCommand(r) {
   const modelPath = r.model.files?.[r.format]?.path || "<model-path>",
     q = (s) => `"${String(s).replaceAll('"', '\\"')}"`;
@@ -398,7 +402,7 @@ function renderMatrix(matrix, observations = []) {
   validationRows = [];
   const trackedMetrics = new Map();
   for (const item of comparableStatusTrendObservations(observations)) {
-    const key = `${item.model_id}/${item.machine_id}/${item.framework}/${item.format}/${item.backend}`;
+    const key = `${item.model_id}/${item.machine_id}/${item.framework}/${canonicalModelFormat(item.format)}/${item.backend}`;
     if (!trackedMetrics.has(key)) trackedMetrics.set(key, item);
   }
   for (const row of matrix.models || []) {
@@ -408,7 +412,7 @@ function renderMatrix(matrix, observations = []) {
         const matches = (cell.results || []).filter(
             (x) =>
               x.framework === spec.framework &&
-              x.format === spec.format &&
+              canonicalModelFormat(x.format) === spec.format &&
               x.backend === spec.backend,
           ),
           result =
@@ -445,7 +449,8 @@ function renderMatrix(matrix, observations = []) {
       for (const result of cell.results || []) {
         if (result.framework === "backpack" && result.backend === "vulkan")
           continue;
-        const key = `${result.framework}/${result.format}/${result.backend}`;
+        const format = canonicalModelFormat(result.format),
+          key = `${result.framework}/${format}/${result.backend}`;
         if (!seen.has(key))
           validationRows.push({
             model: row.model,
@@ -453,7 +458,7 @@ function renderMatrix(matrix, observations = []) {
             conformance: result.conformance,
             conformant: result.conformance === "pass",
             artifact: true,
-            format: result.format,
+            format,
             framework: result.framework,
             backend: result.backend,
             result,
@@ -2241,7 +2246,7 @@ function renderTrendChart(observations, modelMap, machineMap) {
 }
 let statusTrendState = { devices: [], runtimes: [], metrics: ["decode_tok_s"] };
 function statusTrendRuntime(row) {
-  return `${row.framework}/${row.format}/${row.backend}`;
+  return `${row.framework}/${canonicalModelFormat(row.format)}/${row.backend}`;
 }
 function statusTrendRuntimeLabel(key) {
   const [framework, format, backend] = key.split("/");
@@ -2263,7 +2268,7 @@ function compatiblePerformanceRevision(a, b) {
 function validPerformanceObservations(items) {
   const groups = new Map();
   for (const item of items) {
-    const key = `${item.model_id}|${item.machine_id}|${item.framework}|${item.format}|${item.backend}`;
+    const key = `${item.model_id}|${item.machine_id}|${item.framework}|${canonicalModelFormat(item.format)}|${item.backend}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(item);
   }
@@ -2274,7 +2279,7 @@ function validPerformanceObservations(items) {
     )
       return false;
     if (item.conformance === "pass") return true;
-    const key = `${item.model_id}|${item.machine_id}|${item.framework}|${item.format}|${item.backend}`;
+    const key = `${item.model_id}|${item.machine_id}|${item.framework}|${canonicalModelFormat(item.format)}|${item.backend}`;
     return groups
       .get(key)
       .some(
