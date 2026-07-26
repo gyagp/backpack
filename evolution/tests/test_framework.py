@@ -9,7 +9,7 @@ from evolution.agent import (argv_option, backpack_conformance_argv,
                              conformance_passed, current_base_worktree,
                              extract_backpack_output, rewrite_python_argv,
                              rewrite_repo_argv)
-from evolution.domain import DomainError
+from evolution.domain import DomainError, Thresholds
 from evolution.policy import PolicyEngine
 from evolution.server import read_goal, write_goal
 from evolution.store import Store, latest_backpack_executable
@@ -18,6 +18,17 @@ from evolution.benchmark_llamacpp import (conformance_passed as llamacpp_conform
 
 
 class FrameworkTest(unittest.TestCase):
+    def test_thresholds_support_legacy_root_values_and_nested_overrides(self) -> None:
+        legacy = Thresholds.from_policy({
+            "positive_percent": 3, "negative_percent": -1, "max_cv_percent": 4})
+        self.assertEqual((3, -1, 4), (legacy.positive_percent,
+                                     legacy.negative_percent,
+                                     legacy.max_cv_percent))
+        nested = Thresholds.from_policy({
+            "negative_percent": -1,
+            "thresholds": {"negative_percent": -0.5}})
+        self.assertEqual(-0.5, nested.negative_percent)
+
     def test_llamacpp_exact_conformance_rejects_extra_text(self) -> None:
         self.assertTrue(llamacpp_conformance_passed("4", "4", "4"))
         self.assertFalse(llamacpp_conformance_passed("The answer is 4", "4", "4"))

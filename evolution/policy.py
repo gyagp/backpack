@@ -193,15 +193,15 @@ class PolicyEngine:
                     separated_delta = (math.inf if min(base_samples) == 0 else
                                        (max(candidate_samples) / min(base_samples) - 1.0) * 100.0)
                 separated_regression = (metric in protected and
-                                        separated_delta < thresholds.negative_percent)
+                                        separated_delta <= thresholds.negative_percent)
                 if separated_regression:
                     verdict, why = "negative", "non-overlapping regression band exceeds threshold"
                 elif cv > thresholds.max_cv_percent:
                     verdict = "inconclusive"
                     why = "sample variability exceeds policy"
-                elif delta > thresholds.positive_percent:
+                elif delta >= thresholds.positive_percent:
                     verdict, why = "positive", "improvement exceeds threshold"
-                elif delta < thresholds.negative_percent:
+                elif delta <= thresholds.negative_percent:
                     verdict, why = "negative", "regression exceeds threshold"
                 else:
                     verdict, why = "neutral", "delta is within equivalence band"

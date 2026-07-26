@@ -71,7 +71,12 @@ class Thresholds:
 
     @classmethod
     def from_policy(cls, policy: dict[str, Any] | None) -> "Thresholds":
-        values = (policy or {}).get("thresholds", {})
+        # Early task manifests stored thresholds at the policy root while the
+        # current schema nests them under ``thresholds``.  Honour both forms;
+        # otherwise a task that deliberately tightens its regression limit is
+        # silently evaluated with the defaults.
+        policy = policy or {}
+        values = {**policy, **(policy.get("thresholds") or {})}
         return cls(
             positive_percent=float(values.get("positive_percent", 2.0)),
             negative_percent=float(values.get("negative_percent", -2.0)),
