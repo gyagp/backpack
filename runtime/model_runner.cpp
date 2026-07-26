@@ -1778,8 +1778,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
 
     // Qwen 2B also fits (360 MiB), but its candidate measurements did not
     // satisfy the <=5% CV gate. Keep it on the packed fallback until stable.
-    const bool q6PersistentTuple = cfg.arch == "qwen35" &&
-        gpu->adapterName.find("Intel") != std::string::npos &&
+    const bool q6PersistentAdapter = gpu->adapterName.find("Intel") != std::string::npos ||
+        (gpu->adapterName.find("NVIDIA") != std::string::npos &&
+         std::getenv("BP_QWEN_DISABLE_NVIDIA_Q6_PERSISTENT_TILE") == nullptr);
+    const bool q6PersistentTuple = cfg.arch == "qwen35" && q6PersistentAdapter &&
         std::getenv("BP_Q6K_DISABLE_PERSISTENT_TILE") == nullptr &&
         cfg.nLayer == 32u && cfg.nEmbd == 2560u && cfg.intermediateSize == 9216u;
     const uint64_t q6PersistentBytes = (uint64_t)cfg.nLayer * cfg.nEmbd *
@@ -1787,7 +1789,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     const bool q6PersistentSafe = q6PersistentTuple && q6PersistentBytes <= (1ull << 30) &&
         q6PersistentBytes <= (16ull << 30) * 8u / 100u;
     if (q6PersistentTuple)
-        fprintf(stderr, "  Intel persistent Q6_K FFN-down: %llu bytes (%s)\n",
+        fprintf(stderr, "  Persistent Q6_K FFN-down: %llu bytes (%s)\n",
                 (unsigned long long)q6PersistentBytes, q6PersistentSafe ? "enabled" : "memory guard rejected");
     auto uploadQ6Dense = [&](const std::string& name, const uint8_t* raw,
                              uint32_t N, uint32_t K, GPUBuffer& weights, GPUBuffer& scales) {
