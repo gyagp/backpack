@@ -7385,6 +7385,8 @@ int32_t ModelRunner::prefillQwen35Batched(
         // benefit or remain neutral.
         const bool intelRank32=gpu->adapterName.find("Intel")!=std::string::npos&&
             cfg.ssmTimeStepRank==32u;
+        const bool nvidiaRank32=gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+            cfg.ssmTimeStepRank==32u;
         const bool nvidiaRank16=gpu->adapterName.find("NVIDIA")!=std::string::npos&&
             cfg.ssmTimeStepRank==16u;
         const bool deltaX4=!intelRank32&&!nvidiaRank16&&
@@ -7392,10 +7394,11 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool repeatedGgufHeads=modelFormat!="onnx"&&
             cfg.ssmTimeStepRank>cfg.ssmGroupCount;
         const bool portableAmdScan=gpu->adapterName.find("AMD")!=std::string::npos&&!exactSingle;
-        const bool intelLogical8=intelRank32&&!exactSingle&&repeatedGgufHeads&&
-            std::getenv("BP_QWEN_DISABLE_INTEL_DELTA_LOGICAL8")==nullptr;
+        const bool logical8Rank32=!exactSingle&&repeatedGgufHeads&&(
+            (intelRank32&&std::getenv("BP_QWEN_DISABLE_INTEL_DELTA_LOGICAL8")==nullptr)||
+            (nvidiaRank32&&std::getenv("BP_QWEN_DISABLE_NVIDIA_DELTA_LOGICAL8")==nullptr));
         const CompiledPipeline* deltaKernel=nullptr;
-        if(intelLogical8){
+        if(logical8Rank32){
             deltaKernel=&gpu->getOrCreatePipeline("delta_net_scan_logical8_global",deltaNetLogical8GlobalStateSource(),8);
         }else if(repeatedGgufHeads){
             const char*base=exactSingle?WGSL_DELTA_NET_DECODE:
@@ -7581,7 +7584,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
                 add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
                 auto dp=mkp(L+"delta_p",{R,cfg.ssmGroupCount,cfg.ssmStateSize,DV,M});
-                const uint32_t deltaCols=intelLogical8?4u:(deltaX4?4u:2u);
+                const uint32_t deltaCols=logical8Rank32?4u:(deltaX4?4u:2u);
                 add(*deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,exactSingle?DV:(DV+deltaCols-1u)/deltaCols,1,L+"delta");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u delta built\n",li);fflush(stderr);}
                 auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
