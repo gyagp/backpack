@@ -136,6 +136,14 @@ void ExecutionContext::ResetParamPoolCursors() {
     for (auto& pool : paramPool_) pool.nextIdx = 0;
 }
 
+bool ExecutionContext::IsParamPoolBuffer(WGPUBuffer handle) const {
+    if (!handle) return false;
+    for (const auto& pool : paramPool_)
+        for (const auto& buffer : pool.buffers)
+            if (buffer.handle == handle) return true;
+    return false;
+}
+
 // ─── Dispatch Batching ──────────────────────────────────────────────────────
 
 void ExecutionContext::QueueDispatch(WGPUComputePipeline pipeline, WGPUBindGroup bg,

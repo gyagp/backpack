@@ -253,6 +253,42 @@ struct GenericOnnxState {
     int qwenActiveVariant = -1;
     int qwenNextReplayVariant = 0;
 
+    bool IsNvidiaQwenCapture() const {
+        return arch == "qwen3_5_text" &&
+            gpu->adapterName.find("NVIDIA") != std::string::npos;
+    }
+
+    void ClassifyNvidiaQwenCaptureWrites() {
+        if (!IsNvidiaQwenCapture() || qwenCapturedVariants != 2) return;
+        auto& a = qwenCaptureVariants[0].writes;
+        auto& b = qwenCaptureVariants[1].writes;
+        // Pairing is deliberately strict. Any graph/order/size ambiguity keeps
+        // both writes on the replay path. Only parameter-pool buffers can be
+        // immutable: other CPU-produced buffers may be shared and overwritten
+        // between captures. Handles differ because the two captures
+        // intentionally own disjoint parameter-pool ranges.
+        if (a.size() == b.size()) {
+            for (size_t i = 0; i < a.size(); ++i) {
+                const bool sameSite = a[i].opName == b[i].opName &&
+                    a[i].offset == b[i].offset &&
+                    a[i].data.size() == b[i].data.size() &&
+                    execCtx.IsParamPoolBuffer(a[i].handle) &&
+                    execCtx.IsParamPoolBuffer(b[i].handle);
+                if (sameSite && a[i].data == b[i].data) {
+                    a[i].replay = false;
+                    b[i].replay = false;
+                }
+            }
+        }
+        size_t captured = a.size() + b.size();
+        size_t replayed = 0;
+        for (const auto& w : a) replayed += w.replay;
+        for (const auto& w : b) replayed += w.replay;
+        fprintf(stderr,
+            "  [fast decode writes] %zu captured, %zu replayed, %zu immutable\n",
+            captured, replayed, captured - replayed);
+    }
+
     // Shape-specialized prefill capture used by reused-generator benchmarks.
     // The reset snapshots retain the stable zero-state input buffers while
     // the ordinary state maps advance to the captured outputs.
@@ -420,6 +456,10 @@ struct GenericOnnxState {
             execCtx.ReleaseCaptured();
             fastDecodeCaptured = false;
         }
+        // Captured NVIDIA Qwen variants reserve disjoint parameter-pool
+        // ranges. They are reusable only after every captured bind group has
+        // been released above.
+        execCtx.ResetParamPoolCursors();
         execCtx.InvalidateWarmCaches();
 
         for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
@@ -801,7 +841,7 @@ struct GenericOnnxState {
             // execution. Restore the capture variant's writes before applying
             // the token/position-specific overrides below.
             for (const auto& write : execCtx.capturedWrites_) {
-                if (!write.handle || write.data.empty()) continue;
+                if (!write.replay || !write.handle || write.data.empty()) continue;
                 gpu->writeBufferRaw(write.handle, write.offset,
                                     write.data.data(), write.data.size());
             }
@@ -915,12 +955,17 @@ struct GenericOnnxState {
                     execCtx.replayParamUpdates_.size());
                 StoreCurrentQwenCapture(variant);
                 qwenCapturedVariants++;
-                execCtx.ResetParamPoolCursors();
+                // NVIDIA fast decode freezes invariant CPU-produced constants.
+                // Keep capture 1 and capture 2 in disjoint parameter-pool
+                // ranges so neither parity overwrites the other's constants.
+                if (!IsNvidiaQwenCapture())
+                    execCtx.ResetParamPoolCursors();
                 // Qwen's recurrent and convolution state buffers ping-pong
                 // every token. Preserve both binding parities and alternate
                 // them during replay, just as the ordinary graph does.
                 const int requiredVariants = 2;
                 if (qwenCapturedVariants == requiredVariants) {
+                    ClassifyNvidiaQwenCaptureWrites();
                     fastDecodeCaptured = true;
                     // Three ordinary decode steps settle the tensor plan
                     // before capture. Recurrent caches are safely in-place,

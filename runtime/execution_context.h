@@ -113,6 +113,7 @@ struct ExecutionContext {
     /// Get a reusable param buffer (16/32/48/64 bytes).
     GPUBuffer getParamBuffer(uint32_t sizeBytes);
     void ResetParamPoolCursors();
+    bool IsParamPoolBuffer(WGPUBuffer handle) const;
 
     // ─── Fast Decode (Capture + Replay) ─────────────────────────────────
 
@@ -142,6 +143,9 @@ struct ExecutionContext {
         uint64_t offset;
         std::vector<uint8_t> data;
         std::string opName;
+        // Conservative by default.  A model-specific capture classifier may
+        // prove that this value is immutable for the lifetime of its capture.
+        bool replay = true;
     };
     std::vector<CapturedWrite> capturedWrites_;
 
