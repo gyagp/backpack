@@ -157,6 +157,7 @@ struct ModelRunner {
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
         GPUBuffer qkvQ4Dense, qkvQ4ScaleMin, oQ4Dense, oQ4ScaleMin;
         GPUBuffer guQ4Dense, guQ4ScaleMin, dnQ4Dense, dnQ4ScaleMin;
+        GPUBuffer dnQ6Dense, dnQ6Scale;
         GGUFType qkvKQType = (GGUFType)UINT32_MAX, oKQType = (GGUFType)UINT32_MAX;
         GGUFType guKQType = (GGUFType)UINT32_MAX, dnKQType = (GGUFType)UINT32_MAX;
         uint32_t qkvKQNBlocks = 0, qkvKQRowStride = 0;

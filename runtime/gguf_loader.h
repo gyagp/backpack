@@ -125,6 +125,15 @@ struct Q4KDensePacked {
     uint32_t N, K;
 };
 
+// Persistent, exactly decoded Q6_K layout for DP4A prefill. Four signed
+// weights are packed per u32 in logical [N,K] order. Q6_K has an independent
+// effective scale for every 16 values.
+struct Q6KDensePacked {
+    std::vector<uint32_t> weights;
+    std::vector<float> scales;
+    uint32_t N, K;
+};
+
 Q4KDensePacked repack_q4k_dense(const void* raw_data, uint32_t N, uint32_t K);
 
 /// Pack Q5_K raw data (176-byte blocks) for GPU upload.
@@ -133,6 +142,7 @@ KQuantPacked pack_q5k(const void* raw_data, uint32_t N, uint32_t K);
 /// Pack Q6_K raw data (210-byte blocks) for GPU upload.
 /// Pads row stride to 4-byte alignment since 210 is not word-aligned.
 KQuantPacked pack_q6k(const void* raw_data, uint32_t N, uint32_t K);
+Q6KDensePacked repack_q6k_dense(const void* raw_data, uint32_t N, uint32_t K);
 
 /// Pack Q2_K (84 bytes / 256 elements) — already u32-aligned, 21 words/block.
 KQuantPacked pack_q2k(const void* raw_data, uint32_t N, uint32_t K);

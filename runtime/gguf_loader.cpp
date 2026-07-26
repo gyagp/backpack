@@ -470,6 +470,44 @@ KQuantPacked pack_q6k(const void* raw_data, uint32_t N, uint32_t K) {
     return result;
 }
 
+Q6KDensePacked repack_q6k_dense(const void* raw_data, uint32_t N, uint32_t K) {
+    Q6KDensePacked result;
+    result.N = N; result.K = K;
+    result.weights.assign(((uint64_t)N * K + 3) / 4, 0);
+    result.scales.resize((uint64_t)N * ((K + 15) / 16));
+    const uint32_t nBlocks = (K + 255) / 256;
+    const auto* src = reinterpret_cast<const uint8_t*>(raw_data);
+    for (uint32_t row = 0; row < N; ++row) {
+        for (uint32_t b = 0; b < nBlocks; ++b) {
+            const uint8_t* blk = src + ((uint64_t)row * nBlocks + b) * 210;
+            uint16_t dh; memcpy(&dh, blk + 208, sizeof(dh));
+            const float d = kq_fp16_to_f32(dh);
+            for (uint32_t n = 0; n < 256; n += 128) {
+                const uint8_t* ql = blk + n / 2;
+                const uint8_t* qh = blk + 128 + n / 4;
+                const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192 + n / 16);
+                for (uint32_t l = 0; l < 32; ++l) {
+                    const uint32_t is = l / 16;
+                    const int q[4] = {
+                        int((ql[l] & 15u) | (((qh[l] >> 0u) & 3u) << 4u)) - 32,
+                        int((ql[l + 32] & 15u) | (((qh[l] >> 2u) & 3u) << 4u)) - 32,
+                        int((ql[l] >> 4u) | (((qh[l] >> 4u) & 3u) << 4u)) - 32,
+                        int((ql[l + 32] >> 4u) | (((qh[l] >> 6u) & 3u) << 4u)) - 32};
+                    for (uint32_t part = 0; part < 4; ++part) {
+                        const uint32_t k = b * 256 + n + l + part * 32;
+                        if (k >= K) continue;
+                        const uint64_t wi = (uint64_t)row * K + k;
+                        result.weights[wi / 4] |= uint32_t(uint8_t(int8_t(q[part]))) << ((wi & 3) * 8);
+                        result.scales[(uint64_t)row * ((K + 15) / 16) + k / 16] =
+                            d * float(sc[is + part * 2]);
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
 // ─── K-quant dequantization ─────────────────────────────────────────────────
 
 static float kq_fp16_to_f32(uint16_t h) {

@@ -312,6 +312,19 @@ std::string q5kOrtRepackedTileSource() {
     return s;
 }
 
+std::string q6kDenseOrtTileSource() {
+    std::string s=q4kOrtRepackedTileSource();
+    auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
+    all("input_b: array<vec2<u32>>","input_b: array<vec4<u32>>");
+    all("let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=DequantizedFrom4BitsTo8Bits(v,0);",
+        "let v=input_b[br*uniforms.K16+kidx_v+col];tile_B[col][row]=v;");
+    all("let xs=scales_a[ar*(uniforms.K/32u)+kidx_v/2u];scale_A[row]=vec2<f32>(xs,xs*f32(sumPacked(a0)+sumPacked(a1)));",
+        "let xs=scales_a[ar*(uniforms.K/32u)+kidx_v/2u];scale_A[row]=vec2<f32>(xs,xs);");
+    all("return output_element_t(mul_precision(local_sum) * mul_precision(scale.x) - mul_precision(scale.y));",
+        "var first=dot4I8Packed(a1.x,b1.x)+dot4I8Packed(a1.y,b1.y)+dot4I8Packed(a1.z,b1.z)+dot4I8Packed(a1.w,b1.w);var second=dot4I8Packed(a2.x,b2.x)+dot4I8Packed(a2.y,b2.y)+dot4I8Packed(a2.z,b2.z)+dot4I8Packed(a2.w,b2.w);return output_element_t(mul_precision(first)*mul_precision(scale.x)+mul_precision(second)*mul_precision(scale.y));");
+    return s;
+}
+
 std::string q4ZpBatchedRows8Source() {
     std::string result=getEmbeddedKernels().at("matmul_q4_zp_batched_dp4a").source;
     auto replace=[&](const std::string& from,const std::string& to){
@@ -1730,6 +1743,29 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         gpu->writeBuffer(scalesMins, dense.scalesMins.data(), dense.scalesMins.size() * sizeof(float));
     };
 
+    // Qwen 2B also fits (360 MiB), but its candidate measurements did not
+    // satisfy the <=5% CV gate. Keep it on the packed fallback until stable.
+    const bool q6PersistentTuple = cfg.arch == "qwen35" &&
+        gpu->adapterName.find("Intel") != std::string::npos &&
+        std::getenv("BP_Q6K_DISABLE_PERSISTENT_TILE") == nullptr &&
+        cfg.nLayer == 32u && cfg.nEmbd == 2560u && cfg.intermediateSize == 9216u;
+    const uint64_t q6PersistentBytes = (uint64_t)cfg.nLayer * cfg.nEmbd *
+        cfg.intermediateSize * 5u / 4u;
+    const bool q6PersistentSafe = q6PersistentTuple && q6PersistentBytes <= (1ull << 30) &&
+        q6PersistentBytes <= (16ull << 30) * 8u / 100u;
+    if (q6PersistentTuple)
+        fprintf(stderr, "  Intel persistent Q6_K FFN-down: %llu bytes (%s)\n",
+                (unsigned long long)q6PersistentBytes, q6PersistentSafe ? "enabled" : "memory guard rejected");
+    auto uploadQ6Dense = [&](const std::string& name, const uint8_t* raw,
+                             uint32_t N, uint32_t K, GPUBuffer& weights, GPUBuffer& scales) {
+        if (!q6PersistentSafe) return;
+        auto dense = repack_q6k_dense(raw, N, K);
+        weights = gpu->createBuffer(name + ".weights", dense.weights.size() * sizeof(uint32_t));
+        scales = gpu->createBuffer(name + ".scales", dense.scales.size() * sizeof(float));
+        gpu->writeBuffer(weights, dense.weights.data(), dense.weights.size() * sizeof(uint32_t));
+        gpu->writeBuffer(scales, dense.scales.data(), dense.scales.size() * sizeof(float));
+    };
+
     // Helper: repack any quantized tensor to Q8_0 format for GPU
     // For Q8_0: direct repack. For other types: dequant→fp32→quantize→Q8.
     auto repackToQ8 = [&](const uint8_t* data, uint32_t N, uint32_t K, GGUFType type) -> Q8Repacked {
@@ -2148,6 +2184,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     uploadKQWeight("L" + std::to_string(i) + ".dn_kq", kq, lw.dnKQ);
                     if (lw.dnKQType == GGUF_TYPE_Q4_K)
                         uploadQ4Dense("L" + std::to_string(i) + ".dn_ort", kq, lw.dnQ4Dense, lw.dnQ4ScaleMin);
+                    else if (lw.dnKQType == GGUF_TYPE_Q6_K)
+                        uploadQ6Dense("L" + std::to_string(i) + ".dn_q6_ort",
+                            fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM,
+                            lw.dnQ6Dense, lw.dnQ6Scale);
                 } else {
                     auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
                                             cfg.nEmbd, layerIM, (GGUFType)ti.type);
@@ -7389,6 +7429,16 @@ int32_t ModelRunner::prefillQwen35Batched(
                 add(tile,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,qwen35Pf.q5ProjectionDenseScratch},
                     {3,qwen35Pf.q5ProjectionScaleMinScratch},{4,y},{5,p}},mt*nt,1,1,n+"_q5_ort64");
             }
+            else if(t==GGUF_TYPE_Q6_K&&batchedQ6Prefill&&dense.handle&&scaleMin.handle&&
+                    M==qwen35Pf.capacity&&endsWith("/down")){
+                auto qp=mkp(n+"_q6_ort_quant_p",{K,N,M,nb,rs});
+                auto&quant=getKernel("q8_quantize_batched_dp4a");
+                add(quant,{{0,x},{1,qwen35Pf.kqActQ8},{2,qwen35Pf.kqActScale},{3,qp}},(K+255)/256,M,1,n+"_q6_ort_quant");
+                const uint32_t mt=(M+63)/64,nt=(N+63)/64;
+                auto p=mkp(n+"_q6_ort_p",{1,M,N,K,K/8,K/16,mt,nt,0,0});
+                auto&tile=gpu->getOrCreatePipeline("q6k_dense_ort_tile64",q6kDenseOrtTileSource(),6);
+                add(tile,{{0,qwen35Pf.kqActQ8},{1,qwen35Pf.kqActScale},{2,dense},{3,scaleMin},{4,y},{5,p}},mt*nt,1,1,n+"_q6_ort64");
+            }
             else if(t==GGUF_TYPE_Q4_K&&packedOrtQ4Tile){
                 auto qp=mkp(n+"_direct_quant_p",{K,N,M,nb,rs});
                 auto&quant=getKernel("q8_quantize_batched_dp4a");
@@ -7521,7 +7571,10 @@ int32_t ModelRunner::prefillQwen35Batched(
             uint32_t im=pl.intermediateSize;proj(qwen35Pf.norm,lw.guKQ,lw.guQ4Dense,lw.guQ4ScaleMin,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,lw.guW,lw.guS,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u gateup built\n",li);fflush(stderr);}
             auto sap=mkp(L+"silu_p",{M,im});add(silu,{{0,qwen35Pf.gateup},{1,qwen35Pf.act},{2,sap}},(M*im+255)/256,1,1,L+"silu");
-            proj(qwen35Pf.act,lw.dnKQ,lw.dnQ4Dense,lw.dnQ4ScaleMin,lw.dnKQType,lw.dnKQNBlocks,lw.dnKQRowStride,lw.dnW,lw.dnS,zeroBiasE,qwen35Pf.proj,im,E,L+"down");
+            proj(qwen35Pf.act,lw.dnKQ,
+                lw.dnKQType==GGUF_TYPE_Q6_K?lw.dnQ6Dense:lw.dnQ4Dense,
+                lw.dnKQType==GGUF_TYPE_Q6_K?lw.dnQ6Scale:lw.dnQ4ScaleMin,
+                lw.dnKQType,lw.dnKQNBlocks,lw.dnKQRowStride,lw.dnW,lw.dnS,zeroBiasE,qwen35Pf.proj,im,E,L+"down");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u down built\n",li);fflush(stderr);}
             if(lw.postFfwNorm.handle){auto nap=mkp(L+"normadd_p",{E,E,eb});add(normadd,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,lw.postFfwNorm},{3,qwen35Pf.rstd},{4,nap}},M,1,1,L+"ffn_add");}
             else{auto ap=mkp(L+"add_p",{M*E});add(addip,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,ap}},(M*E+255)/256,1,1,L+"ffn_add");}
