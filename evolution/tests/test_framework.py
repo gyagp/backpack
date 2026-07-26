@@ -350,6 +350,30 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("reject", result["aggregate_verdict"])
         self.assertIn("protected metric regressed", result["reason"])
 
+    def test_unprotected_diagnostic_regression_does_not_block_accepted_transition(self) -> None:
+        task = self.store.create_task({
+            "title": "Throughput gain with profiling overhead",
+            "kind": "optimization",
+            "hypothesis": "An unprotected diagnostic must not contradict the aggregate policy.",
+            "origin": {"type": "test"},
+            "decision_policy": {"protected_metrics": ["decode_tok_s"]},
+        }, "test")
+        with self.store._db:
+            self.store._db.execute(
+                "UPDATE tasks SET state='evaluating',aggregate_verdict='accept' WHERE id=?",
+                (task["id"],))
+            self.store._db.execute(
+                "INSERT INTO evaluations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("eval-positive", task["id"], self.machine["id"], "decode_tok_s",
+                 "positive", 60.0, 66.0, 10.0, "{}", "2026-01-01T00:00:00+00:00"))
+            self.store._db.execute(
+                "INSERT INTO evaluations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("eval-diagnostic", task["id"], self.machine["id"], "profile_gpu_ms",
+                 "negative", 4.0, 5.0, -20.0, "{}", "2026-01-01T00:00:00+00:00"))
+
+        transitioned = self.store.transition_task(task["id"], "ready_to_merge", "test")
+        self.assertEqual("ready_to_merge", transitioned["state"])
+
     def test_non_overlapping_regression_rejects_before_cv_gate(self) -> None:
         for metric, base, candidate in (
             ("prefill_tok_s", [303.7, 303.5], [276.2, 235.3]),
