@@ -5750,6 +5750,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ─── Pre-allocate prefill resources ──────────────────────────────────────────
 
 void ModelRunner::initQwen35PrefillResources() {
+    // The standardized prompt fits in one NVIDIA graph.  Keeping it whole
+    // avoids three scratch-buffer synchronization boundaries and gives the
+    // projection tiles enough rows to occupy the adapter.  DeltaNet still
+    // scans tokens sequentially inside its dispatch, so this changes graph
+    // decomposition rather than recurrent arithmetic.  Retain an exact
+    // same-binary fallback for paired admission measurements.
+    if(gpu->adapterName.find("NVIDIA")!=std::string::npos&&
+       std::getenv("BP_QWEN_DISABLE_NVIDIA_PREFILL_512")==nullptr)
+        qwen35Pf.capacity=512;
     const uint32_t C=qwen35Pf.capacity,E=cfg.nEmbd;
     const uint32_t convChannels=cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize;
     const uint32_t qdim=cfg.nHead*cfg.headDim,kvdim=cfg.nKvHeads*cfg.headDim;
