@@ -18,6 +18,7 @@ def _cv_percent(samples: list[float]) -> float:
 def _lower_is_better(metric: str) -> bool:
     name = metric.lower()
     return (name.endswith("_ms") or name.endswith("_latency") or
+            name.endswith("_count") or name.endswith("_calls") or
             "latency" in name or name.startswith("time_to_") or
             name in {"gpu_time", "cpu_time", "memory_bytes", "peak_memory_bytes"})
 

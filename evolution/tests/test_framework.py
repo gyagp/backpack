@@ -399,6 +399,25 @@ class FrameworkTest(unittest.TestCase):
         self.assertGreater(result["evaluations"][0]["delta_percent"], 0)
         self.assertEqual("lower_is_better", result["evaluations"][0]["details"]["direction"])
 
+    def test_lower_operation_count_is_an_improvement(self) -> None:
+        task = self.store.create_task({
+            "title": "Reduce replay calls", "kind": "optimization",
+            "hypothesis": "Fewer host API calls reduce replay overhead",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["replay_write_calls"]},
+            "device_policy": {"required": [self.machine["id"]]},
+            "decision_policy": {"protected_metrics": ["replay_write_calls"]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "replay_write_calls", "correctness": {"passed": True}}
+        self.store.add_evidence({**common, "variant": "base", "samples": [1464, 1464],
+                                 "commit_sha": "base"}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [56, 56],
+                                 "commit_sha": "candidate"}, "test")
+        result = PolicyEngine(self.store).evaluate(task["id"])
+        self.assertEqual("accept", result["aggregate_verdict"])
+        self.assertEqual("lower_is_better", result["evaluations"][0]["details"]["direction"])
+
     def test_commit_mismatch_is_rejected(self) -> None:
         with self.assertRaises(DomainError):
             self.store.add_evidence({"task_id": self.task["id"], "machine_id": self.machine["id"],
