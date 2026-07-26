@@ -1013,6 +1013,14 @@ void GraphExecutor::Execute(
     ctx.gpu = gpu;
     ctx.profilingEnabled = profilingEnabled;
 
+    // A GPUBuffer handle can be recycled by the warm tensor plan between
+    // Execute calls. Bound Q4 activation reuse to this exact graph execution
+    // so a same-address/different-content buffer can never hit the cache.
+    ctx.q4DecodeActivations_.clear();
+    ++ctx.q4DecodeActivationGeneration_;
+    ctx.q4DecodeQuantizeDispatches_ = 0;
+    ctx.q4DecodeReuseHits_ = 0;
+
     // Enable writeBuffer recording for fast decode capture (after input setup, inside Execute)
     if (ctx.fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing && !gpu->captureWritesCb_) {
         gpu->captureWritesCb_ = [](WGPUBuffer handle, uint64_t offset,

@@ -962,10 +962,12 @@ struct GenericOnnxState {
                 for (auto& f : execCtx.capturedFlushes_)
                     nDisp += static_cast<int>(f.dispatches.size());
                 fprintf(stderr,
-                    "  [fast decode capture %d/2] %zu flushes, %d dispatches, %zu param updates\n",
+                    "  [fast decode capture %d/2] %zu flushes, %d dispatches, %zu param updates, Q4 quantize=%u reuse=%u\n",
                     variant + 1,
                     execCtx.capturedFlushes_.size(), nDisp,
-                    execCtx.replayParamUpdates_.size());
+                    execCtx.replayParamUpdates_.size(),
+                    execCtx.q4DecodeQuantizeDispatches_,
+                    execCtx.q4DecodeReuseHits_);
                 StoreCurrentQwenCapture(variant);
                 qwenCapturedVariants++;
                 // NVIDIA fast decode freezes invariant CPU-produced constants.

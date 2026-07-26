@@ -69,6 +69,26 @@ struct ExecutionContext {
         Dispatch fallback;
     } pendingQ4Pair_;
 
+    // Per-Execute ownership for NVIDIA ONNX Q4 M=1 activation quantization.
+    // Entries never cross an Execute boundary: tensor-plan buffers may be
+    // assigned new contents on the next invocation. During fast-decode
+    // capture the quantized buffers stay alive through captured bind groups.
+    struct Q4DecodeActivation {
+        WGPUBuffer inputHandle = nullptr;
+        uint64_t inputOffset = 0;
+        uint64_t inputSize = 0;
+        uint32_t k = 0;
+        int dtype = 0;
+        uint64_t generation = 0;
+        std::string inputName;
+        GPUBuffer quantized;
+        GPUBuffer scales;
+    };
+    std::vector<Q4DecodeActivation> q4DecodeActivations_;
+    uint64_t q4DecodeActivationGeneration_ = 0;
+    uint32_t q4DecodeQuantizeDispatches_ = 0;
+    uint32_t q4DecodeReuseHits_ = 0;
+
     void FlushPendingQ4Pair() {
         if (!pendingQ4Pair_.valid) return;
         pendingDispatches_.push_back(std::move(pendingQ4Pair_.fallback));

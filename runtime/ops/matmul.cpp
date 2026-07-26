@@ -530,13 +530,42 @@ if (lid.x == 0u) {
             ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
             !std::getenv("BP_ONNX_DISABLE_NVIDIA_Q4_PREQUANT_DECODE");
         if (useOrtPrequantDecode) {
-            GpuTensor xq = ex.AllocTensor({(int64_t)K / 4}, TensorDtype::Int32);
-            GpuTensor xs = ex.AllocTensor({(int64_t)K / 128}, TensorDtype::Float16);
-            uint32_t qCount = K / 4u;
-            auto qp = ex.getParamBuffer(16);
-            uint32_t qParams[4] = {qCount, 0, 0, 0};
-            ex.getGpu()->writeBuffer(qp, qParams, sizeof(qParams));
-            auto& qpl = ex.GetPipelineT("ort_q4_decode_quantize_f32", 4, []() {
+            const bool allowReuse =
+                std::getenv("BP_ONNX_DISABLE_Q4_ACTIVATION_REUSE") == nullptr;
+            const std::string& inputName = n.inputs.empty() ? std::string() : n.inputs[0];
+            const uint64_t generation = ex.exec.q4DecodeActivationGeneration_;
+            ExecutionContext::Q4DecodeActivation* cached = nullptr;
+            if (allowReuse) {
+                for (auto& entry : ex.exec.q4DecodeActivations_) {
+                    if (entry.generation == generation &&
+                        entry.inputHandle == X->buffer.handle &&
+                        entry.inputOffset == X->buffer.offset &&
+                        entry.inputSize == X->buffer.size &&
+                        entry.k == K &&
+                        entry.dtype == static_cast<int>(X->dtype) &&
+                        entry.inputName == inputName) {
+                        cached = &entry;
+                        break;
+                    }
+                }
+            }
+
+            GPUBuffer xqBuffer;
+            GPUBuffer xsBuffer;
+            if (cached) {
+                xqBuffer = cached->quantized;
+                xsBuffer = cached->scales;
+                ++ex.exec.q4DecodeReuseHits_;
+            } else {
+                GpuTensor xq = ex.AllocTensor({(int64_t)K / 4}, TensorDtype::Int32);
+                GpuTensor xs = ex.AllocTensor({(int64_t)K / 128}, TensorDtype::Float16);
+                xqBuffer = xq.buffer;
+                xsBuffer = xs.buffer;
+                uint32_t qCount = K / 4u;
+                auto qp = ex.getParamBuffer(16);
+                uint32_t qParams[4] = {qCount, 0, 0, 0};
+                ex.getGpu()->writeBuffer(qp, qParams, sizeof(qParams));
+                auto& qpl = ex.GetPipelineT("ort_q4_decode_quantize_f32", 4, []() {
                 std::string source(WGSL_ORT_DP4A_QUANTIZE_EXACT);
                 const std::string input = "input_a: array<vec4<f16>>";
                 if (auto p = source.find(input); p != std::string::npos)
@@ -552,11 +581,19 @@ if (lid.x == 0u) {
                      p = source.find(store, p + 16))
                     source.replace(p, store.size(), "=f16(scale/127);");
                 return source;
-            });
-            auto qbg = ex.MakeBindGroup(qpl, {
-                {0, X->buffer}, {1, xq.buffer}, {2, xs.buffer}, {3, qp}});
-            ex.QueueDispatch(qpl.pipeline, qbg, (qCount + 63u) / 64u, 1, 1,
-                             "ort_q4_decode_quantize");
+                });
+                auto qbg = ex.MakeBindGroup(qpl, {
+                    {0, X->buffer}, {1, xqBuffer}, {2, xsBuffer}, {3, qp}});
+                ex.QueueDispatch(qpl.pipeline, qbg, (qCount + 63u) / 64u, 1, 1,
+                                 "ort_q4_decode_quantize");
+                ++ex.exec.q4DecodeQuantizeDispatches_;
+                if (allowReuse) {
+                    ex.exec.q4DecodeActivations_.push_back({
+                        X->buffer.handle, X->buffer.offset, X->buffer.size, K,
+                        static_cast<int>(X->dtype), generation, inputName,
+                        xqBuffer, xsBuffer});
+                }
+            }
 
             auto mp = ex.getParamBuffer(16);
             uint32_t decodeParams[4] = {N, K, 0, 0};
@@ -564,7 +601,7 @@ if (lid.x == 0u) {
             auto& mpl = ex.GetPipelineT("ort_q4_prequant_decode", 6,
                 []() { return std::string(WGSL_MATMUL_Q4_PREQUANT_DECODE); });
             auto mbg = ex.MakeBindGroup(mpl, {
-                {0, xq.buffer}, {1, xs.buffer}, {2, W->buffer},
+                {0, xqBuffer}, {1, xsBuffer}, {2, W->buffer},
                 {3, S->buffer}, {4, out[0]->buffer}, {5, mp}});
             ex.QueueDispatch(mpl.pipeline, mbg, (N + 3u) / 4u, 1, 1,
                              "ort_q4_prequant_decode");
