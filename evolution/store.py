@@ -1352,8 +1352,6 @@ class Store:
                               framework: str, fmt: str, backend: str) -> tuple[str, str | None]:
         """Quarantine unconfirmed, like-for-like regressions before they affect Status."""
         metrics = data.get("metrics") or {}
-        if data.get("conformance", "unknown") != "pass":
-            return "valid", None
         prompt = metrics.get("prompt_tokens", metrics.get("prompt_length"))
         generated = metrics.get("generated_tokens", metrics.get("decode_tokens",
                                 metrics.get("generation_tokens", metrics.get("generation_length"))))
@@ -1369,12 +1367,27 @@ class Store:
         rows = self._all("""SELECT * FROM observations
           WHERE validity='valid' AND model_id=? AND machine_id=? AND framework=? AND format=? AND backend=?
           ORDER BY created_at DESC,rowid DESC""", (model_id, machine_id, framework, fmt, backend))
+        # Performance is sometimes uploaded separately from correctness and is
+        # then paired with a passing observation for the same revision in the
+        # Status UI. Do not let that split-record representation bypass the
+        # regression gate merely because the performance row itself says N/A.
+        passing_revisions = [row.get("revision") for row in rows if row.get("conformance") == "pass"]
+
+        def conformance_backed(row: dict[str, Any]) -> bool:
+            if row.get("conformance") == "pass":
+                return True
+            revision = str(row.get("revision") or "").lower().strip()
+            if not revision:
+                return False
+            return any(revision == str(candidate or "").lower().strip()
+                       for candidate in passing_revisions)
+
         comparable = [row for row in rows
                       if (row.get("metrics", {}).get("prompt_tokens", row.get("metrics", {}).get("prompt_length")) == prompt
                           and row.get("metrics", {}).get("generated_tokens", row.get("metrics", {}).get("decode_tokens",
                               row.get("metrics", {}).get("generation_tokens", row.get("metrics", {}).get("generation_length")))) == generated
                           and self._graph_capture(row, framework, fmt) == capture
-                          and row.get("conformance") == "pass")]
+                          and conformance_backed(row))]
         if not comparable:
             return "valid", None
         drops = []

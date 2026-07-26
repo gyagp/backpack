@@ -554,6 +554,24 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("quarantined", result["validity"])
         self.assertIn("decode_tok_s", result["validity_reason"])
 
+    def test_split_performance_observation_cannot_bypass_regression_guard(self) -> None:
+        model = self.store.upsert_model({"id": "split-guard", "name": "Split Guard",
+                                         "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "gguf", "backend": "webgpu"}
+        self.store.add_observation({**common, "id": "split-pass", "revision": "base",
+                                    "conformance": "pass", "metrics": {}}, "test")
+        self.store.add_observation({**common, "id": "split-base", "revision": "base",
+                                    "conformance": "not_applicable", "metrics": {
+            "prefill_tok_s": 100, "decode_tok_s": 20, "prompt_tokens": 512,
+            "generated_tokens": 128}}, "test")
+        result = self.store.add_observation({**common, "id": "split-drop", "revision": "candidate",
+                                             "conformance": "not_applicable", "metrics": {
+            "prefill_tok_s": 90, "decode_tok_s": 18, "prompt_tokens": 512,
+            "generated_tokens": 128}}, "test")
+        self.assertEqual("quarantined", result["validity"])
+        self.assertIn("split-base", result["validity_reason"])
+
     def test_confirmed_regression_remains_auditable_but_not_in_status(self) -> None:
         model = self.store.upsert_model({"id": "confirmed-guard", "name": "Confirmed", "files": {"gguf": {}}})
         common = {"model_id": model["id"], "machine_id": self.machine["id"],
