@@ -416,6 +416,33 @@ class FrameworkTest(unittest.TestCase):
         transitioned = self.store.transition_task(task["id"], "ready_to_merge", "test")
         self.assertEqual("ready_to_merge", transitioned["state"])
 
+    def test_missing_unprotected_diagnostic_does_not_block_protected_gain(self) -> None:
+        task = self.store.create_task({
+            "title": "Throughput gain with optional profile", "kind": "optimization",
+            "hypothesis": "A missing diagnostic must remain visible without blocking throughput.",
+            "base_sha": "base", "candidate_sha": "candidate",
+            "manifest": {"metrics": ["decode_tok_s", "profile_gpu_ms"]},
+            "device_policy": {"required": [self.machine["id"]]},
+            "decision_policy": {"protected_metrics": ["decode_tok_s"]},
+        })
+        common = {"task_id": task["id"], "machine_id": self.machine["id"],
+                  "metric": "decode_tok_s", "correctness": {"passed": True}}
+        self.store.add_evidence({**common, "variant": "base", "samples": [100, 100],
+                                 "commit_sha": "base"}, "test")
+        self.store.add_evidence({**common, "variant": "candidate", "samples": [103, 103],
+                                 "commit_sha": "candidate"}, "test")
+
+        result = PolicyEngine(self.store).evaluate(task["id"])
+
+        self.assertEqual("accept", result["aggregate_verdict"])
+        diagnostic = next(row for row in result["evaluations"]
+                          if row["metric"] == "profile_gpu_ms")
+        self.assertEqual("inconclusive", diagnostic["verdict"])
+        with self.store._db:
+            self.store._db.execute("UPDATE tasks SET state='evaluating' WHERE id=?", (task["id"],))
+        transitioned = self.store.transition_task(task["id"], "ready_to_merge", "test")
+        self.assertEqual("ready_to_merge", transitioned["state"])
+
     def test_unprotected_diagnostic_gain_cannot_authorize_neutral_throughput(self) -> None:
         task = self.store.create_task({
             "title": "Fewer dispatches without throughput gain", "kind": "optimization",

@@ -358,7 +358,7 @@ class Store:
             if missing:
                 summary = ", ".join(f"{machine_id}/{metric}" for machine_id, metric in missing)
                 raise DomainError(f"optimization lacks protected evidence for required device metrics: {summary}")
-            if any(row["verdict"] == "inconclusive" or
+            if any((row["verdict"] == "inconclusive" and row["metric"] in protected) or
                    (row["verdict"] == "negative" and row["metric"] in protected)
                    for row in evaluations):
                 raise DomainError("optimization has regressed or inconclusive required-device evidence")

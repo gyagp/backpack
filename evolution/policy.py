@@ -216,16 +216,17 @@ class PolicyEngine:
                                 "direction": "lower_is_better" if lower_is_better else "higher_is_better"},
                 })
 
-        verdicts = {row["verdict"] for row in rows}
         protected_negative = any(r["verdict"] == "negative" and r["metric"] in protected for r in rows)
         protected_positive = any(r["verdict"] == "positive" and r["metric"] in protected for r in rows)
+        protected_inconclusive = any(r["verdict"] == "inconclusive" and
+                                     r["metric"] in protected for r in rows)
         correctness_negative = any(r["details"].get("correctness_failed") for r in rows)
         if correctness_negative:
             aggregate, reason = "reject", "correctness failed on a required device"
         elif protected_negative:
             aggregate, reason = "reject", "a protected metric regressed on a required device"
-        elif "inconclusive" in verdicts:
-            aggregate, reason = "blocked", "required evidence is missing or too noisy"
+        elif protected_inconclusive:
+            aggregate, reason = "blocked", "protected evidence is missing or too noisy"
         elif protected_positive:
             aggregate, reason = "accept", "all required results are positive or neutral"
         else:
