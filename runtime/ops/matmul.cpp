@@ -536,7 +536,9 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
              (isNvidia && K == 2560u &&
               std::getenv("BP_ONNX_DISABLE_NVIDIA_K2560_PAIR") == nullptr) ||
              (isNvidia && K == 9216u &&
-              std::getenv("BP_ONNX_DISABLE_NVIDIA_K9216_NARROW") == nullptr));
+              std::getenv("BP_ONNX_DISABLE_NVIDIA_K9216_NARROW") == nullptr) ||
+             (isNvidia && K == 4096u &&
+              std::getenv("BP_ONNX_DISABLE_NVIDIA_K4096_NARROW") == nullptr));
         const bool useOneColumnDecode = useTwoColumnDecode &&
             ex.getGpu()->adapterName.find("Intel") == std::string::npos;
         auto& pl = usePackedPrefill
