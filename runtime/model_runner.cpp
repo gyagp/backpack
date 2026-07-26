@@ -49,6 +49,39 @@ std::string deltaNetRepeatedHeadSource(const char* source) {
     return result;
 }
 
+const char* deltaNetLogical8GlobalStateSource() {
+    // llama.cpp Vulkan uses four logical 8-lane column groups in one native
+    // subgroup for S_V=128. Keep Backpack's state globally visible after each
+    // token so this experiment changes decomposition only, not state residency.
+    return R"WGSL(enable subgroups;
+@group(0) @binding(0)var<storage,read>Q:array<f32>;
+@group(0) @binding(1)var<storage,read>K:array<f32>;
+@group(0) @binding(2)var<storage,read>V:array<f32>;
+@group(0) @binding(3)var<storage,read>Beta:array<f32>;
+@group(0) @binding(4)var<storage,read>Gate:array<f32>;
+@group(0) @binding(5)var<storage,read_write>State:array<f32>;
+@group(0) @binding(6)var<storage,read_write>Y:array<f32>;
+@group(0) @binding(7)var<storage,read>P:array<u32>;
+fn reduce8(x0:f32)->f32{var x=x0;x+=subgroupShuffleXor(x,4u);x+=subgroupShuffleXor(x,2u);x+=subgroupShuffleXor(x,1u);return x;}
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id)wid:vec3<u32>,@builtin(local_invocation_id)lid:vec3<u32>){
+ let nv=P[0];let nk=P[1];let dk=P[2];let dv=P[3];let T=P[4];let head=wid.x;
+ let lane=lid.x&7u;let col_group=lid.x>>3u;let vi=wid.y*4u+col_group;
+ let valid=head<nv&&vi<dv;let kh=head%nk;let sb=head*dk*dv;let qs=inverseSqrt(f32(dk));
+ var old:array<f32,16>;
+ for(var t=0u;t<T;t++){
+  let qbase=(t*nk+kh)*dk;let vbase=(t*nv+head)*dv;
+  let bh=select(0.0,Beta[t*nv+head],valid);let gh=select(0.0,exp(Gate[t*nv+head]),valid);
+  var pred=0.0;
+  for(var r=0u;r<16u;r++){let ki=r*8u+lane;let idx=sb+vi*dk+ki;old[r]=select(0.0,State[idx],valid);let kv=select(0.0,K[qbase+ki],valid);pred+=gh*old[r]*kv;}
+  pred=reduce8(pred);let delta=select(0.0,(V[vbase+vi]-pred)*bh,valid);var out=0.0;
+  for(var r=0u;r<16u;r++){let ki=r*8u+lane;let idx=sb+vi*dk+ki;let kv=select(0.0,K[qbase+ki],valid);let qv=select(0.0,Q[qbase+ki]*qs,valid);let sn=gh*old[r]+kv*delta;if(valid){State[idx]=sn;}out+=sn*qv;}
+  out=reduce8(out);if(lane==0u&&valid){Y[vbase+vi]=out;}
+ }
+}
+)WGSL";
+}
+
 std::string deltaNetPortableScanReductionSource(const std::string& source) {
     // The scan shaders split 256 threads into two logical 128-thread tiles.
     // subgroupAdd cannot implement those tiles when the adapter uses wave64:
@@ -7350,8 +7383,12 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool repeatedGgufHeads=modelFormat!="onnx"&&
             cfg.ssmTimeStepRank>cfg.ssmGroupCount;
         const bool portableAmdScan=gpu->adapterName.find("AMD")!=std::string::npos&&!exactSingle;
+        const bool intelLogical8=intelRank32&&!exactSingle&&repeatedGgufHeads&&
+            std::getenv("BP_QWEN_DISABLE_INTEL_DELTA_LOGICAL8")==nullptr;
         const CompiledPipeline* deltaKernel=nullptr;
-        if(repeatedGgufHeads){
+        if(intelLogical8){
+            deltaKernel=&gpu->getOrCreatePipeline("delta_net_scan_logical8_global",deltaNetLogical8GlobalStateSource(),8);
+        }else if(repeatedGgufHeads){
             const char*base=exactSingle?WGSL_DELTA_NET_DECODE:
                 (deltaX4?WGSL_DELTA_NET_SCAN_X4:WGSL_DELTA_NET_SCAN_X2);
             std::string source=deltaNetRepeatedHeadSource(base);
@@ -7535,7 +7572,8 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto spm=mkp(L+"ssm_split_p",{cfg.ssmGroupCount,R,cfg.ssmStateSize,DV,eb,M});
                 add(splitSsmKernel,{{0,qwen35Pf.conv},{1,qwen35Pf.sq},{2,qwen35Pf.sk},{3,qwen35Pf.sv},{4,spm}},3,std::max(cfg.ssmGroupCount,R),M,L+"ssm_split");
                 auto dp=mkp(L+"delta_p",{R,cfg.ssmGroupCount,cfg.ssmStateSize,DV,M});
-                add(*deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,exactSingle?DV:(DV+(deltaX4?3u:1u))/(deltaX4?4u:2u),1,L+"delta");
+                const uint32_t deltaCols=intelLogical8?4u:(deltaX4?4u:2u);
+                add(*deltaKernel,{{0,qwen35Pf.sq},{1,qwen35Pf.sk},{2,qwen35Pf.sv},{3,qwen35Pf.beta},{4,qwen35Pf.gate},{5,ssmHState[li]},{6,qwen35Pf.sy},{7,dp}},R,exactSingle?DV:(DV+deltaCols-1u)/deltaCols,1,L+"delta");
                 if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u delta built\n",li);fflush(stderr);}
                 auto ngp=mkp(L+"ng_p",{R,DV,eb,M});
                 add(normGateKernel,{{0,qwen35Pf.sy},{1,lw.ssmNorm},{2,qwen35Pf.z},{3,qwen35Pf.snorm},{4,ngp}},R,exactSingle?1:M,1,L+"normgate");
