@@ -146,9 +146,9 @@ std::string q4kPackedOrtTileSource() {
     std::string s=q4kOrtRepackedTileSource();
     auto all=[&](const std::string&from,const std::string&to){size_t p=0;while((p=s.find(from,p))!=std::string::npos){s.replace(p,from.size(),to);p+=to.size();}};
     all("input_b: array<vec2<u32>>","input_b: array<u32>");
-    all("scales_b: array<vec2<f32>>","packed_headers: array<u32>");
+    all("scales_b: array<vec2<f32>>","packed_headers: array<vec4<u32>>");
     const std::string loader=R"WGSL(fn unpackQ4KWord(p:u32,high:bool)->u32{return select(p&0x0f0f0f0fu,(p>>4u)&0x0f0f0f0fu,high);}
-fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let gr=kidx_v/2u;let block=gr/8u;let sb=gr&7u;if(block>=uniforms.zero_blocks_per_col){return;}let base=br*uniforms.weight_idx+block*36u;let qb=base+4u+(sb/2u)*8u+col*4u;let high=(sb&1u)!=0u;tile_B[col][row]=vec4<u32>(unpackQ4KWord(input_b[qb],high),unpackQ4KWord(input_b[qb+1u],high),unpackQ4KWord(input_b[qb+2u],high),unpackQ4KWord(input_b[qb+3u],high));if(col==0u){let dm=unpack2x16float(packed_headers[base]);let sh=(sb&3u)*8u;let dv=(packed_headers[base+1u]>>sh)&255u;let mv=(packed_headers[base+2u]>>sh)&255u;var sc:u32;var mn:u32;if(sb<4u){sc=dv&63u;mn=mv&63u;}else{let hi=(packed_headers[base+3u]>>sh)&255u;sc=(hi&15u)|((dv>>2u)&48u);mn=(hi>>4u)|((mv>>2u)&48u);}scale_B[row]=vec2<f32>(dm.x*f32(sc),dm.y*f32(mn));}}
+fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+row;if(br>=uniforms.N){return;}let gr=kidx_v/2u;let block=gr/8u;let sb=gr&7u;if(block>=uniforms.zero_blocks_per_col){return;}let base=br*uniforms.weight_idx+block*36u;let qb=base+4u+(sb/2u)*8u+col*4u;let high=(sb&1u)!=0u;tile_B[col][row]=vec4<u32>(unpackQ4KWord(input_b[qb],high),unpackQ4KWord(input_b[qb+1u],high),unpackQ4KWord(input_b[qb+2u],high),unpackQ4KWord(input_b[qb+3u],high));if(col==0u){let header=packed_headers[base/4u];let dm=unpack2x16float(header.x);let sh=(sb&3u)*8u;let dv=(header.y>>sh)&255u;let mv=(header.z>>sh)&255u;var sc:u32;var mn:u32;if(sb<4u){sc=dv&63u;mn=mv&63u;}else{let hi=(header.w>>sh)&255u;sc=(hi&15u)|((dv>>2u)&48u);mn=(hi>>4u)|((mv>>2u)&48u);}scale_B[row]=vec2<f32>(dm.x*f32(sc),dm.y*f32(mn));}}
 
 )WGSL";
     auto a=s.find("fn loadSHMB("),b=s.find("@compute @workgroup_size",a);
