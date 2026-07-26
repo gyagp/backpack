@@ -430,6 +430,55 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
                 (N + 127) / 128, ((uint32_t)M + 7) / 8, 1, "matmul_q4_zp_wide");
         }
     } else {
+        const bool useOrtPrequantDecode = M == 1 &&
+            ex.fastDecodeState() == ExecutionContext::FastDecodeState::Capturing &&
+            X->dtype == TensorDtype::Float32 &&
+            (K % 128u) == 0u && (N % 4u) == 0u &&
+            ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
+            ex.getGpu()->supportsSubgroups &&
+            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+            !std::getenv("BP_ONNX_DISABLE_NVIDIA_Q4_PREQUANT_DECODE");
+        if (useOrtPrequantDecode) {
+            GpuTensor xq = ex.AllocTensor({(int64_t)K / 4}, TensorDtype::Int32);
+            GpuTensor xs = ex.AllocTensor({(int64_t)K / 128}, TensorDtype::Float16);
+            uint32_t qCount = K / 4u;
+            auto qp = ex.getParamBuffer(16);
+            uint32_t qParams[4] = {qCount, 0, 0, 0};
+            ex.getGpu()->writeBuffer(qp, qParams, sizeof(qParams));
+            auto& qpl = ex.GetPipelineT("ort_q4_decode_quantize_f32", 4, []() {
+                std::string source(WGSL_ORT_DP4A_QUANTIZE_EXACT);
+                const std::string input = "input_a: array<vec4<f16>>";
+                if (auto p = source.find(input); p != std::string::npos)
+                    source.replace(p, input.size(), "input_a: array<vec4<f32>>");
+                const std::string element = "alias input_a_element_t = f16;";
+                if (auto p = source.find(element); p != std::string::npos)
+                    source.replace(p, element.size(), "alias input_a_element_t = f32;");
+                const std::string value = "alias input_a_value_t = vec4<f16>;";
+                if (auto p = source.find(value); p != std::string::npos)
+                    source.replace(p, value.size(), "alias input_a_value_t = vec4<f32>;");
+                const std::string store = "=scale/127;";
+                for (auto p = source.find(store); p != std::string::npos;
+                     p = source.find(store, p + 16))
+                    source.replace(p, store.size(), "=f16(scale/127);");
+                return source;
+            });
+            auto qbg = ex.MakeBindGroup(qpl, {
+                {0, X->buffer}, {1, xq.buffer}, {2, xs.buffer}, {3, qp}});
+            ex.QueueDispatch(qpl.pipeline, qbg, (qCount + 63u) / 64u, 1, 1,
+                             "ort_q4_decode_quantize");
+
+            auto mp = ex.getParamBuffer(16);
+            uint32_t decodeParams[4] = {N, K, 0, 0};
+            ex.getGpu()->writeBuffer(mp, decodeParams, sizeof(decodeParams));
+            auto& mpl = ex.GetPipelineT("ort_q4_prequant_decode", 6,
+                []() { return std::string(WGSL_MATMUL_Q4_PREQUANT_DECODE); });
+            auto mbg = ex.MakeBindGroup(mpl, {
+                {0, xq.buffer}, {1, xs.buffer}, {2, W->buffer},
+                {3, S->buffer}, {4, out[0]->buffer}, {5, mp}});
+            ex.QueueDispatch(mpl.pipeline, mbg, (N + 3u) / 4u, 1, 1,
+                             "ort_q4_prequant_decode");
+            return;
+        }
         const bool useOrtDp4aPrefill = M >= 64 &&
             (X->dtype == TensorDtype::Float16 || X->dtype == TensorDtype::Float32) &&
             (K % 128u) == 0u && (N % 64u) == 0u &&
