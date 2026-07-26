@@ -1957,10 +1957,18 @@ void LmSession::EnableProfiling() {
 
 void LmSession::PrintProfileReport(const std::string& htmlPath) {
     if (!impl_) return;
+    auto prefillProfileTokens=[](){
+        constexpr uint32_t fallback=64;
+        const char* value=std::getenv("BP_PROFILE_PREFILL_TOKENS");
+        if(!value||!*value)return fallback;
+        char* end=nullptr;unsigned long parsed=std::strtoul(value,&end,10);
+        return end!=value&&*end=='\0'&&parsed>=1&&parsed<=4096
+            ?static_cast<uint32_t>(parsed):fallback;
+    };
     if (impl_->backend == Impl::Backend::GenericOnnx) {
         auto* gen = impl_->gen_.get();
         if (std::getenv("BP_PROFILE_PREFILL")) {
-            constexpr uint32_t kProfileTokens = 64;
+            const uint32_t kProfileTokens = prefillProfileTokens();
             std::vector<int32_t> tokens(kProfileTokens, 1);
             gen->ResetCaches();
             gen->execCtx.enableGpuProfiling();
@@ -1997,7 +2005,7 @@ void LmSession::PrintProfileReport(const std::string& htmlPath) {
             return;
 
         if (std::getenv("BP_PROFILE_PREFILL")) {
-            constexpr uint32_t kProfileTokens = 64;
+            const uint32_t kProfileTokens = prefillProfileTokens();
             st->Reset();
             st->runner.profiler->nextIndex = 0;
             st->runner.profiler->entries.clear();
