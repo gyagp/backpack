@@ -374,6 +374,37 @@ class FrameworkTest(unittest.TestCase):
         transitioned = self.store.transition_task(task["id"], "ready_to_merge", "test")
         self.assertEqual("ready_to_merge", transitioned["state"])
 
+    def test_merge_requires_every_protected_metric_on_every_required_device(self) -> None:
+        second = self.store.register_machine({
+            "name": "second-required", "fingerprint": {"gpu_vendor": "amd"},
+        })
+        task = self.store.create_task({
+            "title": "Incomplete device matrix", "kind": "optimization",
+            "hypothesis": "Partial evidence must never authorize a merge.",
+            "origin": {"type": "test"},
+            "device_policy": {"required": [self.machine["id"], second["id"]]},
+            "decision_policy": {
+                "protected_metrics": ["prefill_tok_s", "decode_tok_s"],
+            },
+        }, "test")
+        with self.store._db:
+            self.store._db.execute(
+                "UPDATE tasks SET state='evaluating',aggregate_verdict='accept' WHERE id=?",
+                (task["id"],))
+            for machine_id, metric in (
+                (self.machine["id"], "prefill_tok_s"),
+                (self.machine["id"], "decode_tok_s"),
+                (second["id"], "decode_tok_s"),
+            ):
+                self.store._db.execute(
+                    "INSERT INTO evaluations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (f"eval-{machine_id}-{metric}", task["id"], machine_id, metric,
+                     "neutral", 100.0, 100.0, 0.0, "{}",
+                     "2026-01-01T00:00:00+00:00"))
+
+        with self.assertRaisesRegex(DomainError, "second-required|prefill_tok_s"):
+            self.store.transition_task(task["id"], "ready_to_merge", "test")
+
     def test_non_overlapping_regression_rejects_before_cv_gate(self) -> None:
         for metric, base, candidate in (
             ("prefill_tok_s", [303.7, 303.5], [276.2, 235.3]),

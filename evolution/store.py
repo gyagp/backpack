@@ -345,12 +345,19 @@ class Store:
         if task["kind"] == "optimization" and target in {"implementing", "candidate_ready", "validating", "evaluating"} and self.has_conformance_gaps():
             raise DomainError("optimization is blocked until every cared model/device passes Backpack conformance")
         if task["kind"] == "optimization" and target in {"ready_to_merge", "integrating", "integrated"}:
-            evaluations = self._all("SELECT metric,verdict FROM evaluations WHERE task_id=?", (task_id,))
+            evaluations = self._all("SELECT machine_id,metric,verdict FROM evaluations WHERE task_id=?", (task_id,))
             if task.get("aggregate_verdict") != "accept" or not evaluations:
                 raise DomainError("only an accepted optimization with required-device evidence can be merged")
             configured = task.get("decision_policy", {}).get("protected_metrics")
             protected = (set(configured) if configured is not None else
                          {row["metric"] for row in evaluations})
+            required = set(task.get("device_policy", {}).get("required") or [])
+            evaluated = {(row["machine_id"], row["metric"]) for row in evaluations}
+            missing = sorted((machine_id, metric) for machine_id in required
+                             for metric in protected if (machine_id, metric) not in evaluated)
+            if missing:
+                summary = ", ".join(f"{machine_id}/{metric}" for machine_id, metric in missing)
+                raise DomainError(f"optimization lacks protected evidence for required device metrics: {summary}")
             if any(row["verdict"] == "inconclusive" or
                    (row["verdict"] == "negative" and row["metric"] in protected)
                    for row in evaluations):
