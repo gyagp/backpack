@@ -15,6 +15,7 @@ from .memory import (ContextBudget, VALID_KINDS, VALID_ROLES, VALID_SCOPES,
 
 STATUS_PROMPT_TOKENS = 512
 STATUS_GENERATED_TOKENS = 128
+PROTECTED_REGRESSION_PERCENT = 2.0
 BACKPACK_BACKUP_ROOT = Path(r"D:\backup\x64\backpack")
 
 
@@ -1364,30 +1365,40 @@ class Store:
         rows = self._all("""SELECT * FROM observations
           WHERE validity='valid' AND model_id=? AND machine_id=? AND framework=? AND format=? AND backend=?
           ORDER BY created_at DESC,rowid DESC""", (model_id, machine_id, framework, fmt, backend))
-        baseline = next((row for row in rows
-                         if (row.get("metrics", {}).get("prompt_tokens", row.get("metrics", {}).get("prompt_length")) == prompt
-                             and row.get("metrics", {}).get("generated_tokens", row.get("metrics", {}).get("decode_tokens",
-                                 row.get("metrics", {}).get("generation_tokens", row.get("metrics", {}).get("generation_length")))) == generated
-                             and self._graph_capture(row, fmt) == capture
-                             and row.get("conformance") == "pass")), None)
-        if not baseline:
+        comparable = [row for row in rows
+                      if (row.get("metrics", {}).get("prompt_tokens", row.get("metrics", {}).get("prompt_length")) == prompt
+                          and row.get("metrics", {}).get("generated_tokens", row.get("metrics", {}).get("decode_tokens",
+                              row.get("metrics", {}).get("generation_tokens", row.get("metrics", {}).get("generation_length")))) == generated
+                          and self._graph_capture(row, fmt) == capture
+                          and row.get("conformance") == "pass")]
+        if not comparable:
             return "valid", None
         drops = []
         for metric, value in performance.items():
-            old = baseline.get("metrics", {}).get(metric)
+            # Protect the strongest accepted comparable result, not merely the
+            # preceding row. Otherwise repeated sub-threshold drops can ratchet
+            # Status downward into a material cumulative regression.
+            candidates = [(float(row["metrics"][metric]), row["id"]) for row in comparable
+                          if isinstance(row.get("metrics", {}).get(metric), (int, float))
+                          and not isinstance(row.get("metrics", {}).get(metric), bool)
+                          and row["metrics"][metric] > 0]
+            if not candidates:
+                continue
+            old, baseline_id = max(candidates)
             if (isinstance(old, (int, float)) and not isinstance(old, bool) and old > 0
                     and isinstance(value, (int, float)) and not isinstance(value, bool)):
                 delta = (float(value) / float(old) - 1.0) * 100.0
-                if delta <= -5.0:
-                    drops.append(f"{metric} {delta:.2f}% vs {baseline['id']}")
+                if delta <= -PROTECTED_REGRESSION_PERCENT:
+                    drops.append(f"{metric} {delta:.2f}% vs {baseline_id}")
         if not drops:
             return "valid", None
         evidence = data.get("confirmed_regression_evidence")
         evidence_present = (isinstance(evidence, str) and bool(evidence.strip())) or \
             (isinstance(evidence, (dict, list)) and bool(evidence))
-        if evidence_present:
-            return "valid", "confirmed regression: " + "; ".join(drops)
-        return "quarantined", "unconfirmed regression: " + "; ".join(drops)
+        state = "confirmed" if evidence_present else "unconfirmed"
+        # Confirmation makes a regression actionable; it does not make the
+        # regressed result eligible to replace the protected Status baseline.
+        return "quarantined", state + " protected regression: " + "; ".join(drops)
 
     def invalidate_observation(self, observation_id: str, reason: str, actor: str) -> dict[str, Any]:
         reason = require(reason, "reason").strip()

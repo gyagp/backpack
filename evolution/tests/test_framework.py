@@ -512,7 +512,7 @@ class FrameworkTest(unittest.TestCase):
             "metrics": {"prefill_tok_s": 100, "decode_tok_s": 20,
                         "prompt_tokens": 512, "generated_tokens": 128}}, "test")
         regressed = self.store.add_observation({**common, "id": "guard-drop", "revision": "drop",
-            "metrics": {"prefill_tok_s": 94.9, "decode_tok_s": 20,
+            "metrics": {"prefill_tok_s": 97.9, "decode_tok_s": 20,
                         "prompt_tokens": 512, "generated_tokens": 128}}, "test")
         self.assertEqual("valid", baseline["validity"])
         self.assertEqual("quarantined", regressed["validity"])
@@ -539,7 +539,7 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("valid", shape["validity"])
         self.assertEqual("valid", capture["validity"])
 
-    def test_confirmed_regression_remains_visible(self) -> None:
+    def test_confirmed_regression_remains_auditable_but_not_in_status(self) -> None:
         model = self.store.upsert_model({"id": "confirmed-guard", "name": "Confirmed", "files": {"gguf": {}}})
         common = {"model_id": model["id"], "machine_id": self.machine["id"],
                   "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
@@ -551,9 +551,25 @@ class FrameworkTest(unittest.TestCase):
             "confirmed_regression_evidence": {"repetitions": 5, "artifact": "paired.json"},
             "metrics": {"prefill_tok_s": 90, "decode_tok_s": 18, "prompt_tokens": 512,
                         "generated_tokens": 128}}, "test")
-        self.assertEqual("valid", result["validity"])
-        self.assertIn("confirmed regression", result["validity_reason"])
-        self.assertEqual("confirmed-drop", self.store.latest_observations()[0]["id"])
+        self.assertEqual("quarantined", result["validity"])
+        self.assertIn("confirmed protected regression", result["validity_reason"])
+        self.assertEqual("confirmed-base", self.store.latest_observations()[0]["id"])
+
+    def test_regression_guard_prevents_cumulative_ratcheting(self) -> None:
+        model = self.store.upsert_model({"id": "ratchet-guard", "name": "Ratchet", "files": {"gguf": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "gguf", "backend": "webgpu",
+                  "conformance": "pass"}
+        for observation_id, rate in (("ratchet-base", 100), ("ratchet-small", 98.5)):
+            result = self.store.add_observation({**common, "id": observation_id, "metrics": {
+                "prefill_tok_s": rate, "decode_tok_s": 20, "prompt_tokens": 512,
+                "generated_tokens": 128}}, "test")
+            self.assertEqual("valid", result["validity"])
+        result = self.store.add_observation({**common, "id": "ratchet-cumulative", "metrics": {
+            "prefill_tok_s": 97, "decode_tok_s": 20, "prompt_tokens": 512,
+            "generated_tokens": 128}}, "test")
+        self.assertEqual("quarantined", result["validity"])
+        self.assertIn("ratchet-base", result["validity_reason"])
 
     def test_invalidated_observation_is_auditable_but_not_latest(self) -> None:
         model = self.store.upsert_model({"id": "invalidated", "name": "Invalidated", "files": {"gguf": {}}})
