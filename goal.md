@@ -141,6 +141,41 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
   gains back to their source study, and summarize meaningful accepted findings
   in the daily Digest.
 
+### Multi-agent collaboration
+
+Adapted from the published Gemma collaboration retrospective
+(`https://huggingface.co/spaces/agent-collaborations/gemma-collab-lessons`).
+
+- Preserve failure experience so later work does not repeat it. A settled
+  direction — rejected, reverted, or contradicted by a recorded failure — must
+  be surfaced against a new proposal that overlaps it, before that proposal is
+  run. A rejection is only useful if the next agent sees it without having to
+  re-run the experiment.
+- Counter agent collapse. Agents converge quickly onto a few familiar
+  directions and under-explore harder ones such as custom quantization, large
+  fused kernels, and inference-engine restructuring. Reserve an explicit share
+  of capacity for directions not already represented in recent work, and treat
+  a queue that has narrowed to one theme as a defect to correct.
+- Keep guidance balanced. Rules should push toward exploration and direct
+  collaboration without prescribing the answer; an instruction specific enough
+  to determine the result has removed the search that was the point.
+- Bound message volume. High-frequency long messages are unreadable for a human
+  reviewer and bias every later reader toward whatever was said first. Separate
+  durable state from narration, keep narration short, and route it by topic
+  rather than appending to one shared stream.
+- Keep human review at the point of taste. Route decisions that turn on
+  judgement rather than measurement — which direction is worth pursuing, when a
+  neutral result should still be kept — to a human, and record the resolution
+  where the next agent will read it.
+- Preserve whole traces, not just outcomes. A summary and an artifact do not
+  explain how a result was reached or which human prompt changed its direction.
+  Retain the trace for accepted and rejected work alike, and attribute
+  contributions across messages, artifacts, and traces.
+- Keep metrics multi-dimensional. A single headline number invites optimizing
+  the measurement instead of the system. Every performance claim stays paired
+  with deterministic conformance and with the other protected metrics on the
+  same artifact, and no result is accepted on one number alone.
+
 ## Operability and visibility
 
 - Keep Dashboard Status, Tasks, Evolution, Digest, Devices, performance

@@ -322,6 +322,56 @@ class Store:
             (entity_type, entity_id, event_type, actor, json_text(payload or {}), utc_now()),
         )
 
+    _PRIOR_ATTEMPT_STOPWORDS = frozenset("""
+        the a an and or for with without into onto from that this these those then than
+        will would should could must may might can are was were been being have has had
+        not non per via use uses used using make makes made new old more less than into
+        when where which while about across after before during under over between
+        backpack evolution task tasks device devices model models test tests run runs
+        webgpu gpu cpu percent tok tokens token metric metrics result results
+    """.split())
+
+    @classmethod
+    def _significant_terms(cls, *texts: Any) -> set[str]:
+        words = re.findall(r"[a-z0-9_]{4,}", " ".join(str(t or "") for t in texts).lower())
+        return {w for w in words if w not in cls._PRIOR_ATTEMPT_STOPWORDS}
+
+    def related_prior_attempts(self, title: str, hypothesis: str = "",
+                               limit: int = 5) -> list[dict[str, Any]]:
+        """Find already-settled work that overlaps a proposed one.
+
+        Agents converge on the same few ideas and re-file directions that were
+        already measured and rejected, or that a recorded failure already
+        disproves. Surfacing those at creation time is what keeps a rejection
+        from having to be rediscovered by running the experiment again.
+        """
+        terms = self._significant_terms(title, hypothesis)
+        if not terms:
+            return []
+        found: list[dict[str, Any]] = []
+        for row in self._all("""SELECT id,task_number,title,kind,state,hypothesis,verdict_reason
+              FROM tasks WHERE state IN ('rejected','reverted','failed')
+              ORDER BY updated_at DESC LIMIT 400"""):
+            overlap = terms & self._significant_terms(
+                row["title"], row.get("hypothesis"), row.get("verdict_reason"))
+            if len(overlap) >= 2:
+                found.append({"kind": "settled_task", "id": row["id"],
+                              "task_number": row.get("task_number"),
+                              "state": row["state"], "title": row["title"],
+                              "reason": row.get("verdict_reason"),
+                              "matched": sorted(overlap), "score": len(overlap)})
+        for row in self._all("""SELECT id,kind,title,content,importance FROM memory_records
+              WHERE kind IN ('failure','constraint') AND state!='retired'
+              ORDER BY importance DESC LIMIT 400"""):
+            overlap = terms & self._significant_terms(row["title"], row["content"])
+            if len(overlap) >= 2:
+                found.append({"kind": "recorded_" + row["kind"], "id": row["id"],
+                              "title": row["title"],
+                              "reason": str(row["content"])[:400],
+                              "matched": sorted(overlap), "score": len(overlap)})
+        found.sort(key=lambda item: item["score"], reverse=True)
+        return found[:limit]
+
     def create_task(self, data: dict[str, Any], actor: str = "human") -> dict[str, Any]:
         now = utc_now()
         task_id = data.get("id") or f"evo-{uuid.uuid4().hex[:10]}"
@@ -334,6 +384,12 @@ class Store:
             slug = re.sub(r"[^a-z0-9]+", "-", str(data.get("title", "experiment")).lower()).strip("-")[:42]
             manifest = {**manifest, "atomic_experiment": True,
                         "experiment_branch": manifest.get("experiment_branch") or f"experiment/{task_id}-{slug}"}
+        # Attach settled work this proposal overlaps, so a direction that was
+        # already measured and rejected is visible before it is run again.
+        prior = self.related_prior_attempts(str(data.get("title") or ""),
+                                            str(data.get("hypothesis") or ""))
+        if prior and "prior_attempts" not in manifest:
+            manifest = {**manifest, "prior_attempts": prior}
         initial_state = "blocked" if kind == "optimization" and self.has_conformance_gaps(True) else "proposed"
         with self._lock, self._db:
             task_number = self._db.execute("SELECT COALESCE(MAX(task_number),0)+1 FROM tasks").fetchone()[0]

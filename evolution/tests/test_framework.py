@@ -696,6 +696,45 @@ class FrameworkTest(unittest.TestCase):
                 "machine_id": self.machine["id"], "format": "gguf",
                 "phase": "not-a-phase", "kernel": "x"}, "test")
 
+    def test_new_task_surfaces_settled_work_it_would_repeat(self) -> None:
+        """A rejected direction must be visible before it is run a second time."""
+        repeat = self.store.create_task({
+            "title": "Merge decode replay command submits into one per token",
+            "kind": "optimization",
+            "hypothesis": "Fewer queue submits per token should reduce replay overhead"})
+        self.store.transition_task(repeat["id"], "rejected",
+                                   "measured -19% decode; per-flush submits give CPU/GPU overlap")
+        self.store.upsert_memory({
+            "scope": "project", "scope_id": "backpack", "kind": "failure",
+            "title": "Merging replay submits serializes encode against execution",
+            "content": ("Merging the per-flush decode replay submits into a single queue submit "
+                        "measured decode 205.0 -> 166.9 tok/s because the GPU idles until the whole "
+                        "token is encoded.")}, "test")
+
+        prior = self.store.related_prior_attempts(
+            "Reduce replay submits per token during decode",
+            "Merging the decode submits should cut queue overhead")
+        kinds = {item["kind"] for item in prior}
+        self.assertIn("settled_task", kinds)
+        self.assertIn("recorded_failure", kinds)
+        self.assertTrue(all(len(item["matched"]) >= 2 for item in prior))
+
+        # Creating the near-duplicate carries the evidence in its manifest.
+        again = self.store.create_task({
+            "title": "Reduce replay submits per token during decode",
+            "kind": "optimization",
+            "hypothesis": "Merging the decode submits should cut queue overhead"})
+        attempts = again["manifest"].get("prior_attempts") or []
+        self.assertTrue(attempts)
+        self.assertIn(repeat["id"], [a.get("id") for a in attempts])
+
+        # An unrelated proposal is not burdened with false matches.
+        unrelated = self.store.create_task({
+            "title": "Add ragged batch shape coverage to the tokenizer harness",
+            "kind": "correctness",
+            "hypothesis": "Ragged tokenizer batches may expose padding defects"})
+        self.assertNotIn("prior_attempts", unrelated["manifest"])
+
     def test_transition_is_guarded_and_audited(self) -> None:
         self.store.transition_task(self.task["id"], "triaged", "reviewer")
         detail = self.store.task_detail(self.task["id"])

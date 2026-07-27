@@ -523,14 +523,22 @@ if (lid.x == 0u) {
                 (N + 127) / 128, ((uint32_t)M + 7) / 8, 1, "matmul_q4_zp_wide");
         }
     } else {
+        // The prequant decode kernel splits its 128-thread workgroup into four
+        // 32-lane groups and reduces each with a subgroupShuffleXor butterfly
+        // over masks 16..1. Those masks never cross a 32-lane boundary, so the
+        // reduction is correct on any subgroup at least 32 wide -- including
+        // AMD wave64, where lanes 0-31 and 32-63 reduce independently. The real
+        // requirement is that width, not a vendor name; gating on "NVIDIA" left
+        // AMD on the generic path and measurably behind ORT.
         const bool useOrtPrequantDecode = M == 1 &&
             ex.fastDecodeState() == ExecutionContext::FastDecodeState::Capturing &&
             X->dtype == TensorDtype::Float32 &&
             (K % 128u) == 0u && (N % 4u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups &&
-            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
-            !std::getenv("BP_ONNX_DISABLE_NVIDIA_Q4_PREQUANT_DECODE");
+            ex.getGpu()->subgroupMinSize >= 32u &&
+            !std::getenv("BP_ONNX_DISABLE_NVIDIA_Q4_PREQUANT_DECODE") &&
+            !std::getenv("BP_ONNX_DISABLE_Q4_PREQUANT_DECODE");
         if (useOrtPrequantDecode) {
             const bool allowReuse =
                 std::getenv("BP_ONNX_DISABLE_Q4_ACTIVATION_REUSE") == nullptr;

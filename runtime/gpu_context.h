@@ -98,6 +98,11 @@ struct GPUContext {
     bool supportsSubgroups = false;
     bool supportsSubgroupMatrix = false;
     bool supportsTimestampQuery = false;
+    // Reported subgroup width bounds. Kernels that reduce with a fixed-width
+    // butterfly (subgroupShuffleXor over masks < W) need subgroupMinSize >= W
+    // to stay correct, which is a real requirement rather than a vendor name.
+    uint32_t subgroupMinSize = 0;
+    uint32_t subgroupMaxSize = 0;
 
     // OOM detection: set by Dawn error callback, checked after buffer creation
     bool lastAllocFailed = false;

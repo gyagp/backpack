@@ -130,8 +130,12 @@ bool GPUContext::init(WGPUBackendType backend) {
     wgpuAdapterGetInfo(adapter, &info);
     adapterName = sv_str(info.device);
     adapterDescription = sv_str(info.description);
+    subgroupMinSize = info.subgroupMinSize;
+    subgroupMaxSize = info.subgroupMaxSize;
     fprintf(stderr, "GPU: %s (%s)\n", sv_str(info.device).c_str(),
            sv_str(info.description).c_str());
+    fprintf(stderr, "  Subgroup size: min=%u max=%u\n",
+            (unsigned)subgroupMinSize, (unsigned)subgroupMaxSize);
 
     if (wgpuAdapterGetLimits(adapter, &adapterLimits) != WGPUStatus_Success) {
         fprintf(stderr, "FATAL: wgpuAdapterGetLimits failed; refusing to fall back to WebGPU default limits.\n");
