@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -30,6 +31,7 @@
 #include <map>
 #include <numeric>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -1961,6 +1963,66 @@ TEST(gqa_decode_subgroup_score) {
     assertCloseVec(outputs["PresentV"].asFloat32(), allV, 1e-6f, 1e-6f, "gqa present value");
 }
 
+TEST(gqa_decode_tiled_scores_qwen512_parity) {
+    constexpr int H = 16, KVH = 4, D = 256, PAST = 511, TOTAL = 512;
+    std::vector<float> q(H * D), k(KVH * D), v(KVH * D);
+    std::vector<float> pastK(KVH * PAST * D), pastV(KVH * PAST * D);
+    for (size_t i = 0; i < q.size(); ++i)
+        q[i] = float(int(i % 31) - 15) * 0.0017f;
+    for (size_t i = 0; i < k.size(); ++i)
+        k[i] = float(int(i % 29) - 14) * 0.0019f;
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = float(int(i % 23) - 11) * 0.0021f;
+    for (size_t i = 0; i < pastK.size(); ++i)
+        pastK[i] = float(int(i % 37) - 18) * 0.0009f;
+    for (size_t i = 0; i < pastV.size(); ++i)
+        pastV[i] = float(int(i % 41) - 20) * 0.0008f;
+    const float scale = 1.0f / 16.0f;
+    auto model = buildOnnxModel(
+        {{"GroupQueryAttention", {"Q", "K", "V", "PK", "PV", "", ""},
+          {"Y", "PresentK", "PresentV"},
+          {{"num_heads", AttrDef::INT, H}, {"kv_num_heads", AttrDef::INT, KVH},
+           {"scale", AttrDef::FLOAT, 0, scale}, {"do_rotary", AttrDef::INT, 0}}}},
+        {{"Q", ONNX_FLOAT, {1, 1, H * D}}, {"K", ONNX_FLOAT, {1, 1, KVH * D}},
+         {"V", ONNX_FLOAT, {1, 1, KVH * D}},
+         {"PK", ONNX_FLOAT, {1, KVH, PAST, D}},
+         {"PV", ONNX_FLOAT, {1, KVH, PAST, D}}},
+        {{"Y", ONNX_FLOAT, {1, 1, H * D}},
+         {"PresentK", ONNX_FLOAT, {1, KVH, TOTAL, D}},
+         {"PresentV", ONNX_FLOAT, {1, KVH, TOTAL, D}}});
+    const std::map<std::string, std::pair<std::vector<uint8_t>, TensorInfo>> inputs = {
+        {"Q", makeInputF32("Q", {1, 1, H * D}, q)},
+        {"K", makeInputF32("K", {1, 1, KVH * D}, k)},
+        {"V", makeInputF32("V", {1, 1, KVH * D}, v)},
+        {"PK", makeInputF32("PK", {1, KVH, PAST, D}, pastK)},
+        {"PV", makeInputF32("PV", {1, KVH, PAST, D}, pastV)}};
+    const char* oldEnv = std::getenv("BP_DISABLE_QWEN4_TILED_GQA");
+    const std::string savedEnv = oldEnv ? oldEnv : "";
+#ifdef _WIN32
+    _putenv_s("BP_DISABLE_QWEN4_TILED_GQA", "1");
+#else
+    setenv("BP_DISABLE_QWEN4_TILED_GQA", "1", 1);
+#endif
+    auto control = runOnnxModel(gpu, model, inputs, {"Y", "PresentK", "PresentV"});
+#ifdef _WIN32
+    _putenv_s("BP_DISABLE_QWEN4_TILED_GQA", "");
+#else
+    unsetenv("BP_DISABLE_QWEN4_TILED_GQA");
+#endif
+    auto candidate = runOnnxModel(gpu, model, inputs, {"Y", "PresentK", "PresentV"});
+#ifdef _WIN32
+    _putenv_s("BP_DISABLE_QWEN4_TILED_GQA", savedEnv.c_str());
+#else
+    if (oldEnv) setenv("BP_DISABLE_QWEN4_TILED_GQA", savedEnv.c_str(), 1);
+    else unsetenv("BP_DISABLE_QWEN4_TILED_GQA");
+#endif
+    if (control["Y"].data != candidate["Y"].data)
+        throw std::runtime_error("tiled-score GQA output differs from control");
+    if (control["PresentK"].data != candidate["PresentK"].data ||
+        control["PresentV"].data != candidate["PresentV"].data)
+        throw std::runtime_error("tiled-score GQA changed KV cache output");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -2009,6 +2071,7 @@ int main(int argc, char** argv) {
     RUN(matmul_nbits_q8_decode);
     RUN(linear_attention_gated_delta_vec4);
     RUN(gqa_decode_subgroup_score);
+    RUN(gqa_decode_tiled_scores_qwen512_parity);
     RUN(softmax);
     RUN(simplified_layer_norm);
     RUN(softplus);

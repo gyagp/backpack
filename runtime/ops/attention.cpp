@@ -566,20 +566,49 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
             }
         } else {
             // Single-token decode path
-            auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() { return instantiateTemplate(WGSL_GQA_DECODE_T, TensorDtype::Float32); });
-
             uint32_t attnParams[8] = {(uint32_t)num_heads, (uint32_t)head_dim,
                                        (uint32_t)totalSeq, (uint32_t)kv_heads,
                                        scale_u32, (uint32_t)maxSeq, 0, 0};
             auto apBuf = ex.getParamBuffer(32);
             ex.getGpu()->writeBuffer(apBuf, attnParams, 32);
             ex.RegisterReplayParam(apBuf, 8, ExecutionContext::ReplayParamUpdate::TotalSeq);
-
-            auto attnBg = ex.MakeBindGroup(attnPl, {
-                {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
-                {3, out[0]->buffer}, {4, apBuf}});
-            ex.QueueDispatch(attnPl.pipeline, attnBg,
-                1, (uint32_t)num_heads, 1, "gqa_decode");
+            const bool tiledScores =
+                std::getenv("BP_DISABLE_QWEN4_TILED_GQA") == nullptr &&
+                batch == 1 && num_heads == 16 && kv_heads == 4 &&
+                head_dim == 256 && ex.getGpu()->supportsSubgroups &&
+                ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
+                ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
+            if (tiledScores) {
+                GpuTensor scores =
+                    ex.AllocTensor({num_heads, maxSeq}, TensorDtype::Float32);
+                auto& scorePl = ex.GetPipeline(
+                    "gqa_score_tiles_f32", WGSL_GQA_SCORE_TILES_F32, 4);
+                auto scoreBg = ex.MakeBindGroup(scorePl, {
+                    {0, Q->buffer}, {1, presentKey.buffer},
+                    {2, scores.buffer}, {3, apBuf}});
+                ex.QueueDispatch(scorePl.pipeline, scoreBg,
+                    (uint32_t)((maxSeq + 7) / 8), (uint32_t)num_heads, 1,
+                    "gqa_score_tiles_f32");
+                auto& applyPl = ex.GetPipeline(
+                    "gqa_apply_scores_online_f32",
+                    WGSL_GQA_APPLY_SCORES_ONLINE_F32, 4);
+                auto applyBg = ex.MakeBindGroup(applyPl, {
+                    {0, scores.buffer}, {1, presentVal.buffer},
+                    {2, out[0]->buffer}, {3, apBuf}});
+                ex.QueueDispatch(applyPl.pipeline, applyBg,
+                    1, (uint32_t)num_heads, 1,
+                    "gqa_apply_scores_online_f32");
+            } else {
+                auto& attnPl = ex.GetPipelineT("gqa_decode", 5, []() {
+                    return instantiateTemplate(WGSL_GQA_DECODE_T,
+                                               TensorDtype::Float32);
+                });
+                auto attnBg = ex.MakeBindGroup(attnPl, {
+                    {0, Q->buffer}, {1, presentKey.buffer}, {2, presentVal.buffer},
+                    {3, out[0]->buffer}, {4, apBuf}});
+                ex.QueueDispatch(attnPl.pipeline, attnBg,
+                    1, (uint32_t)num_heads, 1, "gqa_decode");
+            }
         }
     }
 
