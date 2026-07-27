@@ -54,8 +54,12 @@ def parse_benchmark(output: str) -> tuple[float, float]:
 
 
 def run(command: list[str], cwd: Path, timeout: int) -> str:
+    # model_chat.exe is an interactive binary held non-interactive only by a
+    # flag. Closing stdin means a future flag change degrades into an EOF
+    # rather than a child blocked on a console read while holding the GPU.
     completed = subprocess.run(command, cwd=cwd, text=True, encoding="utf-8", errors="replace",
-                               capture_output=True, timeout=timeout, shell=False)
+                               capture_output=True, timeout=timeout, shell=False,
+                               stdin=subprocess.DEVNULL)
     output = completed.stdout + "\n" + completed.stderr
     if completed.returncode:
         raise RuntimeError(f"command exited {completed.returncode}:\n{output[-4000:]}")
