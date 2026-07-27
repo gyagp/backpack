@@ -53,8 +53,13 @@ def main() -> int:
                          "--temp", "0", "-ngl", "99", "--no-display-prompt",
                          "--conversation", "-st", "--jinja", "--reasoning", "off",
                          "--reasoning-budget", "0", "-n", str(args.conformance_tokens)]
+        # Conversation mode reads stdin when a turn ends without stopping. An
+        # inherited console blocks that read forever while the process still
+        # holds the GPU, which presents as a wedged driver that resists
+        # termination rather than as a timeout. DEVNULL makes the read EOF.
         checked = subprocess.run(check_command, cwd=completion.parent, text=True, encoding="utf-8",
-                                 errors="replace", capture_output=True, timeout=300, shell=False)
+                                 errors="replace", capture_output=True, timeout=300, shell=False,
+                                 stdin=subprocess.DEVNULL)
         # --no-display-prompt keeps stdout limited to generated text; llama.cpp
         # diagnostics remain on stderr and must not satisfy an exact-output gate.
         output = final_answer(checked.stdout)
@@ -71,7 +76,8 @@ def main() -> int:
                "-n", str(args.generation_tokens), "-r", str(args.repetitions),
                "-ngl", "99", "-o", "json"]
     completed = subprocess.run(command, cwd=executable.parent, text=True, encoding="utf-8",
-                               errors="replace", capture_output=True, timeout=1800, shell=False)
+                               errors="replace", capture_output=True, timeout=1800, shell=False,
+                               stdin=subprocess.DEVNULL)
     if completed.returncode:
         print(completed.stdout)
         print(completed.stderr)
