@@ -584,12 +584,19 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
                 batch == 1 && kv_heads > 0 && num_heads >= kv_heads &&
                 num_heads % kv_heads == 0 && (num_heads / kv_heads) == 4 &&
                 head_dim == 256;
+            // Both shaders are also subgroup-width agnostic: the score kernel
+            // reduces with subgroupAdd and then combines across subgroups via
+            // score_scratch indexed by subgroup_id up to num_subgroups, and the
+            // apply kernel uses no subgroup ops at all. With workgroup_size(64)
+            // and score_scratch sized 8, any subgroup at least 8 wide yields at
+            // most 8 subgroups. That width is the requirement, not a vendor
+            // name; gating on "NVIDIA" left AMD and Intel on gqa_decode.
             const bool tiledScores =
                 std::getenv("BP_DISABLE_QWEN_TILED_GQA") == nullptr &&
                 std::getenv("BP_DISABLE_QWEN4_TILED_GQA") == nullptr &&
                 tiledScoresShape && ex.getGpu()->supportsSubgroups &&
                 ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
-                ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
+                ex.getGpu()->subgroupMinSize >= 8u;
             if (tiledScores) {
                 GpuTensor scores =
                     ex.AllocTensor({num_heads, maxSeq}, TensorDtype::Float32);
