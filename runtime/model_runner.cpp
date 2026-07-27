@@ -8028,7 +8028,11 @@ int32_t ModelRunner::prefillGemmaBatched(
             ds.push_back(allDecodeDispatches[argmaxReduceDispatchIndex]);
             flushParams();
             auto buildEnd = PrefillClock::now();
-            auto bytes=gpu->submitAndReadback(ds,argmaxResultBuf,4,passPerDispatch);
+            // Profiled submits record per-dispatch GPU timestamps, which is the
+            // only way batched Gemma prefill becomes visible to --profile.
+            auto bytes=(profiler&&profiler->enabled())
+                ?gpu->submitAndReadbackProfiled(ds,argmaxResultBuf,4,*profiler)
+                :gpu->submitAndReadback(ds,argmaxResultBuf,4,passPerDispatch);
             auto submitEnd = PrefillClock::now();
             buildMs += std::chrono::duration<double, std::milli>(buildEnd-buildStart).count();
             submitMs += std::chrono::duration<double, std::milli>(submitEnd-buildEnd).count();
@@ -8040,8 +8044,12 @@ int32_t ModelRunner::prefillGemmaBatched(
             // the shared scratch arena is reused below.  A multi-chunk prompt
             // must therefore finish this chunk before cleanup; submitting it
             // asynchronously caused use-after-release heap corruption as soon
-            // as Gemma exceeded the 128-token chunk capacity.
-            (void)gpu->submitAndReadback(ds,gemmaPf.x,4,true);
+            // as Gemma exceeded the 128-token chunk capacity.  Both variants
+            // read back, so both wait.
+            if(profiler&&profiler->enabled())
+                (void)gpu->submitAndReadbackProfiled(ds,gemmaPf.x,4,*profiler);
+            else
+                (void)gpu->submitAndReadback(ds,gemmaPf.x,4,true);
             auto submitEnd = PrefillClock::now();
             buildMs += std::chrono::duration<double, std::milli>(buildEnd-buildStart).count();
             submitMs += std::chrono::duration<double, std::milli>(submitEnd-buildEnd).count();
