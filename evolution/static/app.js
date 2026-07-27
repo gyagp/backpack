@@ -188,6 +188,7 @@ async function refresh() {
   ]
     .map(([l, v]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`)
     .join("");
+  renderBottlenecks(status.bottlenecks || []);
   const enriched = activity.tasks || activity.active_tasks || [],
     terminal = new Set(["integrated", "rejected", "failed", "reverted"]),
     pending = enriched.filter(
@@ -397,6 +398,37 @@ function renderStatusModelTabs() {
       ),
     );
 }
+function renderBottlenecks(rows) {
+  const card = $("#bottleneck-card"),
+    body = $("#bottlenecks"),
+    count = $("#bottleneck-count");
+  if (!card || !body) return;
+  card.classList.toggle("hidden", rows.length === 0);
+  if (!rows.length) return;
+  if (count) count.textContent = `${rows.length} recorded`;
+  const num = (v, digits = 1) =>
+    typeof v === "number" ? v.toFixed(digits) : "—";
+  body.innerHTML =
+    `<table class="matrix"><thead><tr>` +
+    `<th>Device</th><th>Model</th><th>Format</th><th>Phase</th>` +
+    `<th>Kernel</th><th>Share</th><th>Total</th><th>Calls</th><th>Avg</th><th>Note</th>` +
+    `</tr></thead><tbody>` +
+    rows
+      .map(
+        (r) =>
+          `<tr><td>${r.device || ""}</td><td>${r.model_id || "—"}</td>` +
+          `<td>${r.format || ""}</td><td>${r.phase || ""}</td>` +
+          `<td><code>${r.kernel || ""}</code></td>` +
+          `<td><b>${num(r.share_percent)}%</b></td>` +
+          `<td>${num(r.total_ms, 2)} ms</td>` +
+          `<td>${r.call_count ?? "—"}</td>` +
+          `<td>${num(r.avg_us)} µs</td>` +
+          `<td>${r.note || ""}</td></tr>`,
+      )
+      .join("") +
+    `</tbody></table>`;
+}
+
 function renderMatrix(matrix, observations = []) {
   statusPerformanceProfile = matrix.performance_profile || statusPerformanceProfile;
   validationRows = [];

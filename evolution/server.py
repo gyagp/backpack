@@ -157,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/api/status":
                 return self._send_json(self.server.store.status())
+            if path == "/api/bottlenecks":
+                return self._send_json(self.server.store.list_bottlenecks())
             if path == "/api/goal":
                 return self._send_json(read_goal())
             if path == "/api/activity":
@@ -287,6 +289,10 @@ class Handler(BaseHTTPRequestHandler):
                     "validity": result["validity"],
                 })
                 return self._send_json(result)
+            if path == "/api/bottlenecks":
+                result = self.server.store.add_bottleneck(body, actor)
+                self.server.events.publish("bottleneck-recorded", result)
+                return self._send_json(result, HTTPStatus.CREATED)
             if path == "/api/observations":
                 result = self.server.store.add_observation(body, actor)
                 created = self.server.store.ensure_automatic_tasks()

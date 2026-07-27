@@ -666,6 +666,36 @@ class FrameworkTest(unittest.TestCase):
             result["evaluations"][0]["details"]["reason"],
         )
 
+    def test_status_ranks_profiled_bottlenecks(self) -> None:
+        self.store.upsert_model({"id": "bn-model", "name": "BN", "files": {"gguf": {}}})
+        self.store.add_bottleneck({
+            "machine_id": self.machine["id"], "model_id": "bn-model", "format": "gguf",
+            "phase": "prefill", "kernel": "gpf_gateup", "share_percent": 28.8,
+            "total_ms": 33.80, "call_count": 140, "avg_us": 241.4}, "test")
+        self.store.add_bottleneck({
+            "machine_id": self.machine["id"], "model_id": "bn-model", "format": "gguf",
+            "phase": "prefill", "kernel": "gpf_attn", "share_percent": 48.4,
+            "total_ms": 56.92, "call_count": 140, "avg_us": 406.6}, "test")
+        status = self.store.status()
+        ranked = [item["kernel"] for item in status["bottlenecks"]]
+        self.assertEqual(["gpf_attn", "gpf_gateup"], ranked)
+        self.assertEqual("gpu-1", status["bottlenecks"][0]["device"])
+
+        # Re-profiling the same kernel updates in place rather than accumulating.
+        self.store.add_bottleneck({
+            "machine_id": self.machine["id"], "model_id": "bn-model", "format": "gguf",
+            "phase": "prefill", "kernel": "gpf_attn", "share_percent": 12.0,
+            "total_ms": 9.9, "call_count": 140, "avg_us": 70.0}, "test")
+        status = self.store.status()
+        self.assertEqual(2, len(status["bottlenecks"]))
+        self.assertEqual(["gpf_gateup", "gpf_attn"],
+                         [item["kernel"] for item in status["bottlenecks"]])
+
+        with self.assertRaises(DomainError):
+            self.store.add_bottleneck({
+                "machine_id": self.machine["id"], "format": "gguf",
+                "phase": "not-a-phase", "kernel": "x"}, "test")
+
     def test_transition_is_guarded_and_audited(self) -> None:
         self.store.transition_task(self.task["id"], "triaged", "reviewer")
         detail = self.store.task_detail(self.task["id"])

@@ -90,6 +90,14 @@ CREATE TABLE IF NOT EXISTS optimization_history (
   after_json TEXT NOT NULL, gains_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
   commit_sha TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS profiling_bottlenecks (
+  id TEXT PRIMARY KEY, machine_id TEXT NOT NULL REFERENCES machines(id),
+  model_id TEXT REFERENCES models(id), format TEXT NOT NULL, phase TEXT NOT NULL,
+  kernel TEXT NOT NULL, share_percent REAL, total_ms REAL, call_count INTEGER,
+  avg_us REAL, note TEXT, revision TEXT, task_id TEXT REFERENCES tasks(id),
+  created_at TEXT NOT NULL,
+  UNIQUE(machine_id,model_id,format,phase,kernel)
+);
 CREATE TABLE IF NOT EXISTS milestones (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
   commit_sha TEXT NOT NULL, remote TEXT NOT NULL, remote_ref TEXT NOT NULL,
@@ -1247,7 +1255,45 @@ class Store:
             "machines_online": self._db.execute("SELECT COUNT(*) FROM machines WHERE status='online'").fetchone()[0],
             "pending_decisions": self._db.execute("SELECT COUNT(*) FROM decisions WHERE status='pending'").fetchone()[0],
             "cared_models": self._db.execute("SELECT COUNT(*) FROM models WHERE cared=1").fetchone()[0],
+            "bottlenecks": self.list_bottlenecks(limit=12),
         }
+
+    def add_bottleneck(self, data: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Record one profiled hotspot so Status can rank what to work on next."""
+        machine_id = require(data.get("machine_id"), "machine_id")
+        if not self.get_machine(machine_id):
+            raise DomainError("machine not found")
+        model_id = data.get("model_id")
+        if model_id and not self.get_model(model_id):
+            raise DomainError("model not found")
+        phase = str(data.get("phase") or "decode")
+        if phase not in {"prefill", "decode", "load"}:
+            raise DomainError("phase must be prefill, decode, or load")
+        bottleneck_id = data.get("id") or f"bn-{uuid.uuid4().hex[:10]}"
+        values = (
+            bottleneck_id, machine_id, model_id, str(data.get("format") or "gguf"), phase,
+            require(data.get("kernel"), "kernel"),
+            data.get("share_percent"), data.get("total_ms"), data.get("call_count"),
+            data.get("avg_us"), data.get("note"), data.get("revision"), data.get("task_id"),
+            utc_now(),
+        )
+        with self._lock, self._db:
+            self._db.execute("""INSERT INTO profiling_bottlenecks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(machine_id,model_id,format,phase,kernel) DO UPDATE SET
+              id=excluded.id,share_percent=excluded.share_percent,total_ms=excluded.total_ms,
+              call_count=excluded.call_count,avg_us=excluded.avg_us,note=excluded.note,
+              revision=excluded.revision,task_id=excluded.task_id,created_at=excluded.created_at""", values)
+            self.audit("machine", machine_id, "bottleneck_recorded", actor,
+                       {"kernel": data.get("kernel"), "phase": phase,
+                        "share_percent": data.get("share_percent")})
+        return self._row(self._db.execute(
+            "SELECT * FROM profiling_bottlenecks WHERE id=?", (bottleneck_id,)).fetchone())  # type: ignore[return-value]
+
+    def list_bottlenecks(self, limit: int | None = None) -> list[dict[str, Any]]:
+        rows = self._all("""SELECT b.*, m.name AS device FROM profiling_bottlenecks b
+          JOIN machines m ON m.id=b.machine_id
+          ORDER BY COALESCE(b.share_percent,0) DESC, b.total_ms DESC""")
+        return rows[:limit] if limit else rows
 
     def activity(self, limit: int = 40) -> dict[str, Any]:
         self.expire_stale_runs()

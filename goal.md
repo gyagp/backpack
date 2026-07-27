@@ -130,8 +130,9 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
   devices. Run deterministic conformance first, then record standardized
   512-input/128-output prefill and decode TPS with runtime revisions, dates,
   graph-capture mode, commands, and artifacts.
-- Study upstream ONNX Runtime, ONNX Runtime GenAI, llama.cpp, Modular, and the
-  accumulated experience in `docs/` regularly.
+- Study upstream ONNX Runtime, ONNX Runtime GenAI, llama.cpp, vLLM
+  (`https://github.com/vllm-project/vllm`), Modular, and the accumulated
+  experience in `docs/` regularly.
 - Record each study date and its concrete potential tasks. Split ideas into
   atomic experiments that can be run independently and in parallel.
 - Give every task a stable ID and source. Use a separate experiment branch per
