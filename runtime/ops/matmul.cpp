@@ -629,13 +629,18 @@ if (lid.x == 0u) {
             }
             return;
         }
+        // The DP4A prefill matmul already branches on subgroup width itself:
+        // it uses the subgroupShuffle broadcast only when sg_size == 16 and
+        // otherwise reads the same values straight out of tile_B workgroup
+        // memory, so it is correct at any width. The quantize kernel reduces
+        // with subgroupMax, which is width-independent. What both actually
+        // need is DP4A and subgroups, not a vendor name; the old test excluded
+        // AMD, whose ONNX prefill then ran the generic path.
         const bool useOrtDp4aPrefill = M >= 64 &&
             (X->dtype == TensorDtype::Float16 || X->dtype == TensorDtype::Float32) &&
             (K % 128u) == 0u && (N % 64u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups &&
-            (ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos ||
-             ex.getGpu()->adapterName.find("Intel") != std::string::npos) &&
             !std::getenv("BP_QWEN_Q4_DISABLE_ORT_PREFILL");
         if (useOrtDp4aPrefill) {
             GpuTensor xq = ex.AllocTensor({M, (int64_t)K / 4}, TensorDtype::Int32);
