@@ -568,46 +568,14 @@ function statusCommand(row, label) {
   return `<button class="secondary row-command" data-device="${esc(row.machine.name)}" data-title="${esc(title)}" data-command="${esc(performanceCommand(row))}">${esc(label)}</button>`;
 }
 function renderValidationRows() {
-  const query = ($("#validation-search")?.value || "").trim().toLowerCase(),
-    sort = $("#validation-sort")?.value || "device",
-    direction = $("#validation-direction")?.dataset.direction || "asc",
-    keys = {
-      device: (r) => r.machine.name,
-      framework: (r) => r.label,
-      backend: (r) =>
-        `${r.backpack?.backend || ""}/${r.reference?.backend || ""}`,
-      conformance: (r) =>
-        `${r.backpack?.conformance || "pending"}/${r.reference?.conformance || "pending"}`,
-    };
-  let rows = comparisonStatusRows().filter(
-    (r) =>
-      !query ||
-      [
-        r.machine.name,
-        r.machine.fingerprint?.gpu,
-        r.model.name,
-        r.format,
-        r.label,
-        "Backpack",
-        r.backpack?.backend,
-        r.reference?.backend,
-        r.backpack?.conformance,
-        r.reference?.conformance,
-        r.backpack?.result?.revision,
-        r.reference?.result?.revision,
-      ].some((v) =>
-        String(v || "")
-          .toLowerCase()
-          .includes(query),
-      ),
-  );
+  // Status is a fixed comparison matrix, so it always shows every row in a
+  // stable device/format order; there is nothing to search or re-sort.
+  const rows = comparisonStatusRows();
   rows.sort(
     (a, b) =>
-      String(keys[sort](a)).localeCompare(String(keys[sort](b))) ||
       a.machine.name.localeCompare(b.machine.name) ||
       a.format.localeCompare(b.format),
   );
-  if (direction === "desc") rows.reverse();
   const selected = validationRows.find(
     (r) => r.model.id === activeStatusModel,
   )?.model;
@@ -1803,15 +1771,6 @@ $("#provision-form").onsubmit = async (e) => {
   } finally {
     submit.disabled = false;
   }
-};
-$("#validation-search").oninput = renderValidationRows;
-$("#validation-sort").onchange = renderValidationRows;
-$("#validation-direction").onclick = (e) => {
-  const b = e.currentTarget,
-    next = b.dataset.direction === "asc" ? "desc" : "asc";
-  b.dataset.direction = next;
-  b.textContent = next === "asc" ? "Ascending ↑" : "Descending ↓";
-  renderValidationRows();
 };
 let analysisState = {
     metric: "decode_tok_s",
