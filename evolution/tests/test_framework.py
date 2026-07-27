@@ -1148,6 +1148,42 @@ class FrameworkTest(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.store.transition_task(optimization["id"], "implementing", "test")
 
+    def test_paused_device_does_not_idle_the_assignable_fleet(self) -> None:
+        """A device excused with a recorded reason must not gate healthy devices.
+
+        It can never clear its own conformance gap while offline, so counting
+        it when admitting work would stall every remaining device indefinitely.
+        """
+        self.store.upsert_model({"id": "gated-model", "name": "Gated", "files": {"gguf": {}}})
+        offline = self.store.register_machine(
+            {"name": "offline-device", "fingerprint": {"backend": "webgpu"}})
+        self.store.add_observation({
+            "model_id": "gated-model", "machine_id": self.machine["id"],
+            "framework": "backpack", "format": "gguf", "conformance": "pass"}, "test")
+        # The reachable device conforms, but the offline one still gates work.
+        self.assertTrue(self.store.has_conformance_gaps(True))
+
+        self.store.set_machine_activity(offline["id"], True, "test")
+        self.assertFalse(self.store.has_conformance_gaps(True))
+        # The unnarrowed question is unchanged: the gap is real, just excused.
+        self.assertTrue(self.store.has_conformance_gaps())
+        admitted = self.store.create_task({"title": "Tune kernel", "kind": "optimization",
+                                           "hypothesis": "A faster tile helps"})
+        self.assertEqual("proposed", admitted["state"])
+        self.store.transition_task(admitted["id"], "triaged", "test")
+        self.assertEqual("implementing",
+                         self.store.transition_task(admitted["id"], "implementing", "test")["state"])
+
+        # Relaxing admission must not relax the merge gate: an optimization
+        # still needs an accepted verdict and required-device evidence.
+        with self.assertRaises(DomainError):
+            self.store.transition_task(admitted["id"], "ready_to_merge", "test")
+
+        # With every device paused the gate closes again rather than opening
+        # vacuously on an empty fleet.
+        self.store.set_machine_activity(self.machine["id"], True, "test")
+        self.assertTrue(self.store.has_conformance_gaps(True))
+
     def test_regressed_optimization_cannot_advance_to_merge(self) -> None:
         task = self.store.create_task({
             "title": "Regressed candidate", "kind": "optimization",

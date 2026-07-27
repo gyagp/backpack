@@ -326,7 +326,7 @@ class Store:
             slug = re.sub(r"[^a-z0-9]+", "-", str(data.get("title", "experiment")).lower()).strip("-")[:42]
             manifest = {**manifest, "atomic_experiment": True,
                         "experiment_branch": manifest.get("experiment_branch") or f"experiment/{task_id}-{slug}"}
-        initial_state = "blocked" if kind == "optimization" and self.has_conformance_gaps() else "proposed"
+        initial_state = "blocked" if kind == "optimization" and self.has_conformance_gaps(True) else "proposed"
         with self._lock, self._db:
             task_number = self._db.execute("SELECT COALESCE(MAX(task_number),0)+1 FROM tasks").fetchone()[0]
             values = (
@@ -356,7 +356,7 @@ class Store:
         task = self.get_task(task_id)
         if not task:
             raise DomainError("task not found")
-        if task["kind"] == "optimization" and target in {"implementing", "candidate_ready", "validating", "evaluating"} and self.has_conformance_gaps():
+        if task["kind"] == "optimization" and target in {"implementing", "candidate_ready", "validating", "evaluating"} and self.has_conformance_gaps(True):
             raise DomainError("optimization is blocked until every cared model/device passes Backpack conformance")
         if task["kind"] == "optimization" and target in {"ready_to_merge", "integrating", "integrated"}:
             evaluations = self._all("SELECT machine_id,metric,verdict FROM evaluations WHERE task_id=?", (task_id,))
@@ -423,9 +423,27 @@ class Store:
             self.compact_memory(actor)
         return self.get_task(task_id)  # type: ignore[return-value]
 
-    def has_conformance_gaps(self) -> bool:
+    def has_conformance_gaps(self, assignable_only: bool = False) -> bool:
+        """Report cared model/device pairs lacking a passing Backpack conformance.
+
+        ``assignable_only`` narrows the question to devices that can actually
+        run work right now. A paused device is one goal.md has already excused
+        with a recorded reason, and it can never clear its own gap while it is
+        offline. Counting it when admitting work would idle every healthy
+        device for as long as any one device is unreachable, which contradicts
+        the requirement that cared devices stay productively assigned. This
+        only relaxes admission: the merge gate is enforced separately against
+        each task's required device policy, so an unreachable required device
+        still blocks integration.
+        """
         models = self.list_models(cared_only=True)
         machines = self.list_machines()
+        if assignable_only:
+            assignable = [item for item in machines
+                          if not item.get("labels", {}).get("activity_paused")]
+            # Falling back to the full fleet keeps the gate closed rather than
+            # vacuously open when nothing is assignable.
+            machines = assignable or machines
         if not models or not machines:
             return False
         latest = self.latest_observations()
