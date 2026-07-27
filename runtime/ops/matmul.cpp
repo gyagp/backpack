@@ -13,7 +13,9 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <map>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static float fp16ToFloat(uint16_t h) {
@@ -603,8 +605,20 @@ if (lid.x == 0u) {
             auto mbg = ex.MakeBindGroup(mpl, {
                 {0, xqBuffer}, {1, xsBuffer}, {2, W->buffer},
                 {3, S->buffer}, {4, out[0]->buffer}, {5, mp}});
-            ex.QueueDispatch(mpl.pipeline, mbg, (N + 3u) / 4u, 1, 1,
-                             "ort_q4_prequant_decode");
+            static const bool shapeLabels =
+                std::getenv("BP_DIAG_Q4_PREQUANT_SHAPE_LABELS") != nullptr;
+            if (shapeLabels) {
+                static std::map<std::pair<uint32_t, uint32_t>, std::string> labels;
+                auto it = labels.find({N, K});
+                if (it == labels.end())
+                    it = labels.emplace(std::pair<uint32_t, uint32_t>{N, K},
+                                        "ort_q4_prequant_decode:N" + std::to_string(N) +
+                                        "xK" + std::to_string(K)).first;
+                ex.QueueDispatch(mpl.pipeline, mbg, (N + 3u) / 4u, 1, 1, it->second.c_str());
+            } else {
+                ex.QueueDispatch(mpl.pipeline, mbg, (N + 3u) / 4u, 1, 1,
+                                 "ort_q4_prequant_decode");
+            }
             return;
         }
         const bool useOrtDp4aPrefill = M >= 64 &&

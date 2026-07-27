@@ -6,6 +6,64 @@ against these guidelines.
 
 ---
 
+## 0. Optimization Order: Eliminate CPU-Side Bottlenecks First
+
+**Remove the host-side bottleneck before tuning a single kernel.**  A
+WebGPU decode step is a pipeline: the CPU encodes and submits commands
+while the GPU executes them.  Whichever side is slower sets throughput.
+If the CPU side dominates, a faster kernel changes nothing measurable —
+the GPU just waits longer for its next command.  Kernel work done in that
+state looks like a failed optimization and is easy to misread as "the
+kernel is already optimal".
+
+Decide which side dominates before choosing what to change:
+
+```
+GPU HW time (hardware timestamps)   3.35 ms/tok   <- GPU-side cost
+Wall time  (measured throughput)    4.98 ms/tok   <- what the user gets
+                                    --------------
+Host-side gap                       1.63 ms/tok   = 33%
+```
+
+Measure wall time from a **clean run** and GPU HW time from a profiled
+run; profiling instrumentation inflates the host side and would report a
+gap that is mostly its own overhead.
+
+**Order of work:**
+
+1. **Cut host-side cost per token.**  The dominant terms are command
+   encoding (`SetPipeline` + `SetBindGroup` + `DispatchWorkgroups` per
+   dispatch, ~2 µs each), buffer writes, and any blocking queue wait.
+   The strongest lever is *fewer dispatches per token* — fusing ops,
+   merging sibling projections, and caching quantized activations all
+   reduce host work and GPU launch overhead at the same time.  Confirm
+   blocking waits are actually gone: `BP_EXEC_STATS=1` prints a
+   `[sync sources]` breakdown naming the op behind every queue wait.
+2. **Then optimize GPU kernels**, ranked by measured share, using
+   effective bandwidth to tell a genuinely slow kernel from one already
+   at the device limit (see §3.5).
+
+### Do not serialize the pipeline while "reducing overhead"
+
+Fewer submits is not the same as less overhead.  Decode replay issues one
+command buffer per captured flush *on purpose*: submitting each flush as
+it is recorded lets the GPU begin executing early command buffers while
+the CPU is still encoding later ones.  Merging all flushes into a single
+encoder and submit was measured on webgfx-104 (Qwen 3.5 2B ONNX, 512/128,
+5 repetitions):
+
+| Replay strategy | Decode tok/s | Prefill tok/s |
+|-----------------|--------------|---------------|
+| One submit per flush (current) | **205.0** | **5488** |
+| One merged submit per token | 166.9 (−19%) | 4394 (−20%) |
+
+The merged version removes 7 submits per token and is decisively slower,
+because the GPU idles until the entire token is encoded.  Reduce the
+*amount* of host work, not the number of opportunities for the GPU to
+start working.
+
+---
+
 ## 1. Model Optimization
 
 ### 1.1 Weight Quantization

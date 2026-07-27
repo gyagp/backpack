@@ -303,6 +303,15 @@ void ExecutionContext::ReplayDispatches(bool skipFence) {
 
     bool profiling = gpuProfiler && gpuProfiler->enabled();
 
+    // One encoder and one queue submit PER FLUSH is deliberate, not leftover
+    // capture structure. Submitting each flush as it is recorded lets the GPU
+    // start executing early command buffers while the CPU is still encoding
+    // later ones, which matters because decode encodes ~635 dispatches per
+    // token and that encoding is ~33% of wall time. Merging all flushes into a
+    // single encoder and submit was measured on webgfx-104 (Qwen 3.5 2B ONNX,
+    // 512/128, 5 reps): decode 205.0 -> 166.9 tok/s (-19%) and prefill
+    // 5488 -> 4394 (-20%), because the GPU then idles until the whole token is
+    // encoded. Do not "optimize" these submits away.
     for (auto& flush : capturedFlushes_) {
         if (flush.dispatches.empty() && flush.copies.empty()) continue;
 

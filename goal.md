@@ -88,6 +88,41 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
   device, model, runtime/backend/format, command, conformance result, dates, and
   all measured TPS values.
 
+### Profile before optimizing
+
+- Every performance task must start from a profile of the exact artifact,
+  model, device, and workload it intends to change, and must name the specific
+  kernel, dispatch, or host-side cost it is targeting together with that item's
+  measured share. An optimization proposed without a profile behind it is a
+  guess and must not be started ahead of a measured one.
+- Attribute the gap between GPU and wall time before blaming a kernel. Record
+  GPU hardware-timestamp time per token, wall time per token, dispatch count,
+  submit/flush count, and fence wait separately. A change that speeds up a
+  kernel will not show up if the workload is bound by host-side command
+  encoding or submission instead, so identify which side dominates first.
+- Eliminate host-side bottlenecks before optimizing GPU kernels. While the CPU
+  side dominates, a faster kernel cannot show up in throughput and will be
+  misread as a failed experiment. Reduce per-token host work first — dispatch
+  count, buffer writes, and blocking queue waits — and only then rank and tune
+  kernels. Reducing host work must not remove the CPU/GPU overlap that lets the
+  GPU start on early command buffers while later ones are still being encoded;
+  see `docs/opt-guide.md` §0.
+- Prefer the profile's own units of blame: per-kernel totals with call counts
+  and average duration, and effective memory bandwidth for weight-bound
+  kernels. A kernel already running near the device's achievable bandwidth is
+  not a target no matter how large its share; a small kernel invoked hundreds
+  of times per token may be, because dispatch cost is per call.
+- Verify the premise before implementing. Confirm from the artifact and the
+  code path actually taken that the assumed inefficiency exists, and reject the
+  task with the evidence when it does not.
+- Profiling instrumentation perturbs what it measures. Note which numbers were
+  taken under profiling and which under a clean run, and never mix the two in
+  one comparison or report a profiled throughput as a result.
+- Record the profile with the task and re-profile after the change, so the
+  measured gain can be attributed to the item that was targeted. When a change
+  regresses, keep the finding and the numbers in the code or the task so the
+  same idea is not retried blindly.
+
 ## Continuous evolution
 
 - Every day, measure the latest llama.cpp/Vulkan release and the latest built
