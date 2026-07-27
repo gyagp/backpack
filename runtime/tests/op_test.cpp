@@ -1963,8 +1963,10 @@ TEST(gqa_decode_subgroup_score) {
     assertCloseVec(outputs["PresentV"].asFloat32(), allV, 1e-6f, 1e-6f, "gqa present value");
 }
 
-TEST(gqa_decode_tiled_scores_qwen512_parity) {
-    constexpr int H = 16, KVH = 4, D = 256, PAST = 511, TOTAL = 512;
+// Tiled-score GQA must match the untiled control bit for bit at every GQA
+// shape the gate admits, not just the one it was first tuned for.
+static void checkTiledScoreParity(GPUContext& gpu, int H, int KVH, const char* label) {
+    constexpr int D = 256, PAST = 511, TOTAL = 512;
     std::vector<float> q(H * D), k(KVH * D), v(KVH * D);
     std::vector<float> pastK(KVH * PAST * D), pastV(KVH * PAST * D);
     for (size_t i = 0; i < q.size(); ++i)
@@ -1996,31 +1998,39 @@ TEST(gqa_decode_tiled_scores_qwen512_parity) {
         {"V", makeInputF32("V", {1, 1, KVH * D}, v)},
         {"PK", makeInputF32("PK", {1, KVH, PAST, D}, pastK)},
         {"PV", makeInputF32("PV", {1, KVH, PAST, D}, pastV)}};
-    const char* oldEnv = std::getenv("BP_DISABLE_QWEN4_TILED_GQA");
+    const char* oldEnv = std::getenv("BP_DISABLE_QWEN_TILED_GQA");
     const std::string savedEnv = oldEnv ? oldEnv : "";
 #ifdef _WIN32
-    _putenv_s("BP_DISABLE_QWEN4_TILED_GQA", "1");
+    _putenv_s("BP_DISABLE_QWEN_TILED_GQA", "1");
 #else
-    setenv("BP_DISABLE_QWEN4_TILED_GQA", "1", 1);
+    setenv("BP_DISABLE_QWEN_TILED_GQA", "1", 1);
 #endif
     auto control = runOnnxModel(gpu, model, inputs, {"Y", "PresentK", "PresentV"});
 #ifdef _WIN32
-    _putenv_s("BP_DISABLE_QWEN4_TILED_GQA", "");
+    _putenv_s("BP_DISABLE_QWEN_TILED_GQA", "");
 #else
-    unsetenv("BP_DISABLE_QWEN4_TILED_GQA");
+    unsetenv("BP_DISABLE_QWEN_TILED_GQA");
 #endif
     auto candidate = runOnnxModel(gpu, model, inputs, {"Y", "PresentK", "PresentV"});
 #ifdef _WIN32
-    _putenv_s("BP_DISABLE_QWEN4_TILED_GQA", savedEnv.c_str());
+    _putenv_s("BP_DISABLE_QWEN_TILED_GQA", savedEnv.c_str());
 #else
-    if (oldEnv) setenv("BP_DISABLE_QWEN4_TILED_GQA", savedEnv.c_str(), 1);
-    else unsetenv("BP_DISABLE_QWEN4_TILED_GQA");
+    if (oldEnv) setenv("BP_DISABLE_QWEN_TILED_GQA", savedEnv.c_str(), 1);
+    else unsetenv("BP_DISABLE_QWEN_TILED_GQA");
 #endif
     if (control["Y"].data != candidate["Y"].data)
-        throw std::runtime_error("tiled-score GQA output differs from control");
+        throw std::runtime_error(std::string("tiled-score GQA output differs from control at ") + label);
     if (control["PresentK"].data != candidate["PresentK"].data ||
         control["PresentV"].data != candidate["PresentV"].data)
-        throw std::runtime_error("tiled-score GQA changed KV cache output");
+        throw std::runtime_error(std::string("tiled-score GQA changed KV cache output at ") + label);
+}
+
+TEST(gqa_decode_tiled_scores_qwen512_parity) {
+    checkTiledScoreParity(gpu, 16, 4, "Qwen 3.5 4B (16 heads / 4 kv)");
+}
+
+TEST(gqa_decode_tiled_scores_qwen2b_parity) {
+    checkTiledScoreParity(gpu, 8, 2, "Qwen 3.5 2B (8 heads / 2 kv)");
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -2072,6 +2082,7 @@ int main(int argc, char** argv) {
     RUN(linear_attention_gated_delta_vec4);
     RUN(gqa_decode_subgroup_score);
     RUN(gqa_decode_tiled_scores_qwen512_parity);
+    RUN(gqa_decode_tiled_scores_qwen2b_parity);
     RUN(softmax);
     RUN(simplified_layer_norm);
     RUN(softplus);

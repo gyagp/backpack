@@ -572,10 +572,22 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
             auto apBuf = ex.getParamBuffer(32);
             ex.getGpu()->writeBuffer(apBuf, attnParams, 32);
             ex.RegisterReplayParam(apBuf, 8, ExecutionContext::ReplayParamUpdate::TotalSeq);
+            // Both tiled-score shaders are shape-generic: they read num_heads,
+            // head_dim and kv_heads from params and derive kv_head as
+            // head / (num_heads / kv_heads). The original 16/4 test admitted
+            // only Qwen 3.5 4B and silently dropped 2B (8 heads, 2 kv heads)
+            // onto the slower gqa_decode path, where score cost grows with KV
+            // length. Gate on what the shaders actually require instead: a
+            // single sequence, an exact GQA grouping, and head_dim within the
+            // four accumulators the apply shader unrolls (lane + 192).
+            const bool tiledScoresShape =
+                batch == 1 && kv_heads > 0 && num_heads >= kv_heads &&
+                num_heads % kv_heads == 0 && (num_heads / kv_heads) == 4 &&
+                head_dim == 256;
             const bool tiledScores =
+                std::getenv("BP_DISABLE_QWEN_TILED_GQA") == nullptr &&
                 std::getenv("BP_DISABLE_QWEN4_TILED_GQA") == nullptr &&
-                batch == 1 && num_heads == 16 && kv_heads == 4 &&
-                head_dim == 256 && ex.getGpu()->supportsSubgroups &&
+                tiledScoresShape && ex.getGpu()->supportsSubgroups &&
                 ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
                 ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos;
             if (tiledScores) {
