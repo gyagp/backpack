@@ -152,7 +152,12 @@ def sync_base(server: str, repo: Path, worktrees: Path) -> bool:
         (worktrees / "CURRENT_BASE").write_text(f"{sha}\n{target}\n", encoding="utf-8")
         return False
     worktrees.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "-C", str(repo), "fetch", milestone["remote"], sha], check=True, shell=False)
+    # Hosted Git servers commonly reject fetch-by-object-id even when the
+    # commit is reachable. Fetch the advertised milestone ref, then detach at
+    # the frozen SHA so older and newly published milestones both synchronize.
+    fetch_target = milestone.get("remote_ref") or sha
+    subprocess.run(["git", "-C", str(repo), "fetch", milestone["remote"], fetch_target],
+                   check=True, shell=False)
     subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(target), sha], check=True, shell=False)
     (worktrees / "CURRENT_BASE").write_text(f"{sha}\n{target}\n", encoding="utf-8")
     print(f"Synchronized evolution base {sha} to {target}")

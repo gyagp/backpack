@@ -277,6 +277,16 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.store.add_evidence(body, actor)
                 self.server.events.publish("evidence-added", {"task_id": result["task_id"], "id": result["id"]})
                 return self._send_json(result, HTTPStatus.CREATED)
+            match = re.fullmatch(r"/api/evidence/([^/]+)/validity", path)
+            if match:
+                result = self.server.store.set_evidence_validity(
+                    match.group(1), str(body.get("validity", "")),
+                    str(body.get("reason", "")), actor)
+                self.server.events.publish("evidence-validity-changed", {
+                    "task_id": result["task_id"], "id": result["id"],
+                    "validity": result["validity"],
+                })
+                return self._send_json(result)
             if path == "/api/observations":
                 result = self.server.store.add_observation(body, actor)
                 created = self.server.store.ensure_automatic_tasks()

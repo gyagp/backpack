@@ -116,6 +116,87 @@ class FrameworkTest(unittest.TestCase):
         self.store.add_evidence({**common, "variant": "candidate", "samples": candidate, "commit_sha": "candidate",
                                  "correctness": {"passed": passed}}, "test")
 
+    def test_invalid_evidence_is_auditable_but_policy_fails_closed(self) -> None:
+        self.add_pair([100, 100], [110, 110])
+        candidate = next(item for item in self.store.list_evidence(self.task["id"])
+                         if item["variant"] == "candidate")
+        changed = self.store.set_evidence_validity(
+            candidate["id"], "invalid", "intermediate parity failed", "reviewer")
+        self.assertEqual("invalid", changed["validity"])
+        self.assertEqual("reviewer", changed["invalidated_by"])
+        self.assertEqual(["base"], [item["variant"]
+                                    for item in self.store.list_evidence(self.task["id"])])
+        detail = self.store.task_detail(self.task["id"])
+        self.assertEqual({"valid", "invalid"},
+                         {item["validity"] for item in detail["evidence"]})
+        result = PolicyEngine(self.store).evaluate(self.task["id"])
+        self.assertEqual("blocked", result["aggregate_verdict"])
+        self.assertIn("missing", result["reason"])
+        events = self.store._all("""SELECT * FROM audit_events
+          WHERE entity_type='evidence' AND entity_id=?""", (candidate["id"],))
+        self.assertEqual(1, len(events))
+        self.assertEqual({"from": "valid", "to": "invalid",
+                          "reason": "intermediate parity failed", "task_id": self.task["id"]},
+                         events[0]["payload"])
+        with self.assertRaises(DomainError):
+            self.store.add_evidence({
+                "task_id": self.task["id"], "machine_id": self.machine["id"],
+                "metric": "decode_tok_s", "variant": "candidate", "samples": [120],
+                "commit_sha": "candidate", "correctness": {"passed": True}}, "test")
+
+    def test_invalidated_evidence_is_excluded_from_digest_and_milestone(self) -> None:
+        self.add_pair([100, 100], [110, 110])
+        candidate = next(item for item in self.store.list_evidence(self.task["id"])
+                         if item["variant"] == "candidate")
+        self.store.add_history({
+            "task_id": self.task["id"], "title": "Measured gain",
+            "summary": "Candidate improved decode", "after": {"decode_tok_s": 110},
+            "gains": {"decode_percent": 10},
+            "evidence": [{"evidence_id": candidate["id"]}],
+            "commit_sha": "candidate",
+        }, "test")
+        self.assertEqual(1, len(self.store.list_history()))
+        self.store.set_evidence_validity(candidate["id"], "invalid",
+                                         "correctness disproved", "reviewer")
+        self.assertEqual([], self.store.list_history())
+        with self.assertRaises(DomainError):
+            self.store.add_history({
+                "task_id": self.task["id"], "title": "Invalid gain",
+                "summary": "Must not enter digest", "after": {"decode_tok_s": 110},
+                "gains": {"decode_percent": 10},
+                "evidence": [{"evidence_id": candidate["id"]}],
+            }, "test")
+        with self.store._db:
+            self.store._db.execute("UPDATE tasks SET state='integrated' WHERE id=?",
+                                   (self.task["id"],))
+        with self.assertRaises(DomainError):
+            self.store.create_milestone(self.task["id"], "candidate", "origin", "main")
+
+    def test_legacy_evidence_migrates_to_unverified(self) -> None:
+        path = Path(self.tmp.name) / "legacy-evidence.db"
+        db = sqlite3.connect(path)
+        db.execute("""CREATE TABLE evidence (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, machine_id TEXT NOT NULL,
+          variant TEXT NOT NULL, metric TEXT NOT NULL, unit TEXT NOT NULL,
+          samples_json TEXT NOT NULL, correctness_json TEXT NOT NULL,
+          environment_json TEXT NOT NULL, artifacts_json TEXT NOT NULL,
+          commit_sha TEXT NOT NULL, created_at TEXT NOT NULL,
+          UNIQUE(task_id,machine_id,variant,metric))""")
+        db.execute("INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "legacy-ev", "old-task", "old-machine", "candidate", "decode_tok_s",
+            "TPS", "[70]", '{"passed":true}', "{}", "[]", "old-sha",
+            "2026-01-01T00:00:00+00:00"))
+        db.commit()
+        db.close()
+        migrated = Store(path)
+        try:
+            rows = migrated.list_evidence("old-task", include_invalid=True)
+            self.assertEqual("unverified", rows[0]["validity"])
+            self.assertEqual([], migrated.list_evidence("old-task"))
+            self.assertEqual(1, len(rows))
+        finally:
+            migrated.close()
+
     def test_goal_document_round_trip_and_validation(self) -> None:
         path = Path(self.tmp.name) / "goal.md"
         saved = write_goal("# Goal\r\n\r\n- Stay conformant", path)

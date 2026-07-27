@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS evidence (
   metric TEXT NOT NULL, unit TEXT NOT NULL, samples_json TEXT NOT NULL,
   correctness_json TEXT NOT NULL, environment_json TEXT NOT NULL,
   artifacts_json TEXT NOT NULL, commit_sha TEXT NOT NULL,
-  created_at TEXT NOT NULL,
+  created_at TEXT NOT NULL, validity TEXT NOT NULL DEFAULT 'valid',
+  validity_reason TEXT, invalidated_at TEXT, invalidated_by TEXT,
   UNIQUE(task_id, machine_id, variant, metric)
 );
 CREATE TABLE IF NOT EXISTS evaluations (
@@ -196,6 +197,19 @@ class Store:
                     self._db.execute(f"ALTER TABLE observations ADD COLUMN {name} {declaration}")
             self._db.execute("UPDATE observations SET validity='valid' WHERE validity IS NULL")
             self._db.execute("CREATE INDEX IF NOT EXISTS observation_valid_latest_idx ON observations(validity,model_id,machine_id,framework,format,backend,created_at)")
+            evidence_columns = {row[1] for row in self._db.execute("PRAGMA table_info(evidence)")}
+            # Existing evidence predates provenance validity.  Fail closed:
+            # migration cannot infer that old correctness claims bind to the
+            # exact binary/model/flags used for the performance samples.
+            for name, declaration in (
+                    ("validity", "TEXT NOT NULL DEFAULT 'unverified'"),
+                    ("validity_reason", "TEXT"),
+                    ("invalidated_at", "TEXT"),
+                    ("invalidated_by", "TEXT")):
+                if name not in evidence_columns:
+                    self._db.execute(f"ALTER TABLE evidence ADD COLUMN {name} {declaration}")
+            self._db.execute("UPDATE evidence SET validity='unverified' WHERE validity IS NULL")
+            self._db.execute("CREATE INDEX IF NOT EXISTS evidence_valid_task_idx ON evidence(validity,task_id,machine_id,metric,variant)")
             self._cancel_terminal_task_runs()
         self._backfill_learning_memory()
 
@@ -789,23 +803,65 @@ class Store:
         if expected_sha and commit_sha != expected_sha:
             raise DomainError(f"evidence commit {commit_sha} does not match frozen {variant} SHA {expected_sha}")
         evidence_id = data.get("id") or f"ev-{uuid.uuid4().hex[:12]}"
+        validity = str(data.get("validity") or "valid")
+        if validity not in {"valid", "unverified", "invalid", "superseded"}:
+            raise DomainError("invalid evidence validity")
+        existing = self._row(self._db.execute("""SELECT * FROM evidence
+          WHERE task_id=? AND machine_id=? AND variant=? AND metric=?""", (
+            task_id, machine_id, variant, data.get("metric", "decode_tok_s"))).fetchone())
+        if existing and existing.get("validity") != "valid":
+            raise DomainError("non-valid evidence is immutable; add evidence under a new task")
         values = (
             evidence_id, task_id, machine_id, variant, data.get("metric", "decode_tok_s"),
             data.get("unit", "tok/s"), json_text(samples), json_text(data.get("correctness") or {"passed": True}),
             json_text(data.get("environment") or {}), json_text(data.get("artifacts") or []), commit_sha, utc_now(),
+            validity, data.get("validity_reason"), None, None,
         )
         with self._lock, self._db:
-            self._db.execute("""INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            self._db.execute("""INSERT INTO evidence(
+              id,task_id,machine_id,variant,metric,unit,samples_json,correctness_json,
+              environment_json,artifacts_json,commit_sha,created_at,validity,validity_reason,
+              invalidated_at,invalidated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
               ON CONFLICT(task_id,machine_id,variant,metric) DO UPDATE SET
               id=excluded.id,unit=excluded.unit,samples_json=excluded.samples_json,
               correctness_json=excluded.correctness_json,environment_json=excluded.environment_json,
-              artifacts_json=excluded.artifacts_json,commit_sha=excluded.commit_sha,created_at=excluded.created_at""", values)
+              artifacts_json=excluded.artifacts_json,commit_sha=excluded.commit_sha,created_at=excluded.created_at,
+              validity=excluded.validity,validity_reason=excluded.validity_reason,
+              invalidated_at=NULL,invalidated_by=NULL""", values)
             self.audit("task", task_id, "evidence_added", actor,
                        {"evidence_id": evidence_id, "machine_id": machine_id, "variant": variant})
         return self._row(self._db.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone())  # type: ignore[return-value]
 
-    def list_evidence(self, task_id: str) -> list[dict[str, Any]]:
-        return self._all("SELECT * FROM evidence WHERE task_id=? ORDER BY machine_id,metric,variant", (task_id,))
+    def list_evidence(self, task_id: str, include_invalid: bool = False) -> list[dict[str, Any]]:
+        validity = "" if include_invalid else " AND validity='valid'"
+        return self._all(f"""SELECT * FROM evidence WHERE task_id=?{validity}
+          ORDER BY machine_id,metric,variant""", (task_id,))
+
+    def set_evidence_validity(self, evidence_id: str, validity: str,
+                              reason: str, actor: str) -> dict[str, Any]:
+        if validity not in {"valid", "unverified", "invalid", "superseded"}:
+            raise DomainError("invalid evidence validity")
+        reason = require(reason, "reason").strip()
+        row = self._row(self._db.execute(
+            "SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone())
+        if not row:
+            raise DomainError("evidence not found")
+        old = str(row.get("validity") or "unverified")
+        if old == validity and row.get("validity_reason") == reason:
+            return row
+        now = utc_now()
+        invalidated = now if validity in {"invalid", "superseded"} else None
+        invalidated_by = actor if invalidated else None
+        with self._lock, self._db:
+            self._db.execute("""UPDATE evidence SET validity=?,validity_reason=?,
+              invalidated_at=?,invalidated_by=? WHERE id=?""",
+              (validity, reason, invalidated, invalidated_by, evidence_id))
+            self.audit("evidence", evidence_id, "validity_changed", actor, {
+                "from": old, "to": validity, "reason": reason,
+                "task_id": row["task_id"],
+            })
+        return self._row(self._db.execute(
+            "SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone())  # type: ignore[return-value]
 
     def replace_evaluations(self, task_id: str, rows: list[dict[str, Any]], aggregate: str, reason: str) -> None:
         with self._lock, self._db:
@@ -859,7 +915,7 @@ class Store:
         task = self.get_task(task_id)
         if not task:
             return None
-        task["evidence"] = self.list_evidence(task_id)
+        task["evidence"] = self.list_evidence(task_id, include_invalid=True)
         task["evaluations"] = self.list_evaluations(task_id)
         task["decisions"] = self._all("SELECT * FROM decisions WHERE task_id=? ORDER BY created_at DESC", (task_id,))
         task["audit"] = self._all("SELECT * FROM audit_events WHERE entity_type='task' AND entity_id=? ORDER BY id", (task_id,))
@@ -1820,6 +1876,14 @@ class Store:
         if data.get("overall_gain_percent") is not None:
             gains["overall_gain_percent"] = float(data["overall_gain_percent"])
         evidence = list(data.get("evidence") or [])
+        linked_ids = self._evidence_ids(evidence)
+        if linked_ids:
+            placeholders = ",".join("?" for _ in linked_ids)
+            valid_ids = {row[0] for row in self._db.execute(
+                f"SELECT id FROM evidence WHERE validity='valid' AND id IN ({placeholders})",
+                tuple(linked_ids)).fetchall()}
+            if valid_ids != linked_ids:
+                raise DomainError("history references missing or non-valid evidence")
         if data.get("device"):
             evidence.append({"kind": "device", "device": data["device"]})
         with self._lock, self._db:
@@ -1835,6 +1899,21 @@ class Store:
 
     def list_history(self) -> list[dict[str, Any]]:
         records = self._all("SELECT * FROM optimization_history ORDER BY created_at DESC")
+        # Explicit evidence links fail closed. Legacy history without evidence
+        # IDs remains visible, but cannot acquire new accepted evidence unless
+        # that evidence is present and valid.
+        filtered = []
+        for record in records:
+            linked_ids = self._evidence_ids(record.get("evidence") or [])
+            if linked_ids:
+                placeholders = ",".join("?" for _ in linked_ids)
+                valid_ids = {row[0] for row in self._db.execute(
+                    f"SELECT id FROM evidence WHERE validity='valid' AND id IN ({placeholders})",
+                    tuple(linked_ids)).fetchall()}
+                if valid_ids != linked_ids:
+                    continue
+            filtered.append(record)
+        records = filtered
         machines = self.list_machines()
         machine_by_id = {item["id"]: item for item in machines}
         machine_names = {item["name"] for item in machines}
@@ -1974,7 +2053,29 @@ class Store:
             record["impact"] = classify(representative)
         return records
 
+    @staticmethod
+    def _evidence_ids(value: Any) -> set[str]:
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"evidence_id", "evidence_ids"}:
+                    values = child if isinstance(child, list) else [child]
+                    found.update(str(item) for item in values
+                                 if isinstance(item, str) and item.startswith("ev-"))
+                found.update(Store._evidence_ids(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.update(Store._evidence_ids(child))
+        return found
+
     def create_milestone(self, task_id: str, commit_sha: str, remote: str, remote_ref: str) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if not task:
+            raise DomainError("task not found")
+        if task.get("kind") == "optimization" and task.get("state") == "integrated":
+            all_evidence = self.list_evidence(task_id, include_invalid=True)
+            if not all_evidence or any(item.get("validity") != "valid" for item in all_evidence):
+                raise DomainError("milestone requires exclusively valid optimization evidence")
         milestone_id = f"milestone-{uuid.uuid4().hex[:10]}"
         with self._lock, self._db:
             self._db.execute("INSERT INTO milestones VALUES(?,?,?,?,?,?,?,?,?)", (
