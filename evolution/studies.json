@@ -487,8 +487,8 @@
     "source": "vLLM",
     "url": "https://github.com/vllm-project/vllm",
     "title": "vLLM intake: paged KV, continuous batching, and quantized kernel design",
-    "revision": "pending",
-    "status": "proposed",
+    "revision": "intake",
+    "status": "running",
     "summary": "Added to the standing upstream study set on 2026-07-27 by Goal review. vLLM is a CUDA-first serving stack, so its kernels do not port directly to WebGPU, but its scheduling and memory design is the most mature reference for the areas Backpack is weakest in: paged/blocked KV cache layout, chunked prefill, prefix caching, and the split between prefill and decode kernel shapes. Read for design, not for code.",
     "scope": [
       "vllm/v1/core: paged KV block manager and prefix caching",
