@@ -385,11 +385,18 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
+        // Both Q8 decode kernels reduce with a subgroupShuffleXor butterfly
+        // over masks 16..1 across logical 32-lane warps, so they need a
+        // subgroup at least 32 wide and are wrong below it. Intel reports
+        // subgroupMinSize 16, so the old adapter-name exclusion was right for
+        // the wrong reason; stating the width keeps Intel out for a checkable
+        // cause and stops excluding AMD, which reports 32.
+        const bool wideSubgroupDecode = ex.getGpu()->subgroupMinSize >= 32u;
         const bool useDp4aDecode = useSubgroupDecode && (K % 256u) == 0u &&
-            ex.getGpu()->adapterName.find("Intel") == std::string::npos;
+            wideSubgroupDecode;
         const bool fuseGreedyArgmax = useSubgroupDecode && M == 1 &&
             N >= 65536u && n.name.find("lm_head") != std::string::npos &&
-            ex.getGpu()->adapterName.find("NVIDIA") != std::string::npos &&
+            wideSubgroupDecode &&
             std::getenv("BP_ONNX_DISABLE_FUSED_LMHEAD_ARGMAX") == nullptr;
         const CompiledPipeline* pipelinePtr = nullptr;
         if (fuseGreedyArgmax) {
