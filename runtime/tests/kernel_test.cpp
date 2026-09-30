@@ -485,6 +485,56 @@ static std::vector<TestEntry> g_tests;
 // KERNEL TESTS — Raw WGSL dispatch (from test_kernels.py)
 // ═══════════════════════════════════════════════════════════════════════════
 
+TEST(causal_attention_sliding_window_rows) {
+    // With Q=K=0 the expected result is the mean of the visible V rows.
+    // Distinct values expose over-masking of early rows in a prefill chunk.
+    for(uint32_t hd:{128u,256u,512u}) {
+        std::string shader=getEmbeddedKernels().at("causal_attn").source;
+        for(const auto& patch:std::vector<std::pair<std::string,std::string>>{
+                {"const HD: u32 = 128u;","const HD: u32 = "+std::to_string(hd)+"u;"},
+                {"const HD_PER_THREAD: u32 = 4u;","const HD_PER_THREAD: u32 = "+std::to_string(hd/32)+"u;"}})
+            shader.replace(shader.find(patch.first),patch.first.size(),patch.second);
+        for (const auto& c : std::vector<std::vector<uint32_t>>{
+                {0,1,0},{0,17,512},{500,17,512},{512,8,512},
+                {513,7,512},{512,8,0},{384,128,512},{15,7,16}}) {
+            const uint32_t cache=c[0], rows=c[1], window=c[2], total=cache+rows, heads=8;
+            std::vector<float> query(rows*heads*hd,0.0f);
+            std::vector<uint16_t> key(total*hd,0), value(total*hd);
+            for(uint32_t t=0;t<total;++t)
+                for(uint32_t d=0;d<hd;++d) value[t*hd+d]=f32ToF16(float(t));
+            auto q=makeBuffer(gpu,"swa_q",query.data(),int(query.size()));
+            auto k=gpu.createBuffer("swa_k",key.size()*2);
+            auto v=gpu.createBuffer("swa_v",value.size()*2);
+            auto y=makeBuffer(gpu,"swa_y",nullptr,int(query.size()));
+            gpu.writeBuffer(k,key.data(),key.size()*2);gpu.writeBuffer(v,value.data(),value.size()*2);
+            uint32_t params[8]={hd,heads,total,cache,rows,f32AsU32(1.0f),f32AsU32(-1e9f),
+                               window};
+            auto p=gpu.createBuffer("swa_p",sizeof(params),BUF_UNIFORM|BUF_COPY_DST);
+            gpu.writeBuffer(p,params,sizeof(params));
+            auto bytes=dispatchAndReadback(gpu,shader,{{0,q},{1,k},{2,v},{3,y},{4,p}},
+                heads,(rows+3)/4,1,y,query.size()*4);
+            const auto* actual=reinterpret_cast<const float*>(bytes.data());
+            CheckResult result{true,""};
+            for(uint32_t row=0;row<rows && result.ok;++row){
+                const uint32_t pos=cache+row;
+                const uint32_t first=window && pos+1>window ? pos+1-window : 0u;
+                double sum=0;for(uint32_t t=first;t<=pos;++t)sum+=double(t);
+                const float expected=float(sum/double(pos-first+1));
+                for(uint32_t d=0;d<heads*hd;++d){
+                    const float got=actual[row*heads*hd+d];
+                    if(!std::isfinite(got) || std::abs(got-expected)>0.003f){
+                        result={false,"hd="+std::to_string(hd)+" cache="+std::to_string(cache)+" row="+std::to_string(row)+
+                            " got="+std::to_string(got)+" expected="+std::to_string(expected)};break;
+                    }
+                }
+            }
+            for(auto b:{q,k,v,y,p})wgpuBufferRelease(b.handle);
+            if(!result.ok)return result;
+        }
+    }
+    return {true,""};
+}
+
 TEST(qwen35_key_rope_continuous_frequencies) {
     // Nonzero positions and all three section boundaries distinguish the
     // correct continuous frequency domain from an accidental section reset.

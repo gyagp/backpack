@@ -206,6 +206,24 @@ fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+r
     s.replace(a,b-a,loader);return s;
 }
 
+const char* gemmaEmbeddingBatchedSource() {
+    // Use the same resident embedding values as pooled prefill and decode.
+    // Gathering directly from Q4 bypasses the fp16 conversion made at load.
+    return R"WGSL(enable f16;
+@group(0) @binding(0) var<storage,read> W:array<f16>;
+@group(0) @binding(1) var<storage,read> Tokens:array<i32>;
+@group(0) @binding(2) var<storage,read_write> Out:array<f32>;
+@group(0) @binding(3) var<storage,read> P:array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+    let M=P[0];let D=P[1];let vocab=P[2];let flat=gid.x;
+    if(flat>=M*D){return;}
+    let t=Tokens[flat/D];let token=select(0u,u32(t),t>=0&&u32(t)<vocab);
+    Out[flat]=f32(W[token*D+flat%D])*bitcast<f32>(P[3]);
+}
+)WGSL";
+}
+
 const char* gemmaQ4PleBatchedSource() {
     // Preserve the serial PLE path's fp32 activations. Its model projection,
     // input gate and output projection do not use activation quantization.
@@ -7994,9 +8012,18 @@ int32_t ModelRunner::prefillGemmaBatched(
         if (weightsAreNativeQ4) {
             memcpy(&scaleBits, &embScale, 4);
             auto embP = mkP("gpf_emb_p", {M, cfg.nEmbd, cfg.nVocab, scaleBits});
-            add(q4Gather, {{0,lmHeadQ8W},{1,lmHeadQ8S},{2,gemmaPf.tokens},
-                           {3,gemmaPf.x},{4,embP}},
-                (M * cfg.nEmbd + 255) / 256, 1, "gpf_embed");
+            if (embeddingGpuIsF16 && embeddingGpuBuf.handle &&
+                gpu->backendType == WGPUBackendType_D3D12 &&
+                gpu->adapterName == "NVIDIA GeForce RTX 5080") {
+                auto& gather=gpu->getOrCreatePipeline("gemma_embedding_batched_f16",
+                    gemmaEmbeddingBatchedSource(),4);
+                add(gather,{{0,embeddingGpuBuf},{1,gemmaPf.tokens},{2,gemmaPf.x},{3,embP}},
+                    (M*cfg.nEmbd+255)/256,1,"gpf_embed");
+            } else {
+                add(q4Gather, {{0,lmHeadQ8W},{1,lmHeadQ8S},{2,gemmaPf.tokens},
+                               {3,gemmaPf.x},{4,embP}},
+                    (M * cfg.nEmbd + 255) / 256, 1, "gpf_embed");
+            }
         } else {
             std::vector<float> embeddings((size_t)M * cfg.nEmbd);
             for (uint32_t r = 0; r < M; r++) {
@@ -8111,6 +8138,13 @@ int32_t ModelRunner::prefillGemmaBatched(
 
         uint32_t cacheLen = kvCache[0].len;
         auto& rms = getKernel("rms_norm_batched");
+        // The serial kernel already supports row strides. Match its reduction
+        // order before Q8 activation quantization: one-ulp norm differences can
+        // move exact half-way values into different integer bins.
+        auto& inputRms = weightsAreNativeQ4 &&
+            gpu->backendType == WGPUBackendType_D3D12 &&
+            gpu->adapterName == "NVIDIA GeForce RTX 5080"
+            ? getKernel("rms_norm") : rms;
         auto& sandwich = getKernel("gemma_sandwich_attn_batched");
         auto& normAdd = getKernel("gemma_norm_add_batched");
         auto& geluMul = getKernel("gelu_mul_batched");
@@ -8120,7 +8154,7 @@ int32_t ModelRunner::prefillGemmaBatched(
             auto& lw = layerWeights[li]; auto& pl = cfg.perLayer[li];
             const uint32_t hd=pl.headDim,qdim=pl.qDim,kvdim=pl.kvDim,im=pl.intermediateSize;
             auto rp = mkP("gpf_rms_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
-            add(rms,{{0,gemmaPf.x},{1,gemmaPf.norm},{2,lw.inputNorm},
+            add(inputRms,{{0,gemmaPf.x},{1,gemmaPf.norm},{2,lw.inputNorm},
                      {3,gemmaPf.rstd},{4,rp}},M,1,"gpf_rms");
 
             bool qonly = lw.qOnly;
@@ -8157,9 +8191,10 @@ int32_t ModelRunner::prefillGemmaBatched(
                 ? total-cfg.slidingWindow:0u;
             float ascale=1.0f,ni=-1e9f;uint32_t asb,nib;
             memcpy(&asb,&ascale,4);memcpy(&nib,&ni,4);
-            auto ap=mkP("gpf_attn_"+std::to_string(li),
-                {kvdim,cfg.nHead/cfg.nKvHeads,total,cacheLen,M,asb,nib,kvStart},true);
             const bool mmaAttn=gpu->backendType!=WGPUBackendType_D3D12&&gpu->supportsSubgroupMatrix;
+            uint32_t windowSize=swa?cfg.slidingWindow:0u;
+            auto ap=mkP("gpf_attn_"+std::to_string(li),
+                {kvdim,cfg.nHead/cfg.nKvHeads,total,cacheLen,M,asb,nib,mmaAttn?kvStart:windowSize},true);
             auto& attn=getKernelHD(mmaAttn?"flash_attn_vulkan":"causal_attn",hd);
             add(attn,{{0,gemmaPf.qrot},{1,kvCache[cacheLayer].K},
                       {2,kvCache[cacheLayer].V},{3,gemmaPf.attn},{4,ap}},

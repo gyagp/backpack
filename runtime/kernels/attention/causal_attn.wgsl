@@ -22,7 +22,7 @@ struct AttnParams {
     T_prefill: u32,
     scale_bits: u32,
     neg_inf_bits: u32,
-    kv_start: u32,
+    window_size: u32, // 0 means full causal history
 };
 @group(0) @binding(4) var<uniform> params: AttnParams;
 
@@ -53,6 +53,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let q_idx = q_block * QUERIES_PER_WG + warp_id;
     let q_abs_pos = cache_offset + q_idx;
     let q_valid = q_idx < params.T_prefill;
+    // Every query has its own lower bound, including queries in a chunk that
+    // crosses the window boundary. A bound based on T_total masks too much
+    // history for all but the chunk's last query.
+    let window_start = select(0u,
+        q_abs_pos + 1u - min(q_abs_pos + 1u, params.window_size),
+        params.window_size > 0u);
 
     let q_base = q_idx * n_head_total * HD + head * HD;
     var q: array<f32, HD_PER_THREAD>;
@@ -75,7 +81,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let max_causal = min(cache_offset + q_block * QUERIES_PER_WG + QUERIES_PER_WG, T_total);
 
     for (var t = 0u; t < max_causal; t = t + 1u) {
-        let causal_valid = q_valid && t >= params.kv_start && t <= q_abs_pos;
+        let causal_valid = q_valid && t >= window_start && t <= q_abs_pos;
 
         let k_base = t * kv_stride + kv_off;
         let k_off = k_base + lane * HD_PER_THREAD;
