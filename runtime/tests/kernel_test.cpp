@@ -1818,6 +1818,51 @@ TEST(delta_net_decode_x2_repeated_heads) {
     return assertClose((const float*)result.data(),expected.data(),expected.size(),3e-4f,3e-4f);
 }
 
+TEST(delta_net_decode_x2_reduction_reuse) {
+    // Match the cared GGUF decode shape, including value-major state, and
+    // rerun identical inputs. Both reductions share workgroup scratch.
+    const int NV=16,NK=4,DK=128,DV=128; Rng rng(775);
+    auto q=rng.randnVec(NK*DK),k=rng.randnVec(NK*DK),v=rng.randnVec(NV*DV);
+    auto beta=rng.randnVec(NV),gate=rng.randnVec(NV),state=rng.randnVec(NV*DK*DV);
+    for(auto* values:{&q,&k})for(float& x:*values)x*=0.1f;
+    for(float& b:beta)b=1.0f/(1.0f+std::exp(-b));
+    for(float& g:gate)g=-std::abs(g)*0.1f;
+    auto ref=state;std::vector<float> expected(NV*DV);
+    for(int h=0;h<NV;++h)for(int vi=0;vi<DV;++vi){
+        const int kh=h%NK,sb=h*DK*DV+vi*DK;
+        const double gh=std::exp(double(gate[h]));double pred=0,out=0;
+        for(int d=0;d<DK;++d)pred+=gh*double(state[sb+d])*k[kh*DK+d];
+        const double delta=(double(v[h*DV+vi])-pred)*beta[h];
+        for(int d=0;d<DK;++d){
+            const double sn=gh*double(state[sb+d])+double(k[kh*DK+d])*delta;
+            ref[sb+d]=float(sn);out+=sn*double(q[kh*DK+d])/std::sqrt(double(DK));
+        }
+        expected[h*DV+vi]=float(out);
+    }
+    auto shader=useRepeatedQkHeadLayout(WGSL_DELTA_NET_DECODE_X2);
+    const std::string from="state_base + ki * dv + vi",to="state_base + vi * dk + ki";
+    size_t pos=0;while((pos=shader.find(from,pos))!=std::string::npos){shader.replace(pos,from.size(),to);pos+=to.size();}
+    auto bq=makeBuffer(gpu,"Q",q.data(),q.size()),bk=makeBuffer(gpu,"K",k.data(),k.size());
+    auto bv=makeBuffer(gpu,"V",v.data(),v.size()),bb=makeBuffer(gpu,"B",beta.data(),beta.size());
+    auto bg=makeBuffer(gpu,"G",gate.data(),gate.size()),bs=makeBuffer(gpu,"S",state.data(),state.size());
+    auto by=makeBuffer(gpu,"Y",nullptr,NV*DV),p=makeParams(gpu,"P",{NV,NK,DK,DV});
+    std::vector<uint8_t> first;
+    for(int repetition=0;repetition<20;++repetition){
+        gpu.writeBuffer(bs,state.data(),state.size()*4);
+        auto result=dispatchAndReadback(gpu,shader,{{0,bq},{1,bk},{2,bv},{3,bb},{4,bg},{5,bs},{6,by},{7,p}},NV,DV/2,1,by,NV*DV*4,8);
+        const float* actual=reinterpret_cast<const float*>(result.data());
+        for(int i=0;i<NV*DV;++i)if(!std::isfinite(actual[i]))return {false,"non-finite DeltaNet output"};
+        auto close=assertClose(actual,expected.data(),expected.size(),2e-5f,3e-4f);
+        if(!close.ok)return close;
+        if(repetition==0)first=result;
+        else if(first!=result)return {false,"identical DeltaNet inputs produced different output bits"};
+        auto stateBytes=gpu.readBuffer(bs,state.size()*4);
+        close=assertClose(reinterpret_cast<const float*>(stateBytes.data()),ref.data(),ref.size(),3e-5f,3e-4f);
+        if(!close.ok)return close;
+    }
+    return {true,""};
+}
+
 TEST(delta_net_scan_x4) {
     std::string wgsl=WGSL_DELTA_NET_SCAN_X4;const int T=3,NV=1,NK=1,DK=128,DV=5;Rng rng(655);
     if(gpu.adapterName.find("AMD")!=std::string::npos)wgsl=usePortableDeltaScanReduction(wgsl);

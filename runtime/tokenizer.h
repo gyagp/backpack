@@ -47,6 +47,8 @@ struct Tokenizer {
 
     // Special token IDs
     int32_t eos_token_id = -1;
+    int32_t eot_token_id = -1;
+    int32_t eom_token_id = -1;
     int32_t bos_token_id = -1;
     bool add_bos_token = false;
     bool add_space_prefix = true;  // SPM only: prefix input with ▁
@@ -56,6 +58,12 @@ struct Tokenizer {
 
     /// Load tokenizer from GGUF metadata
     bool load(const GGUFFile& gguf);
+
+    /// GGUF end-of-generation markers; other control tokens are not stops.
+    bool is_end_token(int32_t token_id) const {
+        return token_id >= 0 && (token_id == eos_token_id ||
+            token_id == eot_token_id || token_id == eom_token_id);
+    }
 
     /// Encode text to token IDs
     std::vector<int32_t> encode(const std::string& text) const;

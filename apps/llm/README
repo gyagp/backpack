@@ -3,6 +3,9 @@
 Shared C++ chat and benchmark application for GGUF and supported ONNX models.
 All commands for the active goal run on webgfx-104 (RTX 5080) only.
 
+Generation honors the model's end-of-sequence, end-of-turn, and end-of-message
+markers. Benchmarks continue to produce the exact requested token count.
+
 Build from the repository root:
 
 ```powershell

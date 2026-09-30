@@ -229,6 +229,8 @@ bool Tokenizer::load(const GGUFFile& gguf) {
 
     // Special tokens
     eos_token_id = (int32_t)gguf.getU32("tokenizer.ggml.eos_token_id", 151645);
+    eot_token_id = (int32_t)gguf.getU32("tokenizer.ggml.eot_token_id", uint32_t(-1));
+    eom_token_id = (int32_t)gguf.getU32("tokenizer.ggml.eom_token_id", uint32_t(-1));
     bos_token_id = (int32_t)gguf.getU32("tokenizer.ggml.bos_token_id", -1);
     add_bos_token = gguf.getBool("tokenizer.ggml.add_bos_token",
                                  model_kind == Model::LlamaSpm);

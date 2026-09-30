@@ -23,7 +23,11 @@ fn reduce_col_128(x: f32, tid: u32, pair: u32) -> f32 {
         }
         workgroupBarrier();
     }
-    return reduce_scratch[pair * 128u];
+    let total = reduce_scratch[pair * 128u];
+    // A later reduction reuses this array. Every lane must finish reading
+    // the result before any lane can write the next reduction's inputs.
+    workgroupBarrier();
+    return total;
 }
 
 @compute @workgroup_size(256)

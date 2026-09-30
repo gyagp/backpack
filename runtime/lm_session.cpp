@@ -2009,11 +2009,10 @@ std::string LmSession::Generate(const std::string& prompt, int maxTokens,
 
     int32_t next = Prefill(tokens.data(), (uint32_t)tokens.size());
     if (impl_->gpu->deviceLost) return {};
-    int32_t eos = GetEosTokenId();
     auto isEnd = [&](int32_t token) {
         if (impl_->backend == Impl::Backend::GenericOnnx) return impl_->gen_->tokenizer.is_end_token(token);
         if (impl_->std_->format == "onnx") return impl_->std_->onnxTokenizer.is_end_token(token);
-        return token == eos;
+        return impl_->std_->ggufTokenizer.is_end_token(token);
     };
 
     bool useSampling = (sampling.temperature > 0.0f);
