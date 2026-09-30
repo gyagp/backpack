@@ -1,6 +1,6 @@
 # webgfx-104 model enablement
 
-Status as of 2026-09-30. The active scope in `goal.md` is this device only;
+Status as of 2026-10-01. The active scope in `goal.md` is this device only;
 neither model enablement nor acceptance requires another machine.
 
 ## Device and execution scope
@@ -234,6 +234,11 @@ gitignore/venvs/gguf-validation/Scripts/python.exe -B runtime/tests/test_gguf_re
 
 Exact-name and official-Qwen Hugging Face API searches returned no
 Qwen-Image-3.0 artifact. The official catalog includes Qwen-Image-2.1.
+The 2026-10-01 recheck also covers Unsloth's catalog. A similarly named
+community repository, `UnifiedHorusRA/qwen-image-3`, contains metadata but no
+weights. The exact official repository endpoint returns HTTP 401, which does
+not establish whether a private or unpublished artifact exists. Evidence:
+`gitignore/logs/image-identity-20261001/`.
 A repository link or confirmation of a different release has been requested;
 the original image-model requirement remains pending (task #741).
 The current `apps/image` implementation is for Z-Image-Turbo and does not
@@ -828,5 +833,56 @@ checks on all nine real model shapes and independent CPU samples. Its corrected
 shader preserves the uniform binding after layout constants are substituted.
 Two full-model repetitions per mode match all 128 expected tokens, and profiling
 confirms 497 specialized calls. Sampled Q4 GPU time is 155.07 → 149.98 ms.
-This modest diagnostic gain still requires clean repeated measurement and is
-not integrated. Evidence: `gitignore/logs/qwen38-q4-decode-layout/`.
+The clean comparison retained ten samples per mode, including reverse order.
+Mean prefill/decode gains were 2.53%/3.15%, but baseline decode variability was
+5.53%, above policy. The result is inconclusive and is not integrated. Task
+#766 separately validates the complete scoped configuration against the accepted
+runtime. Evidence: `gitignore/logs/qwen38-q4-decode-layout/`.
+
+## Local native reference refresh
+
+Task #765 replaces the removed external build helper with
+`evolution/build_native_reference.py`. Builds and backup publication enforce
+webgfx-104 and keep generated files under `gitignore/`. The driver preserves
+existing build generators, builds the shared-provider library, normalizes the
+ORT SDK, and builds GenAI and the structured conformance helper. The refresh
+script uses the emitted build paths and publishes complete, hashed backups.
+
+All 117 framework tests pass. A real build of pinned ORT `a27f28316f` and GenAI
+`8412ddd855` passes reset conformance and five 512/128 benchmark repetitions
+on Gemma E2B, Qwen3.5-2B/4B, and Qwen3.8-27B. The exact post-build script sections
+also build `model_chat`, publish an isolated backup, and pass a Gemma chat check.
+Packaged runtime hashes match the four-model validation.
+
+This validates the local orchestration repair. Fetching and building the latest
+upstream revisions was a separate follow-up; this task preserved selected backups.
+Evidence: `gitignore/logs/native-refresh-local-helper/integration.json`.
+
+Task #769 completed that follow-up on webgfx-104. It fetched ORT `967a8e064d`
+and GenAI `fa55959bc6`, then retained the validated local fixes at ORT `9a60fe69d9`
+and GenAI `19a003a751`. The GenAI merge uses upstream session-owned embedding
+staging and retains safe chunk copies for opaque WebGPU handles.
+
+All four native LLM adapters pass reset conformance and five 512/128 measurements.
+The rebuilt binaries preserve all 128 tokens against the previous validated
+native pair on every model, including internal Qwen prefill chunking. The original
+Qwen sky prompt stops at the same 29 tokens. Eighteen int64 metadata/view cases
+pass with CPU fallback disabled. Profiles confirm heavy decoder operations on
+WebGPU for all four models; Qwen capture/replay markers and the native process's
+RTX 5080 GPU UUID are recorded. Qwen3.5-2B/4B still use the explicitly marked
+temporary capture-disabled configuration.
+
+The complete validated package is selected at
+`gitignore/evolution/backups/ort/20260930-183323-ort-9a60fe69d9-genai-19a003a751/`.
+Older packages are preserved. The adapter accepts both existing manifest hash
+formats while checking every required binary; all 117 framework tests pass.
+Evidence: `gitignore/logs/native-latest-refresh-20261001/`.
+
+Task #766's separate Backpack default bundle remains isolated. Ten samples per
+version show mean prefill 20.63 → 26.05 tok/s and decode 0.926 → 4.334 tok/s,
+with exact output. All 69 operator tests and eight LLM model/format checks pass.
+Other-model regression checks also pass; Gemma's independent complete-session
+measurements retain the slow repetition seen in both versions. The default gate
+still marks Qwen baseline decode variability (5.79%) inconclusive. A tested,
+opt-in separated-sample exception is awaiting user approval; production policy
+and Backpack runtime binaries have not changed.

@@ -92,6 +92,13 @@ class OrtReferenceArtifactTest(unittest.TestCase):
             metadata = {"capabilities": ["qwen38_static_capture_b1_c640"], "artifacts": artifacts}
             self.assertEqual({"ORTGENAI_QWEN_STATIC_CAPTURE": "1"},
                 qwen_static_capture_environment(root, root, metadata, 512, 128))
+            published = {"capabilities": metadata["capabilities"],
+                         "artifacts": list(artifacts), "artifact_hashes": artifacts}
+            self.assertEqual({"ORTGENAI_QWEN_STATIC_CAPTURE": "1"},
+                qwen_static_capture_environment(root, root, published, 512, 128))
+            with self.assertRaisesRegex(RuntimeError, "artifact hash mapping"):
+                qwen_static_capture_environment(root, root,
+                    {"capabilities": metadata["capabilities"], "artifacts": list(artifacts)}, 512, 128)
             with self.assertRaisesRegex(RuntimeError, "capacity640"):
                 qwen_static_capture_environment(root, root, metadata, 1024, 128)
             with self.assertRaisesRegex(RuntimeError, "does not declare"):
@@ -105,6 +112,8 @@ class OrtReferenceArtifactTest(unittest.TestCase):
             (root / "onnxruntime-genai.dll").write_bytes(b"unvalidated build")
             with self.assertRaisesRegex(RuntimeError, "artifact hash differs"):
                 qwen_static_capture_environment(root, root, metadata, 512, 128)
+            with self.assertRaisesRegex(RuntimeError, "artifact hash differs"):
+                qwen_static_capture_environment(root, root, published, 512, 128)
 
     def test_static_conformance_uses_bounded_capacity_and_checks_resets(self):
         with tempfile.TemporaryDirectory() as tmp:

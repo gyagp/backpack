@@ -146,7 +146,9 @@ def qwen_static_capture_environment(model: Path, bin_dir: Path, metadata: dict,
         raise RuntimeError("Qwen static capture requires the validated batch1/context640/chunk32 model view")
     if prompt_tokens + generation_tokens != 640:
         raise RuntimeError("Qwen static capture benchmark requires total context capacity640")
-    hashes = metadata.get("artifacts", {})
+    hashes = metadata.get("artifact_hashes", metadata.get("artifacts", {}))
+    if not isinstance(hashes, dict):
+        raise RuntimeError("Native capture package must provide an artifact hash mapping")
     for name in ["onnxruntime.dll", "onnxruntime-genai.dll", "genai_state_reference.exe", "model_benchmark.exe", "dxcompiler.dll"]:
         path = bin_dir / name
         if not path.is_file() or hashes.get(name) != hashlib.sha256(path.read_bytes()).hexdigest():

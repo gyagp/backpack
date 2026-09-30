@@ -77,11 +77,16 @@
         "relative_dir": "Qwen3.8-27B-ONNX",
         "repository": "amd/Qwen3.8-27B-fp16-ve-fp16-int4-k_quant-gs128-text-onnx",
         "revision": "3d00750aaa18e3e09e0b271a82e7762a4586718f",
-        "validated_configuration": {"backend": "d3d12", "max_seq_len": 640, "prefill_chunk": 32, "text_only": true},
+        "validated_configuration": {
+          "backend": "d3d12",
+          "max_seq_len": 640,
+          "prefill_chunk": 32,
+          "text_only": true
+        },
         "reference_note": "Original graph and weights have a validated captured native reference at batch1/context640/chunk32; CPU embedding rows are copied to stable GPU inputs.",
         "native_reference": {
           "path": "D:/workspace/project/backpack/gitignore/models/Qwen3.8-27B-ORT-WebGPU",
-          "bin_dir": "D:/workspace/project/backpack/gitignore/evolution/backups/ort-models/20260930-qwen38-capture-routed",
+          "bin_dir": "D:/workspace/project/backpack/gitignore/evolution/backups/ort/20260930-183323-ort-9a60fe69d9-genai-19a003a751",
           "qwen_static_capture": true
         }
       }
@@ -101,7 +106,8 @@
     "conformance_spec": {
       "workload": "text-to-image",
       "status": "artifact_identity_pending",
-      "reason": "No exact release found in Hugging Face search or official Qwen model catalog on 2026-09-29; requested repository clarification."
+      "reason": "No exact public release found in refreshed Hugging Face exact-name, official Qwen, or Unsloth catalogs on 2026-10-01. The similarly named community repository has no weights. Exact repository/revision clarification remains pending.",
+      "identity_evidence": "gitignore/logs/image-identity-20261001/summary.json"
     }
   }
 ]
