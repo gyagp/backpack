@@ -485,6 +485,78 @@ static std::vector<TestEntry> g_tests;
 // KERNEL TESTS — Raw WGSL dispatch (from test_kernels.py)
 // ═══════════════════════════════════════════════════════════════════════════
 
+TEST(gemma_sandwich_reduction_reuse) {
+    const std::string shader=getEmbeddedKernels().at("gemma_sandwich_attn_batched").source;
+    for(int n:{256,1536,2048}) {
+        const int rows=33;Rng rng(773+n);
+        auto x=rng.randnVec(rows*n),a=rng.randnVec(rows*n),post=rng.randnVec(n),next=rng.randnVec(n);
+        for(float& v:a)v*=0.05f;
+        auto ref=x;std::vector<float> expected(rows*n);
+        for(int row=0;row<rows;++row){
+            double ss=0;for(int d=0;d<n;++d)ss+=double(a[row*n+d])*a[row*n+d];
+            double ar=1/std::sqrt(ss/n+1e-6);
+            ss=0;for(int d=0;d<n;++d){ref[row*n+d]=float(double(x[row*n+d])+double(a[row*n+d])*ar*post[d]);ss+=double(ref[row*n+d])*ref[row*n+d];}
+            double xr=1/std::sqrt(ss/n+1e-6);
+            for(int d=0;d<n;++d)expected[row*n+d]=float(double(ref[row*n+d])*xr*next[d]);
+        }
+        auto bx=makeBuffer(gpu,"sand_x",x.data(),x.size()),ba=makeBuffer(gpu,"sand_a",a.data(),a.size());
+        auto bp=makeBuffer(gpu,"sand_post",post.data(),n),bn=makeBuffer(gpu,"sand_next",next.data(),n);
+        auto by=makeBuffer(gpu,"sand_y",nullptr,rows*n),br=makeBuffer(gpu,"sand_rstd",nullptr,rows),p=makeParams(gpu,"sand_p",{uint32_t(n),uint32_t(n),f32AsU32(1e-6f)});
+        std::vector<uint8_t> first;
+        for(int rep=0;rep<20;++rep){
+            gpu.writeBuffer(bx,x.data(),x.size()*4);
+            auto result=dispatchAndReadback(gpu,shader,{{0,bx},{1,ba},{2,bp},{3,bn},{4,by},{5,br},{6,p}},rows,1,1,by,expected.size()*4,7);
+            const float* values=reinterpret_cast<const float*>(result.data());
+            for(size_t i=0;i<expected.size();++i)if(!std::isfinite(values[i]))return {false,"non-finite sandwich output"};
+            auto check=assertClose(values,expected.data(),expected.size(),2e-5f,1e-4f);if(!check.ok)return check;
+            if(rep==0)first=result;else if(first!=result)return {false,"sandwich output changes across identical inputs"};
+        }
+        for(auto b:{bx,ba,bp,bn,by,br,p})wgpuBufferRelease(b.handle);
+    }
+    return {true,""};
+}
+
+TEST(gemma_rope_reduction_reuse) {
+    for(auto shape:std::vector<std::pair<int,int>>{{256,128},{512,64},{512,256}}){
+        const int hd=shape.first,half=shape.second,rows=33,heads=8,stride=(heads+2)*hd;
+        auto shader=std::string(getEmbeddedKernels().at("gemma_rope_batched").source);
+        const std::string old="const HD: u32 = 128u;";shader.replace(shader.find(old),old.size(),"const HD: u32 = "+std::to_string(hd)+"u;");
+        Rng rng(775+hd+half);auto qkv=rng.randnVec(rows*stride);
+        std::vector<float> qw(hd,1),kw(hd,1),cosine(rows*half),sine(rows*half);
+        for(int row=0;row<rows;++row){
+            for(int d=0;d<hd;++d){qkv[row*stride+heads*hd+d]*=0.1f;qkv[row*stride+(heads+1)*hd+d]*=3.0f;}
+            for(int d=0;d<half;++d){const float angle=float(row)*(d+1)*0.001f;cosine[row*half+d]=std::cos(angle);sine[row*half+d]=std::sin(angle);}
+        }
+        std::vector<float> expectedK(rows*hd),expectedV(rows*hd);
+        for(int row=0;row<rows;++row){
+            const int kb=row*stride+heads*hd,vb=kb+hd;double ks=0,vs=0;
+            for(int d=0;d<hd;++d){ks+=double(qkv[kb+d])*qkv[kb+d];vs+=double(qkv[vb+d])*qkv[vb+d];}
+            const double kr=1/std::sqrt(ks/hd+1e-6),vr=1/std::sqrt(vs/hd+1e-6);
+            for(int d=0;d<hd;++d){expectedK[row*hd+d]=float(qkv[kb+d]*kr);expectedV[row*hd+d]=float(qkv[vb+d]*vr);}
+            for(int d=0;d<half;++d){const float a=expectedK[row*hd+d],b=expectedK[row*hd+d+half],c=cosine[row*half+d],s=sine[row*half+d];expectedK[row*hd+d]=a*c-b*s;expectedK[row*hd+d+half]=b*c+a*s;}
+        }
+        auto bq=makeBuffer(gpu,"rope_qkv",qkv.data(),qkv.size()),bqr=makeBuffer(gpu,"rope_qrot",nullptr,rows*heads*hd);
+        auto bk=gpu.createBuffer("rope_k",rows*hd*2),bv=gpu.createBuffer("rope_v",rows*hd*2);
+        auto bc=makeBuffer(gpu,"rope_cos",cosine.data(),cosine.size()),bs=makeBuffer(gpu,"rope_sin",sine.data(),sine.size());
+        auto bqw=makeBuffer(gpu,"rope_qw",qw.data(),hd),bkw=makeBuffer(gpu,"rope_kw",kw.data(),hd);
+        auto p=makeParams(gpu,"rope_p",{uint32_t(heads),uint32_t(heads*hd),uint32_t(hd),0,uint32_t(half),0,1,2});
+        std::vector<uint8_t> firstK,firstV;
+        for(int rep=0;rep<20;++rep){
+            auto k=dispatchAndReadback(gpu,shader,{{0,bq},{1,bqr},{2,bk},{3,bv},{4,bc},{5,bs},{6,bqw},{7,bkw},{8,p}},heads+1,rows,1,bk,rows*hd*2,9);
+            auto v=gpu.readBuffer(bv,rows*hd*2);
+            const auto* kh=reinterpret_cast<const uint16_t*>(k.data());const auto* vh=reinterpret_cast<const uint16_t*>(v.data());
+            for(int i=0;i<rows*hd;++i){
+                const float ka=f16ToF32(kh[i]),va=f16ToF32(vh[i]);
+                if(!std::isfinite(ka)||!std::isfinite(va)||std::abs(ka-expectedK[i])>0.004f||std::abs(va-expectedV[i])>0.004f)
+                    return {false,"Gemma normalized KV differs from CPU reference at "+std::to_string(i)};
+            }
+            if(rep==0){firstK=k;firstV=v;}else if(firstK!=k||firstV!=v)return {false,"Gemma KV changes across identical inputs"};
+        }
+        for(auto b:{bq,bqr,bk,bv,bc,bs,bqw,bkw,p})wgpuBufferRelease(b.handle);
+    }
+    return {true,""};
+}
+
 TEST(causal_attention_sliding_window_rows) {
     // With Q=K=0 the expected result is the mean of the visible V rows.
     // Distinct values expose over-masking of early rows in a prefill chunk.

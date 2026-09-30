@@ -27,7 +27,10 @@ fn row_rms(base: u32, tid: u32) -> f32 {
         if(tid<stride){sums[tid]+=sums[tid+stride];}
         workgroupBarrier();
     }
-    return inverseSqrt(sums[0]/f32(HD)+1e-6);
+    let result = inverseSqrt(sums[0]/f32(HD)+1e-6);
+    // K and V normalization share scratch within the same workgroup.
+    workgroupBarrier();
+    return result;
 }
 
 @compute @workgroup_size(128)

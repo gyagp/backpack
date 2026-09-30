@@ -22,7 +22,10 @@ fn reduce_sum(v: f32, tid: u32) -> f32 {
         if (tid < offset) { sums[tid] += sums[tid + offset]; }
         workgroupBarrier();
     }
-    return sums[0];
+    let total = sums[0];
+    // The following normalization reuses sums. Finish every read first.
+    workgroupBarrier();
+    return total;
 }
 
 @compute @workgroup_size(256)
