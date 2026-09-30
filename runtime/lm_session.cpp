@@ -1744,21 +1744,22 @@ struct StandardState {
         bool pooledPrefill = runner.pleGpuPreprocess || runner.cfg.arch == "qwen35";
         bool qwenBatched = runner.cfg.arch == "qwen35" && n > 16 &&
                            runner.qwen35FastPrefill;
-        // This artifact/device pair passed exact serial/ORT continuation checks
-        // and paired application benchmarks. BP_GEMMA_SERIAL_PREFILL retains
-        // the previous route; GGUF continues through its existing selection.
+        // Validated Gemma E2B routes use batching on this device. The serial
+        // override retains the previous route; GGUF additionally requires the
+        // native-Q4 layout validated by the shared application checks.
         const bool gemmaOnnxBatched = format == "onnx" && runner.cfg.arch == "gemma4" &&
             runner.cfg.nLayer == 35 && runner.cfg.nEmbd == 1536 && runner.cfg.nVocab == 262144 &&
             runner.hasBatchedPrefill() && n > 16 && gpu->backendType == WGPUBackendType_D3D12 &&
             gpu->adapterName.find("RTX 5080") != std::string::npos &&
             !std::getenv("BP_GEMMA_SERIAL_PREFILL");
         const char* ggufProbe = std::getenv("BP_GEMMA_GGUF_BATCHED_PROBE");
-        const bool gemmaGgufProbe = ggufProbe && std::strcmp(ggufProbe, "1") == 0 &&
+        const bool gemmaGgufBatched = (!ggufProbe || std::strcmp(ggufProbe, "0") != 0) &&
             format == "gguf" && runner.cfg.arch == "gemma4" && runner.cfg.nLayer == 35 &&
-            runner.cfg.nEmbd == 1536 && runner.cfg.nVocab == 262144 && runner.hasBatchedPrefill() && n > 16 &&
+            runner.cfg.nEmbd == 1536 && runner.cfg.nVocab == 262144 && runner.weightsAreNativeQ4 &&
+            runner.hasBatchedPrefill() && n > 16 &&
             gpu->backendType == WGPUBackendType_D3D12 && gpu->adapterName == "NVIDIA GeForce RTX 5080" &&
             !std::getenv("BP_GEMMA_SERIAL_PREFILL");
-        if ((qwenBatched || gemmaOnnxBatched || gemmaGgufProbe) && !std::getenv("BP_SYNC_PREFILL")) {
+        if ((qwenBatched || gemmaOnnxBatched || gemmaGgufBatched) && !std::getenv("BP_SYNC_PREFILL")) {
             next = runner.prefillBatched(tokens, n, startPos);
         } else if (pooledPrefill && !std::getenv("BP_SYNC_PREFILL")) {
             next = runner.prefillPooledKnown(tokens, n, startPos);
