@@ -169,7 +169,9 @@ class OrtReferenceArtifactTest(unittest.TestCase):
                 self.assertEqual('Answer "4" exactly.', request["prompt"])
                 self.assertIs(request["graph_capture"], False)
                 self.assertEqual(root, cwd)
-                Path(command[3]).write_text(json.dumps({"text": "4", "graph_capture_requested": False}))
+                self.assertEqual((2, 1), (request["repetitions"], request["warmup_runs"]))
+                Path(command[3]).write_text(json.dumps({"text": "4", "graph_capture_requested": False,
+                    "warmup_runs": 1, "tokens": [19], "runs": [{"tokens": [19]}, {"tokens": [19]}]}))
                 return "reference log"
             with patch("evolution.benchmark_ort.run", side_effect=execute):
                 answer, command = run_conformance(root, root / "model", 'Answer "4" exactly.', False, root / "evidence")

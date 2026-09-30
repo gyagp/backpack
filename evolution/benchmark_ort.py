@@ -225,9 +225,8 @@ def run_conformance(bin_dir: Path, model: Path, prompt: str, capture: bool | Non
         request = directory / "request.json"
         result = directory / "result.json"
         payload = {"prompt": prompt, "max_new_tokens": 128,
-                   "max_seq_len": capacity, "graph_capture": capture is True}
-        if environment:
-            payload.update(repetitions=2, warmup_runs=1)
+                   "max_seq_len": capacity, "graph_capture": capture is True,
+                   "repetitions": 2, "warmup_runs": 1}
         request.write_text(json.dumps(payload), encoding="utf-8")
         command = [str(reference), str(model), str(request), str(result)]
         log = run(command, bin_dir, 300, environment) if environment else run(command, bin_dir, 300)
@@ -236,11 +235,10 @@ def run_conformance(bin_dir: Path, model: Path, prompt: str, capture: bool | Non
         data = json.loads(result.read_text(encoding="utf-8"))
         if data.get("graph_capture_requested") is not (capture is True):
             raise RuntimeError("Reference used a different graph-capture setting")
-        if environment:
-            runs = data.get("runs", [])
-            if (data.get("warmup_runs") != 1 or len(runs) != 2 or not data.get("tokens")
-                    or any(item.get("tokens") != data["tokens"] for item in runs)):
-                raise RuntimeError("Native capture conformance did not preserve its continuation across resets")
+        runs = data.get("runs", [])
+        if (data.get("warmup_runs") != 1 or len(runs) != 2 or not data.get("tokens")
+                or any(item.get("tokens") != data["tokens"] for item in runs)):
+            raise RuntimeError("Native conformance did not preserve its continuation across resets")
         return str(data["text"]).strip(), command
     command = [str(bin_dir / "model_chat.exe"), "-m", str(model),
                "--user_prompt", prompt, "--non_interactive", "-l", "128"]
