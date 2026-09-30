@@ -46,7 +46,7 @@ KQuantPacked pack_native_quant(const void* raw, uint32_t rows, uint32_t cols, GG
     return out;
 }
 
-std::string nativeQuantShader(GGUFType type, bool gather, bool prefill) {
+std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows) {
     const auto spec = layout(type);
     if (!spec.bytes) throw std::runtime_error("Unsupported native quantization shader");
     std::string source = NATIVE_QUANT_SOURCE;
@@ -55,7 +55,38 @@ std::string nativeQuantShader(GGUFType type, bool gather, bool prefill) {
         if (gather || main == std::string::npos)
             throw std::runtime_error("Invalid native prefill shader assembly");
         source.erase(main);
-        source += NATIVE_QUANT_PREFILL_SOURCE;
+        std::string tile = NATIVE_QUANT_PREFILL_SOURCE;
+        if (prefillRows == 32) {
+            auto replace = [&](const std::string& from, const std::string& to) {
+                const auto p=tile.find(from);
+                if(p==std::string::npos)throw std::runtime_error("Native prefill tile transform mismatch");
+                tile.replace(p,from.size(),to);
+            };
+            replace("array<f32, 528>","array<f32, 1056>");
+            replace("array<f32, 544>","array<f32, 288>");
+            replace("let lm=tid/16u; let ln=tid%16u;","let lm=tid/8u; let ln=tid%8u;");
+            replace("let row=wid.x*16u+lm; let col=wid.y*16u+ln;","let row=wid.x*32u+lm; let col=wid.y*8u+ln;");
+            const auto begin=tile.find("        for(var i=tid;i<512u;i+=256u) {");
+            const auto end=tile.find("        workgroupBarrier();",begin);
+            if(begin==std::string::npos || end==std::string::npos)
+                throw std::runtime_error("Native prefill tile loader not found");
+            tile.replace(begin,end-begin,R"WGSL(        for(var i=tid;i<1024u;i+=256u) {
+            let r=i/32u; let k=i%32u; var a=0.0;
+            if(wid.x*32u+r<M && k0+k<K) { a=bitcast<f32>(X[(wid.x*32u+r)*K+k0+k]); }
+            tileA[r*33u+k]=a;
+        }
+        let br=tid/32u; let bk=tid%32u; var b=0.0;
+        if(wid.y*8u+br<N && k0+bk<K) { b=decode(wid.y*8u+br,k0+bk); }
+        tileB[bk*9u+br]=b;
+)WGSL");
+            size_t p=0;
+            while((p=tile.find("*17u",p))!=std::string::npos){tile.replace(p,4,"*9u");p+=3;}
+            // Arithmetic below the loads is otherwise unchanged: all 32
+            // independent accumulators and the original reduction tree stay.
+        } else if (prefillRows != 16) {
+            throw std::runtime_error("Unsupported native prefill row count");
+        }
+        source += tile;
     }
     for (const auto& entry : {std::pair<std::string, std::string>{"__TYPE__", std::to_string(type)},
                              {"__BLOCK_BYTES__", std::to_string(spec.bytes)},

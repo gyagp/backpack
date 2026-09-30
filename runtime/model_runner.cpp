@@ -30,9 +30,15 @@ bool qwen38NativePrefillTarget(const GPUContext& gpu, const GGUFFile& model, con
         model.getU32("general.file_type") == 26;
 }
 
-const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool gather = false, bool prefill = false) {
-    return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) + (gather ? "_gather" : "") + (prefill ? "_prefill16" : ""),
-                                   nativeQuantShader(type, gather, prefill), 5);
+uint32_t qwen38NativePrefillRows(const GPUContext& gpu) {
+    const char* control=std::getenv("BP_QWEN38_NATIVE_PREFILL_ROWS");
+    return control && std::strcmp(control,"32")==0 &&
+        gpu.backendType==WGPUBackendType_D3D12 && gpu.adapterName=="NVIDIA GeForce RTX 5080" ? 32u : 16u;
+}
+
+const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool gather = false, bool prefill = false, uint32_t rows = 16) {
+    return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) + (gather ? "_gather" : "") + (prefill ? "_prefill"+std::to_string(rows) : ""),
+                                   nativeQuantShader(type, gather, prefill, rows), 5);
 }
 
 std::string deltaNetValueMajorSource(const std::string& source) {
@@ -7760,8 +7766,9 @@ int32_t ModelRunner::prefillQwen35Batched(
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos&&!useIntelFourRows){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
             else if(nativePrefillTile && t!=GGUF_TYPE_Q4_K && t!=GGUF_TYPE_Q5_K && t!=GGUF_TYPE_Q6_K){
-                auto p=mkp(n+"_p",{K,N,nb,rs,0,N,M});auto&kp=nativeQuantPipeline(*gpu,t,false,true);
-                add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+15)/16,(N+15)/16,1,n);
+                const uint32_t rows=qwen38NativePrefillRows(*gpu),cols=256u/rows;
+                auto p=mkp(n+"_p",{K,N,nb,rs,0,N,M});auto&kp=nativeQuantPipeline(*gpu,t,false,true,rows);
+                add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+rows-1)/rows,(N+cols-1)/cols,1,n);
             }
             else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
         auto proj=[&](GPUBuffer x,GPUBuffer kqw,GPUBuffer dense,GPUBuffer scaleMin,GGUFType type,uint32_t nb,uint32_t rs,
@@ -7836,12 +7843,13 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u postnorm built\n",li);fflush(stderr);}
             uint32_t im=pl.intermediateSize;
             if(lw.upKQ.handle){
+                const uint32_t rows=qwen38NativePrefillRows(*gpu),cols=256u/rows;
                 for(uint32_t part=0;part<2;++part){
-                    auto& pipeline=nativeQuantPipeline(*gpu,part?lw.upKQType:lw.guKQType,false,nativePrefillTile);
+                    auto& pipeline=nativeQuantPipeline(*gpu,part?lw.upKQType:lw.guKQType,false,nativePrefillTile,rows);
                     auto p=mkp(L+"split_gu_"+std::to_string(part),{E,im,part?lw.upKQNBlocks:lw.guKQNBlocks,
                         part?lw.upKQRowStride:lw.guKQRowStride,part*im,2u*im,M});
                     add(pipeline,{{0,qwen35Pf.norm},{1,part?lw.upKQ:lw.guKQ},{2,zeroBiasGU},{3,qwen35Pf.gateup},{4,p}},
-                        nativePrefillTile?(M+15)/16:M,nativePrefillTile?(im+15)/16:(im+7)/8,1,L+(part?"up":"gate"));
+                        nativePrefillTile?(M+rows-1)/rows:M,nativePrefillTile?(im+cols-1)/cols:(im+7)/8,1,L+(part?"up":"gate"));
                 }
             }else proj(qwen35Pf.norm,lw.guKQ,lw.guQ4Dense,lw.guQ4ScaleMin,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,lw.guW,lw.guS,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u gateup built\n",li);fflush(stderr);}

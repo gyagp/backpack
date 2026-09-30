@@ -7,7 +7,9 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "Pass independent GGUF reference fixtures\n"); return 2; }
-    const bool tiled = std::string(argv[1]) == "--tiled";
+    const bool tiled32 = std::string(argv[1]) == "--tiled32";
+    const bool tiled = tiled32 || std::string(argv[1]) == "--tiled";
+    const uint32_t tileRows=tiled32?32u:16u, tileCols=tiled32?8u:16u;
     const int firstFixture = tiled ? 2 : 1;
     GPUContext gpu;
     if (!gpu.init(WGPUBackendType_D3D12)) return 1;
@@ -31,7 +33,7 @@ int main(int argc, char** argv) {
             }
             const auto type = GGUFType(header[0]);
             for (uint32_t K : {256u, 768u, 5120u}) {
-             for (uint32_t M : tiled ? std::vector<uint32_t>{3,35} : std::vector<uint32_t>{3}) {
+             for (uint32_t M : tiled32 ? std::vector<uint32_t>{3,16,17,31,32,33,35,64} : tiled ? std::vector<uint32_t>{3,35} : std::vector<uint32_t>{3}) {
               for (bool strided : {false, true}) {
                 const uint32_t N = tiled ? 19u : K == 256u ? 13u : 5u;
                 if (size_t(N) * K > values.size()) continue;
@@ -49,10 +51,17 @@ int main(int argc, char** argv) {
                 auto bx=upload("x",x.data(),x.size()*4), bw=upload("w",packed.data.data(),packed.data.size()*4),
                      bb=upload("bias",bias.data(),bias.size()*4), by=upload("y",zeros.data(),zeros.size()*4),
                      bp=upload("params",params,sizeof(params));
-                auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled),5);
+                auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows),5);
                 auto bg=gpu.createBindGroup(pl,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
-                auto result=gpu.submitAndReadback({{pl.pipeline,bg,tiled?(M+15)/16:M,tiled?(N+15)/16:(N+7)/8,1,"native_quant"}},by,by.size);
+                auto result=gpu.submitAndReadback({{pl.pipeline,bg,tiled?(M+tileRows-1)/tileRows:M,tiled?(N+tileCols-1)/tileCols:(N+7)/8,1,"native_quant"}},by,by.size);
                 wgpuBindGroupRelease(bg);
+                if(tiled32){
+                    auto& legacy=gpu.getOrCreatePipeline("native_quant_legacy_"+std::to_string(type),nativeQuantShader(type,false,true,16),5);
+                    auto legacyBg=gpu.createBindGroup(legacy,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
+                    auto reference=gpu.submitAndReadback({{legacy.pipeline,legacyBg,(M+15)/16,(N+15)/16,1,"native_quant_legacy"}},by,by.size);
+                    wgpuBindGroupRelease(legacyBg);
+                    if(result!=reference){std::fprintf(stderr,"FAIL tile bit parity type=%u K=%u M=%u strided=%d\n",type,K,M,strided);return 1;}
+                }
                 const float* actual=reinterpret_cast<const float*>(result.data());
                 double maxError=0;
                 for(uint32_t m=0;m<M;++m) for(uint32_t n=0;n<N;++n) {
