@@ -206,6 +206,39 @@ fn loadSHMB(b_global_base:u32,kidx_v:u32,row:u32,col:u32){let br=b_global_base+r
     s.replace(a,b-a,loader);return s;
 }
 
+const char* gemmaQ4PleBatchedSource() {
+    // Preserve the serial PLE path's fp32 activations. Its model projection,
+    // input gate and output projection do not use activation quantization.
+    return R"(
+enable subgroups;
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read> S: array<u32>;
+@group(0) @binding(3) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(4) var<storage, read> P: array<u32>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let N = P[1]; let K = P[2];
+    let warp = lid.x / 32u; let lane = lid.x % 32u;
+    let row = wid.x * 4u + warp;
+    var acc = 0.0;
+    if (row < N) {
+        for (var k = lane; k < K; k += 32u) {
+            let word = B[row * (K / 8u) + k / 8u];
+            let q = i32((word >> ((k & 7u) * 4u)) & 15u) - 8;
+            let block = row * (K / 32u) + k / 32u;
+            let sp = unpack2x16float(S[block / 2u]);
+            let scale = select(sp.x, sp.y, (block & 1u) != 0u);
+            acc += X[wid.y * K + k] * f32(q) * scale;
+        }
+    }
+    let total = subgroupAdd(acc);
+    if (lane == 0u && row < N) { Y[wid.y * N + row] = total; }
+}
+)";
+}
+
 const char* q4PrequantBatchedSource() {
     // llama.cpp's Vulkan MMQ path quantizes each activation row once and then
     // reuses it across the output-column tile.  Gemma's older Q4_0 kernel
@@ -8008,9 +8041,16 @@ int32_t ModelRunner::prefillGemmaBatched(
         const uint32_t q4PrequantCols =
             gpu->adapterName.find("AMD") != std::string::npos ? 4u : 8u;
         auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
-                      uint32_t K, uint32_t N, const std::string& name) {
+                      uint32_t K, uint32_t N, const std::string& name,
+                      bool fp32Activation = false) {
             auto p = mkP(name + "_p", {M,N,K});
-            if (prequantQ4) {
+            if (fp32Activation && weightsAreNativeQ4 &&
+                gpu->backendType == WGPUBackendType_D3D12 &&
+                gpu->adapterName == "NVIDIA GeForce RTX 5080") {
+                auto& ple = gpu->getOrCreatePipeline("gemma_q4_ple_batched_a32",
+                    gemmaQ4PleBatchedSource(), 5);
+                add(ple, {{0,x},{1,w},{2,s},{3,y},{4,p}}, (N+3)/4,M,name);
+            } else if (prequantQ4) {
                 auto qp = mkP(name + "_quant_p", {K,N,M});
                 add(*q8quant, {{0,x},{1,gemmaPf.actQ8},{2,gemmaPf.actScale},{3,qp}},
                     (K+255)/256,M,name+"_quant");
@@ -8046,7 +8086,7 @@ int32_t ModelRunner::prefillGemmaBatched(
             }
             auto pm = mkP("gpf_ple_model_p", {M,totalPle,cfg.nEmbd});
             mm(gemmaPf.x,pleModelProjW,pleModelProjS,gemmaPf.pleRaw,
-               cfg.nEmbd,totalPle,"gpf_ple_model");
+               cfg.nEmbd,totalPle,"gpf_ple_model",true);
             auto pc = mkP("gpf_ple_combine_p", {M,cfg.pleSize,cfg.nLayer,eb});
             auto& combine = getKernel("ple_combine_batched");
             add(combine, {{0,gemmaPf.pleRaw},{1,pleProjNormW},
@@ -8166,7 +8206,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                 if(lw.pleInpGateQ4W.handle&&!std::getenv("BP_GEMMA_Q8_PLE")){
                     add(q4zp,{{0,gemmaPf.x},{1,lw.pleInpGateQ4W},{2,lw.pleInpGateQ4S},{3,gemmaPf.pleGate},{4,p1},{5,lw.pleInpGateQ4Z}},
                         (cfg.pleSize+31)/32,(M+3)/4,"gpf_ple_gate_q4");
-                }else{mm(gemmaPf.x,lw.pleInpGateW,lw.pleInpGateS,gemmaPf.pleGate,cfg.nEmbd,cfg.pleSize,"gpf_ple_gate");}
+                }else{mm(gemmaPf.x,lw.pleInpGateW,lw.pleInpGateS,gemmaPf.pleGate,cfg.nEmbd,cfg.pleSize,"gpf_ple_gate",true);}
                 auto p2=mkP("gpf_pm_"+std::to_string(li),{M,cfg.pleSize,li,cfg.nLayer});
                 add(pleMul,{{0,gemmaPf.pleGate},{1,gemmaPf.pleSignal},{2,p2}},
                     (M*cfg.pleSize+255)/256,1,"gpf_ple_mul");
@@ -8174,7 +8214,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                 if(lw.pleProjQ4W.handle&&!std::getenv("BP_GEMMA_Q8_PLE")){
                     add(q4zp,{{0,gemmaPf.pleGate},{1,lw.pleProjQ4W},{2,lw.pleProjQ4S},{3,gemmaPf.pleOut},{4,p3},{5,lw.pleProjQ4Z}},
                         (cfg.nEmbd+31)/32,(M+3)/4,"gpf_ple_proj_q4");
-                }else{mm(gemmaPf.pleGate,lw.pleProjW,lw.pleProjS,gemmaPf.pleOut,cfg.pleSize,cfg.nEmbd,"gpf_ple_proj");}
+                }else{mm(gemmaPf.pleGate,lw.pleProjW,lw.pleProjS,gemmaPf.pleOut,cfg.pleSize,cfg.nEmbd,"gpf_ple_proj",true);}
                 auto p4=mkP("gpf_pa_"+std::to_string(li),{cfg.nEmbd,cfg.nEmbd,eb});
                 add(normAdd,{{0,gemmaPf.x},{1,gemmaPf.pleOut},{2,lw.plePostNorm},
                              {3,gemmaPf.rstd},{4,p4}},M,1,"gpf_ple_add");
