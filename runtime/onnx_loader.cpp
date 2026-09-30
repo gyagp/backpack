@@ -2,6 +2,7 @@
 #include "mapped_file.h"
 #include "json_parser.h"
 
+#include <set>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -375,6 +376,7 @@ WeightMapping mapOnnxName(const std::string& onnxName) {
     // Map names
     struct NameEntry { std::string onnxSuffix; std::string backpackSuffix; };
     static const NameEntry nameMap[] = {
+        {"per_layer_model_projection_consumer", "ple_model_projection_consumer.weight"},
         {"per_layer_model_projection", "ple_model_projection.weight"},
         {"per_layer_input_gate", "ple_input_gate.weight"},
         {"per_layer_projection", "ple_projection.weight"},
@@ -414,7 +416,8 @@ WeightMapping mapOnnxName(const std::string& onnxName) {
                 return {"layers." + std::to_string(layerIdx) + "." + entry.backpackSuffix, layerIdx};
             if (entry.onnxSuffix == "lm_head")
                 return {entry.backpackSuffix, -1};
-            if (entry.onnxSuffix == "per_layer_model_projection")
+            if (entry.onnxSuffix == "per_layer_model_projection" ||
+                entry.onnxSuffix == "per_layer_model_projection_consumer")
                 return {entry.backpackSuffix, -1};
         }
     }
@@ -951,6 +954,37 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
            initializers.size(), nodes.size());
     fflush(stdout);
 
+    // GenAI's Gemma decoder layer count describes cache inputs. Shared-KV
+    // layers still have attention, MLP, and per-layer embeddings in the graph.
+    // Recover the transformer depth before allocating any per-layer weights.
+    if (useGenaiFormat && cfg.arch == "gemma4" &&
+        std::any_of(nodes.begin(), nodes.end(), [](const OnnxNode& node) {
+            return node.opType == "GroupQueryAttention";
+        })) {
+        std::set<uint32_t> attentionLayers;
+        for (const auto& node : nodes) {
+            if (node.opType != "GroupQueryAttention") continue;
+            const auto marker = node.name.find("layers.");
+            if (marker == std::string::npos) continue;
+            const size_t begin = marker + 7;
+            size_t end = begin;
+            while (end < node.name.size() && std::isdigit(static_cast<unsigned char>(node.name[end]))) ++end;
+            if (end == begin) continue;
+            attentionLayers.insert(static_cast<uint32_t>(std::stoul(node.name.substr(begin, end - begin))));
+        }
+        if (attentionLayers.empty() || *attentionLayers.rbegin() + 1 != attentionLayers.size() ||
+            cfg.nLayer > attentionLayers.size()) {
+            fprintf(stderr, "Invalid Gemma attention-layer topology in ONNX graph\n");
+            return false;
+        }
+        const uint32_t transformerLayers = static_cast<uint32_t>(attentionLayers.size());
+        if (transformerLayers != cfg.nLayer) {
+            fprintf(stderr, "  Gemma graph: %u transformer layers, %u configured cache layers\n",
+                    transformerLayers, cfg.nLayer);
+            cfg.nLayer = transformerLayers;
+        }
+    }
+
     // Detect QK-norm from initializer names
     for (auto& [name, t] : initializers) {
         if (name.find("q_norm") != std::string::npos) {
@@ -1293,9 +1327,8 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
             // Gemma 4's decoder contains one quantized per-layer embedding
             // table per transformer layer.  This is not the token embedding:
             // expanding [V, groups, block] here would allocate roughly 4 GiB
-            // per layer and eventually overwrite embeddingCPU.  Keep this a
-            // clear conformance failure until the packed per-layer embedding
-            // path is wired into ModelRunner.
+            // per layer and overwrite embeddingCPU. Keep each table packed
+            // for ModelRunner's per-layer gather.
             if (actualEmbName.find("embed_tokens_per_layer_split") != std::string::npos) {
                 auto embIt = initializers.find(actualEmbName);
                 auto scaleIt = initializers.find(scaleName);
@@ -1613,6 +1646,23 @@ bool loadOnnxModel(const std::string& modelDir, OnnxLoadResult& result) {
         if (it != q8Weights.end()) {
             result.pleModelProjection = std::move(it->second);
             q8Weights.erase(it);
+        }
+        auto consumer = q8Weights.find("ple_model_projection_consumer.weight");
+        if (consumer != q8Weights.end()) {
+            // Current Gemma exports split PLE projection rows into cache-owning
+            // and shared-KV layers. They are consecutive rows of the same
+            // projection for each token, not alternative names for one tensor.
+            auto& producer = result.pleModelProjection;
+            const auto& tail = consumer->second;
+            if (!producer.N || producer.K != tail.K || producer.K != cfg.nEmbd || producer.K % 64 != 0 ||
+                producer.N + tail.N != cfg.nLayer * cfg.pleSize) {
+                fprintf(stderr, "Inconsistent split Gemma PLE model projections\n");
+                return false;
+            }
+            producer.weights.insert(producer.weights.end(), tail.weights.begin(), tail.weights.end());
+            producer.scales.insert(producer.scales.end(), tail.scales.begin(), tail.scales.end());
+            producer.N += tail.N;
+            q8Weights.erase(consumer);
         }
         auto ni = normWeights.find("ple_projection_norm.weight");
         if (ni != normWeights.end()) {

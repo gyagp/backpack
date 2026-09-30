@@ -1,4 +1,4 @@
-enable subgroups;
+// @meta bindings=5 generated=false registry=gqa_decode
 // GQA decode — single query attending to all KV cache entries.
 // Q: [num_heads * head_dim]  (f32, single token)
 // K: [kv_heads, kv_stride, head_dim]  (f32, kv_stride >= total_seq)
@@ -9,23 +9,26 @@ enable subgroups;
 // One workgroup per Q head. Each thread handles dims d, d+64, d+128, ...
 // Dispatch: (1, num_heads, 1)
 
-${T_READ}
-${T_WRITE}
 
-@group(0) @binding(0) var<storage, read> Q: array<${T}>;
-@group(0) @binding(1) var<storage, read> K: array<${T}>;
-@group(0) @binding(2) var<storage, read> V: array<${T}>;
-@group(0) @binding(3) var<storage, read_write> Out: array<${T}>;
+fn t_read(buf: ptr<storage, array<f32>, read>, idx: u32) -> f32 {
+    return (*buf)[idx];
+}
+
+
+fn t_write(buf: ptr<storage, array<f32>, read_write>, idx: u32, val: f32) {
+    (*buf)[idx] = val;
+}
+
+
+@group(0) @binding(0) var<storage, read> Q: array<f32>;
+@group(0) @binding(1) var<storage, read> K: array<f32>;
+@group(0) @binding(2) var<storage, read> V: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(4) var<storage, read> _params_: array<u32>;
-
-var<workgroup> score_scratch: array<f32, 8>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(subgroup_invocation_id) sg_lane: u32,
-        @builtin(subgroup_id) sg_id: u32,
-        @builtin(num_subgroups) num_sg: u32) {
+        @builtin(workgroup_id) wid: vec3<u32>) {
     let num_heads = _params_[0];
     let head_dim = _params_[1];
     let total_seq = _params_[2];
@@ -52,22 +55,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     for (var s = 0u; s < total_seq; s++) {
         let k_base = (kv_h * kv_stride + s) * head_dim;
 
-        // Compute Q·K once cooperatively instead of repeating the full dot
-        // product in every output-dimension thread.
+        // Compute Q·K score once per position (same for all dims)
         var score: f32 = 0.0;
-        for (var dd = d0; dd < head_dim; dd += 64u) {
+        for (var dd = 0u; dd < head_dim; dd++) {
             score += t_read(&Q, q_base + dd) * t_read(&K, k_base + dd);
         }
-        score = subgroupAdd(score);
-        if (sg_lane == 0u) { score_scratch[sg_id] = score; }
-        workgroupBarrier();
-        if (d0 == 0u) {
-            var total = 0.0;
-            for (var sg = 0u; sg < num_sg; sg++) { total += score_scratch[sg]; }
-            score_scratch[0] = total;
-        }
-        workgroupBarrier();
-        score = score_scratch[0] * scale;
+        score *= scale;
 
         // Online softmax
         let m_new = max(m_prev, score);

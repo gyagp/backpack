@@ -31,6 +31,14 @@ project(backpack_runtime LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CPU format checks also run without creating a GPU device.
+add_executable(backpack_gguf_test tests/gguf_test.cpp gguf_loader.cpp)
+target_include_directories(backpack_gguf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(backpack_tokenizer_test tests/tokenizer_test.cpp tokenizer.cpp gguf_loader.cpp)
+target_include_directories(backpack_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(backpack_onnx_tokenizer_test tests/onnx_tokenizer_test.cpp onnx_tokenizer.cpp json_parser.cpp)
+target_include_directories(backpack_onnx_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Use shared CRT (/MD) for all targets — required for passing C++ objects
 # (std::string, std::vector) across the DLL boundary safely.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL" CACHE STRING "MSVC runtime")
@@ -43,6 +51,7 @@ set(DAWN_LIB "${DAWN_BUILD}" CACHE PATH "Dawn shared library")
 # ─── Internal object library (shared between DLL and internal CLI) ───────────
 
 set(BACKPACK_CORE_SOURCES
+    native_quant.cpp
     gpu_context.cpp
     model_runner.cpp
     gguf_loader.cpp
@@ -66,6 +75,23 @@ set(BACKPACK_CORE_SOURCES
 )
 
 add_library(backpack_core OBJECT ${BACKPACK_CORE_SOURCES})
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+file(GLOB_RECURSE BACKPACK_WGSL_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.wgsl")
+set(BACKPACK_GENERATED_WGSL "${CMAKE_CURRENT_BINARY_DIR}/generated/wgsl_shaders.h")
+add_custom_command(OUTPUT "${BACKPACK_GENERATED_WGSL}"
+    COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/gen_wgsl_shaders.py" --output "${BACKPACK_GENERATED_WGSL}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_wgsl_shaders.py" ${BACKPACK_WGSL_SOURCES}
+    VERBATIM)
+add_custom_target(backpack_shaders DEPENDS "${BACKPACK_GENERATED_WGSL}")
+add_dependencies(backpack_core backpack_shaders)
+# Embed the canonical WGSL source into the ignored build directory.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_quant.wgsl")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_quant_prefill.wgsl")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_quant.wgsl" _native_quant_wgsl)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_quant_prefill.wgsl" _native_quant_prefill_wgsl)
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/native_quant_source.h"
+    CONTENT "#pragma once\ninline constexpr char NATIVE_QUANT_SOURCE[] = R\"BPWGSL(${_native_quant_wgsl})BPWGSL\";\ninline constexpr char NATIVE_QUANT_PREFILL_SOURCE[] = R\"BPWGSL(${_native_quant_prefill_wgsl})BPWGSL\";\n")
+target_include_directories(backpack_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(backpack_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${DAWN_SRC}/include
@@ -109,6 +135,8 @@ if(EXISTS ${BACKPACK_LLM_APP})
     )
 endif()
 
+
+
 # ─── Image generation application ────────────────────────────────────────────
 
 set(BACKPACK_IMAGE_APP "${CMAKE_CURRENT_SOURCE_DIR}/../apps/image/main.cpp")
@@ -151,6 +179,8 @@ target_include_directories(op_test_runner PRIVATE
 # ─── Kernel test runner ─────────────────────────────────────────────────────
 
 add_executable(backpack_kernel_test tests/kernel_test.cpp $<TARGET_OBJECTS:backpack_core>)
+add_executable(backpack_native_quant_test tests/native_quant_test.cpp $<TARGET_OBJECTS:backpack_core>)
+target_link_libraries(backpack_native_quant_test PRIVATE backpack)
 target_link_libraries(backpack_kernel_test PRIVATE backpack)
 target_include_directories(backpack_kernel_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -196,10 +226,12 @@ if(WIN32)
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     target_link_libraries(backpack_kernel_test PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    target_link_libraries(backpack_native_quant_test PRIVATE
+        ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     target_link_libraries(backpack_op_test PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     # Copy DLLs next to executables
-    foreach(_target backpack_runtime backpack_llm backpack_image backpack_asr op_test_runner backpack_kernel_test backpack_op_test)
+    foreach(_target backpack_runtime backpack_llm backpack_image backpack_asr op_test_runner backpack_kernel_test backpack_native_quant_test backpack_op_test)
         if(TARGET ${_target})
             add_custom_command(TARGET ${_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -223,5 +255,15 @@ else()
     endif()
     target_link_libraries(op_test_runner PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     target_link_libraries(backpack_kernel_test PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
+    target_link_libraries(backpack_native_quant_test PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
     target_link_libraries(backpack_op_test PRIVATE ${DAWN_LIB}/libwebgpu_dawn.so)
 endif()
+
+# Prefer freshly embedded kernels over the historical checked-in header.
+# Generated artifacts remain under the caller's ignored build directory.
+foreach(_target backpack_core backpack backpack_runtime backpack_llm backpack_image backpack_asr op_test_runner backpack_kernel_test backpack_native_quant_test backpack_op_test)
+    if(TARGET ${_target})
+        add_dependencies(${_target} backpack_shaders)
+        target_include_directories(${_target} BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    endif()
+endforeach()

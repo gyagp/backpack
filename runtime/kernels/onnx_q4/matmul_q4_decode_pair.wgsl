@@ -1,3 +1,4 @@
+// @meta noregistry=true
 // @meta bindings=8
 requires packed_4x8_integer_dot_product;
 enable subgroups;

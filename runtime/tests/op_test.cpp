@@ -16,6 +16,10 @@
 
 #include "gpu_context.h"
 #include "graph_executor.h"
+#include "onnx_loader.h"
+#include "lm_session.h"
+#include "json_parser.h"
+#include "../../apps/common/app_common.h"
 
 #include <algorithm>
 #include <cassert>
@@ -215,6 +219,7 @@ struct TensorInfo {
     std::string name;
     int onnxDtype;
     std::vector<int64_t> shape;
+    int64_t kvCacheCapacity = 0;
 };
 
 struct AttrDef {
@@ -231,6 +236,7 @@ struct NodeDef {
     std::vector<std::string> inputs;
     std::vector<std::string> outputs;
     std::vector<AttrDef> attrs;
+    std::string name;
 };
 
 struct InitializerDef {
@@ -276,7 +282,7 @@ static std::vector<uint8_t> encodeNode(const NodeDef& n) {
     std::vector<uint8_t> buf;
     for (auto& s : n.inputs) pbString(buf, 1, s);
     for (auto& s : n.outputs) pbString(buf, 2, s);
-    pbString(buf, 3, n.opType);   // name (reuse opType)
+    pbString(buf, 3, n.name.empty() ? n.opType : n.name);
     pbString(buf, 4, n.opType);   // op_type
     for (auto& a : n.attrs) {
         auto ab = encodeAttr(a);
@@ -505,7 +511,8 @@ static std::map<std::string, TestOutput> runOnnxModel(
     GPUContext& gpu,
     const std::vector<uint8_t>& onnxBytes,
     const std::map<std::string, std::pair<std::vector<uint8_t>, TensorInfo>>& inputs,
-    const std::vector<std::string>& outputNames)
+    const std::vector<std::string>& outputNames,
+    const std::map<std::string, std::pair<std::vector<uint8_t>, TensorInfo>>& replayInputs = {})
 {
     // Write to temp file
     auto tmpDir = fs::current_path() / "gitignore" / "runtime" / "op-tests" /
@@ -535,6 +542,7 @@ static std::map<std::string, TestOutput> runOnnxModel(
         auto& t = inputTensors[name];
         t.shape = info.shape;
         t.dtype = onnxToTensorDtype(info.onnxDtype);
+        t.kvCacheCapacity = info.kvCacheCapacity;
         size_t bytes = rawData.size();
         if (bytes == 0) bytes = 4;
         t.buffer = gpu.createBuffer(name, bytes);
@@ -560,10 +568,21 @@ static std::map<std::string, TestOutput> runOnnxModel(
         outputPtrs[out.name] = &outputTensors[out.name];
     }
 
-    // Execute
+    // Capture tests change input values in the same buffers before replay.
+    if (!replayInputs.empty()) executor.CaptureBegin();
     executor.Execute(inputPtrs, outputPtrs);
     executor.FlushPendingWork();
     gpu.waitForQueue();
+    if (!replayInputs.empty()) {
+        executor.CaptureEnd();
+        for (const auto& [name, pair] : replayInputs) {
+            const auto& raw = pair.first;
+            const auto& tensor = inputTensors.at(name);
+            if (raw.size() != tensor.ByteSize()) throw std::runtime_error("Replay test shape changed");
+            gpu.writeBuffer(tensor.buffer, raw.data(), raw.size());
+        }
+        executor.ReplayDispatches();
+    }
 
     // Read back
     for (auto& name : outputNames) {
@@ -580,8 +599,8 @@ static std::map<std::string, TestOutput> runOnnxModel(
         if (t->isCpuOnly && !t->cpuData.empty()) {
             out.data = t->cpuData;
         } else if (t->buffer.handle) {
-            auto rb = gpu.readBuffer(t->buffer, bytes);
-            out.data.assign(rb.begin(), rb.end());
+            auto rb = gpu.readBuffer(t->buffer, (bytes + 3) & ~size_t(3));
+            out.data.assign(rb.begin(), rb.begin() + bytes);
         }
         results[name] = std::move(out);
     }
@@ -868,6 +887,59 @@ TEST(fused_silu_broadcast) {
          {"/mlp/up", makeInputF32("/mlp/up", {1, 3, 1}, gate)}}, {"Y"});
     assertCloseVec(outputs["Y"].asFloat32(), expected, 1e-4f, 1e-4f,
                    "fused_silu_broadcast");
+}
+
+TEST(fused_temporary_ownership) {
+    auto model = buildOnnxModel(
+        {{"Sigmoid", {"X"}, {"S"}, {}}, {"Mul", {"S", "X"}, {"Y"}, {}}},
+        {{"X", ONNX_FLOAT, {-1}}}, {{"Y", ONNX_FLOAT, {-1}}});
+    const auto dir = fs::current_path() / "gitignore/runtime/op-tests" /
+        ("fused_ownership_" + std::to_string(g_tempCounter++));
+    fs::create_directories(dir);
+    const auto path = dir / "model.onnx";
+    { std::ofstream f(path, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(model.data()), model.size()); }
+    {
+        GraphExecutor graph;
+        if (!graph.Load(gpu, path.string())) throw std::runtime_error("Cannot load ownership graph");
+        GpuTensor input, output;
+        input.dtype = output.dtype = TensorDtype::Float32;
+        input.buffer = gpu.createBuffer("ownership_input", 128);
+        output.buffer = gpu.createBuffer("ownership_output", 128);
+        {
+            ExecutionContext context;
+            std::unordered_map<std::string, GpuTensor*> inputs{{"X", &input}}, outputs{{"Y", &output}};
+            uint64_t steadyBytes = 0;
+            for (int repetition = 0; repetition < 3; ++repetition) {
+                for (int size : {7, 23}) {
+                    input.shape = output.shape = {size};
+                    std::vector<float> values(size, -0.5f);
+                    gpu.writeBuffer(input.buffer, values.data(), size * 4);
+                    graph.Execute(context, inputs, outputs);
+                }
+                context.CaptureBegin();
+                graph.Execute(context, inputs, outputs);
+                context.CaptureEnd();
+                std::vector<float> changed(23, float(repetition + 1));
+                gpu.writeBuffer(input.buffer, changed.data(), changed.size() * 4);
+                context.ReplayDispatches();
+                auto raw = gpu.readBuffer(output.buffer, changed.size() * 4);
+                std::vector<float> actual(changed.size());
+                memcpy(actual.data(), raw.data(), raw.size());
+                for (float& value : changed) value /= 1.0f + expf(-value);
+                assertCloseVec(actual, changed, 1e-4f, 1e-4f, "fused ownership replay");
+                context.ReleaseCaptured();
+                context.InvalidateWarmCaches();
+                if (repetition && gpu.totalAllocatedBytes != steadyBytes)
+                    throw std::runtime_error("Fused/dynamic-shape temporary buffers leaked");
+                steadyBytes = gpu.totalAllocatedBytes;
+            }
+        }
+        gpu.releaseBuffer(input.buffer);
+        gpu.releaseBuffer(output.buffer);
+    }
+    fs::remove(path);
+    fs::remove(dir);
 }
 
 TEST(relu) {
@@ -1906,6 +1978,516 @@ TEST(linear_attention_gated_delta_vec4) {
                    "linear_attention state");
 }
 
+
+// Independent round-to-nearest/even reference for finite values in these tests.
+static float roundStateF16(float value) {
+    int exponent = 0;
+    std::frexp(value, &exponent);
+    const float quantum = std::ldexp(1.0f, std::max(-24, exponent - 11));
+    return std::nearbyint(value / quantum) * quantum;
+}
+
+static void requireDtype(const TestOutput& output, TensorDtype dtype) {
+    if (output.dtype != dtype) throw std::runtime_error("operator did not preserve output dtype");
+}
+
+static void requireF16Values(const std::vector<float>& values) {
+    for (float value : values) {
+        if (!std::isfinite(value) || value != roundStateF16(value))
+            throw std::runtime_error("promoted cache contains a value not rounded to fp16");
+    }
+}
+
+TEST(causal_conv_state_fp16) {
+    for (int length : {1, 5}) for (bool promoted : {false, true}) {
+        constexpr int C = 2, K = 4;
+        std::vector<float> input(C * length), weight(C * K), bias = {0.03125f, -0.0625f};
+        std::vector<float> past = {0.1f, 0.2f, -0.3f, 0.4f, -0.5f, 0.6f};
+        for (int i = 0; i < C * length; ++i) input[i] = float(i - 3) * 0.0625f;
+        for (int i = 0; i < C * K; ++i) weight[i] = float(i - 2) * 0.125f;
+        if (!promoted) for (auto& x : past) x = f16ToF32(f32ToF16(x));
+        std::vector<float> expected(C * length), present(C * (K - 1));
+        for (int c = 0; c < C; ++c) {
+            auto at = [&](int t) { return t < K - 1 ? past[c * (K - 1) + t] : input[c * length + t - K + 1]; };
+            for (int t = 0; t < length; ++t) {
+                float sum = bias[c];
+                for (int j = 0; j < K; ++j) sum += at(t + j) * weight[c * K + j];
+                expected[c * length + t] = roundStateF16(sum / (1 + expf(-sum)));
+            }
+            for (int j = 0; j < K - 1; ++j) present[c * (K - 1) + j] = roundStateF16(at(length + j));
+        }
+        AttrDef activation{"activation", AttrDef::STRING}; activation.strVal = "silu";
+        auto model = buildOnnxModel(
+            {{"CausalConvWithState", {"X", "W", "B", "S"}, {"Y", "P"}, {activation}}},
+            {{"X", ONNX_FLOAT16, {1, C, length}}, {"S", ONNX_FLOAT16, {1, C, K - 1}}},
+            {{"Y", ONNX_FLOAT16, {1, C, length}}, {"P", ONNX_FLOAT16, {1, C, K - 1}}},
+            {makeInitF16("W", {C, 1, K}, weight), makeInitF16("B", {C}, bias)});
+        auto outputs = runOnnxModel(gpu, model,
+            {{"X", makeInputF16("X", {1, C, length}, input)},
+             {"S", promoted ? makeInputF32("S", {1, C, K - 1}, past) : makeInputF16("S", {1, C, K - 1}, past)}}, {"Y", "P"});
+        requireDtype(outputs["Y"], TensorDtype::Float16);
+        requireDtype(outputs["P"], promoted ? TensorDtype::Float32 : TensorDtype::Float16);
+        assertCloseVec(outputs["Y"].asFloat32(), expected, 1e-4f, 1e-3f, "causal conv fp16 output");
+        assertCloseVec(outputs["P"].asFloat32(), present, 0, 0, "causal conv fp16 state");
+        requireF16Values(outputs["P"].asFloat32());
+    }
+}
+
+TEST(linear_attention_state_fp16) {
+    // T=1 uses the vec4 decode shader; T=7 uses the scalar prefill shader.
+    // T=64, DK=1 distinguishes final-boundary rounding from per-token rounding.
+    for (int length : {1, 7, 64}) for (bool promoted : {false, true}) {
+        const int DK = length == 64 ? 1 : 128, DV = length == 64 ? 1 : 8;
+        std::vector<float> q(length * DK), k(length * DK), v(length * DV);
+        std::vector<float> state(DK * DV), decay(length, -0.03125f), beta(length, 0.34375f);
+        for (int i = 0; i < length * DK; ++i) {
+            q[i] = float(i % 11 - 5) * 0.03125f;
+            k[i] = float(i % 7 - 3) * 0.03125f;
+        }
+        for (int i = 0; i < length * DV; ++i) v[i] = float(i % 9 - 4) * 0.03125f;
+        for (int i = 0; i < DK * DV; ++i) state[i] = float(i % 13 - 6) * 0.001953125f;
+        if (length == 64) {
+            std::fill(q.begin(), q.end(), 1.0f); std::fill(k.begin(), k.end(), 1.0f);
+            std::fill(v.begin(), v.end(), 0.09375f); std::fill(beta.begin(), beta.end(), 0.125f);
+            std::fill(decay.begin(), decay.end(), 0.0f); state[0] = 0;
+        }
+        auto expectedState = state;
+        std::vector<float> expected(length * DV);
+        const float scale = 1.0f / sqrtf(float(DK));
+        float prematurelyRounded = state[0];
+        for (int t = 0; t < length; ++t) {
+            for (float& x : expectedState) x *= expf(decay[t]);
+            for (int j = 0; j < DV; ++j) {
+                float retrieved = 0;
+                for (int d = 0; d < DK; ++d) retrieved += expectedState[d * DV + j] * k[t * DK + d];
+                const float delta = beta[t] * (v[t * DV + j] - retrieved);
+                float sum = 0;
+                for (int d = 0; d < DK; ++d) {
+                    expectedState[d * DV + j] += k[t * DK + d] * delta;
+                    sum += expectedState[d * DV + j] * q[t * DK + d];
+                }
+                expected[t * DV + j] = roundStateF16(sum * scale);
+            }
+            if (length == 64) prematurelyRounded = roundStateF16(prematurelyRounded + beta[t] * (v[t] - prematurelyRounded));
+        }
+        for (float& x : expectedState) x = roundStateF16(x);
+        if (length == 64 && expectedState[0] == prematurelyRounded)
+            throw std::runtime_error("test must distinguish inner-loop rounding");
+        AttrDef rule{"update_rule", AttrDef::STRING}; rule.strVal = "gated_delta";
+        auto model = buildOnnxModel(
+            {{"LinearAttention", {"Q", "K", "V", "S", "D", "B"}, {"Y", "P"},
+              {{"q_num_heads", AttrDef::INT, 1}, {"kv_num_heads", AttrDef::INT, 1}, rule}}},
+            {{"Q", ONNX_FLOAT16, {1, length, DK}}, {"K", ONNX_FLOAT16, {1, length, DK}},
+             {"V", ONNX_FLOAT16, {1, length, DV}}, {"S", ONNX_FLOAT16, {1, 1, DK, DV}},
+             {"D", ONNX_FLOAT16, {1, length, 1}}, {"B", ONNX_FLOAT16, {1, length, 1}}},
+            {{"Y", ONNX_FLOAT16, {1, length, DV}}, {"P", ONNX_FLOAT16, {1, 1, DK, DV}}});
+        auto outputs = runOnnxModel(gpu, model,
+            {{"Q", makeInputF16("Q", {1, length, DK}, q)}, {"K", makeInputF16("K", {1, length, DK}, k)},
+             {"V", makeInputF16("V", {1, length, DV}, v)},
+             {"S", promoted ? makeInputF32("S", {1, 1, DK, DV}, state) : makeInputF16("S", {1, 1, DK, DV}, state)},
+             {"D", makeInputF16("D", {1, length, 1}, decay)}, {"B", makeInputF16("B", {1, length, 1}, beta)}}, {"Y", "P"});
+        requireDtype(outputs["Y"], TensorDtype::Float16);
+        requireDtype(outputs["P"], promoted ? TensorDtype::Float32 : TensorDtype::Float16);
+        requireF16Values(outputs["P"].asFloat32());
+        assertCloseVec(outputs["Y"].asFloat32(), expected, 2e-7f, 1e-3f, "linear attention fp16 output");
+        assertCloseVec(outputs["P"].asFloat32(), expectedState, 2e-6f, 1e-3f, "linear attention fp16 state");
+        if (length == 64) assertCloseVec(outputs["P"].asFloat32(), expectedState, 0, 0, "final boundary only");
+    }
+}
+
+TEST(lp_normalization_fp16) {
+    std::vector<float> input = {0.25f, -0.5f, 0.75f, -1, 0, 0, 0, 0};
+    std::vector<float> expected(input.size());
+    const float denom = sqrtf(0.0625f + 0.25f + 0.5625f + 1.0f);
+    for (size_t i = 0; i < 4; ++i) expected[i] = roundStateF16(input[i] / denom);
+    auto model = buildOnnxModel({{"LpNormalization", {"X"}, {"Y"}, {}}},
+        {{"X", ONNX_FLOAT16, {2, 4}}}, {{"Y", ONNX_FLOAT16, {2, 4}}});
+    auto outputs = runOnnxModel(gpu, model, {{"X", makeInputF16("X", {2, 4}, input)}}, {"Y"});
+    requireDtype(outputs["Y"], TensorDtype::Float16);
+    assertCloseVec(outputs["Y"].asFloat32(), expected, 0, 0, "fp16 normalization");
+}
+
+
+TEST(direct_dispatch_capture_updates) {
+    const std::vector<float> initial(8,0),x={1,2,3,4,5,6,7,8},y={9,10,11,12,13,14,15,16};
+    auto where=buildOnnxModel({{"Where",{"condition","X","Y"},{"Z"},{}}},
+        {{"condition",ONNX_BOOL,{8}},{"X",ONNX_FLOAT,{8}},{"Y",ONNX_FLOAT,{8}}},{{"Z",ONNX_FLOAT,{8}}});
+    auto result=runOnnxModel(gpu,where,
+        {{"condition",makeInputBool("condition",{8},{1,0,1,0,1,0,1,0})},{"X",makeInputF32("X",{8},initial)},{"Y",makeInputF32("Y",{8},initial)}},{"Z"},
+        {{"X",makeInputF32("X",{8},x)},{"Y",makeInputF32("Y",{8},y)}});
+    assertCloseVec(result["Z"].asFloat32(),{1,10,3,12,5,14,7,16},0,0,"captured Where refresh");
+    auto softmax=buildOnnxModel({{"Softmax",{"X"},{"Y"},{{"axis",AttrDef::INT,-1}}}},
+        {{"X",ONNX_FLOAT,{2,4}}},{{"Y",ONNX_FLOAT,{2,4}}});
+    auto soft=runOnnxModel(gpu,softmax,{{"X",makeInputF32("X",{2,4},initial)}},{"Y"},{{"X",makeInputF32("X",{2,4},x)}});
+    std::vector<float> expected(8);
+    const float sum=std::exp(-3.0f)+std::exp(-2.0f)+std::exp(-1.0f)+1;
+    for(int i=0;i<8;++i)expected[i]=std::exp(float(i%4-3))/sum;
+    assertCloseVec(soft["Y"].asFloat32(),expected,1e-6f,1e-5f,"captured Softmax refresh");
+}
+
+TEST(skip_rms_norm_fp16_outputs) {
+    for (int width : {7,128,5120}) {
+        constexpr int rows=3;
+        std::vector<float> x(rows*width),skip(rows*width),weight(width),expected(rows*width),residual(rows*width);
+        for(int i=0;i<rows*width;++i){x[i]=float(i%23-11)/32;skip[i]=float(i%11-5)/128;residual[i]=x[i]+skip[i];}
+        for(int c=0;c<width;++c)weight[c]=float(c%7+1)/8;
+        for(int r=0;r<rows;++r){float ss=0;for(int c=0;c<width;++c)ss+=residual[r*width+c]*residual[r*width+c];
+            float scale=1/std::sqrt(ss/width+1e-6f);for(int c=0;c<width;++c)expected[r*width+c]=roundStateF16(residual[r*width+c]*scale*weight[c]);}
+        auto model=buildOnnxModel({{"SkipSimplifiedLayerNormalization",{"X","Skip","weight"},{"Y","","","residual"},{{"epsilon",AttrDef::FLOAT,0,1e-6f}}}},
+            {{"X",ONNX_FLOAT16,{rows,width}},{"Skip",ONNX_FLOAT16,{rows,width}}},
+            {{"Y",ONNX_FLOAT16,{rows,width}},{"residual",ONNX_FLOAT16,{rows,width}}},{makeInitF16("weight",{width},weight)});
+        auto output=runOnnxModel(gpu,model,{{"X",makeInputF16("X",{rows,width},x)},{"Skip",makeInputF16("Skip",{rows,width},skip)}},{"Y","residual"});
+        requireDtype(output["Y"],TensorDtype::Float16);requireDtype(output["residual"],TensorDtype::Float16);
+        assertCloseVec(output["Y"].asFloat32(),expected,1e-6f,1e-3f,"fp16 skip RMSNorm");
+        assertCloseVec(output["residual"].asFloat32(),residual,0,0,"fp16 residual");
+    }
+}
+
+TEST(cpu_embedding_and_fp16_logits_session) {
+    constexpr int V=8, D=64;
+    const auto dir=fs::current_path()/"gitignore/runtime/op-tests"/("embedding_session_"+std::to_string(g_tempCounter++));
+    fs::create_directories(dir);
+    std::vector<float> table(V*D,0);
+    for(int i=0;i<V;++i)table[i*D+i]=1;
+    auto embedding=buildOnnxModel({{"Gather",{"table","input_ids"},{"inputs_embeds"},{{"axis",AttrDef::INT,0}}}},
+        {{"input_ids",ONNX_INT64,{1,-1}}},{{"inputs_embeds",ONNX_FLOAT16,{1,-1,D}}},{makeInitF16("table",{V,D},table)});
+    std::vector<uint8_t> weights(V*64,0x88);
+    for(int n=0;n<V;++n){int k=(n+V-1)%V;auto& byte=weights[n*64+k/2];byte=uint8_t((byte&~(15u<<((k%2)*4)))|(9u<<((k%2)*4)));}
+    auto decoder=buildOnnxModel({
+        {"Mul",{"inputs_embeds","zero"},{"Q"},{}},
+        {"GroupQueryAttention",{"Q","Q","inputs_embeds","past_key_values.0.key","past_key_values.0.value","",""},
+         {"attention","present.0.key","present.0.value"},{{"num_heads",AttrDef::INT,1},{"kv_num_heads",AttrDef::INT,1},{"scale",AttrDef::FLOAT,0,1.0f},{"do_rotary",AttrDef::INT,0}}},
+        {"Gather",{"attention","last"},{"last_hidden"},{{"axis",AttrDef::INT,1}}},
+        {"MatMulNBits",{"last_hidden","W","scales"},{"logits"},{{"K",AttrDef::INT,D},{"N",AttrDef::INT,V},{"bits",AttrDef::INT,4},{"block_size",AttrDef::INT,128}}}},
+        {{"inputs_embeds",ONNX_FLOAT16,{1,-1,D}}, {"past_key_values.0.key",ONNX_FLOAT16,{1,1,-1,D}}, {"past_key_values.0.value",ONNX_FLOAT16,{1,1,-1,D}}},
+        {{"logits",ONNX_FLOAT16,{1,V}},{"present.0.key",ONNX_FLOAT16,{1,1,-1,D}},{"present.0.value",ONNX_FLOAT16,{1,1,-1,D}}},
+        {makeInitF16("zero",{1},{0}),makeInitI64("last",{}, {-1}),{"W",ONNX_UINT8,{V,1,64},weights},makeInitF16("scales",{V,1},std::vector<float>(V,1))});
+    for(const auto& pair:std::vector<std::pair<std::string,std::vector<uint8_t>>>{{"embedding.onnx",embedding},{"text.onnx",decoder}}){
+        std::ofstream f(dir/pair.first,std::ios::binary);f.write(reinterpret_cast<const char*>(pair.second.data()),pair.second.size());
+    }
+    {std::ofstream f(dir/"config.json");f<<R"({"model_type":"qwen3_5_text","hidden_size":64,"num_hidden_layers":1,"vocab_size":8,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":64,"max_position_embeddings":32,"layer_types":["full_attention"],"eos_token_id":7})";}
+    {std::ofstream f(dir/"genai_config.json");f<<R"({"model":{"decoder":{"filename":"text.onnx"},"embedding":{"filename":"embedding.onnx"}}})";}
+    {std::ofstream f(dir/"tokenizer.json");f<<R"({"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]}})";}
+    {
+        GraphExecutor metadata;
+        const auto before=gpu.totalAllocatedBytes;
+        if(!metadata.Load(gpu,(dir/"embedding.onnx").string(),false))throw std::runtime_error("Metadata load failed");
+        auto* init=metadata.GetInitData("table");
+        if(!init || init->size!=V*D*2 || gpu.totalAllocatedBytes!=before)
+            throw std::runtime_error("CPU embedding metadata allocated a GPU table");
+    }
+    for(bool fast:{false,true}) for(uint32_t chunk:{0u,2u}) {
+        auto device=app::createDevice("d3d12");bp::LmOptions options;options.maxSeqLen=17;options.fastDecode=fast;options.warmupPipelines=false;
+        options.prefillChunkSize=chunk;
+        auto session=bp::LmSession::Create(device,dir.string(),options);
+        if(!session.IsValid())throw std::runtime_error("CPU embedding session failed to load");
+        auto* sessionGpu=static_cast<GPUContext*>(device.GetGPUContext());
+        const auto initialBytes=sessionGpu->totalAllocatedBytes;
+        for(int reset=0;reset<3;++reset)session.Reset();
+        if(sessionGpu->totalAllocatedBytes!=initialBytes)
+            throw std::runtime_error("Idle session reset allocated persistent buffers");
+        uint64_t generationBytes = 0;
+        for(int repetition=0;repetition<3;++repetition){
+            if(repetition){
+                const auto beforeReset=sessionGpu->totalAllocatedBytes;
+                session.Reset();
+                if(sessionGpu->totalAllocatedBytes>beforeReset)
+                    throw std::runtime_error("Session reset allocated buffers after generation");
+            }
+            const int32_t prompt[]={1,1,1,1,1};std::vector<int> counts(V,0);counts[1]=5;
+            auto expected=[&](){int best=0;for(int n=1;n<V;++n)if(counts[(n+V-1)%V]>counts[(best+V-1)%V])best=n;return best;};
+            int32_t token=session.Prefill(prompt,5);
+            if(token!=expected())throw std::runtime_error("FP16 prefill logits were misread");
+            for(int step=0;step<12;++step){
+                const bool profile=fast && chunk==0 && repetition==0 && step==7;
+                if(profile){session.EnableProfiling();sessionGpu->diagnostics={};sessionGpu->diagnosticsEnabled=true;}
+                const auto begin=std::chrono::steady_clock::now();
+                ++counts[token];token=session.Decode();
+                const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+                if(token!=expected())throw std::runtime_error("CPU embedding/FP16 decode or replay mismatch");
+                if(profile){
+                    sessionGpu->diagnosticsEnabled=false;
+                    const auto stats=sessionGpu->diagnostics;
+                    if(!stats.dispatches || !stats.submits || !stats.flushes || !stats.writes || !stats.queueWaits || !stats.mapWaits)
+                        throw std::runtime_error("Decode diagnostics missed GPU activity");
+                    const auto position=session.GetPosition();
+                    const auto path=(dir/"decode-profile.html").string();
+                    session.FinishProfiling(path,1,elapsed);
+                    if(session.GetPosition()!=position || !fs::exists(path+".json"))
+                        throw std::runtime_error("Report-only profiling did not preserve session state");
+                    std::ifstream profileFile(path+".json");
+                    const auto report=json_parse(std::string{std::istreambuf_iterator<char>(profileFile),{}});
+                    if(report["dispatches"].as_int()!=stats.dispatches ||
+                       report["valid_timestamp_pairs"].as_int()!=stats.dispatches)
+                        throw std::runtime_error("GPU timestamp profile omitted dispatches");
+                    const auto liveBytes=sessionGpu->totalAllocatedBytes;
+                    session.TrimMemory();
+                    if(sessionGpu->pooledBufferBytes()!=0 || sessionGpu->totalAllocatedBytes!=liveBytes || session.GetPosition()!=position)
+                        throw std::runtime_error("Pool trim changed live session memory or position");
+                }
+            }
+            if (repetition && sessionGpu->totalAllocatedBytes != generationBytes)
+                throw std::runtime_error("Generation leaked temporary allocations: fast=" +
+                    std::to_string(fast) + " before=" + std::to_string(generationBytes) +
+                    " after=" + std::to_string(sessionGpu->totalAllocatedBytes));
+            generationBytes = sessionGpu->totalAllocatedBytes;
+            if(session.GetPosition()!=17 || session.Decode()!=-1 || !session.DecodeLogits().empty())
+                throw std::runtime_error("Decode exceeded the configured context capacity");
+            bool rejected=false;
+            try { session.Prefill(prompt,1); } catch(const std::runtime_error&) { rejected=true; }
+            if(!rejected || session.GetPosition()!=17)
+                throw std::runtime_error("Over-capacity prefill changed the session");
+        }
+        const std::vector<int32_t> benchmarkPrompt(5,1);
+        const auto benchmark=session.BenchmarkTokens(benchmarkPrompt,12,1);
+        if(benchmark.promptLen!=5 || benchmark.generatedTokens!=12 || benchmark.decodeSampleTokens!=11 ||
+           benchmark.finalPosition!=16 || session.GetPosition()!=0 || benchmark.tokenIds.size()!=12)
+            throw std::runtime_error("Benchmark consumed hidden warmup/output tokens");
+        std::vector<int> benchmarkCounts(V,0);benchmarkCounts[1]=5;
+        for(int token:benchmark.tokenIds){
+            int expected=0;
+            for(int n=1;n<V;++n)if(benchmarkCounts[(n+V-1)%V]>benchmarkCounts[(expected+V-1)%V])expected=n;
+            if(token!=expected)throw std::runtime_error("Benchmark warmup changed measured continuation");
+            ++benchmarkCounts[token];
+        }
+        const auto one=session.BenchmarkTokens(benchmarkPrompt,1,0);
+        if(one.generatedTokens!=1 || one.decodeSampleTokens!=0 || one.decodeMs!=0 || one.finalPosition!=5)
+            throw std::runtime_error("One-output benchmark performed an extra decode");
+        const auto tooLong=session.BenchmarkTokens(benchmarkPrompt,13,0);
+        if(tooLong.generatedTokens!=0 || session.GetPosition()!=0)
+            throw std::runtime_error("Benchmark exceeded configured context capacity");
+    }
+    fs::remove_all(dir);
+}
+
+TEST(matmul_nbits_blocked_q4) {
+    constexpr int N = 5;
+    for (int block : {64,128}) for (int M : {1,5}) for (bool half : {false,true}) for (bool zp : {false,true}) {
+        // Three groups, with padding in the final block and an odd zero-point
+        // count. Every row's zero points must start on its own byte boundary.
+        const int K = 2 * block + 7, groups = 3, weightStride = groups * block / 2, zeroStride = 2;
+        std::vector<float> x(M*K), scales(N*groups), expected(M*N);
+        std::vector<uint8_t> w(N*weightStride,0), zeros(N*zeroStride,0);
+        for (int i=0;i<M*K;++i) x[i]=float(i%19-9)/32;
+        for (int n=0;n<N;++n) for(int g=0;g<groups;++g) {
+            scales[n*groups+g]=half ? float(1+n+g)/128 : 0.01313f*float(1+n+g);
+            const int z=zp ? (n*3+g*5)%16 : 8;
+            zeros[n*zeroStride+g/2] |= uint8_t(z<<((g%2)*4));
+            for(int k=g*block;k<std::min(K,(g+1)*block);++k) {
+                const int q=(n*7+k*3)%16;
+                w[n*weightStride+k/2] |= uint8_t(q<<((k%2)*4));
+                for(int m=0;m<M;++m) expected[m*N+n]+=x[m*K+k]*float(q-z)*scales[n*groups+g];
+            }
+        }
+        std::vector<InitializerDef> inits={{"W",ONNX_UINT8,{N,groups,block/2},w},
+            half ? makeInitF16("scales",{N,groups},scales) : makeInitF32("scales",{N,groups},scales)};
+        if(zp)inits.push_back({"zero_points",ONNX_UINT8,{N,zeroStride},zeros});
+        const auto type=half?ONNX_FLOAT16:ONNX_FLOAT;
+        auto model=buildOnnxModel({{"MatMulNBits",{"X","W","scales",zp?"zero_points":""},{"Y"},
+            {{"K",AttrDef::INT,K},{"N",AttrDef::INT,N},{"bits",AttrDef::INT,4},{"block_size",AttrDef::INT,block}}}},
+            {{"X",type,{1,M,K}}},{{"Y",type,{1,M,N}}},inits);
+        auto result=runOnnxModel(gpu,model,{{"X",half?makeInputF16("X",{1,M,K},x):makeInputF32("X",{1,M,K},x)}},{"Y"});
+        requireDtype(result["Y"],half?TensorDtype::Float16:TensorDtype::Float32);
+        assertCloseVec(result["Y"].asFloat32(),expected,half?2e-4f:2e-5f,half?6e-4f:2e-5f,"Q4 grouped matmul");
+    }
+}
+
+TEST(gemma_onnx_transformer_and_cache_layers) {
+    auto loadFixture = [&](const std::vector<int>& layerIds, uint32_t cacheLayers,
+                           bool withPle, OnnxLoadResult& result) {
+        const auto dir = fs::current_path() / "gitignore" / "runtime" / "op-tests" /
+                         ("gemma_topology_" + std::to_string(g_tempCounter++));
+        const auto decoder = dir / "decoder";
+        fs::create_directories(decoder);
+        {
+            std::ofstream config(dir / "genai_config.json");
+            config << "{\"model\":{\"type\":\"gemma4\",\"vocab_size\":2,\"decoder\":{"
+                   << "\"num_attention_heads\":1,\"num_key_value_heads\":1,\"head_size\":32,"
+                   << "\"hidden_size\":64,\"num_hidden_layers\":" << cacheLayers << "}}}";
+        }
+        std::vector<NodeDef> nodes;
+        std::vector<InitializerDef> initializers;
+        for (int layer : layerIds) {
+            const auto name = "decoder/model/layers." + std::to_string(layer) + "/self_attn/GroupQueryAttention";
+            nodes.push_back({"GroupQueryAttention", {}, {}, {}, name});
+            if (!withPle) continue;
+            const auto prefix = "decoder.model.embed_tokens_per_layer_split." + std::to_string(layer);
+            initializers.push_back({prefix + ".qweight", ONNX_UINT8, {2, 16}, std::vector<uint8_t>(32, 0x98)});
+            initializers.push_back(makeInitF16(prefix + ".scales", {2, 1}, {0.125f, 0.25f}));
+            initializers.push_back({prefix + ".zero_points", ONNX_UINT8, {2, 1}, {0x88, 0x88}});
+            nodes.push_back({"GatherBlockQuantized", {prefix + ".qweight", "ids", prefix + ".scales", prefix + ".zero_points"},
+                             {prefix + ".output"}, {{"bits", AttrDef::INT, 4}, {"block_size", AttrDef::INT, 32}}});
+        }
+        if (withPle) {
+            auto projection = [&](const std::string& suffix, int rows, uint8_t quantized) {
+                const auto prefix = "decoder.model." + suffix;
+                initializers.push_back({prefix + ".weight_t_Q4", ONNX_UINT8, {rows, 2, 16},
+                                        std::vector<uint8_t>(rows * 32, quantized)});
+                initializers.push_back(makeInitF16(prefix + ".weight_t_scales", {rows, 2}, std::vector<float>(rows * 2, 1.0f)));
+                initializers.push_back({prefix + ".weight_t_zero_point", ONNX_UINT8, {rows, 1}, std::vector<uint8_t>(rows, 0x88)});
+                nodes.push_back({"MatMulNBits", {"embedding", prefix + ".weight_t_Q4", prefix + ".weight_t_scales", prefix + ".weight_t_zero_point"},
+                                 {prefix + ".output"}, {{"K", AttrDef::INT, 64}, {"N", AttrDef::INT, rows},
+                                  {"bits", AttrDef::INT, 4}, {"block_size", AttrDef::INT, 32}}});
+            };
+            projection("per_layer_model_projection", cacheLayers * 32, 0x99);
+            projection("per_layer_model_projection_consumer", (static_cast<int>(layerIds.size()) - cacheLayers) * 32, 0xAA);
+        }
+        const auto bytes = buildOnnxModel(nodes, {}, {}, initializers);
+        {
+            std::ofstream file(decoder / "model.onnx", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        const bool loaded = loadOnnxModel(decoder.string(), result);
+        fs::remove_all(dir);
+        return loaded;
+    };
+    std::vector<int> layers(35); std::iota(layers.begin(), layers.end(), 0);
+    OnnxLoadResult shared;
+    if (!loadFixture(layers, 15, true, shared) || shared.cfg.nLayer != 35 || shared.layers.size() != 35 ||
+        shared.pleEmbedding.layers != 35 || shared.pleEmbedding.weights.size() != 35 * 2 * 16)
+        throw std::runtime_error("Gemma cache count truncated transformer or PLE layers");
+    const auto& projection = shared.pleModelProjection;
+    if (projection.N != 35 * 32 || projection.K != 64 || projection.weights.size() != 35 * 32 * 16 ||
+        projection.scales.size() != 35 * 32 ||
+        projection.weights[0] != 0x01010101u || projection.weights[15 * 32 * 16] != 0x02020202u ||
+        f16ToF32(static_cast<uint16_t>(projection.scales[0])) != 1.0f ||
+        f16ToF32(static_cast<uint16_t>(projection.scales[15 * 32])) != 1.0f)
+        throw std::runtime_error("Split PLE producer/consumer rows were overwritten or reordered");
+    OnnxLoadResult embedding;
+    if (!loadFixture({}, 15, false, embedding) || embedding.cfg.nLayer != 15)
+        throw std::runtime_error("Embedding-only graph must not require attention layers");
+    OnnxLoadResult gap, excessive;
+    if (loadFixture({0, 2}, 1, false, gap) || loadFixture({0, 1}, 3, false, excessive))
+        throw std::runtime_error("Invalid Gemma layer topology accepted");
+}
+
+TEST(linear_attention_gate) {
+    for (bool halfInput : {false,true}) {
+        std::vector<float> a(24),b(24),bias={0.1f,-0.2f,0.3f,-0.4f},negA={-0.2f,-0.4f,-0.6f,-0.8f};
+        const float edges[]={-80,-21,-1,0,0.1f,1,21,80};
+        std::vector<float> expectedGate(24),expectedBeta(24);
+        for(int i=0;i<24;++i){
+            a[i]=edges[i%8];b[i]=edges[(i+3)%8];
+            if(halfInput){a[i]=f16ToF32(f32ToF16(a[i]));b[i]=f16ToF32(f32ToF16(b[i]));}
+            float x=a[i]+bias[i%4];
+            expectedGate[i]=negA[i%4]*(std::max(x,0.0f)+std::log1p(std::exp(-std::abs(x))));
+            expectedBeta[i]=1.0f/(1.0f+std::exp(-b[i]));
+        }
+        auto model=buildOnnxModel(
+            {{"LinearAttentionGate",{"A","bias","negA","B"},{"G","beta"}, {}}},
+            {{"A",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,4}},{"B",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,4}}},
+            {{"G",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,4}},{"beta",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,4}}},
+            {makeInitF32("bias",{4},bias),makeInitF32("negA",{4},negA)});
+        auto outputs=runOnnxModel(gpu,model,{
+            {"A",halfInput?makeInputF16("A",{2,3,4},a):makeInputF32("A",{2,3,4},a)},
+            {"B",halfInput?makeInputF16("B",{2,3,4},b):makeInputF32("B",{2,3,4},b)}},{"G","beta"});
+        assertCloseVec(outputs["G"].asFloat32(),expectedGate,2e-5f,halfInput?6e-4f:2e-5f,"linear gate decay");
+        assertCloseVec(outputs["beta"].asFloat32(),expectedBeta,2e-5f,halfInput?6e-4f:2e-5f,"linear gate beta");
+    }
+}
+
+TEST(gated_rms_norm) {
+    for(bool halfInput:{false,true}) {
+        std::vector<float> x(48),z(48),w={0.7f,1.1f,0.9f,1.3f},expected(48);
+        for(int i=0;i<48;++i){x[i]=std::sin(float(i)*0.2f);z[i]=std::cos(float(i)*0.4f);
+            if(halfInput){x[i]=f16ToF32(f32ToF16(x[i]));z[i]=f16ToF32(f32ToF16(z[i]));}}
+        for(int row=0;row<12;++row){double sum=0;for(int d=0;d<4;++d)sum+=double(x[row*4+d])*x[row*4+d];
+            float scale=1.0f/std::sqrt(float(sum/4)+1e-6f);
+            for(int d=0;d<4;++d){int i=row*4+d;expected[i]=x[i]*scale*w[d]*(z[i]/(1+std::exp(-z[i])));}}
+        auto model=buildOnnxModel({{"GatedRMSNorm",{"X","W","Z"},{"Y"},{{"epsilon",AttrDef::FLOAT,0,1e-6f}}}},
+            {{"X",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,8}},{"Z",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,8}}},
+            {{"Y",halfInput?ONNX_FLOAT16:ONNX_FLOAT,{2,3,8}}},{makeInitF32("W",{4},w)});
+        auto outputs=runOnnxModel(gpu,model,{{"X",halfInput?makeInputF16("X",{2,3,8},x):makeInputF32("X",{2,3,8},x)},
+            {"Z",halfInput?makeInputF16("Z",{2,3,8},z):makeInputF32("Z",{2,3,8},z)}},{"Y"});
+        assertCloseVec(outputs["Y"].asFloat32(),expected,halfInput?1e-3f:2e-5f,halfInput?1e-3f:2e-5f,"gated rms norm");
+    }
+}
+
+TEST(unsupported_operator_fails) {
+    auto model=buildOnnxModel({{"NotAnImplementedOperator",{"X"},{"Y"},{}}},
+        {{"X",ONNX_FLOAT,{1}}},{{"Y",ONNX_FLOAT,{1}}});
+    bool rejected=false;
+    try{runOnnxModel(gpu,model,{{"X",makeInputF32("X",{1},{1.0f})}},{"Y"});}
+    catch(const std::runtime_error& e){rejected=std::string(e.what()).find("Unsupported ONNX operator")!=std::string::npos;}
+    if(!rejected)throw std::runtime_error("Unsupported graph silently produced output");
+}
+
+TEST(mrotary_embedding_axes) {
+    constexpr int B=2,T=3,H=2,D=12,R=8,RH=4;
+    std::vector<float> x(B*T*H*D),c(32*RH),s(32*RH);
+    std::vector<int64_t> pos(3*B*T);
+    for(size_t i=0;i<x.size();++i)x[i]=std::sin(float(i)*0.2f);
+    for(int p=0;p<32;++p)for(int j=0;j<RH;++j){float angle=0.13f*(p+1)*(j+1);c[p*RH+j]=std::cos(angle);s[p*RH+j]=std::sin(angle);}
+    for(int axis=0;axis<3;++axis)for(int i=0;i<B*T;++i)pos[axis*B*T+i]=axis*8+i+1;
+    for(int layout:{0,1})for(int interleaved:{0,1}){
+        const int contiguousAxes[]={0,0,1,2},interleavedAxes[]={0,1,2,0};
+        const int* axes=layout?interleavedAxes:contiguousAxes;
+        auto expected=x;
+        for(int token=0;token<B*T;++token)for(int h=0;h<H;++h)for(int pair=0;pair<RH;++pair){
+            int base=(token*H+h)*D;int a=base+(interleaved?2*pair:pair),b=base+(interleaved?2*pair+1:pair+RH);
+            int cache=int(pos[axes[pair]*B*T+token])*RH+pair;
+            expected[a]=x[a]*c[cache]-x[b]*s[cache];expected[b]=x[a]*s[cache]+x[b]*c[cache];
+        }
+        AttrDef sections{"mrope_section",AttrDef::INTS};sections.intList={2,1,1};
+        auto model=buildOnnxModel({{"MRotaryEmbedding",{"X","P","C","S"},{"Y"},
+            {{"num_heads",AttrDef::INT,H},{"rotary_embedding_dim",AttrDef::INT,R},
+             {"interleaved",AttrDef::INT,interleaved},{"mrope_layout",AttrDef::INT,layout},sections}}},
+            {{"X",ONNX_FLOAT,{B,T,H*D}},{"P",ONNX_INT64,{3,B,T}}},{{"Y",ONNX_FLOAT,{B,T,H*D}}},
+            {makeInitF32("C",{32,RH},c),makeInitF32("S",{32,RH},s)});
+        auto outputs=runOnnxModel(gpu,model,{{"X",makeInputF32("X",{B,T,H*D},x)},{"P",makeInputI64("P",{3,B,T},pos)}},{"Y"});
+        assertCloseVec(outputs["Y"].asFloat32(),expected,2e-5f,2e-5f,"multi-axis rotary embedding");
+    }
+}
+
+
+
+TEST(cast_float_capture_updates) {
+    for (const char* name : {"Cast", "/model/layers.0/linear_attn/decay/g_cast/Cast",
+                             "/model/layers.0/linear_attn/gated_norm/gated/Cast",
+                             "/model/layers.3/attn/k_mrope/output/Cast"})
+    for (bool toHalf : {false, true}) {
+        const int sourceType = toHalf ? ONNX_FLOAT : ONNX_FLOAT16;
+        const int targetType = toHalf ? ONNX_FLOAT16 : ONNX_FLOAT;
+        const std::vector<float> initial(8, 0.25f), changed = {1, -2, 0.5f, -0.25f, 4, -8, 16, -32};
+        auto model = buildOnnxModel({{"Cast", {"X"}, {"Y"}, {{"to", AttrDef::INT, targetType}}, name}},
+            {{"X", sourceType, {8}}}, {{"Y", targetType, {8}}});
+        auto output = runOnnxModel(gpu, model,
+            {{"X", toHalf ? makeInputF32("X", {8}, initial) : makeInputF16("X", {8}, initial)}}, {"Y"},
+            {{"X", toHalf ? makeInputF32("X", {8}, changed) : makeInputF16("X", {8}, changed)}});
+        requireDtype(output["Y"], toHalf ? TensorDtype::Float16 : TensorDtype::Float32);
+        assertCloseVec(output["Y"].asFloat32(), changed, 0, 0, "replayed floating point Cast");
+    }
+}
+
+TEST(mrotary_fp16_capture_updates) {
+    constexpr int H = 2, D = 8, R = 6;
+    std::vector<float> initial(H * D, 0.5f), changed(H * D), cosine(12), sine(12), expected(H * D);
+    for (int i = 0; i < H * D; ++i) changed[i] = float(i - 7) * 0.125f;
+    for (int p = 0; p < 4; ++p) for (int j = 0; j < 3; ++j) {
+        const float angle = float(p * (j + 1)) * 0.25f;
+        cosine[p * 3 + j] = cosf(angle); sine[p * 3 + j] = sinf(angle);
+    }
+    for (int h = 0; h < H; ++h) for (int d = 0; d < D; ++d) {
+        if (d >= R) { expected[h * D + d] = changed[h * D + d]; continue; }
+        const int j = d % 3, p = j + 1;
+        const float a = changed[h * D + j], b = changed[h * D + j + 3];
+        expected[h * D + d] = roundStateF16(d < 3 ? a * cosine[p * 3 + j] - b * sine[p * 3 + j]
+                                                                 : a * sine[p * 3 + j] + b * cosine[p * 3 + j]);
+    }
+    AttrDef sections{"mrope_section", AttrDef::INTS}; sections.intList = {1, 1, 1};
+    auto model = buildOnnxModel(
+        {{"MRotaryEmbedding", {"X", "P", "C", "S"}, {"Y"},
+          {{"num_heads", AttrDef::INT, H}, {"rotary_embedding_dim", AttrDef::INT, R}, sections}}},
+        {{"X", ONNX_FLOAT16, {1, 1, H * D}}, {"P", ONNX_INT64, {3, 1, 1}}},
+        {{"Y", ONNX_FLOAT16, {1, 1, H * D}}},
+        {makeInitF32("C", {4, 3}, cosine), makeInitF32("S", {4, 3}, sine)});
+    auto output = runOnnxModel(gpu, model,
+        {{"X", makeInputF16("X", {1, 1, H * D}, initial)}, {"P", makeInputI64("P", {3, 1, 1}, {0, 0, 0})}}, {"Y"},
+        {{"X", makeInputF16("X", {1, 1, H * D}, changed)}, {"P", makeInputI64("P", {3, 1, 1}, {1, 2, 3})}});
+    requireDtype(output["Y"], TensorDtype::Float16);
+    assertCloseVec(output["Y"].asFloat32(), expected, 1e-6f, 1e-3f, "rotary captured fp16 input and positions");
+}
+
 TEST(gqa_decode_subgroup_score) {
     constexpr int H = 2, KVH = 1, D = 64, PAST = 3, TOTAL = PAST + 1;
     std::vector<float> q(H * D), k(D), v(D);
@@ -1965,7 +2547,7 @@ TEST(gqa_decode_subgroup_score) {
 
 // Tiled-score GQA must match the untiled control bit for bit at every GQA
 // shape the gate admits, not just the one it was first tuned for.
-static void checkTiledScoreParity(GPUContext& gpu, int H, int KVH, const char* label) {
+static void checkTiledScoreParity(GPUContext& gpu, int H, int KVH, const char* label, bool reserved = false) {
     constexpr int D = 256, PAST = 511, TOTAL = 512;
     std::vector<float> q(H * D), k(KVH * D), v(KVH * D);
     std::vector<float> pastK(KVH * PAST * D), pastV(KVH * PAST * D);
@@ -1992,12 +2574,25 @@ static void checkTiledScoreParity(GPUContext& gpu, int H, int KVH, const char* l
         {{"Y", ONNX_FLOAT, {1, 1, H * D}},
          {"PresentK", ONNX_FLOAT, {1, KVH, TOTAL, D}},
          {"PresentV", ONNX_FLOAT, {1, KVH, TOTAL, D}}});
-    const std::map<std::string, std::pair<std::vector<uint8_t>, TensorInfo>> inputs = {
+    std::map<std::string, std::pair<std::vector<uint8_t>, TensorInfo>> inputs = {
         {"Q", makeInputF32("Q", {1, 1, H * D}, q)},
         {"K", makeInputF32("K", {1, 1, KVH * D}, k)},
         {"V", makeInputF32("V", {1, 1, KVH * D}, v)},
         {"PK", makeInputF32("PK", {1, KVH, PAST, D}, pastK)},
         {"PV", makeInputF32("PV", {1, KVH, PAST, D}, pastV)}};
+    std::vector<float> expectedK(KVH*TOTAL*D), expectedV(KVH*TOTAL*D);
+    for(int h=0;h<KVH;++h) {
+        std::copy_n(pastK.begin()+h*PAST*D,PAST*D,expectedK.begin()+h*TOTAL*D);
+        std::copy_n(pastV.begin()+h*PAST*D,PAST*D,expectedV.begin()+h*TOTAL*D);
+        std::copy_n(k.begin()+h*D,D,expectedK.begin()+(h*TOTAL+PAST)*D);
+        std::copy_n(v.begin()+h*D,D,expectedV.begin()+(h*TOTAL+PAST)*D);
+    }
+    if (reserved) {
+        inputs["PK"]=makeInputF32("PK",{1,KVH,PAST,D},expectedK);
+        inputs["PV"]=makeInputF32("PV",{1,KVH,PAST,D},expectedV);
+        inputs["PK"].second.kvCacheCapacity=TOTAL;
+        inputs["PV"].second.kvCacheCapacity=TOTAL;
+    }
     const char* oldEnv = std::getenv("BP_DISABLE_QWEN_TILED_GQA");
     const std::string savedEnv = oldEnv ? oldEnv : "";
 #ifdef _WIN32
@@ -2023,6 +2618,8 @@ static void checkTiledScoreParity(GPUContext& gpu, int H, int KVH, const char* l
     if (control["PresentK"].data != candidate["PresentK"].data ||
         control["PresentV"].data != candidate["PresentV"].data)
         throw std::runtime_error(std::string("tiled-score GQA changed KV cache output at ") + label);
+    assertCloseVec(candidate["PresentK"].asFloat32(),expectedK,0,0,"GQA key cache versus CPU");
+    assertCloseVec(candidate["PresentV"].asFloat32(),expectedV,0,0,"GQA value cache versus CPU");
 }
 
 TEST(gqa_decode_tiled_scores_qwen512_parity) {
@@ -2033,18 +2630,43 @@ TEST(gqa_decode_tiled_scores_qwen2b_parity) {
     checkTiledScoreParity(gpu, 8, 2, "Qwen 3.5 2B (8 heads / 2 kv)");
 }
 
+TEST(gqa_cache_layout_with_poisoned_pool) {
+    struct RestorePool { GPUContext& gpu; bool enabled; ~RestorePool() { gpu.bufferPoolEnabled=enabled; } }
+        restore{gpu,gpu.bufferPoolEnabled};
+    gpu.bufferPoolEnabled=true;
+    std::vector<GPUBuffer> poison;
+    const std::vector<float> contents(2*1024*1024/4,1234.0f);
+    for(int i=0;i<8;++i) {
+        auto buffer=gpu.createBuffer("GQA_pool_poison",2*1024*1024);
+        gpu.writeBuffer(buffer,contents.data(),contents.size()*sizeof(float));
+        poison.push_back(buffer);
+    }
+    gpu.waitForQueue();
+    for(auto buffer:poison) gpu.releaseBuffer(buffer);
+    checkTiledScoreParity(gpu,16,4,"packed511 in rounded512 allocation");
+    checkTiledScoreParity(gpu,16,4,"explicit512 capacity",true);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
+    WGPUBackendType backend = WGPUBackendType_Vulkan;
     // Parse args
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--filter" && i + 1 < argc)
             g_filter = argv[++i];
+        else if (std::string(argv[i]) == "--backend" && i + 1 < argc) {
+            std::string name=argv[++i];
+            if(name=="d3d12") backend=WGPUBackendType_D3D12;
+            else if(name=="vulkan") backend=WGPUBackendType_Vulkan;
+            else { std::fprintf(stderr,"Unknown GPU backend\n"); return 2; }
+        }
+        else { std::fprintf(stderr,"Unknown argument: %s\n",argv[i]); return 2; }
     }
 
     // Init GPU
     GPUContext gpu;
-    if (!gpu.init()) {
+    if (!gpu.init(backend)) {
         fprintf(stderr, "Failed to initialize GPU\n");
         return 1;
     }
@@ -2060,6 +2682,7 @@ int main(int argc, char** argv) {
     RUN(sigmoid);
     RUN(fused_silu);
     RUN(fused_silu_broadcast);
+    RUN(fused_temporary_ownership);
     RUN(relu);
     RUN(neg);
 
@@ -2080,9 +2703,24 @@ int main(int argc, char** argv) {
     RUN(matmul_nbits_q4_decode);
     RUN(matmul_nbits_q8_decode);
     RUN(linear_attention_gated_delta_vec4);
+    RUN(causal_conv_state_fp16);
+    RUN(linear_attention_state_fp16);
+    RUN(lp_normalization_fp16);
+    RUN(direct_dispatch_capture_updates);
+    RUN(skip_rms_norm_fp16_outputs);
+    RUN(cpu_embedding_and_fp16_logits_session);
+    RUN(matmul_nbits_blocked_q4);
+    RUN(gemma_onnx_transformer_and_cache_layers);
+    RUN(linear_attention_gate);
+    RUN(gated_rms_norm);
+    RUN(unsupported_operator_fails);
+    RUN(mrotary_embedding_axes);
+    RUN(mrotary_fp16_capture_updates);
+    RUN(cast_float_capture_updates);
     RUN(gqa_decode_subgroup_score);
     RUN(gqa_decode_tiled_scores_qwen512_parity);
     RUN(gqa_decode_tiled_scores_qwen2b_parity);
+    RUN(gqa_cache_layout_with_poisoned_pool);
     RUN(softmax);
     RUN(simplified_layer_norm);
     RUN(softplus);

@@ -5,7 +5,7 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "../wgsl_template.h"
 #include <cstdio>
 #include <cmath>
@@ -104,7 +104,7 @@ static bool ensureTensorFloat32(OpContext& ex, GpuTensor& tensor, const std::str
             rebuilt.dtype = TensorDtype::Float32;
             rebuilt.cpuData.resize(values.size() * sizeof(float));
             memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-            rebuilt.buffer = ex.getGpu()->createBuffer(name.empty() ? "norm_f32_rebuilt" : name,
+            rebuilt.buffer = ex.CreateTemporaryBuffer(name.empty() ? "norm_f32_rebuilt" : name,
                                                   rebuilt.cpuData.size());
             ex.getGpu()->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
             rebuilt.isCpuOnly = false;
@@ -128,7 +128,7 @@ static bool ensureTensorFloat32(OpContext& ex, GpuTensor& tensor, const std::str
     rebuilt.dtype = TensorDtype::Float32;
     rebuilt.cpuData.resize(values.size() * sizeof(float));
     memcpy(rebuilt.cpuData.data(), values.data(), rebuilt.cpuData.size());
-    rebuilt.buffer = ex.getGpu()->createBuffer(name.empty() ? "norm_f32_cast" : name,
+    rebuilt.buffer = ex.CreateTemporaryBuffer(name.empty() ? "norm_f32_cast" : name,
                                           rebuilt.cpuData.size());
     ex.getGpu()->writeBuffer(rebuilt.buffer, rebuilt.cpuData.data(), rebuilt.cpuData.size());
     rebuilt.isCpuOnly = false;
@@ -174,7 +174,7 @@ static void opSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
         // execution-context pool provides a distinct buffer until the fence.
         rstdBuf = rstdBytes <= 64
             ? ex.getParamBuffer(rstdBytes)
-            : ex.getGpu()->createBuffer("rstd", rstdBytes);
+            : ex.CreateTemporaryBuffer("rstd", rstdBytes);
     }
 
     struct { int32_t stride; int32_t N; float eps; } p;
@@ -260,6 +260,35 @@ static void opSkipSimplifiedLayerNorm(OpContext& ex, const OnnxGraphNode& n,
     auto paramBuf = ex.getParamBuffer(16);
     ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
+    if (X->dtype == TensorDtype::Float16 && Skip->dtype == TensorDtype::Float16 && W->dtype == TensorDtype::Float16) {
+        ex.EnsureGpu(*X); ex.EnsureGpu(*Skip); ex.EnsureGpu(*W);
+        auto& pipeline = ex.GetPipelineT("skip_rmsnorm_native_f16", 6, [] {
+            return std::string(R"WGSL(
+enable f16;
+@group(0) @binding(0) var<storage,read> X:array<f16>;
+@group(0) @binding(1) var<storage,read> Skip:array<f16>;
+@group(0) @binding(2) var<storage,read> W:array<f16>;
+@group(0) @binding(3) var<storage,read_write> Y:array<f16>;
+@group(0) @binding(4) var<storage,read_write> Residual:array<f16>;
+@group(0) @binding(5) var<storage,read> P:array<u32>;
+var<workgroup> sums:array<f32,256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) id:vec3<u32>){
+ let row=group.x;let lane=id.x;let width=P[0];var sum=0.0;
+ for(var c=lane;c<width;c+=256u){let i=row*width+c;let v=f32(X[i])+f32(Skip[i]);sum+=v*v;Residual[i]=f16(v);}
+ sums[lane]=sum;workgroupBarrier();
+ for(var step=128u;step>0u;step/=2u){if(lane<step){sums[lane]+=sums[lane+step];}workgroupBarrier();}
+ let scale=inverseSqrt(sums[0]/f32(width)+bitcast<f32>(P[2]));
+ for(var c=lane;c<width;c+=256u){let i=row*width+c;Y[i]=f16((f32(X[i])+f32(Skip[i]))*scale*f32(W[c]));}
+}
+)WGSL");
+        });
+        auto group = ex.MakeBindGroup(pipeline, {{0,X->buffer},{1,Skip->buffer},{2,W->buffer},
+            {3,out[0]->buffer},{4,skipOutBuf},{5,paramBuf}});
+        ex.QueueDispatch(pipeline.pipeline,group,static_cast<uint32_t>(nRows),1,1,"skip_rmsnorm_native_f16");
+        return;
+    }
+
     if (!isVaeDecoderNode(n.name) && canUseFp16NormWeights(ex, X, W) && Skip->dtype == TensorDtype::Float32) {
         ex.EnsureGpu(*X);
         ex.EnsureGpu(*Skip);
@@ -329,7 +358,7 @@ static void opLayerNorm(OpContext& ex, const OnnxGraphNode& n,
     if (B && B->IsValid()) { biasBuf = B->buffer; }
     else {
         std::vector<float> zeros((size_t)hiddenDim, 0.0f);
-        biasBuf = ex.getGpu()->createBuffer("ln_b0", hiddenDim * 4);
+        biasBuf = ex.CreateTemporaryBuffer("ln_b0", hiddenDim * 4);
         ex.getGpu()->writeBuffer(biasBuf, zeros.data(), hiddenDim * 4);
     }
 

@@ -343,6 +343,16 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(Path(rewritten[0]).resolve(), Path(__import__("sys").executable).resolve())
         self.assertEqual("--model", rewritten[2])
 
+    def test_daily_refresh_runs_from_control_checkout(self) -> None:
+        self.store.register_machine({"name": "webgfx-104", "fingerprint": {}})
+        refreshes = self.store.ensure_daily_upstream_tasks()
+        self.assertTrue(refreshes)
+        self.assertTrue(all(task["manifest"]["execution_scope"] == "control"
+                            for task in refreshes))
+        self.store.ensure_daily_upstream_tasks()
+        self.assertTrue(all(self.store.get_task(task["id"])["state"] == "proposed"
+                            for task in refreshes))
+
     def test_agent_preserves_non_python_adapter(self) -> None:
         argv = [r"D:\tools\llama-bench.exe", "--model", r"D:\models\qwen.gguf"]
         self.assertEqual(argv, rewrite_python_argv(argv))
@@ -861,6 +871,40 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("valid", shape["validity"])
         self.assertEqual("valid", capture["validity"])
 
+    def test_regression_guard_separates_artifacts_and_measurement_protocols(self) -> None:
+        model = self.store.upsert_model({"id": "protocol-guard", "name": "Protocol", "files": {"ort": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "ort", "format": "onnx", "backend": "webgpu", "conformance": "pass"}
+        def observe(name, rate, **protocol):
+            return self.store.add_observation({**common, "id": name, "metrics": {
+                "prefill_tok_s": rate, "prompt_tokens": 512, "generation_tokens": 128,
+                "graph_capture": False, **protocol}}, "test")
+        observe("legacy-protocol", 100)
+        current = {"artifact_fingerprint": "export-v2", "prompt_sha256": "prompt-a",
+                   "benchmark_protocol": "fixed-v1", "warmup_runs": 1, "max_seq_len": 640,
+                   "decode_sample_tokens": 127, "reuse_generator": True}
+        self.assertEqual("valid", observe("new-export", 60, **current)["validity"])
+        self.assertEqual("quarantined", observe("same-export-drop", 55, **current)["validity"])
+        for key, value in [("artifact_fingerprint", "export-v3"), ("prompt_sha256", "prompt-b"),
+                           ("benchmark_protocol", "fixed-v2"), ("warmup_runs", 2),
+                           ("max_seq_len", 1024), ("decode_sample_tokens", 128), ("reuse_generator", False)]:
+            self.assertEqual("valid", observe("changed-" + key, 30, **{**current, key: value})["validity"])
+
+    def test_confirmed_regression_does_not_mix_identified_protocols(self) -> None:
+        model = self.store.upsert_model({"id": "protocol-confirmed", "name": "Protocol", "files": {"ort": {}}})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "ort", "format": "onnx", "backend": "webgpu", "conformance": "pass"}
+        for name, artifact, rate in [("p1", "old", 100), ("p2", "new", 60), ("p3", "new", 59)]:
+            self.store.add_observation({**common, "id": name, "metrics": {
+                "prefill_tok_s": rate, "prompt_tokens": 128, "generation_tokens": 64,
+                "graph_capture": True, "artifact_fingerprint": artifact}}, "test")
+        self.assertEqual([], self.store.confirmed_regressions())
+        for name, rate in [("p4", 40), ("p5", 39)]:
+            self.store.add_observation({**common, "id": name, "metrics": {
+                "prefill_tok_s": rate, "prompt_tokens": 128, "generation_tokens": 64,
+                "graph_capture": True, "artifact_fingerprint": "new"}}, "test")
+        self.assertEqual(["p4", "p5"], self.store.confirmed_regressions()[0]["confirmed_by"])
+
     def test_backpack_ort_regression_guard_does_not_require_graph_capture(self) -> None:
         model = self.store.upsert_model({"id": "backpack-ort-guard", "name": "Backpack ORT Guard",
                                          "files": {"ort": {}}})
@@ -952,7 +996,7 @@ class FrameworkTest(unittest.TestCase):
           metrics_json TEXT NOT NULL, revision TEXT, artifacts_json TEXT NOT NULL,
           created_at TEXT NOT NULL)""")
         db.execute("INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
-            "legacy", "model", "machine", "llamacpp", "gguf", "vulkan", "pass",
+            "legacy", "model", "machine", "ort", "onnx", "webgpu-native", "pass",
             "{}", "{}", "legacy", "[]", "2026-01-01T00:00:00+00:00"))
         db.commit()
         db.close()
@@ -960,7 +1004,22 @@ class FrameworkTest(unittest.TestCase):
         row = migrated.list_observations({"include_invalid": "true"})[0]
         self.assertEqual("valid", row["validity"])
         self.assertIsNone(row["validity_reason"])
+        self.assertEqual("ort", row["format"])
+        self.assertEqual("webgpu", row["backend"])
         migrated.close()
+
+    def test_onnx_observation_alias_uses_the_ort_series(self) -> None:
+        model = self.store.upsert_model({"id": "onnx-alias", "name": "ONNX alias",
+                                         "files": {"ort": {}}})
+        observation = self.store.add_observation({
+            "model_id": model["id"], "machine_id": self.machine["id"],
+            "framework": "backpack", "format": "onnx", "backend": "webgpu",
+            "conformance": "pass", "metrics": {},
+        }, "test")
+
+        self.assertEqual("ort", observation["format"])
+        self.assertEqual([observation["id"]], [row["id"] for row in
+                         self.store.list_observations({"format": "onnx"})])
 
     def test_valid_latest_measurement_closes_automatic_task(self) -> None:
         model = self.store.upsert_model({"id": "measured", "name": "Measured", "files": {"gguf": {}}})
@@ -1055,6 +1114,26 @@ class FrameworkTest(unittest.TestCase):
             "title": "Profile cared model", "kind": "profiling",
             "hypothesis": "A completed profile identifies the next bottleneck",
             "origin": {"type": "profiling"},
+            "manifest": {"adapter": "argv", "argv": ["profile"]},
+            "device_policy": {"machine_ids": [self.machine["id"]]},
+        }, "test")
+        self.store.ensure_task_runs()
+        run = self.store.list_runs(task["id"])[0]
+        self.store.update_run(run["id"], {
+            "status": "completed", "progress": 100,
+            "result": {"exit_code": 0},
+        }, "agent")
+
+        self.assertEqual(0, self.store.reconcile_completed_tasks())
+        closed = self.store.get_task(task["id"])
+        self.assertEqual("integrated", closed["state"])
+        self.assertEqual("accepted", closed["aggregate_verdict"])
+
+    def test_successful_diagnostic_run_closes_regardless_of_origin(self) -> None:
+        task = self.store.create_task({
+            "title": "Classify a measured performance gap", "kind": "diagnostic",
+            "hypothesis": "A completed diagnostic records the classification",
+            "origin": {"type": "performance-gap"},
             "manifest": {"adapter": "argv", "argv": ["profile"]},
             "device_policy": {"machine_ids": [self.machine["id"]]},
         }, "test")
@@ -1232,7 +1311,7 @@ class FrameworkTest(unittest.TestCase):
         # The reachable device conforms, but the offline one still gates work.
         self.assertTrue(self.store.has_conformance_gaps(True))
 
-        self.store.set_machine_activity(offline["id"], True, "test")
+        self.store.set_machine_activity(offline["id"], True, "test", "worker is offline")
         self.assertFalse(self.store.has_conformance_gaps(True))
         # The unnarrowed question is unchanged: the gap is real, just excused.
         self.assertTrue(self.store.has_conformance_gaps())
@@ -1250,7 +1329,7 @@ class FrameworkTest(unittest.TestCase):
 
         # With every device paused the gate closes again rather than opening
         # vacuously on an empty fleet.
-        self.store.set_machine_activity(self.machine["id"], True, "test")
+        self.store.set_machine_activity(self.machine["id"], True, "test", "maintenance window")
         self.assertTrue(self.store.has_conformance_gaps(True))
 
     def test_regressed_optimization_cannot_advance_to_merge(self) -> None:
@@ -1323,6 +1402,87 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("512", argv[argv.index("--prompt-tokens") + 1])
         self.assertEqual("128", argv[argv.index("--generation-tokens") + 1])
 
+    def test_daily_measurements_wait_for_refresh_and_cover_every_device(self) -> None:
+        server = self.store.register_machine({
+            "name": "webgfx-104", "fingerprint": {"os": "windows", "gpu_vendor": "nvidia"}
+        })
+        self.store.upsert_model({
+            "id": "daily-model", "name": "Daily Model", "cared": True,
+            "files": {"gguf": {"path": r"D:\models\daily.gguf"},
+                      "ort": {"path": r"D:\models\daily-onnx", "native_reference": {
+                          "path": r"D:\models\daily-native-view", "bin_dir": r"D:\runtimes\daily-native"}}},
+            "conformance_spec": {"prompt": "2+2?", "required_fact": "4",
+                                 "expected_output": "4"},
+        })
+        refreshes = self.store.ensure_daily_upstream_tasks()
+        self.assertEqual(2, len(refreshes))
+        self.assertEqual([], self.store.ensure_daily_reference_tasks())
+        with self.store._db:
+            self.store._db.execute("UPDATE tasks SET state='integrated' WHERE id IN (?,?)",
+                                   (refreshes[0]["id"], refreshes[1]["id"]))
+        measurements = self.store.ensure_daily_reference_tasks()
+        self.assertEqual(4, len(measurements))
+        self.assertEqual({self.machine["id"], server["id"]},
+                         {task["origin"]["machine_id"] for task in measurements})
+        self.assertEqual({"llamacpp", "ort"},
+                         {task["manifest"]["runtimes"][0]["framework"] for task in measurements})
+        self.assertTrue(all("--expected-output" in task["manifest"]["argv"]
+                            for task in measurements))
+        ort_tasks = [task for task in measurements
+                     if task["manifest"]["runtimes"][0]["framework"] == "ort"]
+        self.assertFalse(any("--allow-disabled-graph-capture" in task["manifest"]["argv"]
+                             for task in ort_tasks))
+        for task in ort_tasks:
+            argv = task["manifest"]["argv"]
+            self.assertEqual(r"D:\models\daily-onnx", argv[argv.index("--model") + 1])
+            self.assertEqual(r"D:\models\daily-native-view", argv[argv.index("--reference-model") + 1])
+            self.assertEqual(r"D:\runtimes\daily-native", argv[argv.index("--bin-dir") + 1])
+        self.assertEqual([], self.store.ensure_daily_reference_tasks())
+
+    def test_native_reference_routing_preserves_source_model_and_updates_existing_commands(self) -> None:
+        model_id = "qwen3.8-27b"
+        reference = {"path": "D:/models/native-view", "bin_dir": "D:/runtimes/validated", "qwen_static_capture": True}
+        self.store.upsert_model({"id": model_id, "name": "Qwen 3.8", "cared": True,
+            "files": {"ort": {"path": "D:/models/original", "native_reference": reference}},
+            "conformance_spec": {"prompt": "What is2+2?", "required_fact": "4", "expected_output": "4"}})
+        task = self.store.create_task({"title": "Native routing", "kind": "benchmark", "hypothesis": "Valid native path",
+            "origin": {"type": "automatic", "model_id": model_id},
+            "manifest": {"models": [model_id], "runtimes": [{"framework": "ort", "format": "ort"}]}})
+        self.store.ensure_runnable_automatic_tasks()
+        argv = self.store.get_task(task["id"])["manifest"]["argv"]
+        self.assertEqual("D:/models/original", argv[argv.index("--model") + 1])
+        self.assertEqual(reference["path"], argv[argv.index("--reference-model") + 1])
+        self.assertEqual(reference["bin_dir"], argv[argv.index("--bin-dir") + 1])
+
+        self.assertIn("--qwen-static-capture", argv)
+        self.assertNotIn("--allow-disabled-graph-capture", argv)
+        self.assertEqual("4", argv[argv.index("--expected-output") + 1])
+        reference["bin_dir"] = "D:/runtimes/new-validated"
+        self.store.upsert_model({"id": model_id, "name": "Qwen 3.8", "cared": True,
+            "files": {"ort": {"path": "D:/models/original", "native_reference": reference}}})
+        self.store.ensure_runnable_automatic_tasks()
+        self.store.ensure_runnable_automatic_tasks()
+        argv = self.store.get_task(task["id"])["manifest"]["argv"]
+        self.assertEqual(1, argv.count("--reference-model"))
+        self.assertEqual(1, argv.count("--qwen-static-capture"))
+        self.assertEqual(reference["bin_dir"], argv[argv.index("--bin-dir") + 1])
+        with self.store._db:
+            self.store._db.execute("UPDATE tasks SET state='integrated' WHERE id=?", (task["id"],))
+        frozen = list(argv)
+        reference["bin_dir"] = "D:/runtimes/future"
+        self.store.upsert_model({"id": model_id, "name": "Qwen 3.8", "cared": True,
+            "files": {"ort": {"path": "D:/models/original", "native_reference": reference}}})
+        self.store.ensure_runnable_automatic_tasks()
+        self.assertEqual(frozen, self.store.get_task(task["id"])["manifest"]["argv"])
+
+    def test_status_does_not_count_stale_heartbeat_as_online(self) -> None:
+        with self.store._db:
+            self.store._db.execute("UPDATE machines SET last_seen_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+                                   (self.machine["id"],))
+        status = self.store.status()
+        self.assertEqual(0, status["machines_online"])
+        self.assertEqual(1, status["machines_stale"])
+
     def test_device_runs_track_real_execution_state_and_result(self) -> None:
         self.store.ensure_task_runs()
         run = next(item for item in self.store.list_runs() if item["task_id"] == self.task["id"])
@@ -1354,6 +1514,14 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("failed", expired["status"])
         self.assertEqual("timed out", expired["phase"])
         self.assertIn("timeout:", expired["error"])
+
+    def test_idle_claim_poll_refreshes_machine_heartbeat(self) -> None:
+        with self.store._db:
+            self.store._db.execute(
+                "UPDATE machines SET status='online',last_seen_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+                (self.machine["id"],))
+        self.assertIsNone(self.store.claim_run(self.machine["name"], ["argv"], "agent"))
+        self.assertEqual(1, self.store.status()["machines_online"])
 
     def test_worker_claim_is_capability_filtered_and_atomic(self) -> None:
         executable = self.store.create_task({
@@ -1400,10 +1568,14 @@ class FrameworkTest(unittest.TestCase):
             "device_policy": {"machine_ids": [self.machine["id"]]},
         })
         self.store.ensure_task_runs()
-        self.store.set_machine_activity(self.machine["id"], True, "operator")
+        with self.assertRaisesRegex(DomainError, "recorded reason"):
+            self.store.set_machine_activity(self.machine["id"], True, "operator")
+        self.store.set_machine_activity(self.machine["id"], True, "operator", "scheduled maintenance")
         self.store.register_machine({"name": "gpu-1", "fingerprint": {"gpu_vendor": "nvidia"},
                                      "labels": {"role": "required"}})
         self.assertTrue(self.store.get_machine(self.machine["id"])["labels"]["activity_paused"])
+        self.assertEqual("scheduled maintenance",
+                         self.store.get_machine(self.machine["id"])["labels"]["activity_pause_reason"])
         self.assertIsNone(self.store.claim_run("gpu-1", ["argv"], "gpu-1"))
         self.store.set_machine_activity(self.machine["id"], False, "operator")
         claimed = self.store.claim_run("gpu-1", ["argv"], "gpu-1")

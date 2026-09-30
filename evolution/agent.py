@@ -217,7 +217,12 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
     argv = manifest.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
         raise RuntimeError("argv adapter requires a non-empty string array")
-    execution_repo = current_base_worktree(repo)
+    # Control-plane maintenance scripts evolve independently of the accepted
+    # inference base. Runtime/benchmark commands remain pinned to that base;
+    # explicitly marked orchestration runs use the watcher checkout so a new
+    # scheduler is not forced to execute an older copy of itself.
+    execution_repo = (repo if manifest.get("execution_scope") == "control"
+                      else current_base_worktree(repo))
     prior_repair = (run.get("result") or {}).get("codex_repair") or {}
     if prior_repair.get("candidate_sha") and Path(prior_repair.get("worktree", "")).is_dir():
         execution_repo = Path(prior_repair["worktree"])
@@ -292,6 +297,8 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
         if canonical:
             metrics = json.loads(canonical.group(1))
             revision_match = re.search(r"(?m)^(?:RUNTIME|LLAMACPP)_REVISION (\S+)$", completed.stdout)
+            artifact_match = re.search(r"(?m)^RUNTIME_ARTIFACT (.+)$", completed.stdout)
+            command_match = re.search(r"(?m)^RUNTIME_COMMAND (\[.*\])$", completed.stdout)
             conformance_match = re.search(r"(?m)^EVOLUTION_CONFORMANCE (\{.*\})$", completed.stdout)
             conformance = json.loads(conformance_match.group(1)) if conformance_match else {}
             origin = task.get("origin", {})
@@ -305,9 +312,14 @@ def execute_run(server: str, name: str, run: dict[str, Any], repo: Path) -> None
                     "source": f"benchmark task {task.get('id', run['task_id'])}",
                     "prompt": conformance.get("prompt"),
                     "required_fact": conformance.get("required_fact"),
+                    "expected_output": conformance.get("expected_output"),
                     "output": conformance.get("output"),
+                    "conformance_command": conformance.get("command"),
+                    "benchmark_command": json.loads(command_match.group(1)) if command_match else None,
+                    "graph_capture": metrics.get("graph_capture", "not_applicable"),
                 },
-                "metrics": metrics, "artifacts": [],
+                "metrics": metrics,
+                "artifacts": [artifact_match.group(1).strip()] if artifact_match else [],
             }, name)
         rows = re.findall(
             r"(?m)^\s*(\d+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)(?:\s+([0-9.]+)\s+([0-9.]+)%)?\s*$",
@@ -477,7 +489,7 @@ def main(argv: list[str] | None = None) -> int:
     upload = sub.add_parser("upload")
     upload.add_argument("evidence", type=Path)
     sync = sub.add_parser("sync-models")
-    sync.add_argument("--models-dir", type=Path, default=Path(r"D:\workspace\project\agents\ai-models"))
+    sync.add_argument("--models-dir", type=Path, default=Path(__file__).resolve().parents[1] / "gitignore" / "models")
     sync_base_parser = sub.add_parser("sync-base")
     sync_base_parser.add_argument("--repo", type=Path, default=Path.cwd())
     sync_base_parser.add_argument("--worktrees", type=Path)
@@ -486,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
     watch.add_argument("--worktrees", type=Path)
     watch.add_argument("--interval", type=int, default=60)
     args = parser.parse_args(argv)
+    if socket.gethostname().lower() != "webgfx-104" or args.name.lower() != "webgfx-104":
+        parser.error("this goal only permits execution on webgfx-104")
     if args.command == "register":
         labels = dict(item.split("=", 1) for item in args.label)
         result = request_json(args.server + "/api/machines/register", "POST",

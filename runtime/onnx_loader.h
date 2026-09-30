@@ -84,7 +84,7 @@ struct OnnxLoadResult {
         uint32_t weightBytesPerRow = 0, scaleBytesPerRow = 0;
         uint32_t zeroPointBytesPerRow = 0;
     } pleEmbedding;
-    Q8Repacked pleModelProjection;
+    Q8Repacked pleModelProjection{};
     std::vector<float> pleProjectionNorm;
 
     /// LM head weights.

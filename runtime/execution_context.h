@@ -182,6 +182,7 @@ struct ExecutionContext {
     }
 
     void CaptureBegin() {
+        ReleaseCaptured();
         fastDecodeState_ = FastDecodeState::Capturing;
         capturedFlushes_.clear();
         capturedWrites_.clear();
@@ -264,6 +265,12 @@ struct ExecutionContext {
     bool tensorPlanValid_ = false;
     std::vector<GpuTensor> plannedOutputHints_;
     size_t plannedOutputHintCursor_ = 0;
+
+    // Own original allocations independently of tensor views and in-place
+    // dtype conversions. Tensor names alone do not preserve overwritten buffers.
+    std::unordered_map<WGPUBuffer, GPUBuffer> ownedTensorBuffers_;
+    std::vector<GPUBuffer> capturedTemporaryBuffers_;
+    void ReleaseTensorBuffer(GPUBuffer buffer);
 
     /// Invalidate warm execute caches.
     void InvalidateWarmCaches();
@@ -354,6 +361,8 @@ struct OpContext {
                                 const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
 
     GpuTensor AllocTensor(std::vector<int64_t> shape, TensorDtype dtype);
+
+    GPUBuffer CreateTemporaryBuffer(const std::string& name, uint64_t bytes);
 
     GpuTensor AllocCpuTensor(const std::vector<int64_t>& shape, TensorDtype dtype,
                              const void* data, size_t bytes);

@@ -283,7 +283,9 @@ inline bool writeBaselineJson(
     int decodeTokens,
     const std::vector<BenchResultEntry>& results,
     const LoadingInfo* loading = nullptr,
-    const MemoryInfo* memory = nullptr)
+    const MemoryInfo* memory = nullptr,
+    const char* benchmarkProtocol = nullptr,
+    int warmupRuns = -1)
 {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) {
@@ -292,6 +294,11 @@ inline bool writeBaselineJson(
     }
 
     fprintf(f, "{\n");
+    if (benchmarkProtocol) {
+        fprintf(f, "  \"benchmark_protocol\": \"%s\",\n", jsonEscape(benchmarkProtocol).c_str());
+        fprintf(f, "  \"warmup_runs\": %d, \"reuse_generator\": true,\n", warmupRuns);
+        fprintf(f, "  \"prefill_includes_first_token\": true, \"decode_sample_tokens\": %d,\n", std::max(0,decodeTokens-1));
+    }
     fprintf(f, "  \"system\": {\n");
     fprintf(f, "    \"cpu\": \"%s\",\n", jsonEscape(sys.cpu).c_str());
     fprintf(f, "    \"memory_gb\": %llu,\n", (unsigned long long)sys.memoryGB);

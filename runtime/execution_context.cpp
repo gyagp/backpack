@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 
 // Debug label for current op (shared file-scope state — fine for
 // single-threaded interleaved sessions, would need thread_local for
@@ -34,8 +37,15 @@ ExecutionContext::~ExecutionContext() {
     // shutdown releases every underlying buffer exactly once.
     std::set<WGPUBuffer> releasedBuffers;
 
-    // Release captured bind groups
+    // Release captured bind groups and their private temporary allocations.
+    for (const auto& buffer : capturedTemporaryBuffers_)
+        releasedBuffers.insert(buffer.handle);
     ReleaseCaptured();
+
+    for (const auto& [handle, buffer] : ownedTensorBuffers_) {
+        if (releasedBuffers.insert(handle).second) gpu->releaseBuffer(buffer);
+    }
+    ownedTensorBuffers_.clear();
 
     if (fusedLmHeadArgmaxResult_.handle) {
         gpu->releaseBuffer(fusedLmHeadArgmaxResult_);
@@ -192,6 +202,7 @@ void ExecutionContext::QueueCopy(GPUBuffer src, uint64_t srcOffset,
 
 void ExecutionContext::flushToEncoder() {
     if (pendingDispatches_.empty() && pendingCopies_.empty()) return;
+    if (gpu->diagnosticsEnabled) ++gpu->diagnostics.flushes;
 
     // Fast Decode Capture: save AND submit
     if (fastDecodeState_ == FastDecodeState::Capturing) {
@@ -214,6 +225,7 @@ void ExecutionContext::flushToEncoder() {
     }
 
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = gpu->diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
 
     if (!pendingDispatches_.empty()) {
@@ -226,6 +238,7 @@ void ExecutionContext::flushToEncoder() {
                 auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
                 wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+                if (gpu->diagnosticsEnabled) ++gpu->diagnostics.dispatches;
                 wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
                 wgpuComputePassEncoderEnd(pass);
                 wgpuComputePassEncoderRelease(pass);
@@ -236,6 +249,7 @@ void ExecutionContext::flushToEncoder() {
             for (auto& d : pendingDispatches_) {
                 wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+                if (gpu->diagnosticsEnabled) ++gpu->diagnostics.dispatches;
                 wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
             }
             wgpuComputePassEncoderEnd(pass);
@@ -248,7 +262,8 @@ void ExecutionContext::flushToEncoder() {
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(gpu->queue, 1, &cb);
+    gpu->recordEncode(diagnosticEncodeStart);
+    gpu->submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
     for (auto& d : pendingDispatches_)
@@ -314,8 +329,10 @@ void ExecutionContext::ReplayDispatches(bool skipFence) {
     // encoded. Do not "optimize" these submits away.
     for (auto& flush : capturedFlushes_) {
         if (flush.dispatches.empty() && flush.copies.empty()) continue;
+        if (gpu->diagnosticsEnabled) ++gpu->diagnostics.flushes;
 
         WGPUCommandEncoderDescriptor enD{};
+        const auto diagnosticEncodeStart = gpu->diagnosticTimestamp();
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
 
         if (profiling) {
@@ -327,6 +344,7 @@ void ExecutionContext::ReplayDispatches(bool skipFence) {
                 auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
                 wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
+                if (gpu->diagnosticsEnabled) ++gpu->diagnostics.dispatches;
                 wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
                 wgpuComputePassEncoderEnd(pass);
                 wgpuComputePassEncoderRelease(pass);
@@ -337,6 +355,7 @@ void ExecutionContext::ReplayDispatches(bool skipFence) {
             for (auto& cmd : flush.dispatches) {
                 wgpuComputePassEncoderSetPipeline(pass, cmd.pipeline);
                 wgpuComputePassEncoderSetBindGroup(pass, 0, cmd.bindGroup, 0, nullptr);
+                if (gpu->diagnosticsEnabled) ++gpu->diagnostics.dispatches;
                 wgpuComputePassEncoderDispatchWorkgroups(pass, cmd.gx, cmd.gy, cmd.gz);
             }
             wgpuComputePassEncoderEnd(pass);
@@ -348,20 +367,23 @@ void ExecutionContext::ReplayDispatches(bool skipFence) {
 
         WGPUCommandBufferDescriptor cbD{};
         auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        gpu->recordEncode(diagnosticEncodeStart);
+        gpu->submitCommandBuffer(cb);
         wgpuCommandEncoderRelease(enc);
         wgpuCommandBufferRelease(cb);
     }
 
     if (!skipFence && readbackSize_ > 0 && readbackSrc_.handle && readbackDst_.handle) {
         WGPUCommandEncoderDescriptor enD{};
+        const auto diagnosticEncodeStart = gpu->diagnosticTimestamp();
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
         wgpuCommandEncoderCopyBufferToBuffer(enc,
             readbackSrc_.handle, readbackSrc_.offset,
             readbackDst_.handle, readbackDst_.offset, readbackSize_);
         WGPUCommandBufferDescriptor cbD{};
         auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        gpu->recordEncode(diagnosticEncodeStart);
+        gpu->submitCommandBuffer(cb);
         wgpuCommandEncoderRelease(enc);
         wgpuCommandBufferRelease(cb);
         readbackSize_ = 0;
@@ -381,17 +403,40 @@ void ExecutionContext::ReleaseCaptured() {
     capturedWrites_.clear();
     replayParamUpdates_.clear();
     capturedTokenIdBufs_.clear();
+    replayScalarUpdates_.clear();
+    replaySkipBuffers_.clear();
+    for (const auto& buffer : capturedTemporaryBuffers_)
+        gpu->releaseBuffer(buffer);
+    capturedTemporaryBuffers_.clear();
 }
 
 // ─── Warm Execute Cache ─────────────────────────────────────────────────────
 
+void ExecutionContext::ReleaseTensorBuffer(GPUBuffer buffer) {
+    auto owner = ownedTensorBuffers_.find(buffer.handle);
+    if (owner != ownedTensorBuffers_.end()) {
+        // Release the parent allocation, not a smaller/offset tensor view.
+        gpu->releaseBuffer(owner->second);
+        ownedTensorBuffers_.erase(owner);
+    } else {
+        gpu->releaseBuffer(buffer);
+    }
+}
+
 void ExecutionContext::InvalidateWarmCaches() {
+    if (std::getenv("BP_ALLOC_TRACE")) {
+        uint64_t bytes = 0;
+        for (const auto& [handle, buffer] : ownedTensorBuffers_) bytes += buffer.size;
+        fprintf(stderr, "[alloc-owner] invalidate plan=%zu owned=%zu bytes=%llu captured=%zu\n",
+            tensorPlan_.size(), ownedTensorBuffers_.size(), (unsigned long long)bytes,
+            capturedTemporaryBuffers_.size());
+    }
     if (tensorPlanValid_) {
         std::set<WGPUBuffer> released;
         for (auto& [name, alloc] : tensorPlan_) {
             if (alloc.buffer.handle && released.find(alloc.buffer.handle) == released.end()) {
                 released.insert(alloc.buffer.handle);
-                gpu->releaseBuffer(alloc.buffer);
+                ReleaseTensorBuffer(alloc.buffer);
             }
         }
         tensorPlan_.clear();
@@ -400,6 +445,9 @@ void ExecutionContext::InvalidateWarmCaches() {
     shapeCacheValid_ = false;
     shapeCachePopulating_ = false;
     nodeShapeCache_.clear();
+    // These are borrowed aliases of the plan just released. A subsequent
+    // Execute rebuilds the store; destruction must not release them twice.
+    tensorStore_.clear();
 }
 
 // ─── GPU Profiling ──────────────────────────────────────────────────────────
@@ -409,6 +457,8 @@ void ExecutionContext::enableGpuProfiling() {
         fprintf(stderr, "GPU timestamp queries not supported\n");
         return;
     }
+    if (gpuProfiler) { gpuProfiler->destroy(); delete gpuProfiler; gpuProfiler = nullptr; }
+    if (clockCalibration) { delete clockCalibration; clockCalibration = nullptr; }
     gpuProfiler = new GPUProfiler();
     if (!gpuProfiler->init(gpu->device, gpu->instance, gpu->queue)) {
         fprintf(stderr, "Failed to init GPU profiler\n");
@@ -431,11 +481,13 @@ void ExecutionContext::printGpuProfileReport(int nDecodeTokens, double decodeMs,
 
     {
         WGPUCommandEncoderDescriptor enD{};
+        const auto diagnosticEncodeStart = gpu->diagnosticTimestamp();
         auto enc = wgpuDeviceCreateCommandEncoder(gpu->device, &enD);
         gpuProfiler->resolveAndReport(enc);
         WGPUCommandBufferDescriptor cbD{};
         auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-        wgpuQueueSubmit(gpu->queue, 1, &cb);
+        gpu->recordEncode(diagnosticEncodeStart);
+        gpu->submitCommandBuffer(cb);
         wgpuCommandBufferRelease(cb);
         wgpuCommandEncoderRelease(enc);
     }
@@ -466,9 +518,14 @@ void ExecutionContext::printGpuProfileReport(int nDecodeTokens, double decodeMs,
     struct AggEntry { double totalUs = 0; uint32_t count = 0; };
     std::unordered_map<std::string, AggEntry> agg;
     double totalGpuUs = 0;
+    uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max(), lastTimestamp = 0;
+    size_t validTimestamps = 0;
     for (auto& e : gpuProfiler->entries) {
         uint64_t begin = ptr[e.beginIdx], end = ptr[e.endIdx];
         if (end <= begin || begin == 0) continue;
+        firstTimestamp = std::min(firstTimestamp, begin);
+        lastTimestamp = std::max(lastTimestamp, end);
+        ++validTimestamps;
         double durUs = (double)(end - begin) / 1000.0;
         agg[e.name].totalUs += durUs;
         agg[e.name].count++;
@@ -493,6 +550,20 @@ void ExecutionContext::printGpuProfileReport(int nDecodeTokens, double decodeMs,
                 name.c_str(), totalMs, e.count, avgUs, pct);
     }
     double totalGpuMs = totalGpuUs / 1000.0;
+    std::ofstream json(htmlPath + ".json");
+    json << std::setprecision(12) << "{\"tokens\":" << nDecodeTokens
+         << ",\"wall_ms\":" << decodeMs << ",\"gpu_ms\":" << totalGpuMs
+         << ",\"gpu_span_ms\":" << (validTimestamps ? double(lastTimestamp - firstTimestamp) / 1e6 : 0)
+         << ",\"dispatches\":" << gpuProfiler->entries.size()
+         << ",\"valid_timestamp_pairs\":" << validTimestamps << ",\"kernels\":[";
+    bool firstKernel = true;
+    for (const auto& [name, entry] : sorted) {
+        json << (firstKernel ? "" : ",") << "{\"name\":" << std::quoted(name)
+             << ",\"total_ms\":" << entry.totalUs / 1000.0 << ",\"calls\":" << entry.count
+             << ",\"average_us\":" << entry.totalUs / entry.count << "}";
+        firstKernel = false;
+    }
+    json << "]}\n";
     double cpuMs = decodeMs / std::max(1, nDecodeTokens);
     fprintf(stderr, "%-25s %10.2f\n", "GPU TOTAL", totalGpuMs);
     fprintf(stderr, "\nGPU HW time: %.1fms/tok   CPU wall time: %.1fms/tok   Bubble: %.0f%%\n",
@@ -543,7 +614,16 @@ GpuTensor OpContext::AllocTensor(std::vector<int64_t> shape, TensorDtype dtype) 
             return result;
         }
     }
-    return graph.AllocTensor(std::move(shape), dtype);
+    auto tensor = graph.AllocTensor(std::move(shape), dtype);
+    if (tensor.buffer.handle)
+        exec.ownedTensorBuffers_[tensor.buffer.handle] = tensor.buffer;
+    return tensor;
+}
+
+GPUBuffer OpContext::CreateTemporaryBuffer(const std::string& name, uint64_t bytes) {
+    auto buffer = graph.gpu->createBuffer(name, bytes);
+    if (buffer.handle) exec.ownedTensorBuffers_[buffer.handle] = buffer;
+    return buffer;
 }
 
 GpuTensor OpContext::AllocCpuTensor(const std::vector<int64_t>& shape, TensorDtype dtype,
@@ -581,7 +661,10 @@ GpuTensor OpContext::AllocCpuTensor(const std::vector<int64_t>& shape, TensorDty
 }
 
 void OpContext::EnsureGpu(GpuTensor& t) {
+    const bool hadBuffer = t.buffer.handle != nullptr;
     graph.EnsureGpu(t);
+    if (!hadBuffer && t.buffer.handle)
+        exec.ownedTensorBuffers_[t.buffer.handle] = t.buffer;
 }
 
 const OnnxInitData* OpContext::GetInitData(const std::string& name) const {
@@ -603,12 +686,32 @@ void OpContext::Submit(const std::vector<Dispatch>& dispatches) {
     // Direct submissions must not overtake work accumulated by QueueDispatch.
     // WebGPU preserves queue submission order, but pending work has not reached
     // the queue yet until SubmitPending is called.
+    if (exec.fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing ||
+        (exec.gpuProfiler && exec.gpuProfiler->enabled())) {
+        SubmitAsync(dispatches);
+        exec.FlushPendingWork();
+        return;
+    }
     exec.SubmitPending();
     graph.Submit(dispatches);
 }
 
 void OpContext::SubmitAsync(const std::vector<Dispatch>& dispatches) {
     exec.SubmitPending();
+    if (exec.fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing ||
+        (exec.gpuProfiler && exec.gpuProfiler->enabled())) {
+        // Preserve direct-submission boundaries, but retain the operations for
+        // replay. Bypassing this queue froze Where-generated rotary cache rows.
+        if (dispatches.size() != 1) exec.lastCapturedBindings_.clear();
+        for (const auto& dispatch : dispatches) {
+            exec.QueueDispatch(dispatch.pipeline, dispatch.bindGroup, dispatch.gx, dispatch.gy, dispatch.gz,
+                               dispatch.name.c_str());
+            if (!dispatch.capturedBindings.empty())
+                exec.pendingDispatches_.back().capturedBindings = dispatch.capturedBindings;
+        }
+        exec.SubmitPending();
+        return;
+    }
     graph.SubmitAsync(dispatches);
 }
 

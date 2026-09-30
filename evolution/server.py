@@ -113,6 +113,7 @@ class EvolutionServer(ThreadingHTTPServer):
         self.store.ensure_runnable_automatic_tasks()
         self.store.ensure_task_runs()
         self.store.ensure_daily_upstream_tasks()
+        self.store.ensure_daily_reference_tasks()
         studies_path = Path(__file__).with_name("studies.json")
         if studies_path.is_file():
             for study in json.loads(studies_path.read_text(encoding="utf-8")):
@@ -163,6 +164,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(read_goal())
             if path == "/api/activity":
                 self.server.store.ensure_daily_upstream_tasks()
+                self.server.store.ensure_daily_reference_tasks()
                 query = parse_qs(urlparse(self.path).query)
                 return self._send_json(self.server.store.activity(int((query.get("limit") or [40])[0])))
             if path == "/api/tasks":
@@ -368,10 +370,13 @@ class Handler(BaseHTTPRequestHandler):
                 action = body.get("action")
                 if action not in {"pause", "resume"}:
                     raise DomainError("activity action must be pause or resume")
-                result = self.server.store.set_machine_activity(match.group(1), action == "pause", actor)
+                result = self.server.store.set_machine_activity(
+                    match.group(1), action == "pause", actor, str(body.get("reason") or ""))
                 self.server.events.publish("machine-updated", result)
                 return self._send_json(result)
             if path == "/api/machines/provision":
+                if self.server.store.machine_names is not None:
+                    raise DomainError("remote provisioning is disabled for this device-only goal")
                 name = str(body.get("name", "")).strip().lower()
                 if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name):
                     raise DomainError("device name must contain only letters, numbers, and hyphens")
@@ -512,7 +517,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     args = parser.parse_args(argv)
-    store = Store(args.db)
+    # goal.md limits both execution and acceptance to this device. Historical
+    # fleet records remain in the database, but cannot receive new work.
+    store = Store(args.db, machine_names=("webgfx-104",))
     server = EvolutionServer((args.host, args.port), store)
     print(f"Backpack evolution dashboard: http://{args.host}:{args.port}")
     print(f"State database: {args.db}")

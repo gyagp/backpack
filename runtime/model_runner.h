@@ -155,6 +155,10 @@ struct ModelRunner {
         GPUBuffer qOnlyQ4W, qOnlyQ4S, qOnlyQ4Z;
         // K-quant: single buffer per weight (raw block data as u32)
         GPUBuffer qkvKQ, oKQ, guKQ, dnKQ;
+        // Differently quantized gate/up matrices cannot be concatenated.
+        GPUBuffer upKQ;
+        GGUFType upKQType = (GGUFType)UINT32_MAX;
+        uint32_t upKQNBlocks = 0, upKQRowStride = 0;
         GPUBuffer qkvQ4Dense, qkvQ4ScaleMin, oQ4Dense, oQ4ScaleMin;
         GPUBuffer guQ4Dense, guQ4ScaleMin, dnQ4Dense, dnQ4ScaleMin;
         GPUBuffer dnQ6Dense, dnQ6Scale;
@@ -273,6 +277,9 @@ struct ModelRunner {
     bool embeddingGpuIsF16 = false;
     bool embeddingGatherFromQ8 = false;  // gather embeddings from tied Q8 LM head
     bool embeddingGatherFromKQ = false;  // gather embeddings from tied native K-quant LM head
+    GPUBuffer embeddingNative;
+    GGUFType embeddingNativeType = (GGUFType)UINT32_MAX;
+    uint32_t embeddingNativeNBlocks = 0, embeddingNativeRowStride = 0;
     GPUBuffer qOnlyScratchK, qOnlyScratchV;  // discard KV targets for shared-KV layers
     // Per-layer rope/attention param buffers for variable head-dim models
     // (Gemma 4: 256-wide sliding-window layers, 512-wide global layers).

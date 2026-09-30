@@ -30,10 +30,15 @@ def main() -> int:
     parser.add_argument("--prompt")
     parser.add_argument("--required-fact")
     parser.add_argument("--expected-output")
+    parser.add_argument("--prompt-format", choices=("conversation", "qwen-nothink"), default="conversation")
     parser.add_argument("--conformance-tokens", type=int, default=256)
     parser.add_argument("--root", type=Path,
-                        default=Path(r"D:\backup\x64\llamacpp"))
+                        default=Path(__file__).resolve().parents[1] / "gitignore/evolution/backups/llamacpp")
     args = parser.parse_args()
+    args.model = args.model.resolve()
+    args.root = args.root.resolve()
+    if min(args.prompt_tokens, args.generation_tokens, args.repetitions) <= 0:
+        parser.error("prompt tokens, generation tokens, and repetitions must be positive")
 
     versions = sorted(
         (path for path in args.root.glob("b*/vulkan/llama-bench.exe")
@@ -49,10 +54,17 @@ def main() -> int:
         if not completion.exists():
             raise SystemExit(f"llama-completion.exe is missing beside {executable}")
         prompt = args.prompt or "What is 2 + 2?"
-        check_command = [str(completion), "-m", str(args.model), "-p", prompt,
+        formatted_prompt = prompt
+        chat_flags = ["--conversation", "-st", "--jinja", "--reasoning", "off", "--reasoning-budget", "0"]
+        if args.prompt_format == "qwen-nothink":
+            # Official Qwen enable_thinking=false prefix, also used by backpack_llm.
+            formatted_prompt = ("<|im_start|>user\n" + prompt + "<|im_end|>\n"
+                                "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            chat_flags = ["--no-conversation"]
+        check_command = [str(completion), "-m", str(args.model), "-p", formatted_prompt,
                          "--temp", "0", "-ngl", "99", "--no-display-prompt",
-                         "--conversation", "-st", "--jinja", "--reasoning", "off",
-                         "--reasoning-budget", "0", "-n", str(args.conformance_tokens)]
+                         *chat_flags, "-c", str(max(1024, args.prompt_tokens + args.generation_tokens)),
+                         "-n", str(args.conformance_tokens)]
         # Conversation mode reads stdin when a turn ends without stopping. An
         # inherited console blocks that read forever while the process still
         # holds the GPU, which presents as a wedged driver that resists
@@ -68,35 +80,48 @@ def main() -> int:
         print("EVOLUTION_CONFORMANCE " + json.dumps({
             "passed": passed, "prompt": prompt, "required_fact": args.required_fact,
             "expected_output": args.expected_output, "output": output[-4000:],
-            "revision": revision,
+            "revision": revision, "command": check_command,
         }, separators=(",", ":")))
         if not passed:
             return checked.returncode or 2
-    command = [str(executable), "-m", str(args.model), "-p", str(args.prompt_tokens),
-               "-n", str(args.generation_tokens), "-r", str(args.repetitions),
-               "-ngl", "99", "-o", "json"]
-    completed = subprocess.run(command, cwd=executable.parent, text=True, encoding="utf-8",
-                               errors="replace", capture_output=True, timeout=1800, shell=False,
-                               stdin=subprocess.DEVNULL)
-    if completed.returncode:
-        print(completed.stdout)
-        print(completed.stderr)
-        return completed.returncode
-    rows = json.loads(completed.stdout)
-    prefill = next((row for row in rows if int(row.get("n_prompt", 0)) > 0), None)
-    decode = next((row for row in rows if int(row.get("n_gen", 0)) > 0), None)
+    # llama-bench -p P -n G runs independent pp and tg tests; tg starts at
+    # context depth zero. Populate P tokens outside the timed decode region
+    # so the result can be compared with Backpack's decode after prefill.
+    common = [str(executable), "-m", str(args.model), "-r", str(args.repetitions),
+              "-ngl", "99", "-o", "json"]
+    commands = [common + ["-p", str(args.prompt_tokens), "-n", "0", "-d", "0"],
+                common + ["-p", "0", "-n", str(args.generation_tokens), "-d", str(args.prompt_tokens)]]
+    rows = []
+    for command in commands:
+        completed = subprocess.run(command, cwd=executable.parent, text=True, encoding="utf-8",
+                                   errors="replace", capture_output=True, timeout=1800, shell=False,
+                                   stdin=subprocess.DEVNULL)
+        if completed.returncode:
+            print(completed.stdout)
+            print(completed.stderr)
+            return completed.returncode
+        rows.extend(json.loads(completed.stdout))
+    prefill = next((row for row in rows if (row.get("n_prompt"), row.get("n_gen"), row.get("n_depth"))
+                    == (args.prompt_tokens, 0, 0)), None)
+    decode = next((row for row in rows if (row.get("n_prompt"), row.get("n_gen"), row.get("n_depth"))
+                   == (0, args.generation_tokens, args.prompt_tokens)), None)
     if not prefill or not decode:
-        raise SystemExit("llama-bench did not return separate prompt and generation records")
+        raise SystemExit("llama-bench did not return the requested prefill and populated-context decode records")
     metrics = {
         "prompt_tokens": args.prompt_tokens,
         "generation_tokens": args.generation_tokens,
+        "decode_context_tokens": args.prompt_tokens,
         "prefill_tok_s": float(prefill["avg_ts"]),
         "decode_tok_s": float(decode["avg_ts"]),
         "prefill_stddev_tok_s": float(prefill.get("stddev_ts", 0)),
         "decode_stddev_tok_s": float(decode.get("stddev_ts", 0)),
+        "prefill_samples_tok_s": prefill.get("samples_ts", []),
+        "decode_samples_tok_s": decode.get("samples_ts", []),
     }
     print("EVOLUTION_METRICS " + json.dumps(metrics, separators=(",", ":")))
     print(f"LLAMACPP_REVISION {revision}")
+    print(f"RUNTIME_ARTIFACT {executable.parent}")
+    print("RUNTIME_COMMAND " + json.dumps(commands, separators=(",", ":")))
     return 0
 
 

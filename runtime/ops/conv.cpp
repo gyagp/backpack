@@ -3,7 +3,7 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>

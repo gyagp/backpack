@@ -8,7 +8,7 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
@@ -277,10 +277,93 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 )WGSL";
 
+// General Q4 block layout used by the Qwen3.8 gs128 export. Accumulate in
+// f32 while preserving the activation/output and scale storage types.
+static void matMulQ4Blocked(OpContext& ex, const OnnxGraphNode& node,
+                           const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    auto& x = *in[0]; auto& weights = *in[1]; auto& scales = *in[2];
+    auto* zeroPoints = in.size() > 3 && in[3] && in[3]->IsValid() ? in[3] : nullptr;
+    const uint32_t K = static_cast<uint32_t>(node.GetInt("K"));
+    const uint32_t N = static_cast<uint32_t>(node.GetInt("N"));
+    const uint32_t block = static_cast<uint32_t>(node.GetInt("block_size", 32));
+    if (!K || !N || block < 16 || (block & (block - 1)) || x.shape.empty() || x.shape.back() != K ||
+        (x.dtype != TensorDtype::Float16 && x.dtype != TensorDtype::Float32) ||
+        (scales.dtype != TensorDtype::Float16 && scales.dtype != TensorDtype::Float32) ||
+        weights.dtype != TensorDtype::UInt8 || (zeroPoints && zeroPoints->dtype != TensorDtype::UInt8))
+        throw std::runtime_error("Unsupported MatMulNBits Q4 block layout");
+    const uint32_t groups = (K + block - 1) / block;
+    const uint32_t weightStride = groups * (block / 2), zeroStride = (groups + 1) / 2;
+    if (weights.ByteSize() < uint64_t(N) * weightStride || scales.ElementCount() < int64_t(N) * groups ||
+        (zeroPoints && zeroPoints->ByteSize() < uint64_t(N) * zeroStride))
+        throw std::runtime_error("Truncated MatMulNBits Q4 tensors");
+    const uint32_t M = static_cast<uint32_t>(x.ElementCount() / K);
+    auto shape = x.shape; shape.back() = N;
+    *out[0] = ex.AllocTensor(shape, x.dtype);
+    ex.EnsureGpu(x); ex.EnsureGpu(weights); ex.EnsureGpu(scales);
+    if (zeroPoints) ex.EnsureGpu(*zeroPoints);
+    const bool half = x.dtype == TensorDtype::Float16, halfScale = scales.dtype == TensorDtype::Float16;
+    const std::string key = std::string("matmul_q4_blocked_") + (half ? "f16" : "f32") +
+        (halfScale ? "_s16" : "_s32") + (zeroPoints ? "_zp" : "_symmetric");
+    auto& pipeline = ex.GetPipelineT(key, 6, [&] {
+        std::string source = R"WGSL(
+struct Params { M:u32, N:u32, K:u32, block:u32, groups:u32, weight_stride:u32, zero_stride:u32, pad:u32 };
+@group(0) @binding(0) var<storage,read> X:array<X_TYPE>;
+@group(0) @binding(1) var<storage,read> W:array<u32>;
+@group(0) @binding(2) var<storage,read> S:array<S_TYPE>;
+@group(0) @binding(3) var<storage,read> Z:array<u32>;
+@group(0) @binding(4) var<storage,read_write> Y:array<X_TYPE>;
+@group(0) @binding(5) var<uniform> p:Params;
+var<workgroup> sums:array<vec4<f32>,128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) group:vec3<u32>, @builtin(local_invocation_id) id:vec3<u32>) {
+    let row=group.y; let first=group.x*4u; let lane=id.x;
+    var total=vec4<f32>(0.0);
+    for(var k=lane;k<p.K;k+=128u){
+        let x=f32(X[row*p.K+k]); let block=k/p.block;
+        for(var c=0u;c<4u;c++){
+            let n=first+c;
+            if(n<p.N){
+                let byte_index=n*p.weight_stride+k/2u;
+                let quant=i32((W[byte_index/4u]>>((byte_index%4u)*8u+(k%2u)*4u))&15u);
+                var zero=8;
+                if(HAS_ZERO){
+                    let zi=n*p.zero_stride+block/2u;
+                    zero=i32((Z[zi/4u]>>((zi%4u)*8u+(block%2u)*4u))&15u);
+                }
+                total[c]+=x*(f32(quant-zero)*f32(S[n*p.groups+block]));
+            }
+        }
+    }
+    sums[lane]=total;workgroupBarrier();
+    for(var stride=64u;stride>0u;stride/=2u){
+        if(lane<stride){sums[lane]+=sums[lane+stride];}workgroupBarrier();
+    }
+    if(lane==0u){for(var c=0u;c<4u;c++){if(first+c<p.N){Y[row*p.N+first+c]=X_TYPE(sums[0][c]);}}}
+}
+)WGSL";
+        auto replace = [&](const std::string& token, const std::string& value) {
+            size_t at = 0;
+            while ((at = source.find(token, at)) != std::string::npos) { source.replace(at, token.size(), value); at += value.size(); }
+        };
+        replace("X_TYPE", half ? "f16" : "f32"); replace("S_TYPE", halfScale ? "f16" : "f32");
+        replace("HAS_ZERO", zeroPoints ? "true" : "false");
+        return (half || halfScale ? "enable f16;\n" : "") + source;
+    });
+    uint32_t params[8] = {M,N,K,block,groups,weightStride,zeroStride,0};
+    auto param = ex.getParamBuffer(sizeof(params));ex.getGpu()->writeBuffer(param,params,sizeof(params));
+    auto group = ex.MakeBindGroup(pipeline, {{0,x.buffer},{1,weights.buffer},{2,scales.buffer},
+        {3,zeroPoints ? zeroPoints->buffer : weights.buffer},{4,out[0]->buffer},{5,param}});
+    ex.QueueDispatch(pipeline.pipeline,group,(N+3)/4,M,1,"MatMulNBitsQ4Blocked");
+}
+
 static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
                            const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
     auto* X = in[0]; auto* W = in[1]; auto* S = in[2];
     if (!X || !W || !S || !X->IsValid() || !W->IsValid() || !S->IsValid()) return;
+    if (n.GetInt("bits", 4) == 4 && n.GetInt("block_size", 32) != 32) {
+        matMulQ4Blocked(ex, n, in, out);
+        return;
+    }
     // Keep input dtype (fp16 or f32) — the templated kernel handles both
     ex.EnsureGpu(*X);
     ex.EnsureGpu(*W);

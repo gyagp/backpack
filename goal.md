@@ -8,6 +8,14 @@ The current priority models are:
 - Gemma 4 E2B IT QAT
 - Qwen 3.5 2B
 - Qwen 3.5 4B
+- Qwen-Image-3.0 (image generation; verify the exact published model identity)
+- Qwen 3.8 27B (LLM; verify the exact published model identity)
+
+Resolve these requested names against published model metadata before downloading
+or claiming support. Do not silently substitute a different release or size.
+Prefer a usable ONNX artifact; when none is available, start with an Unsloth
+GGUF artifact of the exact model. Record unavailable artifacts and identity
+questions explicitly while continuing work on available cared models.
 
 This list is the present execution focus, not a permanent limit. New models may
 be added to the cared-model set through Goal review as priorities evolve. Every
@@ -15,22 +23,30 @@ newly cared model inherits the same correctness, measurement, regression, and
 milestone requirements below; adding one must not weaken coverage for models
 that remain cared.
 
-The cared devices are `webgfx-104` (server/NVIDIA), `webgfx-103` (AMD), and
-`webgfx-31` (Intel). All three devices must remain productively assigned to
-conformance, measurement, or optimization work unless explicitly stopped or
-blocked with a recorded reason.
+The only cared device for this goal is `webgfx-104` (local NVIDIA GeForce RTX 5080).
+Run model support, applications, conformance, profiling, optimization, and
+reference measurements on this device only. Do not dispatch work, synchronize
+artifacts, or require acceptance evidence on any other device, including
+`webgfx-103` or `webgfx-31`.
 
 ## Required combinations
 
-For every cared model and device, track and validate these independent pairs:
+For every cared model on webgfx-104, track available formats and validate these
+independent pairs where the artifact and reference support the workload:
 
 1. Backpack/WebGPU/GGUF compared with llama.cpp/Vulkan/GGUF.
 2. Backpack/WebGPU/ONNX compared with ORT/WebGPU/ONNX.
 
+An unavailable format remains explicitly pending; GGUF-first enablement must
+not be represented as completed ONNX support. For image generation, llama.cpp
+is not an image-synthesis reference: use a compatible independent reference
+pipeline on webgfx-104 and record its backend, revision, and exact artifacts.
+
 Models are synchronized from `D:\workspace\project\agents\ai-models`.
-Backpack and ORT are built once on webgfx-104, backed up with source revision
-and date, and copied to compatible x64 devices. The latest llama.cpp release is
-downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
+Backpack and ORT are built on webgfx-104 and backed up with source revision
+and date locally. The latest llama.cpp release is downloaded for local use.
+All new downloaded models, build outputs, logs, images, and other generated
+artifacts belong under `gitignore/`; existing external model caches may be read.
 
 ## Acceptance criteria
 
@@ -54,8 +70,8 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
 - The default decision policy remains stricter: a repeatable regression beyond
   2% in a protected metric rejects the candidate unless further measurements
   prove it is noise or an explicitly approved tradeoff.
-- A strong improvement specific to one device is acceptable when the other
-  devices remain conformant and within the neutral/noise band.
+- Accept improvements using conformance and repeated comparable measurements
+  on webgfx-104; other devices are outside this goal's acceptance scope.
 - Base and candidate measurements must use the same prompt length, generated
   token count, model artifact, runtime options, warmup, graph-capture mode, and
   sample method. Incomparable measurements must never be drawn as a regression
@@ -68,6 +84,11 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
 ### Performance direction
 
 - Record prefill TPS and decode TPS separately, with bounded execution time.
+- For image models, record end-to-end image latency, denoising latency per step,
+  peak memory, resolution, step count, seed, scheduler, guidance, and precision.
+  Validate image output and intermediate tensors against the independent
+  reference with documented tolerances before accepting performance results.
+  Do not apply LLM token-throughput metrics to image synthesis.
 - In general, work on the largest validated performance gap first. Rank gaps by
   Backpack's relative deficit against the matching independent reference on the
   same model, device, format, prompt length, generation length, and options:
@@ -130,6 +151,8 @@ downloaded to `D:\backup\x64\llamacpp` and distributed in the same way.
   devices. Run deterministic conformance first, then record standardized
   512-input/128-output prefill and decode TPS with runtime revisions, dates,
   graph-capture mode, commands, and artifacts.
+- Apply the daily image-reference cycle with fixed prompt, seed, resolution,
+  scheduler, guidance, and step count, recording image metrics instead of TPS.
 - Study upstream ONNX Runtime, ONNX Runtime GenAI, llama.cpp, vLLM
   (`https://github.com/vllm-project/vllm`), Modular, and the accumulated
   experience in `docs/` regularly.
@@ -184,8 +207,14 @@ Adapted from the published Gemma collaboration retrospective
   results must be visible promptly; stale or invalid data must be corrected or
   removed.
 - Keep the common LLM application under `apps/` working with every currently
-  cared model and supported format, so a person can run an end-to-end prompt
+  cared LLM and supported format, so a person can run an end-to-end prompt
   and review correctness manually before accepting performance evidence.
+- Complete a usable image-generation application under `apps/` for the requested
+  image model, including model loading, prompt, seed, resolution, step count,
+  image saving, clear errors, and documented runnable commands on webgfx-104.
+- Complete shared LLM chat and benchmark flows for the requested 27B model,
+  including its tokenizer/chat template, bounded generation, and documented
+  commands. Record the actual device memory budget and validated configuration.
 
 ## Milestone gate
 
@@ -197,7 +226,7 @@ A milestone may be pushed and synchronized as the next base only after:
 4. every result is attached to the exact revision and dated artifact; and
 5. the dashboard Tasks, Status, Evolution, Digest, and performance history are
    updated; and
-6. the common application remains conformant for the affected cared models.
+6. the LLM and image applications remain conformant for the affected cared models.
 
-Accepted milestones are pushed automatically, backed up, and synchronized to
-all cared devices as the base for subsequent evolution.
+Accepted milestones are pushed automatically and backed up on webgfx-104 as
+the base for subsequent evolution. No remote-device synchronization is in scope.

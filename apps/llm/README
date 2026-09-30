@@ -1,58 +1,149 @@
-# C++ LLM Application
-#
-# End-to-end text generation using the Backpack public API (backpack.h).
-# Supports all architectures (Gemma 4, Qwen 3.5, Phi-4, LLaMA, etc.) in GGUF and ONNX,
-# plus non-standard architectures (LFM2 conv+MoE) via generic ONNX.
-#
-# ─── Build ────────────────────────────────────────────────────────────────
-#
-#   cd gitignore/runtime/build
-#   cmake ../../../runtime
-#   cmake --build . --config Release
-#
-# This produces:
-#   backpack_llm       - LLM application (this app)
-#   backpack_runtime   - Low-level CLI (advanced profiling/benchmarks)
-#   backpack.lib       - Static library (for custom apps)
-#
-# ─── Usage ────────────────────────────────────────────────────────────────
-#
-# Chat with Phi-4 (ONNX):
-#   ./Release/backpack_llm --model E:/ai-models/phi-4/ --chat "What is 2+2?"
-#
-# Manually check cared-model correctness (ONNX directories or GGUF files):
-#   ./Release/backpack_llm --model E:/ai-models/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf --chat "What is 2+2? Answer with only the number." --max-tokens 8
-#   ./Release/backpack_llm --model E:/ai-models/Qwen3.5-2B/onnx-webgpu --chat "What is 2+2? Answer with only the number." --max-tokens 8
-#   ./Release/backpack_llm --model E:/ai-models/Qwen3.5-4B/onnx-webgpu --chat "What is 2+2? Answer with only the number." --max-tokens 8
-#
-# Raw prompt:
-#   ./Release/backpack_llm --model models/qwen-3/ --prompt "Once upon a time"
-#
-# Benchmark:
-#   ./Release/backpack_llm --model models/phi-4/ --benchmark
-#
-# Save baseline performance:
-#   ./Release/backpack_llm --model models/phi-4/ --save-baseline
-#   ./Release/backpack_llm --model models/phi-4/ --save-baseline results.json
-#
-# All options:
-#   --model <path>       Model path (GGUF file, GGUF dir, or ONNX dir)
-#   --prompt <text>      Raw text prompt
-#   --chat <message>     Chat message (auto-wrapped in ChatML template)
-#   --max-tokens <n>     Max tokens to generate (default: 100)
-#   --backend <name>     GPU backend: vulkan, d3d12, metal
-#   --format <fmt>       Force model format: gguf / onnx
-#   --benchmark          Run prefill+decode benchmark
-#   --profile            Enable GPU timestamp profiling
-#   --save-baseline [path]  Save benchmark to JSON (default: baseline.json)
-#
-# ─── API Quick Start ──────────────────────────────────────────────────────
-#
-#   #include "backpack.h"
-#
-#   auto* model = bp_model_load("models/phi-4/");
-#   auto* ctx   = bp_context_create(model);
-#   bp_generate(ctx, "Hello!", {.maxTokens = 50},
-#       [](const std::string& t) { printf("%s", t.c_str()); return true; });
-#   bp_context_free(ctx);
-#   bp_model_free(model);
+# Backpack LLM
+
+Shared C++ chat and benchmark application for GGUF and supported ONNX models.
+All commands for the active goal run on webgfx-104 (RTX 5080) only.
+
+Build from the repository root:
+
+```powershell
+python -B build.py runtime
+```
+
+The executable is `gitignore/runtime/build/backpack_llm.exe`. Shader embedding
+is automatic; build outputs and generated headers stay under `gitignore/`.
+
+## Qwen3.8-27B on this device
+
+The tested artifact is Unsloth `Qwen3.8-27B-UD-IQ3_S.gguf`, revision
+`4ca720788d1e01f1bff70c033e0d0028fd02e502`. Use the bounded context below:
+
+```powershell
+gitignore/runtime/build/backpack_llm.exe --model gitignore/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf --backend d3d12 --max-seq-len 1024 --max-tokens 128 --chat "Explain why the sky is blue."
+```
+
+`--chat` applies the Qwen non-thinking template with the common system message.
+Windows arguments are converted from UTF-16 to UTF-8, so Chinese prompts also
+work. Generation defaults to deterministic greedy decoding. The app rejects
+requests whose prompt plus generation limit exceeds the configured context.
+
+The runtime keeps the mixed quantized projections and input embedding table
+compressed on the GPU and loads the model's separate output head. The appended
+MTP block is excluded from the 64-layer target decoder; speculative MTP is not
+enabled by this command.
+
+Batched prefill with a native quantized tile is selected automatically for
+this artifact on RTX 5080. At revision `a3d1cc8`, five alternating measurements
+showed 53.90 prefill
+tokens/s and 9.93 decode tokens/s under the earlier 512-input/128-decode-call
+protocol: 4.67x the
+initial prefill rate, with neutral decode and unchanged allocation peak. Both
+serial and batched prefill match the six-prompt llama.cpp conformance corpus.
+The broader performance targets remain open; see `docs/webgfx-104-enablement.md`.
+
+## Qwen3.8-27B ONNX on webgfx-104
+
+The shared application runs the text decoder from
+`amd/Qwen3.8-27B-fp16-ve-fp16-int4-k_quant-gs128-text-onnx`, pinned to revision
+`3d00750aaa18e3e09e0b271a82e7762a4586718f`. Its validated configuration is available in the main workspace build.
+From the workspace root:
+
+```powershell
+gitignore/runtime/build/backpack_llm.exe --model gitignore/models/Qwen3.8-27B-ONNX --backend d3d12 --max-seq-len 640 --prefill-chunk 32 --max-tokens 128 --chat "Explain why the sky is blue in one sentence."
+```
+
+`--prefill-chunk` bounds each generic ONNX prompt batch to control temporary
+memory. The runtime processes the chunks in order, retaining recurrent state
+and attention caches. Whole-prompt capture is disabled for multi-chunk prompts;
+decode capture remains enabled. Reference comparisons must use the same batch
+schedule because FP16 recurrent state is rounded at each batch boundary.
+
+The oversized FP16 embedding table is mapped on the CPU; selected token rows
+are copied to the GPU. Media placeholders are rejected. This is text-only
+enablement on the RTX 5080 using D3D12, without subgroup-matrix operations.
+
+At context capacity 640, the 512-input/128-output diagnostic with 32-token
+batches matches all 128 tokens from the original native ORT WebGPU export.
+Peak logical GPU allocation was 15.15 GiB; live allocation after decode was
+13.40 GiB. These counters exclude free buffer pools and driver staging, and do
+not establish full physical residency. Three complete short sky responses have
+stable live allocations and identical output. The sky response matches the
+higher-accuracy ORT CPU diagnostic; the published accuracy-level-4 reference
+chooses different wording. See `gitignore/logs/qwen38-onnx/` for exact evidence.
+Comparable throughput measurements and performance acceptance remain pending.
+
+## Benchmarks and validation
+
+The `fix/webgfx104-benchmark-protocol` experiment provides exact workload
+measurements in `gitignore/runtime/build/backpack_llm.exe`.
+For example, from the workspace root:
+
+```powershell
+gitignore/runtime/build/backpack_llm.exe --model D:/workspace/project/agents/ai-models/Qwen3.5-2B/onnx-webgpu --backend d3d12 --max-seq-len 640 --benchmark --bench-prompt-len 512 --bench-gen-tokens 128 --bench-warmup 1 --bench-repetitions 5 --bench-json gitignore/logs/qwen2b-exact-benchmark.json
+```
+
+The default workload is 512 space-separated `A` tokens. Supply `--prompt` or
+`--bench-prompt-file` to use different raw text; `--bench-prompt-len` checks the
+actual count. Benchmark text does not acquire an implicit chat/BOS prefix.
+The C++ `BenchmarkTokens` API also accepts an exact token vector.
+
+Each warmup runs a complete workload, then resets before measurement. A
+128-token result contains the first prediction from prefill and exactly 127
+decode calls. No unreported warmup tokens advance the measured context.
+Prefill timing includes the first prediction; native ORT comparisons must add
+its separate first-token sampling time to prompt processing. JSON retains the
+actual prompt/output IDs, counts, final position and per-run timings. Changed
+continuations or WebGPU execution errors fail the benchmark.
+
+Protocol `llm-fixed-text-reuse-first-token-v2` identifies these measurements.
+A bounded generic ONNX batch adds a suffix such as `-chunk32`; compare only
+matching batch schedules. Earlier synthetic-prompt and hidden-decode-warmup
+results are not comparable with this protocol. The benchmark uses the same
+selected prefill path as the application, including `--fast-prefill` where
+explicitly enabled.
+
+```powershell
+gitignore/runtime/build/backpack_llm.exe --model gitignore/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf --backend d3d12 --max-seq-len 1024 --fast-prefill --benchmark --bench-prompt-len 512 --bench-gen-tokens 128 --save-baseline gitignore/logs/qwen38-benchmark.json
+
+python -B benchmarks/validate_qwen_gguf.py --model gitignore/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf --reference gitignore/evolution/backups/llamacpp/b11256/vulkan/llama-completion.exe --include-batched
+```
+
+The benchmark reports prefill and decode separately. Run clean measurements
+without `--profile`; profiling changes timing. The conformance runner stores
+commands, binary hashes, both output streams, and exact-output verdicts under
+`gitignore/logs/`. It executes the two runtimes sequentially.
+
+## Other models and formats
+
+The same executable accepts GGUF files and supported ONNX package directories:
+
+```powershell
+gitignore/runtime/build/backpack_llm.exe --model D:/workspace/project/agents/ai-models/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf --backend d3d12 --chat "Answer with only the number. What is 2 + 2?" --max-tokens 8
+```
+
+The working-tree executable now runs the current Gemma 4 E2B and
+Qwen3.5-2B/4B ONNX packages, using the compatibility fixes validated at `111d7be`.
+The broader performance audit and milestone publication remain pending.
+
+```powershell
+gitignore/runtime/build/backpack_llm.exe --model D:/workspace/project/agents/ai-models/gemma-4-E2B-it/onnx-webgpu --backend d3d12 --max-seq-len 1024 --max-tokens 16 --chat "What is the capital of France?"
+
+gitignore/runtime/build/backpack_llm.exe --model D:/workspace/project/agents/ai-models/Qwen3.5-2B/onnx-webgpu --backend d3d12 --max-seq-len 1024 --max-tokens 32 --chat "Explain why the sky is blue in one sentence."
+```
+
+Gemma matches native ORT CPU/WebGPU on four checked workloads, including a
+520-token recall prompt. Both Qwen models pass exact-answer checks; numerical
+comparisons and capture behavior are documented in `docs/webgfx-104-enablement.md`.
+Qwen3.8 ONNX validation is documented above. Artifact-specific evidence and
+remaining performance gates are retained in `gitignore/logs/qwen38-onnx/`.
+
+On RTX 5080/D3D12, Gemma 4 E2B ONNX prompts longer than 16 tokens now use
+batched prefill by default. The validated 512/128 workload improves prefill
+about 8.1 times while preserving exact output and decode throughput. Set
+`BP_GEMMA_SERIAL_PREFILL=1` to select the previous serial path. GGUF uses its
+existing prefill route. Streaming session reset drains outstanding decode
+readbacks before accepting the next prompt.
+
+Useful options: `--prompt` for already formatted text, `--format gguf|onnx`,
+`--max-tokens`, `--max-seq-len`, `--prefill-chunk`, `--backend`, `--benchmark`, `--bench-prompt-len`,
+`--bench-gen-tokens`, and `--save-baseline <path>`. The C++ API is `bp::Device`
+and `bp::LmSession` in `runtime/backpack.h` and `runtime/lm_session.h`.

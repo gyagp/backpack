@@ -19,6 +19,31 @@ PROTECTED_REGRESSION_PERCENT = 2.0
 BACKPACK_BACKUP_ROOT = Path(r"D:\backup\x64\backpack")
 
 
+def native_reference_arguments(model_entry: dict[str, Any]) -> list[str]:
+    reference = model_entry.get("native_reference")
+    if not reference:
+        return []
+    arguments = ["--reference-model", require(reference.get("path"), "native reference path"),
+                 "--bin-dir", require(reference.get("bin_dir"), "native reference runtime")]
+    if reference.get("qwen_static_capture"):
+        arguments.append("--qwen-static-capture")
+    return arguments
+
+
+def with_native_reference_arguments(argv: list[str], model_entry: dict[str, Any]) -> list[str]:
+    additions = native_reference_arguments(model_entry)
+    if not additions:
+        return argv
+    updated = list(argv)
+    for option in ["--reference-model", "--bin-dir"]:
+        if option in updated:
+            index = updated.index(option)
+            del updated[index:index + 2]
+    if "--qwen-static-capture" in updated:
+        updated.remove("--qwen-static-capture")
+    return updated + additions
+
+
 def latest_backpack_executable(root: Path = BACKPACK_BACKUP_ROOT) -> Path | None:
     candidates = [path for path in root.glob("*-20??????/backpack_llm.exe") if path.is_file()]
     if not candidates:
@@ -173,8 +198,18 @@ JSON_FIELDS = {
 }
 
 
+def canonical_model_format(value: Any) -> str:
+    """Use one identity for ONNX model observations across all runtimes."""
+    normalized = str(value or "gguf").strip().lower()
+    return "ort" if normalized in {"onnx", "ort"} else normalized
+
+
 class Store:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, machine_names: Iterable[str] | None = None):
+        self.machine_names = None if machine_names is None else frozenset(
+            name.strip().lower() for name in machine_names)
+        if self.machine_names is not None and not self.machine_names:
+            raise ValueError("device scope must contain at least one machine")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -195,6 +230,7 @@ class Store:
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS tasks_number_idx ON tasks(task_number)")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='backpack' AND backend='d3d12'")
             self._db.execute("UPDATE observations SET backend='webgpu' WHERE framework='ort' AND backend='webgpu-native'")
+            self._db.execute("UPDATE observations SET format='ort' WHERE lower(format) IN ('onnx','ort') AND format!='ort'")
             observation_columns = {row[1] for row in self._db.execute("PRAGMA table_info(observations)")}
             for name, declaration in (
                     ("validity", "TEXT NOT NULL DEFAULT 'valid'"),
@@ -220,6 +256,28 @@ class Store:
             self._db.execute("CREATE INDEX IF NOT EXISTS evidence_valid_task_idx ON evidence(validity,task_id,machine_id,metric,variant)")
             self._cancel_terminal_task_runs()
         self._backfill_learning_memory()
+        self._cancel_out_of_scope_runs()
+
+    def machine_in_scope(self, name: str) -> bool:
+        return self.machine_names is None or name.strip().lower() in self.machine_names
+
+    def require_machine_in_scope(self, name: str) -> None:
+        if not self.machine_in_scope(name):
+            raise DomainError(f"device {name} is outside the active goal scope")
+
+    def _cancel_out_of_scope_runs(self) -> None:
+        if self.machine_names is None:
+            return
+        with self._lock, self._db:
+            for machine in self._all("SELECT * FROM machines"):
+                if self.machine_in_scope(machine["name"]):
+                    continue
+                for run in self._all("SELECT * FROM task_runs WHERE machine_id=? AND status IN ('pending','blocked')",
+                                     (machine["id"],)):
+                    now = utc_now()
+                    self._db.execute("""UPDATE task_runs SET status='cancelled',phase='outside goal device scope',
+                      completed_at=?,updated_at=? WHERE id=?""", (now, now, run["id"]))
+                    self.audit("run", run["id"], "scope_excluded", "goal", {"machine": machine["name"]})
 
     def _backfill_learning_memory(self) -> None:
         """Migrate existing studies into cursors and hypothesis memory exactly once."""
@@ -429,7 +487,17 @@ class Store:
             configured = task.get("decision_policy", {}).get("protected_metrics")
             protected = (set(configured) if configured is not None else
                          {row["metric"] for row in evaluations})
-            required = set(task.get("device_policy", {}).get("required") or [])
+            # Match the evaluator's resolution of names, IDs, and selectors.
+            # Comparing a hostname directly with evidence machine IDs rejects
+            # otherwise complete evidence for the device-only goal.
+            from .policy import required_machine_ids
+            required, unresolved = required_machine_ids(task, self.list_machines())
+            if not task.get("device_policy", {}).get("required"):
+                # Retrospective/imported accepted evaluations may predate an
+                # explicit device policy; retain their evaluated devices.
+                required = {row["machine_id"] for row in evaluations}
+            if unresolved or not required:
+                raise DomainError("optimization has unresolved required devices")
             evaluated = {(row["machine_id"], row["metric"]) for row in evaluations}
             missing = sorted((machine_id, metric) for machine_id in required
                              for metric in protected if (machine_id, metric) not in evaluated)
@@ -503,6 +571,11 @@ class Store:
         models = self.list_models(cared_only=True)
         machines = self.list_machines()
         if assignable_only:
+            # A requested model with unresolved identity has no executable
+            # artifact yet. Keep it in the full goal audit/matrix, but do not
+            # idle validated models while awaiting that external information.
+            models = [model for model in models if model.get("files") or
+                      model.get("conformance_spec", {}).get("status") != "artifact_identity_pending"]
             assignable = [item for item in machines
                           if not item.get("labels", {}).get("activity_paused")]
             # Falling back to the full fleet keeps the gate closed rather than
@@ -563,6 +636,7 @@ class Store:
         now = utc_now()
         machine_id = data.get("id") or f"machine-{uuid.uuid4().hex[:10]}"
         name = require(data.get("name"), "name")
+        self.require_machine_in_scope(name)
         with self._lock, self._db:
             existing = self._db.execute("SELECT id,labels_json FROM machines WHERE name=?", (name,)).fetchone()
             if existing:
@@ -584,6 +658,7 @@ class Store:
         now = utc_now()
         machine_id = data.get("id") or f"machine-{uuid.uuid4().hex[:10]}"
         name = require(data.get("name"), "name")
+        self.require_machine_in_scope(name)
         status = data.get("status", "offline")
         if status not in {"offline", "unreachable", "maintenance"}:
             raise DomainError("configured machine status must be offline, unreachable, or maintenance")
@@ -610,17 +685,26 @@ class Store:
         return self._row(self._db.execute("SELECT * FROM machines WHERE id=?", (machine_id,)).fetchone())
 
     def list_machines(self) -> list[dict[str, Any]]:
-        return self._all("SELECT * FROM machines ORDER BY name")
+        return [machine for machine in self._all("SELECT * FROM machines ORDER BY name")
+                if self.machine_in_scope(machine["name"])]
 
-    def set_machine_activity(self, machine_id: str, paused: bool, actor: str) -> dict[str, Any]:
+    def set_machine_activity(self, machine_id: str, paused: bool, actor: str,
+                             reason: str = "") -> dict[str, Any]:
         machine = self.get_machine(machine_id)
         if not machine:
             raise DomainError("machine not found")
+        reason = str(reason or "").strip()
+        if paused and not reason:
+            raise DomainError("a recorded reason is required to stop cared-device work")
         labels = {**machine.get("labels", {}), "activity_paused": paused}
+        if paused:
+            labels["activity_pause_reason"] = reason
+        else:
+            labels.pop("activity_pause_reason", None)
         with self._lock, self._db:
             self._db.execute("UPDATE machines SET labels_json=? WHERE id=?", (json_text(labels), machine_id))
             self.audit("machine", machine_id, "activity_paused" if paused else "activity_resumed",
-                       actor, {"device": machine["name"]})
+                       actor, {"device": machine["name"], "reason": reason or None})
         return self.get_machine(machine_id)  # type: ignore[return-value]
 
     def list_todo_dismissals(self) -> list[str]:
@@ -1072,6 +1156,8 @@ class Store:
         """Attach concrete Backpack commands to automatically generated device work."""
         updated = 0
         for task in self.list_tasks():
+            if task["state"] in {"integrated", "observing", "rejected", "failed", "reverted"}:
+                continue
             origin = task.get("origin", {})
             if origin.get("type") not in {"automatic", "continuous-learning", "learning-study"} or task["kind"] not in {"correctness", "benchmark"}:
                 continue
@@ -1080,6 +1166,9 @@ class Store:
                 argv = manifest.get("argv") or []
                 model_id = origin.get("model_id") or next(iter(manifest.get("models") or []), "")
                 model = self.get_model(model_id)
+                if model and any(Path(str(value).replace("\\", "/")).name == "benchmark_ort.py" for value in argv[:3]):
+                    argv = with_native_reference_arguments(argv, model.get("files", {}).get("ort", {}))
+                    manifest = {**manifest, "argv": argv}
                 if task["kind"] in {"correctness", "benchmark"} and model:
                     manifest = {**manifest, "conformance_spec": model.get("conformance_spec", {})}
                 if argv and argv[0] == "gitignore/runtime/build/backpack_llm.exe":
@@ -1123,6 +1212,11 @@ class Store:
                         "--prompt-tokens", str(STATUS_PROMPT_TOKENS),
                         "--generation-tokens", str(STATUS_GENERATED_TOKENS),
                         "--repetitions", "5"]
+                if spec.get("expected_output"):
+                    argv += ["--expected-output", str(spec["expected_output"])]
+                if model_id.startswith("qwen3.5-"):
+                    argv += ["--allow-disabled-graph-capture"]
+                argv = with_native_reference_arguments(argv, model_entry)
             else:
                 backed_up = latest_backpack_executable()
                 executable = str(backed_up) if backed_up else r"D:\workspace\project\backpack\gitignore\runtime\build\backpack_llm.exe"
@@ -1157,8 +1251,9 @@ class Store:
             return []
         existing = {task.get("origin", {}).get("automation_key"): task for task in self.list_tasks()}
         specs = [
-            ("ort-webgpu", "Update ORT and ORT GenAI; build and measure native WebGPU",
-             ["node", r"D:\workspace\project\agents\webgfx-agents\ai-test\scripts\build-ort.js"]),
+            ("ort-webgpu", "Update ORT and ORT GenAI; build native WebGPU on webgfx-104",
+             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+              r"D:\workspace\project\backpack\evolution\refresh_ort.ps1"]),
             ("llamacpp-vulkan", "Download latest llama.cpp Vulkan and refresh reference performance",
              ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
               r"D:\workspace\project\backpack\evolution\refresh_llamacpp.ps1"]),
@@ -1166,9 +1261,39 @@ class Store:
         created = []
         for name, title, argv in specs:
             key = f"daily:{name}:{day}"
+            # An unfinished daily refresh from an older date must not sit ahead
+            # of today's work forever. Preserve its trace, but make the current
+            # dated artifact the only runnable refresh for this source.
+            obsolete = [task for task in self.list_tasks()
+                        if str(task.get("origin", {}).get("automation_key", "")).startswith(
+                            f"daily:{name}:")
+                        and task.get("origin", {}).get("automation_key") != key
+                        and task["state"] not in {"integrated", "rejected", "failed", "reverted"}]
+            for task in obsolete:
+                with self._lock, self._db:
+                    now = utc_now()
+                    self._db.execute("""UPDATE tasks SET state='rejected',aggregate_verdict='superseded',
+                      verdict_reason=?,updated_at=? WHERE id=?""",
+                                     (f"Superseded by {key}", now, task["id"]))
+                    self._cancel_terminal_task_runs(task["id"])
+                    self.audit("task", task["id"], "superseded", "daily-scheduler",
+                               {"replacement": key})
             if key in existing:
                 current = existing[key]
-                manifest = {**current.get("manifest", {}), "adapter": "argv", "argv": argv}
+                if (current["state"] == "rejected"
+                        and current.get("verdict_reason") == f"Superseded by {key}"):
+                    # Repair state written by the original supersession pass,
+                    # which accidentally included today's task itself.
+                    with self._lock, self._db:
+                        now = utc_now()
+                        self._db.execute("""UPDATE tasks SET state='proposed',aggregate_verdict=NULL,
+                          verdict_reason=NULL,updated_at=? WHERE id=?""", (now, current["id"]))
+                        self._db.execute("""UPDATE task_runs SET status='pending',phase='proposed',progress=0,
+                          started_at=NULL,completed_at=NULL,updated_at=? WHERE task_id=? AND status='cancelled'""",
+                                         (now, current["id"]))
+                    current = self.get_task(current["id"])
+                manifest = {**current.get("manifest", {}), "adapter": "argv", "argv": argv,
+                            "execution_scope": "control"}
                 if manifest != current.get("manifest", {}):
                     with self._lock, self._db:
                         self._db.execute("UPDATE tasks SET manifest_json=?,updated_at=? WHERE id=?",
@@ -1178,10 +1303,95 @@ class Store:
                 "title": title, "kind": "maintenance",
                 "hypothesis": "Daily upstream references detect conformance changes and performance regressions early.",
                 "origin": {"type": "scheduled", "automation_key": key, "cadence": "daily", "date": day},
-                "manifest": {"adapter": "argv", "argv": argv, "conformance_first": True,
+                "manifest": {"adapter": "argv", "argv": argv, "execution_scope": "control",
+                             "conformance_first": True,
                              "models": ["gemma-4-e2b-it-qat", "qwen3.5-2b", "qwen3.5-4b"]},
                 "device_policy": {"machine_ids": [server["id"]]},
             }, "daily-scheduler"))
+        if created:
+            self.ensure_task_runs()
+        return created
+
+    def ensure_daily_reference_tasks(self) -> list[dict[str, Any]]:
+        """Queue today's reference measurements after their refresh succeeds.
+
+        Refresh and measurement are deliberately separate tasks: no cared
+        device may benchmark yesterday's binary while webgfx-104 is still
+        building and distributing today's artifact.
+        """
+        day = datetime.now(timezone.utc).date().isoformat()
+        tasks = self.list_tasks()
+        machines = self.list_machines()
+        models = self.list_models(cared_only=True)
+        created: list[dict[str, Any]] = []
+        specs = {
+            "llamacpp-vulkan": {
+                "framework": "llamacpp", "format": "gguf", "backend": "vulkan",
+                "script": str(Path(__file__).with_name("benchmark_llamacpp.py")),
+            },
+            "ort-webgpu": {
+                "framework": "ort", "format": "ort", "backend": "webgpu",
+                "script": str(Path(__file__).with_name("benchmark_ort.py")),
+            },
+        }
+        existing = {task.get("origin", {}).get("automation_key"): task for task in tasks}
+        for source, runtime in specs.items():
+            refresh_key = f"daily:{source}:{day}"
+            refresh = next((task for task in tasks
+                            if task.get("origin", {}).get("automation_key") == refresh_key), None)
+            if not refresh or refresh["state"] != "integrated":
+                continue
+            for model in models:
+                model_entry = model.get("files", {}).get(runtime["format"])
+                if not model_entry or not model_entry.get("path"):
+                    continue
+                spec = model.get("conformance_spec", {})
+                for machine in machines:
+                    argv = ["python", runtime["script"], "--model", model_entry["path"],
+                            "--prompt-tokens", str(STATUS_PROMPT_TOKENS),
+                            "--generation-tokens", str(STATUS_GENERATED_TOKENS),
+                            "--repetitions", "5", "--prompt",
+                            spec.get("prompt", "What is 2 + 2?"), "--required-fact",
+                            spec.get("required_fact", "4")]
+                    if spec.get("expected_output"):
+                        argv += ["--expected-output", str(spec["expected_output"])]
+                    if source == "llamacpp-vulkan" and model["id"].startswith("qwen"):
+                        argv += ["--prompt-format", "qwen-nothink"]
+                    if source == "ort-webgpu" and model["id"].startswith("qwen3.5-"):
+                        argv += ["--allow-disabled-graph-capture"]
+                    if source == "ort-webgpu":
+                        argv = with_native_reference_arguments(argv, model_entry)
+                    key = f"daily-measure:{source}:{day}:{model['id']}:{machine['id']}"
+                    if key in existing:
+                        current = existing[key]
+                        if current["state"] not in {"integrated", "rejected", "failed", "reverted"}:
+                            manifest = {**current.get("manifest", {}), "argv": argv}
+                            if manifest != current.get("manifest", {}):
+                                with self._lock, self._db:
+                                    self._db.execute("UPDATE tasks SET manifest_json=?,updated_at=? WHERE id=?",
+                                                     (json_text(manifest), utc_now(), current["id"]))
+                        continue
+                    task = self.create_task({
+                        "title": (f"Daily {model['name']} {runtime['framework']}/"
+                                  f"{runtime['backend']} measurement on {machine['name']}"),
+                        "kind": "benchmark",
+                        "hypothesis": "Daily deterministic conformance and 512/128 reference throughput must remain current.",
+                        "origin": {"type": "scheduled", "automation_key": key,
+                                   "cadence": "daily", "date": day,
+                                   "model_id": model["id"], "machine_id": machine["id"],
+                                   "refresh_task_id": refresh["id"]},
+                        "manifest": {"adapter": "argv", "argv": argv,
+                                     "models": [model["id"]],
+                                     "metrics": ["prefill_tok_s", "decode_tok_s"],
+                                     "runtimes": [{k: runtime[k] for k in
+                                                   ("framework", "format", "backend")}],
+                                     "conformance_first": True,
+                                     "prompt_tokens": STATUS_PROMPT_TOKENS,
+                                     "generated_tokens": STATUS_GENERATED_TOKENS},
+                        "device_policy": {"machine_ids": [machine["id"]]},
+                    }, "daily-scheduler")
+                    created.append(task)
+                    existing[key] = task
         if created:
             self.ensure_task_runs()
         return created
@@ -1196,11 +1406,18 @@ class Store:
 
     def claim_run(self, machine_name: str, capabilities: list[str], actor: str) -> dict[str, Any] | None:
         """Atomically claim the oldest pending run this worker knows how to execute."""
+        if not self.machine_in_scope(machine_name):
+            return None
         self.expire_stale_runs()
         machine = self._row(self._db.execute(
             "SELECT * FROM machines WHERE lower(name)=lower(?)", (machine_name,)).fetchone())
         if not machine:
             raise DomainError("machine is not registered")
+        # An idle watcher proves liveness by polling for work. Treat every
+        # claim attempt as a heartbeat, including the common no-work response.
+        with self._lock, self._db:
+            self._db.execute("UPDATE machines SET status='online',last_seen_at=? WHERE id=?",
+                             (utc_now(), machine["id"]))
         if machine.get("labels", {}).get("activity_paused"):
             return None
         allowed = {str(item) for item in capabilities}
@@ -1273,6 +1490,7 @@ class Store:
                 self._db.execute("UPDATE machines SET current_run_id=NULL WHERE current_run_id=?", (run_id,))
         if status == "completed":
             self.reconcile_completed_tasks()
+            self.ensure_daily_reference_tasks()
         return self.get_run(run_id)  # type: ignore[return-value]
 
     def expire_stale_runs(self, benchmark_timeout_seconds: int = 1800) -> int:
@@ -1306,9 +1524,22 @@ class Store:
 
     def status(self) -> dict[str, Any]:
         counts = {row["state"]: row["n"] for row in self._db.execute("SELECT state,COUNT(*) n FROM tasks GROUP BY state")}
+        now = datetime.now(timezone.utc)
+        online = 0
+        stale = 0
+        for machine in self.list_machines():
+            try:
+                age = (now - datetime.fromisoformat(machine["last_seen_at"])).total_seconds()
+            except (TypeError, ValueError):
+                age = float("inf")
+            if machine["status"] == "online" and age <= 150:
+                online += 1
+            elif machine["status"] == "online":
+                stale += 1
         return {
             "tasks": counts,
-            "machines_online": self._db.execute("SELECT COUNT(*) FROM machines WHERE status='online'").fetchone()[0],
+            "machines_online": online,
+            "machines_stale": stale,
             "pending_decisions": self._db.execute("SELECT COUNT(*) FROM decisions WHERE status='pending'").fetchone()[0],
             "cared_models": self._db.execute("SELECT COUNT(*) FROM models WHERE cared=1").fetchone()[0],
             "bottlenecks": self.list_bottlenecks(limit=12),
@@ -1367,7 +1598,8 @@ class Store:
             fleet.append({"id": machine["id"], "name": machine["name"],
                           "status": effective, "age_seconds": age_seconds,
                           "gpu": machine.get("fingerprint", {}).get("gpu", "unknown"),
-                          "activity_paused": bool(machine.get("labels", {}).get("activity_paused"))})
+                          "activity_paused": bool(machine.get("labels", {}).get("activity_paused")),
+                          "activity_pause_reason": machine.get("labels", {}).get("activity_pause_reason")})
         tasks = self.list_tasks()
         latest_observations = self.latest_observations()
         all_runs = self.list_runs()
@@ -1490,19 +1722,20 @@ class Store:
             raise DomainError("invalid conformance status")
         observation_id = data.get("id") or f"obs-{uuid.uuid4().hex[:12]}"
         backend = data.get("backend", "webgpu")
+        fmt = canonical_model_format(data.get("format", "gguf"))
         if framework in {"backpack", "ort"} and backend in {"d3d12", "webgpu-native", "webgpu"}:
             backend = "webgpu"
         with self._lock, self._db:
             # Keep baseline selection and insertion in one critical section so
             # simultaneous uploads cannot both bypass the newest valid sample.
             validity, validity_reason = self._observation_validity(
-                data, model_id, machine_id, framework, data.get("format", "gguf"), backend)
+                data, model_id, machine_id, framework, fmt, backend)
             self._db.execute("""INSERT OR IGNORE INTO observations
               (id,model_id,machine_id,framework,format,backend,conformance,
                conformance_details_json,metrics_json,revision,artifacts_json,created_at,
                validity,validity_reason,invalidated_at,invalidated_by)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", (
-                observation_id, model_id, machine_id, framework, data.get("format", "gguf"),
+                observation_id, model_id, machine_id, framework, fmt,
                 backend, conformance,
                 json_text(data.get("conformance_details") or {}), json_text(data.get("metrics") or {}),
                 data.get("revision"), json_text(data.get("artifacts") or []), utc_now(),
@@ -1547,6 +1780,16 @@ class Store:
         left, right = normalize(a), normalize(b)
         return bool(left and right and left == right)
 
+    @staticmethod
+    def _measurement_protocol(row: dict[str, Any]) -> str:
+        # A known export/workload must not be compared to an unidentified old
+        # package at the same mutable path. Two legacy rows remain comparable;
+        # new collectors attach these identities to establish stricter series.
+        keys = ("artifact_fingerprint", "prompt_sha256", "benchmark_protocol",
+                "warmup_runs", "max_seq_len", "decode_sample_tokens", "reuse_generator")
+        metrics, details = row.get("metrics") or {}, row.get("conformance_details") or {}
+        return json_text({key: metrics.get(key, details.get(key)) for key in keys})
+
     def _observation_validity(self, data: dict[str, Any], model_id: str, machine_id: str,
                               framework: str, fmt: str, backend: str) -> tuple[str, str | None]:
         """Quarantine unconfirmed, like-for-like regressions before they affect Status."""
@@ -1583,6 +1826,7 @@ class Store:
                           and row.get("metrics", {}).get("generated_tokens", row.get("metrics", {}).get("decode_tokens",
                               row.get("metrics", {}).get("generation_tokens", row.get("metrics", {}).get("generation_length")))) == generated
                           and self._graph_capture(row, framework, fmt) == capture
+                          and self._measurement_protocol(row) == self._measurement_protocol(data)
                           and conformance_backed(row))]
         if not comparable:
             return "valid", None
@@ -1692,6 +1936,7 @@ class Store:
                                         for item in observations):
                     reason = "Latest matching conformance passes on every cared device"
             elif task["kind"] != "optimization" and (
+                    task["kind"] == "diagnostic" or
                     origin.get("type") in {"scheduled", "profiling"} or (
                         origin.get("type") == "continuous-learning"
                         and task["title"].startswith("Profile "))):
@@ -1771,7 +2016,7 @@ class Store:
         for key, value in filters.items():
             if key in allowed and value:
                 where.append(f"{key}=?")
-                values.append(value)
+                values.append(canonical_model_format(value) if key == "format" else value)
         sql = "SELECT * FROM observations" + (" WHERE " + " AND ".join(where) if where else "")
         return self._all(sql + " ORDER BY created_at DESC,id DESC", tuple(values))
 
@@ -1805,13 +2050,13 @@ class Store:
             metrics = row.get("metrics", {})
             prompt = first_number([metrics.get("prompt_tokens"), metrics.get("prompt_length")])
             generated = first_number([metrics.get("generated_tokens"), metrics.get("decode_tokens"),
-                                      metrics.get("generation_length")])
+                                      metrics.get("generation_tokens"), metrics.get("generation_length")])
             if prompt is None or generated is None:
                 return None
             capture = graph_capture(row)
             if str(row.get("format", "")).lower() in {"onnx", "ort"} and capture is None:
                 return None
-            return prompt, generated, capture or "not_applicable"
+            return prompt, generated, capture or "not_applicable", self._measurement_protocol(row)
 
         for row in rows:
             # Performance is protected only after deterministic correctness has

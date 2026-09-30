@@ -13,7 +13,7 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "../wgsl_template.h"
 #include <cstdio>
 #include <sstream>

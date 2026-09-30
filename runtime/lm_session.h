@@ -31,6 +31,7 @@ struct LmOptions {
     bool fastDecode = true;       ///< Enable fast decode (capture/replay) when supported
     int64_t maxSeqLen = 0;        ///< Max context length (0 = auto from GPU memory)
     bool warmupPipelines = true;  ///< Pre-compile GPU pipelines at load time
+    uint32_t prefillChunkSize = 0; ///< Generic ONNX prompt batch limit (0 = whole prompt)
 };
 
 /// Read-only model metadata (populated at Create time).
@@ -62,6 +63,10 @@ struct BenchmarkResult {
     double decodeTokPerSec = 0;
     double ttftMs = 0;            ///< Time to first token
     double fenceWaitMs = 0;       ///< Time blocked waiting for GPU fences
+    int generatedTokens = 0;     ///< Actual outputs, including prefill's first prediction
+    int decodeSampleTokens = 0;  ///< Actual measured decode calls
+    uint32_t finalPosition = 0;  ///< Processed tokens before the benchmark resets
+    std::vector<int32_t> tokenIds;
 };
 
 /// Callback for streaming token output. Return false to stop generation.
@@ -92,6 +97,8 @@ public:
     // ─── Tokenizer ──────────────────────────────────────────────────────
 
     std::vector<int32_t> Tokenize(const std::string& text) const;
+    /// Encode text without adding a session/chat BOS token.
+    std::vector<int32_t> TokenizeRaw(const std::string& text) const;
     std::string Detokenize(int32_t tokenId) const;
     std::string Detokenize(const std::vector<int32_t>& tokenIds) const;
     int32_t GetEosTokenId() const;
@@ -126,13 +133,26 @@ public:
     /// Reset KV cache / internal state for a new conversation.
     void Reset();
 
+    /// Wait for submitted work, then release unused device buffer-pool storage.
+    /// Returns the released pool bytes; model/state/capture buffers stay live.
+    uint64_t TrimMemory();
+
     /// Current position (number of tokens processed).
     uint32_t GetPosition() const;
 
     // ─── Benchmarking + Profiling ───────────────────────────────────────
 
     BenchmarkResult Benchmark(int promptLen, int genTokens);
+    /// Fixed workload with separate full-workload warmup. Prefill timing includes
+    /// the first prediction; genTokens includes it. Ignores EOS to measure the
+    /// exact requested output count, then resets the conversation.
+    BenchmarkResult BenchmarkTokens(const std::vector<int32_t>& promptTokens,
+                                    int genTokens, int warmupRuns = 1);
     void EnableProfiling();
+    /// Report the workload since EnableProfiling, without executing or resetting
+    /// the session. elapsedMs is the caller-measured instrumented wall time.
+    void FinishProfiling(const std::string& htmlPath, int measuredTokens, double elapsedMs,
+                         bool prefill = false);
     void PrintProfileReport(const std::string& htmlPath = "profile.html");
 
     // ─── Lifecycle ──────────────────────────────────────────────────────

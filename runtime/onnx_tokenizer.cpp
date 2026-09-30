@@ -206,6 +206,9 @@ static const char* skipJsonValue(const char* p, const char* end) {
 // ─── Load from tokenizer.json + config ───────────────────────────────────────
 
 bool OnnxTokenizer::load(const std::string& modelDir) {
+    eos_token_id = -1;
+    bos_token_id = -1;
+    eos_token_ids.clear();
     // Build byte tables
     build_byte_tables(unicode_to_byte_, byte_to_unicode_);
 
@@ -373,6 +376,9 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
                     }
                     if (id >= 0 && !content.empty()) {
                         added_tokens[content] = id;
+                        if (vocab.size() <= (size_t)id) vocab.resize((size_t)id + 1);
+                        vocab[(size_t)id] = content;
+                        token_to_id[content] = id;
                     }
                 }
             }
@@ -388,32 +394,44 @@ bool OnnxTokenizer::load(const std::string& modelDir) {
     }
 
     // 2. Parse config for special tokens
-    std::string cfgPath = (fs::path(modelDir) / "config.json").string();
-    if (!fs::exists(cfgPath))
-        cfgPath = (fs::path(modelDir) / "genai_config.json").string();
-    std::ifstream cfgFile(cfgPath);
-    if (cfgFile.is_open()) {
+    auto addEnd = [&](int32_t id) {
+        if (id >= 0 && std::find(eos_token_ids.begin(), eos_token_ids.end(), id) == eos_token_ids.end())
+            eos_token_ids.push_back(id);
+    };
+    for (const char* filename : {"config.json", "genai_config.json", "generation_config.json", "tokenizer_config.json"}) {
+        std::ifstream cfgFile(fs::path(modelDir) / filename);
+        if (!cfgFile.is_open()) continue;
         std::string cfgStr((std::istreambuf_iterator<char>(cfgFile)),
                             std::istreambuf_iterator<char>());
         cfgFile.close();
         auto cfgJson = json_parse(cfgStr);
-        auto& root = cfgJson.has("model") ? cfgJson["model"] : cfgJson;
+        auto& root = cfgJson.has("model") ? cfgJson["model"] :
+                     cfgJson.has("text_config") ? cfgJson["text_config"] : cfgJson;
 
         if (root.has("eos_token_id")) {
             auto& eos = root["eos_token_id"];
-            if (eos.is_array())
-                eos_token_id = eos[0].as_int();
-            else
-                eos_token_id = eos.as_int();
+            if (eos.is_array()) { for (size_t i=0;i<eos.size();++i) addEnd((int32_t)eos[i].as_int()); }
+            else addEnd((int32_t)eos.as_int());
         }
         if (root.has("bos_token_id"))
             bos_token_id = root["bos_token_id"].as_int();
+        if (root.has("eos_token")) {
+            const auto& value = root["eos_token"];
+            const std::string token = value.is_string() ? value.as_string() : value["content"].as_string();
+            auto found = token_to_id.find(token);
+            if (found != token_to_id.end()) { eos_token_id = found->second; addEnd(eos_token_id); }
+        }
     }
+    if (eos_token_id < 0 && !eos_token_ids.empty()) eos_token_id = eos_token_ids.front();
 
     fprintf(stderr, "  Tokenizer: %zu tokens, %zu merges, %zu added, EOS=%d\n",
            vocab.size(), merge_rank.size(), added_tokens.size(), eos_token_id);
 
     return true;
+}
+
+bool OnnxTokenizer::is_end_token(int32_t id) const {
+    return id == eos_token_id || std::find(eos_token_ids.begin(), eos_token_ids.end(), id) != eos_token_ids.end();
 }
 
 // ─── Decode ──────────────────────────────────────────────────────────────────

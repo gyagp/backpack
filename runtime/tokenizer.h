@@ -50,6 +50,7 @@ struct Tokenizer {
     int32_t bos_token_id = -1;
     bool add_bos_token = false;
     bool add_space_prefix = true;  // SPM only: prefix input with ▁
+    bool qwen35_pre_tokenizer = false;
 
     // --- API ---
 
@@ -71,6 +72,7 @@ private:
 
     // GPT-2 BPE-encode a non-special segment of text.
     std::vector<int32_t> encode_bpe_segment(const std::string& text) const;
+    std::vector<int32_t> encode_bpe_piece(const std::string& text) const;
 
     // Llama-SPM encode a non-special segment of text. Applies ▁ normalization
     // then greedy merge by score.

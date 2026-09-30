@@ -7,6 +7,7 @@
 #include <future>
 #include <thread>
 #include <chrono>
+#include <stdexcept>
 
 // ─── GPUProfiler ─────────────────────────────────────────────────────────────
 
@@ -15,15 +16,19 @@ bool GPUProfiler::init(WGPUDevice dev, WGPUInstance inst, WGPUQueue q) {
     nextIndex = 0;
     entries.clear();
 
-    WGPUQuerySetDescriptor qsd{};
-    qsd.type = WGPUQueryType_Timestamp;
-    qsd.count = MAX_TIMESTAMPS;
-    querySet = wgpuDeviceCreateQuerySet(device, &qsd);
-    if (!querySet) return false;
+    for (uint32_t start = 0; start < MAX_TIMESTAMPS; start += TIMESTAMPS_PER_SET) {
+        WGPUQuerySetDescriptor qsd{};
+        qsd.type = WGPUQueryType_Timestamp;
+        qsd.count = std::min(TIMESTAMPS_PER_SET, MAX_TIMESTAMPS - start);
+        const auto page = wgpuDeviceCreateQuerySet(device, &qsd);
+        if (!page) { destroy(); return false; }
+        querySets.push_back(page);
+    }
+    querySet = querySets.front();
 
     uint64_t bufSize = MAX_TIMESTAMPS * 8;
     WGPUBufferDescriptor bd{};
-    bd.usage = BUF_COPY_SRC | BUF_COPY_DST | BUF_STORAGE;
+    bd.usage = BUF_COPY_SRC | WGPUBufferUsage_QueryResolve;
     bd.size = bufSize;
     resolveBuf = wgpuDeviceCreateBuffer(device, &bd);
 
@@ -36,14 +41,16 @@ bool GPUProfiler::init(WGPUDevice dev, WGPUInstance inst, WGPUQueue q) {
 }
 
 void GPUProfiler::destroy() {
-    if (querySet)    wgpuQuerySetRelease(querySet);
+    for (auto page : querySets) wgpuQuerySetRelease(page);
+    querySets.clear();
     if (resolveBuf)  wgpuBufferRelease(resolveBuf);
     if (readbackBuf) wgpuBufferRelease(readbackBuf);
     querySet = nullptr; resolveBuf = nullptr; readbackBuf = nullptr;
 }
 
 std::pair<uint32_t, uint32_t> GPUProfiler::allocate(const std::string& name) {
-    if (nextIndex + 2 > MAX_TIMESTAMPS) return {0, 0};
+    if (nextIndex + 2 > MAX_TIMESTAMPS)
+        throw std::runtime_error("GPU profile capacity exceeded; profile fewer calls");
     uint32_t b = nextIndex, e = nextIndex + 1;
     nextIndex += 2;
     entries.push_back({name, b, e});
@@ -53,17 +60,18 @@ std::pair<uint32_t, uint32_t> GPUProfiler::allocate(const std::string& name) {
 WGPUPassTimestampWrites GPUProfiler::makeTimestampWrites(
         uint32_t beginIdx, uint32_t endIdx) {
     WGPUPassTimestampWrites tw{};
-    tw.querySet = querySet;
-    tw.beginningOfPassWriteIndex = beginIdx;
-    tw.endOfPassWriteIndex = endIdx;
+    tw.querySet = querySets.at(beginIdx / TIMESTAMPS_PER_SET);
+    tw.beginningOfPassWriteIndex = beginIdx % TIMESTAMPS_PER_SET;
+    tw.endOfPassWriteIndex = endIdx % TIMESTAMPS_PER_SET;
     return tw;
 }
 
 void GPUProfiler::resolveAndReport(WGPUCommandEncoder enc) {
     if (nextIndex == 0) return;
 
-    wgpuCommandEncoderResolveQuerySet(enc, querySet, 0, nextIndex,
-                                       resolveBuf, 0);
+    for (uint32_t start = 0; start < nextIndex; start += TIMESTAMPS_PER_SET)
+        wgpuCommandEncoderResolveQuerySet(enc, querySets.at(start / TIMESTAMPS_PER_SET), 0,
+            std::min(TIMESTAMPS_PER_SET, nextIndex - start), resolveBuf, uint64_t(start) * 8);
     wgpuCommandEncoderCopyBufferToBuffer(enc, resolveBuf, 0,
                                           readbackBuf, 0, nextIndex * 8);
 }
@@ -77,6 +85,7 @@ static std::string sv_str(WGPUStringView sv) {
 // ─── GPUContext::init ────────────────────────────────────────────────────────
 
 bool GPUContext::init(WGPUBackendType backend) {
+    executionError = false;
     backendType = backend;
     adapterName.clear();
     adapterDescription.clear();
@@ -182,7 +191,9 @@ bool GPUContext::init(WGPUBackendType backend) {
         supportsSubgroups = true;
         fprintf(stderr, "  Forcing subgroups feature (0x12)\n");
     }
+#ifndef _WIN32
     tryFeat(supportsSubgroupMatrix, {0x00050034});
+#endif
     tryFeat(supportsTimestampQuery, {0x09});
 
     // Validation toggles: when BACKPACK_DEBUG_VALIDATE=1 in env, enable Dawn
@@ -215,9 +226,12 @@ bool GPUContext::init(WGPUBackendType backend) {
     ddesc.requiredLimits = &adapterLimits;  // request full hardware limits
     ddesc.uncapturedErrorCallbackInfo.callback =
         [](WGPUDevice const*, WGPUErrorType t, WGPUStringView m, void* ud, void*) {
-            const char* n[] = {"OK","Val","OOM","Int","Unk","Lost"};
-            fprintf(stderr, "[DAWN %s] %.*s\n", n[std::min((int)t,5)],
+            const char* kind = t == WGPUErrorType_Validation ? "Val" :
+                t == WGPUErrorType_OutOfMemory ? "OOM" : t == WGPUErrorType_Internal ? "Int" : "Unknown";
+            fprintf(stderr, "[DAWN %s] %.*s\n", kind,
                     (int)m.length, m.data);
+            if (t == WGPUErrorType_Validation || t == WGPUErrorType_OutOfMemory || t == WGPUErrorType_Internal)
+                static_cast<GPUContext*>(ud)->executionError = true;
             // Flag OOM errors so createBuffer can detect failed allocations
             if (t == WGPUErrorType_OutOfMemory) {
                 auto* ctx = static_cast<GPUContext*>(ud);
@@ -326,6 +340,11 @@ int GPUContext::poolBucket(uint64_t size) const {
 
 GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
                                    uint64_t usage, bool mappedAtCreation) {
+    auto traceAllocation = [&](const GPUBuffer& buffer) {
+        if (std::getenv("BP_ALLOC_TRACE"))
+            fprintf(stderr, "[alloc-trace] acquire %p %llu %s\n", (void*)buffer.handle,
+                (unsigned long long)buffer.size, name.c_str());
+    };
     if (std::getenv("BP_EXEC_STATS")) createBufferLabels[name]++;
     // Only pool small transient buffers. Large buffers (weights, embedding,
     // KV cache) live for the whole model lifetime and are never reused, so
@@ -346,6 +365,7 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
             totalAllocCount++;
             if (totalAllocatedBytes > peakAllocatedBytes)
                 peakAllocatedBytes = totalAllocatedBytes;
+            traceAllocation(buf);
             return buf;
         }
         // Round up to bucket size for new allocation
@@ -394,6 +414,7 @@ GPUBuffer GPUContext::createBuffer(const std::string& name, uint64_t size,
     // GraphExecutor::tensorStore_ and would cause name collisions across models.
     if (!name.empty() && name[0] == '_')
         buffers_[name] = buf;
+    traceAllocation(buf);
     return buf;
 }
 
@@ -401,6 +422,9 @@ void GPUContext::releaseBuffer(GPUBuffer buf) {
     if (!buf.handle) return;
     // Don't release aliased buffer views — only the parent buffer is released.
     if (buf.offset != 0) return;
+    if (std::getenv("BP_ALLOC_TRACE"))
+        fprintf(stderr, "[alloc-trace] release %p %llu\n", (void*)buf.handle,
+            (unsigned long long)buf.size);
     if (totalAllocatedBytes >= buf.size)
         totalAllocatedBytes -= buf.size;
     // Only pool small buffers (matches createBuffer's pooling threshold).
@@ -457,27 +481,27 @@ void GPUContext::writeBuffer(GPUBuffer buf, const void* data, uint64_t size,
         const auto* bytes = static_cast<const uint8_t*>(data);
         for (uint64_t done = 0; done < size; done += kUploadChunk) {
             uint64_t chunk = std::min(kUploadChunk, size - done);
-            wgpuQueueWriteBuffer(queue, buf.handle, offset + done, bytes + done, chunk);
+            queueWriteBuffer(buf.handle, offset + done, bytes + done, chunk);
         }
     // WebGPU requires writeBuffer size to be a multiple of 4
     } else
     if (size > 0 && (size & 3)) {
         uint64_t aligned = size & ~(uint64_t)3;
         if (aligned > 0)
-            wgpuQueueWriteBuffer(queue, buf.handle, offset, data, aligned);
+            queueWriteBuffer(buf.handle, offset, data, aligned);
         // Write remaining bytes padded to 4
         uint8_t padded[4] = {0};
         memcpy(padded, (const uint8_t*)data + aligned, (size_t)(size - aligned));
-        wgpuQueueWriteBuffer(queue, buf.handle, offset + aligned, padded, 4);
+        queueWriteBuffer(buf.handle, offset + aligned, padded, 4);
     } else {
-        wgpuQueueWriteBuffer(queue, buf.handle, offset, data, size);
+        queueWriteBuffer(buf.handle, offset, data, size);
     }
     auto t1 = hrc::now();
     timing.write_buf_ns += (t1 - t0).count();
 }
 
 void GPUContext::writeBufferRaw(WGPUBuffer handle, uint64_t offset, const void* data, uint64_t size) {
-    wgpuQueueWriteBuffer(queue, handle, offset, data, size);
+    queueWriteBuffer(handle, offset, data, size);
 }
 
 // ─── Pipelines ───────────────────────────────────────────────────────────────
@@ -669,7 +693,9 @@ WGPUBindGroup GPUContext::createBindGroup(
 
 void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
                             bool singlePass) {
+    if (diagnosticsEnabled && !dispatches.empty()) ++diagnostics.flushes;
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
     if (singlePass) {
@@ -678,6 +704,7 @@ void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
         for (auto& d : dispatches) {
             wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            if (diagnosticsEnabled) ++diagnostics.dispatches;
             wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
         }
         wgpuComputePassEncoderEnd(pass);
@@ -688,6 +715,7 @@ void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
             auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
             wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            if (diagnosticsEnabled) ++diagnostics.dispatches;
             wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
             wgpuComputePassEncoderEnd(pass);
             wgpuComputePassEncoderRelease(pass);
@@ -696,7 +724,8 @@ void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+    submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -708,7 +737,9 @@ void GPUContext::submitOnly(const std::vector<Dispatch>& dispatches,
 
 void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
                                      GPUProfiler& profiler) {
+    if (diagnosticsEnabled && !dispatches.empty()) ++diagnostics.flushes;
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
     for (auto& d : dispatches) {
@@ -719,6 +750,7 @@ void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
         auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
         wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        if (diagnosticsEnabled) ++diagnostics.dispatches;
         wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
@@ -729,7 +761,8 @@ void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+    submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -739,7 +772,9 @@ void GPUContext::submitOnlyProfiled(const std::vector<Dispatch>& dispatches,
 }
 
 void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
+    if (diagnosticsEnabled && !dispatches.empty()) ++diagnostics.flushes;
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
     WGPUComputePassDescriptor cpD{};
@@ -747,6 +782,7 @@ void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
     for (auto& d : dispatches) {
         wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        if (diagnosticsEnabled) ++diagnostics.dispatches;
         wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
     }
     wgpuComputePassEncoderEnd(pass);
@@ -754,7 +790,8 @@ void GPUContext::submitDispatches(const std::vector<Dispatch>& dispatches) {
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+    submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -780,9 +817,11 @@ std::vector<uint8_t> GPUContext::submitAndReadback(
         const std::vector<Dispatch>& dispatches,
         GPUBuffer src, uint64_t readSize,
         bool passPerDispatch) {
+    if (diagnosticsEnabled && !dispatches.empty()) ++diagnostics.flushes;
     auto rb = getOrCreateReadbackBuf(readSize);
 
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
     if (passPerDispatch) {
@@ -792,6 +831,7 @@ std::vector<uint8_t> GPUContext::submitAndReadback(
             auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
             wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            if (diagnosticsEnabled) ++diagnostics.dispatches;
             wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
             wgpuComputePassEncoderEnd(pass);
             wgpuComputePassEncoderRelease(pass);
@@ -803,6 +843,7 @@ std::vector<uint8_t> GPUContext::submitAndReadback(
         for (auto& d : dispatches) {
             wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            if (diagnosticsEnabled) ++diagnostics.dispatches;
             wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
         }
         wgpuComputePassEncoderEnd(pass);
@@ -813,7 +854,8 @@ std::vector<uint8_t> GPUContext::submitAndReadback(
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+    submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -827,8 +869,7 @@ std::vector<uint8_t> GPUContext::submitAndReadback(
     };
     mcb.userdata1 = &ms;
     auto mf = wgpuBufferMapAsync(rb, 1 /*READ*/, 0, readSize, mcb);
-    WGPUFutureWaitInfo mw{mf, 0};
-    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
+    waitForMap(mf);
 
     std::vector<uint8_t> out(readSize);
     if (ms.status == 1 /*Success*/) {
@@ -843,11 +884,13 @@ std::vector<uint8_t> GPUContext::readBuffer(GPUBuffer src, uint64_t readSize) {
     auto rb = getOrCreateReadbackBuf(readSize);
 
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
     wgpuCommandEncoderCopyBufferToBuffer(enc, src.handle, src.offset, rb, 0, readSize);
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+    submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -860,8 +903,7 @@ std::vector<uint8_t> GPUContext::readBuffer(GPUBuffer src, uint64_t readSize) {
     };
     mcb.userdata1 = &ms;
     auto mf = wgpuBufferMapAsync(rb, 1, 0, readSize, mcb);
-    WGPUFutureWaitInfo mw{mf, 0};
-    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
+    waitForMap(mf);
 
     std::vector<uint8_t> out(readSize);
     if (ms.status == 1) {
@@ -883,8 +925,7 @@ std::vector<uint8_t> GPUContext::mapReadbackBuffer(uint64_t readSize) {
     };
     mcb.userdata1 = &ms;
     auto mf = wgpuBufferMapAsync(rb, 1, 0, readSize, mcb);
-    WGPUFutureWaitInfo mw{mf, 0};
-    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
+    waitForMap(mf);
     std::vector<uint8_t> out(readSize);
     if (ms.status == 1) {
         auto ptr = wgpuBufferGetConstMappedRange(rb, 0, readSize);
@@ -898,9 +939,11 @@ std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
         const std::vector<Dispatch>& dispatches,
         GPUBuffer src, uint64_t readSize,
         GPUProfiler& profiler) {
+    if (diagnosticsEnabled && !dispatches.empty()) ++diagnostics.flushes;
     auto rb = getOrCreateReadbackBuf(readSize);
 
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
     // Each dispatch gets its own compute pass with timestamp writes
@@ -912,6 +955,7 @@ std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
         auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
         wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        if (diagnosticsEnabled) ++diagnostics.dispatches;
         wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
@@ -924,7 +968,8 @@ std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
 
     WGPUCommandBufferDescriptor cbD{};
     auto cb = wgpuCommandEncoderFinish(enc, &cbD);
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+    submitCommandBuffer(cb);
     wgpuCommandEncoderRelease(enc);
     wgpuCommandBufferRelease(cb);
 
@@ -938,8 +983,7 @@ std::vector<uint8_t> GPUContext::submitAndReadbackProfiled(
     };
     mcb.userdata1 = &ms;
     auto mf = wgpuBufferMapAsync(rb, 1, 0, readSize, mcb);
-    WGPUFutureWaitInfo mw{mf, 0};
-    wgpuInstanceWaitAny(instance, 1, &mw, UINT64_MAX);
+    waitForMap(mf);
 
     std::vector<uint8_t> out(readSize);
     if (ms.status == 1) {
@@ -954,10 +998,12 @@ WGPUFuture GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatche
                                            GPUBuffer src, uint64_t readSize,
                                            WGPUBuffer stagingBuf,
                                            bool passPerDispatch) {
+    if (diagnosticsEnabled && !dispatches.empty()) ++diagnostics.flushes;
     using hrc = std::chrono::high_resolution_clock;
     auto t0 = hrc::now();
 
     WGPUCommandEncoderDescriptor enD{};
+    const auto diagnosticEncodeStart = diagnosticTimestamp();
     auto enc = wgpuDeviceCreateCommandEncoder(device, &enD);
 
     if (passPerDispatch) {
@@ -966,6 +1012,7 @@ WGPUFuture GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatche
             auto pass = wgpuCommandEncoderBeginComputePass(enc, &cpD);
             wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            if (diagnosticsEnabled) ++diagnostics.dispatches;
             wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
             wgpuComputePassEncoderEnd(pass);
             wgpuComputePassEncoderRelease(pass);
@@ -976,6 +1023,7 @@ WGPUFuture GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatche
         for (auto& d : dispatches) {
             wgpuComputePassEncoderSetPipeline(pass, d.pipeline);
             wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+            if (diagnosticsEnabled) ++diagnostics.dispatches;
             wgpuComputePassEncoderDispatchWorkgroups(pass, d.gx, d.gy, d.gz);
         }
         wgpuComputePassEncoderEnd(pass);
@@ -991,7 +1039,9 @@ WGPUFuture GPUContext::submitAndCopyAsync(const std::vector<Dispatch>& dispatche
     auto t1 = hrc::now();
     timing.encode_ns += (t1 - t0).count();
 
-    wgpuQueueSubmit(queue, 1, &cb);
+    recordEncode(diagnosticEncodeStart);
+
+    submitCommandBuffer(cb);
 
     auto t2 = hrc::now();
     timing.submit_ns += (t2 - t1).count();
@@ -1017,8 +1067,7 @@ int32_t GPUContext::completeAsyncMapI32(WGPUBuffer stagingBuf, WGPUFuture future
     auto t0 = hrc::now();
 
     // Wait for the pending map to complete
-    WGPUFutureWaitInfo fw{future, 0};
-    wgpuInstanceWaitAny(instance, 1, &fw, UINT64_MAX);
+    waitForMap(future);
 
     auto t1 = hrc::now();
     timing.wait_ns += (t1 - t0).count();
@@ -1035,6 +1084,7 @@ int32_t GPUContext::completeAsyncMapI32(WGPUBuffer stagingBuf, WGPUFuture future
 }
 
 void GPUContext::waitForQueue() {
+    const auto begin = diagnosticTimestamp();
     struct { bool done; } s{false};
     WGPUBufferMapCallbackInfo cb{};  // same struct layout as QueueWorkDoneCallbackInfo
     cb.mode = WGPUCallbackMode_WaitAnyOnly;
@@ -1048,4 +1098,37 @@ void GPUContext::waitForQueue() {
         *reinterpret_cast<WGPUQueueWorkDoneCallbackInfo*>(&cb));
     WGPUFutureWaitInfo w{f, 0};
     wgpuInstanceWaitAny(instance, 1, &w, UINT64_MAX);
+    if (diagnosticsEnabled) {
+        ++diagnostics.queueWaits;
+        diagnostics.queueWaitNs += diagnosticTimestamp() - begin;
+    }
+}
+
+void GPUContext::submitCommandBuffer(WGPUCommandBuffer buffer) {
+    const auto begin = diagnosticTimestamp();
+    wgpuQueueSubmit(queue, 1, &buffer);
+    if (diagnosticsEnabled) {
+        ++diagnostics.submits;
+        diagnostics.submitNs += diagnosticTimestamp() - begin;
+    }
+}
+
+void GPUContext::queueWriteBuffer(WGPUBuffer buffer, uint64_t offset, const void* data, uint64_t size) {
+    const auto begin = diagnosticTimestamp();
+    wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+    if (diagnosticsEnabled) {
+        ++diagnostics.writes;
+        diagnostics.writeBytes += size;
+        diagnostics.writeNs += diagnosticTimestamp() - begin;
+    }
+}
+
+void GPUContext::waitForMap(WGPUFuture future) {
+    const auto begin = diagnosticTimestamp();
+    WGPUFutureWaitInfo wait{future, 0};
+    wgpuInstanceWaitAny(instance, 1, &wait, UINT64_MAX);
+    if (diagnosticsEnabled) {
+        ++diagnostics.mapWaits;
+        diagnostics.mapWaitNs += diagnosticTimestamp() - begin;
+    }
 }

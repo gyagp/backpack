@@ -6,7 +6,7 @@
  */
 
 #include "graph_executor.h"
-#include "wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "wgsl_template.h"
 
 #include <algorithm>
@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <set>
 #include <unordered_set>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
@@ -492,8 +493,9 @@ static PBValueInfo parseValueInfo(PBReader& r) {
 
 // ─── Load ONNX Model ────────────────────────────────────────────────────────
 
-bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
+bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath, bool uploadInitializers) {
     gpu = &gpuCtx;
+    initializersUploaded = uploadInitializers;
     auto t0 = std::chrono::steady_clock::now();
 
     // Memory-map .onnx file
@@ -703,8 +705,8 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
     int uploaded = 0, nodata = 0;
     for (auto& t : initTensors) {
         if ((uploaded % 50) == 0 || t.rawSize >= 16u * 1024u * 1024u) {
-            fprintf(stderr, "  Uploading initializer %d/%zu: %s (%.1f MB)\n",
-                    uploaded + 1, initTensors.size(), t.name.c_str(),
+            fprintf(stderr, "  %s initializer %d/%zu: %s (%.1f MB)\n",
+                    uploadInitializers ? "Uploading" : "CPU-mapping", uploaded + 1, initTensors.size(), t.name.c_str(),
                     t.rawSize / (1024.0 * 1024.0));
             fflush(stderr);
         }
@@ -732,6 +734,10 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             }
         }
         if (!t.rawData || t.rawSize == 0) {
+            if (!t.extLocation.empty() && std::find(t.dims.begin(), t.dims.end(), 0) == t.dims.end()) {
+                fprintf(stderr, "Missing external initializer data: %s (%s)\n", t.name.c_str(), t.extLocation.c_str());
+                return false;
+            }
             nodata++;
             if (nodata <= 3)
                 fprintf(stderr, "    [nodata] '%s' dims=%zu rawSize=%zu extLoc='%s' extOff=%lld\n",
@@ -751,6 +757,21 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
             continue;
         }
         auto dtype = fromOnnxDtype(t.dataType);
+        if (!uploadInitializers) {
+            // Raw tensor bytes reside in the retained model/data mappings.
+            // Typed inline payloads need owned storage after this loop returns.
+            GpuTensor tensor;
+            tensor.shape = t.dims;
+            tensor.dtype = dtype;
+            tensor.isCpuOnly = true;
+            if (!inlineDataBuf.empty()) tensor.cpuData = std::move(inlineDataBuf);
+            weightStore_[t.name] = std::move(tensor);
+            const auto& owned = weightStore_[t.name].cpuData;
+            graph_.initializers[t.name] = {owned.empty() ? t.rawData : owned.data(), t.rawSize, dtype, t.dims};
+            persistentTensors_.insert(t.name);
+            ++uploaded;
+            continue;
+        }
 
         // For small tensors, keep as CPU-only (avoid GPU buffer alignment issues)
         int64_t nel = 1; for (auto d : t.dims) nel *= d;
@@ -842,7 +863,8 @@ bool GraphExecutor::Load(GPUContext& gpuCtx, const std::string& onnxPath) {
         uploaded++;
     }
 
-    fprintf(stderr, "  %d initializers uploaded; pipelines compile lazily\n", uploaded);
+    fprintf(stderr, "  %d initializers %s; pipelines compile lazily\n", uploaded,
+            uploadInitializers ? "uploaded" : "mapped on CPU");
     fflush(stderr);
     auto warmupT0 = std::chrono::steady_clock::now();
     // Eagerly creating every generic pipeline can serialize for many minutes
@@ -1009,6 +1031,7 @@ void GraphExecutor::Execute(
         const std::unordered_map<std::string, GpuTensor*>& inputs,
         std::unordered_map<std::string, GpuTensor*>& outputs) {
 
+    if (!initializersUploaded) throw std::runtime_error("Cannot execute a metadata-only ONNX graph");
     // Initialize per-session GPU context
     ctx.gpu = gpu;
     ctx.profilingEnabled = profilingEnabled;
@@ -1296,6 +1319,8 @@ void GraphExecutor::Execute(
         // If this is the first node of a fused group, dispatch the fused kernel
         if (auto fIt = fusedGroups_.find(ni); fIt != fusedGroups_.end()) {
             auto& group = fIt->second;
+            g_currentOpLabel = "Fused:" + group.pipelineName;
+            g_currentOp = g_currentOpLabel.c_str();
             bool ok = true;
 
             // Resolve external inputs
@@ -1325,7 +1350,7 @@ void GraphExecutor::Execute(
                         ok = false;
                         break;
                     }
-                    EnsureGpu(*input);
+                    opCtx.EnsureGpu(*input);
                     extBuffers.push_back(input->buffer);
                     extShapes.push_back(input->shape);
                 }
@@ -1337,6 +1362,8 @@ void GraphExecutor::Execute(
                 // Ensure output tensor exists (last node's output) in per-session store
                 auto& outTensor = ctx.tensorStore_[group.outputName];
                 outTensor = AllocTensor(primaryShape, dtype);
+                if (outTensor.buffer.handle)
+                    ctx.ownedTensorBuffers_[outTensor.buffer.handle] = outTensor.buffer;
 
                 // Build pipeline with dtype suffix
                 std::string pname = group.pipelineName + dtypeSuffix(dtype);
@@ -1492,10 +1519,7 @@ void GraphExecutor::Execute(
                 ctx.pendingReleases_.clear();
             }
         } else {
-            if (skipped < 5)
-                fprintf(stderr, "  [exec] UNIMPL op: %s (%s)\n",
-                        node.opType.c_str(), node.name.c_str());
-            skipped++;
+            throw std::runtime_error("Unsupported ONNX operator: " + node.opType + " (" + node.name + ")");
         }
     }
 
@@ -1505,7 +1529,8 @@ void GraphExecutor::Execute(
     for (auto& [name, tensor] : outputs) {
         auto* srcTensor = findTensor(name);
         if (srcTensor && srcTensor->IsValid()) {
-            size_t outBytes = srcTensor->ByteSize();
+            // WebGPU copies whole words; include tensor allocation padding for odd fp16 outputs.
+            size_t outBytes = (srcTensor->ByteSize() + 3) & ~size_t(3);
             if (outBytes == 0) outBytes = 4;
             if (tensor && tensor->buffer.handle && srcTensor->buffer.handle &&
                 tensor->buffer.handle != srcTensor->buffer.handle &&
@@ -1652,7 +1677,7 @@ void GraphExecutor::Execute(
                     keepHandles.find(it->second.buffer.handle) == keepHandles.end() &&
                     released.find(it->second.buffer.handle) == released.end()) {
                     released.insert(it->second.buffer.handle);
-                    gpu->releaseBuffer(it->second.buffer);
+                    ctx.ReleaseTensorBuffer(it->second.buffer);
                 }
                 it = ctx.tensorStore_.erase(it);
             }
@@ -1672,6 +1697,39 @@ void GraphExecutor::Execute(
             it->second.cpuData = std::move(saved.cpuData);
             it->second.isCpuOnly = saved.isCpuOnly;
         }
+    }
+
+    // Allocation ownership is independent of the final tensor handles: casts,
+    // aliases, dynamic shapes and op-local scratch can replace those handles.
+    // Transfer returned buffers to the caller and retain the warm plan. Capture
+    // owns its additional buffers until every corresponding command is released.
+    std::set<WGPUBuffer> returnedHandles, plannedHandles;
+    for (const auto& [name, tensor] : outputs)
+        if (tensor && tensor->buffer.handle) returnedHandles.insert(tensor->buffer.handle);
+    for (const auto& [name, allocation] : ctx.tensorPlan_)
+        if (allocation.buffer.handle) plannedHandles.insert(allocation.buffer.handle);
+    std::set<WGPUBuffer> retiredHandles;
+    for (auto it = ctx.ownedTensorBuffers_.begin(); it != ctx.ownedTensorBuffers_.end();) {
+        if (plannedHandles.count(it->first)) { ++it; continue; }
+        if (returnedHandles.count(it->first) && std::getenv("BP_ALLOC_TRACE")) {
+            for (const auto& [name, tensor] : outputs)
+                if (tensor && tensor->buffer.handle == it->first)
+                    fprintf(stderr, "[alloc-owner] returned %p %llu %s\n", (void*)it->first,
+                        (unsigned long long)it->second.size, name.c_str());
+        }
+        if (!returnedHandles.count(it->first)) {
+            if (ctx.fastDecodeState_ == ExecutionContext::FastDecodeState::Capturing)
+                ctx.capturedTemporaryBuffers_.push_back(it->second);
+            else {
+                gpu->releaseBuffer(it->second);
+                retiredHandles.insert(it->first);
+            }
+        }
+        it = ctx.ownedTensorBuffers_.erase(it);
+    }
+    for (auto it = ctx.tensorStore_.begin(); it != ctx.tensorStore_.end();) {
+        if (retiredHandles.count(it->second.buffer.handle)) it = ctx.tensorStore_.erase(it);
+        else ++it;
     }
 
     // Print profiling report

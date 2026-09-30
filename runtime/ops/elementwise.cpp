@@ -8,7 +8,7 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
@@ -544,27 +544,9 @@ static void opCast(OpContext& ex, const OnnxGraphNode& n,
         case 9: outDtype = TensorDtype::Bool; break;
     }
 
-    // Qwen 3.5 exports two fp32 -> fp16 casts per recurrent layer even
-    // though the native WebGPU consumers immediately promote those values
-    // back to fp32. Preserve the accumulation dtype across these exact graph
-    // edges, avoiding a lossy round-trip and three transient buffers/layer.
-    const bool redundantQwenRecurrentCast =
-        A->dtype == TensorDtype::Float32 && outDtype == TensorDtype::Float16 &&
-        n.name.find("/linear_attn/") != std::string::npos &&
-        (n.name.find("/decay/g_cast/Cast") != std::string::npos ||
-         n.name.find("/gated_norm/gated/Cast") != std::string::npos);
-    // Qwen's exported mRoPE subgraphs similarly cast their fp32 Q/K results
-    // to fp16 directly before GroupQueryAttention.  Backpack's native GQA
-    // computes in fp32 and would immediately allocate buffers to promote both
-    // inputs again.  Keep these exact graph edges in their accumulation type.
-    const bool redundantQwenGqaCast =
-        A->dtype == TensorDtype::Float32 && outDtype == TensorDtype::Float16 &&
-        (n.name.find("/attn/q_mrope/output/Cast") != std::string::npos ||
-         n.name.find("/attn/k_mrope/output/Cast") != std::string::npos);
-    if (redundantQwenRecurrentCast || redundantQwenGqaCast) {
-        *out[0] = *A;
-        return;
-    }
+    // Preserve explicit floating-point cast boundaries. Keeping these graph
+    // edges in f32 can feed f32 storage into an f16 residual/norm shader when
+    // a quantized projection preserves its declared f16 output type.
 
     // Same type → alias
     if (outDtype == A->dtype) {
@@ -598,7 +580,7 @@ static void opCast(OpContext& ex, const OnnxGraphNode& n,
                 auto& pl = ex.GetPipelineT("cast_f32_to_f16", 3, []() { return std::string(WGSL_CAST_F32_TO_F16); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, A->buffer}, {1, out[0]->buffer}, {2, params}});
-                ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "cast_f32_to_f16"}});
+                ex.QueueDispatch(pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "cast_f32_to_f16");
                 return;
             }
             if (A->dtype == TensorDtype::Float16 && outDtype == TensorDtype::Float32) {
@@ -608,7 +590,7 @@ static void opCast(OpContext& ex, const OnnxGraphNode& n,
                 auto& pl = ex.GetPipelineT("cast_f16_to_f32", 3, []() { return std::string(WGSL_CAST_F16_TO_F32); });
                 auto bg = ex.MakeBindGroup(pl, {
                     {0, A->buffer}, {1, out[0]->buffer}, {2, params}});
-                ex.SubmitAsync({{pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "cast_f16_to_f32"}});
+                ex.QueueDispatch(pl.pipeline, bg, (uint32_t)((N + 255) / 256), 1, 1, "cast_f16_to_f32");
                 return;
             }
         }

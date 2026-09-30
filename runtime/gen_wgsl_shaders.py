@@ -20,6 +20,8 @@ If 'bindings' is not specified, it is auto-counted from @binding(N) annotations.
 If 'generated' is not specified, defaults to false.
 If 'registry' is specified, the kernel uses that name as the registry key.
 If 'noregistry=true', the kernel is excluded from getEmbeddedKernels().
+If 'raw_template=true', emit the dtype template verbatim without instantiating
+an f32 variant; a dedicated *_t.wgsl overrides the corresponding automatic _T.
 
 Run this whenever kernel .wgsl files change:
     python runtime/gen_wgsl_shaders.py
@@ -27,10 +29,11 @@ Run this whenever kernel .wgsl files change:
 import os
 import re
 import sys
+import argparse
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 KERNEL_DIR = os.path.join(_HERE, "kernels")
-OUTPUT = os.path.join(_HERE, "wgsl_shaders.h")
+OUTPUT = os.path.join(_HERE, "..", "gitignore", "runtime", "generated", "wgsl_shaders.h")
 
 # ── f32 template instantiation (mirrors wgsl_template.h) ─────────────────────
 
@@ -87,7 +90,7 @@ def count_bindings(src: str) -> int:
 
 def parse_meta(src: str):
     """Parse // @meta key=value from first few lines."""
-    meta = {"bindings": None, "generated": False, "registry": None, "noregistry": False}
+    meta = {"bindings": None, "generated": False, "registry": None, "noregistry": False, "raw_template": False}
     for line in src.split("\n")[:5]:
         m = re.match(r'//\s*@meta\s+(.*)', line)
         if m:
@@ -102,6 +105,8 @@ def parse_meta(src: str):
                         meta["registry"] = v
                     elif k == "noregistry":
                         meta["noregistry"] = v.lower() == "true"
+                    elif k == "raw_template":
+                        meta["raw_template"] = v.lower() == "true"
     return meta
 
 
@@ -126,6 +131,11 @@ def should_register(filename_base: str, meta: dict, is_tmpl: bool) -> bool:
 
 
 def main():
+    global OUTPUT
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", default=OUTPUT)
+    OUTPUT = parser.parse_args().output
+    os.makedirs(os.path.dirname(os.path.abspath(OUTPUT)), exist_ok=True)
     if not os.path.isdir(KERNEL_DIR):
         print(f"Error: {KERNEL_DIR} not found.", file=sys.stderr)
         sys.exit(1)
@@ -148,6 +158,11 @@ def main():
             categories[cat_name] = kernels
 
     # Build output
+    # Some established dtype templates specialize the generic f32 kernel.
+    # Their dedicated source files override only the generated _T constant.
+    raw_templates = {"WGSL_" + fname[:-5].upper()
+                     for kernels in categories.values() for fname, src in kernels
+                     if parse_meta(src)["raw_template"]}
     lines = []
     lines.append('#pragma once')
     lines.append('// wgsl_shaders.h -- Auto-generated from runtime/kernels/')
@@ -177,7 +192,7 @@ def main():
             name = fname[:-5]  # strip .wgsl
             var_name = "WGSL_" + name.upper()
             meta = parse_meta(src)
-            tmpl = is_template(src)
+            tmpl = is_template(src) and not meta["raw_template"]
 
             # Determine binding count
             bindings = meta["bindings"]
@@ -200,12 +215,13 @@ def main():
                 total_constants += 1
 
                 t_var = var_name + "_T"
-                lines.append(f'// [{cat_name}] {name} — dtype template')
-                lines.append(f'static const char* {t_var} = R"WGSL(')
-                lines.append(src_clean.strip())
-                lines.append(')WGSL";')
-                lines.append('')
-                total_constants += 1
+                if t_var not in raw_templates:
+                    lines.append(f'// [{cat_name}] {name} — dtype template')
+                    lines.append(f'static const char* {t_var} = R"WGSL(')
+                    lines.append(src_clean.strip())
+                    lines.append(')WGSL";')
+                    lines.append('')
+                    total_constants += 1
             else:
                 # Non-template: emit WGSL_NAME
                 src_clean = re.sub(r'//\s*@meta\s+.*\n', '', src)

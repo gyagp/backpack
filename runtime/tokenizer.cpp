@@ -1,9 +1,91 @@
 #include "tokenizer.h"
+#include "qwen_unicode_categories.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <queue>
+
+namespace {
+uint16_t qwenCategory(uint32_t cp) {
+    auto end = std::end(QWEN_UNICODE_CATEGORIES);
+    auto it = std::upper_bound(std::begin(QWEN_UNICODE_CATEGORIES), end, cp,
+        [](uint32_t value, const UnicodeCategoryRange& range) { return value < range.first; });
+    return it == std::begin(QWEN_UNICODE_CATEGORIES) ? 0 : (it - 1)->flags;
+}
+bool qwenSpace(uint32_t cp) {
+    return (cp >= 9 && cp <= 13) || cp == 0x20 || cp == 0x85 || cp == 0xa0 || cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 || cp == 0x202f ||
+           cp == 0x205f || cp == 0x3000;
+}
+
+// Ordered alternatives of Qwen3.5's published Unicode regex. Splitting before
+// BPE matters: merges are not allowed to cross number/word/whitespace pieces.
+std::vector<std::string> splitQwen35(const std::string& text) {
+    std::vector<uint32_t> cp;
+    std::vector<size_t> offsets;
+    for (size_t i = 0; i < text.size();) {
+        offsets.push_back(i);
+        const uint8_t first = uint8_t(text[i++]);
+        uint32_t value = first;
+        int continuation = 0;
+        if ((first & 0xe0) == 0xc0) { value = first & 31; continuation = 1; }
+        else if ((first & 0xf0) == 0xe0) { value = first & 15; continuation = 2; }
+        else if ((first & 0xf8) == 0xf0) { value = first & 7; continuation = 3; }
+        while (continuation-- > 0 && i < text.size() && (uint8_t(text[i]) & 0xc0) == 0x80)
+            value = (value << 6) | (uint8_t(text[i++]) & 63);
+        cp.push_back(value);
+    }
+    offsets.push_back(text.size());
+    const size_t n = cp.size();
+    auto letterMark = [&](size_t i) { return i < n && (qwenCategory(cp[i]) & 20) != 0; };
+    auto number = [&](size_t i) { return i < n && (qwenCategory(cp[i]) & 2) != 0; };
+    auto newline = [&](size_t i) { return i < n && (cp[i] == '\r' || cp[i] == '\n'); };
+    auto punctuation = [&](size_t i) { return i < n && !qwenSpace(cp[i]) && !letterMark(i) && !number(i); };
+    std::vector<std::string> pieces;
+    for (size_t start = 0; start < n;) {
+        size_t end = start;
+        if (cp[start] == '\'') {
+            for (const char* suffix : {"s", "t", "re", "ve", "m", "ll", "d"}) {
+                const size_t len = std::strlen(suffix);
+                bool match = start + 1 + len <= n;
+                for (size_t j = 0; match && j < len; ++j)
+                    match = (cp[start+1+j] | 32u) == uint32_t(suffix[j]);
+                if (match) { end = start + 1 + len; break; }
+            }
+        }
+        if (end == start) {
+            size_t first = start;
+            if (!newline(start) && !(qwenCategory(cp[start]) & 6) && letterMark(start+1)) ++first;
+            if (letterMark(first)) {
+                end = first + 1;
+                while (letterMark(end)) ++end;
+            }
+        }
+        if (end == start && number(start)) end = start + 1;
+        if (end == start) {
+            const size_t first = start + (cp[start] == ' ' && punctuation(start+1) ? 1 : 0);
+            if (punctuation(first)) {
+                end = first + 1;
+                while (punctuation(end)) ++end;
+                while (newline(end)) ++end;
+            }
+        }
+        if (end == start && qwenSpace(cp[start])) {
+            size_t all = start, lastNewline = start;
+            while (all < n && qwenSpace(cp[all])) { if (newline(all)) lastNewline = all+1; ++all; }
+            if (lastNewline > start) end = lastNewline;
+            else if (all == n) end = all;
+            else if (all > start + 1) end = all - 1; // \s+(?!\S)
+            else end = all;
+        }
+        if (end == start) ++end;
+        pieces.push_back(text.substr(offsets[start], offsets[end] - offsets[start]));
+        start = end;
+    }
+    return pieces;
+}
+}
 
 // ─── GPT-2 byte-level BPE encoding ──────────────────────────────────────────
 //
@@ -97,6 +179,7 @@ static std::string bytes_to_bpe_string(const std::string& text,
 // ─── Load from GGUF ──────────────────────────────────────────────────────────
 
 bool Tokenizer::load(const GGUFFile& gguf) {
+    qwen35_pre_tokenizer = gguf.getString("tokenizer.ggml.pre") == "qwen35";
     // Detect tokenizer model.
     std::string model_str = gguf.getString("tokenizer.ggml.model", "gpt2");
     if (model_str == "gpt2")        model_kind = Model::Gpt2Bpe;
@@ -345,6 +428,16 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
 }
 
 std::vector<int32_t> Tokenizer::encode_bpe_segment(const std::string& text) const {
+    if (!qwen35_pre_tokenizer) return encode_bpe_piece(text);
+    std::vector<int32_t> result;
+    for (const auto& piece : splitQwen35(text)) {
+        auto ids = encode_bpe_piece(piece);
+        result.insert(result.end(), ids.begin(), ids.end());
+    }
+    return result;
+}
+
+std::vector<int32_t> Tokenizer::encode_bpe_piece(const std::string& text) const {
     if (text.empty()) return {};
 
     // 1. Convert bytes to BPE string representation

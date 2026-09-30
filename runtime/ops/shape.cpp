@@ -4,7 +4,7 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "../wgsl_template.h"
 #include <webgpu/webgpu.h>
 #include <cstdio>
@@ -442,7 +442,7 @@ static void opGather(OpContext& ex, const OnnxGraphNode& n,
         if (nIdx <= 1024 && haveIndexVals) {
             std::vector<int32_t> i32(nIdx);
             for (int64_t i = 0; i < nIdx; i++) i32[(size_t)i] = (int32_t)indexVals[(size_t)i];
-            idxBuf = ex.getGpu()->createBuffer("gather_idx32", nIdx * 4);
+            idxBuf = ex.CreateTemporaryBuffer("gather_idx32", nIdx * 4);
             ex.getGpu()->writeBuffer(idxBuf, i32.data(), nIdx * 4);
         }
     }
@@ -815,7 +815,7 @@ static void opTranspose(OpContext& ex, const OnnxGraphNode& n,
                 params[4 + i] = outStrides[i];
                 params[4 + ndim + i] = permInStrides[i];
             }
-            auto paramBuf = ex.getGpu()->createBuffer("tr_p", params.size() * 4);
+            auto paramBuf = ex.CreateTemporaryBuffer("tr_p", params.size() * 4);
             ex.getGpu()->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
             // The generic fp16 t_write helper performs a packed-u32
@@ -839,7 +839,7 @@ static void opTranspose(OpContext& ex, const OnnxGraphNode& n,
                 params[4 + i] = outStrides[i] * 2;
                 params[4 + ndim + i] = permInStrides[i] * 2;
             }
-            auto paramBuf = ex.getGpu()->createBuffer("tr_p", params.size() * 4);
+            auto paramBuf = ex.CreateTemporaryBuffer("tr_p", params.size() * 4);
             ex.getGpu()->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
             auto& pl = ex.GetPipelineT("transpose", 3, []() { return std::string(WGSL_TRANSPOSE); });
@@ -1302,7 +1302,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             params[4 + 2*ndim + i] = (uint32_t)startVals[i];
             params[4 + 3*ndim + i] = (uint32_t)(stepVals[i] < 0 ? (uint32_t)(int32_t)stepVals[i] : (uint32_t)stepVals[i]);
         }
-        auto paramBuf = ex.getGpu()->createBuffer("slice_p", params.size() * 4);
+        auto paramBuf = ex.CreateTemporaryBuffer("slice_p", params.size() * 4);
         ex.getGpu()->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
         auto& pl = ex.GetPipelineT("slice" + std::string(dtypeSuffix(data->dtype)), 3,
@@ -1349,7 +1349,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         params[4 + 2*ndim + i] = (uint32_t)startVals[i];
         params[4 + 3*ndim + i] = (uint32_t)(stepVals[i] < 0 ? (uint32_t)(int32_t)stepVals[i] : (uint32_t)stepVals[i]);
     }
-    auto paramBuf = ex.getGpu()->createBuffer("slice_p", params.size() * 4);
+    auto paramBuf = ex.CreateTemporaryBuffer("slice_p", params.size() * 4);
     ex.getGpu()->writeBuffer(paramBuf, params.data(), params.size() * 4);
 
     auto& pl = ex.GetPipelineT("slice", 3, []() { return std::string(WGSL_SLICE); });
@@ -1531,7 +1531,7 @@ static void opExpand(OpContext& ex, const OnnxGraphNode& n,
         params[4+ndim+i] = inDims[i];
         params[4+2*ndim+i] = inStrides[i];
     }
-    auto paramBuf = ex.getGpu()->createBuffer("expand_p", params.size()*4);
+    auto paramBuf = ex.CreateTemporaryBuffer("expand_p", params.size()*4);
     ex.getGpu()->writeBuffer(paramBuf, params.data(), params.size()*4);
 
     // Use templated kernel for dtype-transparent expand

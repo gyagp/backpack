@@ -15,7 +15,7 @@
 #include "wgsl_template.h"
 #include "graph_executor.h"  // for TensorDtype enum
 #include "gguf_loader.h"
-#include "wgsl_shaders.h"
+#include <wgsl_shaders.h>
 
 #include <algorithm>
 #include <cassert>
@@ -484,6 +484,48 @@ static std::vector<TestEntry> g_tests;
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL TESTS — Raw WGSL dispatch (from test_kernels.py)
 // ═══════════════════════════════════════════════════════════════════════════
+
+TEST(qwen35_key_rope_continuous_frequencies) {
+    // Nonzero positions and all three section boundaries distinguish the
+    // correct continuous frequency domain from an accidental section reset.
+    const uint32_t H=2, D=256, M=3, POS=17, CACHE=5, RH=32;
+    std::vector<float> k(M*H*D), v(k.size()), cosine(64*RH), sine(64*RH);
+    for(size_t i=0;i<k.size();++i){k[i]=std::sin(float(i)*0.37f);v[i]=std::cos(float(i)*0.19f);}
+    for(uint32_t p=0;p<64;++p)for(uint32_t j=0;j<RH;++j){
+        float angle=p/std::pow(10000000.0f,float(2*j)/64);
+        cosine[p*RH+j]=std::cos(angle);sine[p*RH+j]=std::sin(angle);
+    }
+    auto bk=makeBuffer(gpu,"rope_k",k.data(),int(k.size()));
+    auto bv=makeBuffer(gpu,"rope_v",v.data(),int(v.size()));
+    auto bc=makeBuffer(gpu,"rope_cos",cosine.data(),int(cosine.size()));
+    auto bs=makeBuffer(gpu,"rope_sin",sine.data(),int(sine.size()));
+    auto kc=gpu.createBuffer("rope_k_cache",(CACHE+M)*H*D*2);
+    auto vc=gpu.createBuffer("rope_v_cache",kc.size);
+    auto qo=makeBuffer(gpu,"rope_q_out",nullptr,int(k.size()));
+    auto p=makeParams(gpu,"rope_batch_params",{M,H,H,D,POS,CACHE,11,11,10,0,RH});
+    auto bytes=dispatchAndReadback(gpu,WGSL_QWEN35_ROPE_KV_BATCHED,
+        {{0,bk},{1,bk},{2,bv},{3,qo},{4,kc},{5,vc},{6,bc},{7,bs},{8,p}},H,M,1,kc,kc.size,9);
+    auto check=[&](const std::vector<uint8_t>& data,uint32_t tokens)->CheckResult{
+        const auto* half=reinterpret_cast<const uint16_t*>(data.data());
+        for(uint32_t t=0;t<tokens;++t)for(uint32_t h=0;h<H;++h)for(uint32_t d=0;d<D;++d){
+            uint32_t base=(t*H+h)*D;
+            float expected=k[base+d];
+            if(d<64){uint32_t j=d%RH;float a=k[base+j],b=k[base+j+RH];
+                expected=d<RH?a*cosine[(POS+t)*RH+j]-b*sine[(POS+t)*RH+j]
+                             :a*sine[(POS+t)*RH+j]+b*cosine[(POS+t)*RH+j];}
+            expected=f16ToF32(f32ToF16(expected));
+            float actual=f16ToF32(half[((CACHE+t)*H+h)*D+d]);
+            if(std::abs(actual-expected)>0.001f)return {false,"key RoPE changed the frequency index at a section boundary"};
+        }
+        return {true,""};
+    };
+    auto result=check(bytes,M);if(!result.ok)return result;
+    auto rp=makeParams(gpu,"rope_decode_params",{H,D,11,11,10,0,POS,RH});
+    auto kp=makeParams(gpu,"rope_cache_params",{H*D,CACHE*H*D});
+    bytes=dispatchAndReadback(gpu,WGSL_QWEN35_KV_CACHE_WRITE_ROPE,
+        {{0,bk},{1,bv},{2,kc},{3,vc},{4,bc},{5,bs},{6,rp},{7,kp}},1,H,1,kc,kc.size,8);
+    return check(bytes,1);
+}
 
 // ── Unary elementwise ───────────────────────────────────────────────────────
 

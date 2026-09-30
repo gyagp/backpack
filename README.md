@@ -71,10 +71,15 @@ experiment instructions.
 
 ## Kernels
 
-All runtime WGSL sources live in `runtime/kernels/`. Regenerate embedded shader constants after editing kernels:
+All runtime WGSL sources live in `runtime/kernels/`. CMake embeds them automatically
+under the ignored build directory. To generate a header manually:
 
 ```powershell
 python runtime/gen_wgsl_shaders.py
 ```
+
+The manual generator writes `gitignore/runtime/generated/wgsl_shaders.h`;
+`--output` selects another ignored build location. The historical checked-in
+header is not used by CMake builds.
 
 Generated and temporary files belong under `gitignore/`; downloaded models should use `gitignore/models/` or another explicitly external model cache.

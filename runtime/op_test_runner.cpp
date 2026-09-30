@@ -58,6 +58,7 @@ static size_t dtypeSize(TensorDtype d) {
 }
 
 int main(int argc, char* argv[]) {
+    try {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <model.onnx> <input_dir> <output_dir>\n", argv[0]);
         return 1;
@@ -72,9 +73,11 @@ int main(int argc, char* argv[]) {
 
     // 1. Init GPU
     GPUContext gpu;
-    if (!gpu.init(WGPUBackendType_Vulkan)) {
-        // Fallback to D3D12
-        if (!gpu.init(WGPUBackendType_D3D12)) {
+    const bool explicitBackend = argc > 4;
+    const std::string backend = explicitBackend ? argv[4] : "vulkan";
+    if (backend != "d3d12" && backend != "vulkan") return 2;
+    if (!gpu.init(backend == "d3d12" ? WGPUBackendType_D3D12 : WGPUBackendType_Vulkan)) {
+        if (explicitBackend || !gpu.init(WGPUBackendType_D3D12)) {
             fprintf(stderr, "Failed to init GPU\n");
             return 1;
         }
@@ -248,4 +251,8 @@ int main(int argc, char* argv[]) {
 
     printf("OK\n");
     return 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "%s\n", error.what());
+        return 1;
+    }
 }

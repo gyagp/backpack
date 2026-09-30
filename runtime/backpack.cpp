@@ -9,7 +9,7 @@
 #include "execution_context.h"
 #include "gpu_context.h"
 #include "graph_executor.h"
-#include "wgsl_shaders.h"
+#include <wgsl_shaders.h>
 
 #include <atomic>
 #include <cstdio>

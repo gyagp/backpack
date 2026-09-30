@@ -30,6 +30,7 @@ struct OnnxTokenizer {
 
     // Special token IDs
     int32_t eos_token_id = -1;
+    std::vector<int32_t> eos_token_ids;
     int32_t bos_token_id = -1;
     bool sentencepiece_bpe = false;
 
@@ -37,6 +38,7 @@ struct OnnxTokenizer {
 
     /// Load tokenizer from model directory (tokenizer.json + config.json)
     bool load(const std::string& modelDir);
+    bool is_end_token(int32_t id) const;
 
     /// Encode text to token IDs
     std::vector<int32_t> encode(const std::string& text) const;

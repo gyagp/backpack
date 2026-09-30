@@ -37,6 +37,9 @@ struct GpuTensor {
     // CPU-side data (for small metadata tensors that don't need GPU)
     std::vector<uint8_t> cpuData;
     bool isCpuOnly = false;
+    // Explicit sequence stride for caller-owned [B,H,capacity,D] KV storage.
+    // Zero means packed tensor data; allocator padding is never a layout hint.
+    int64_t kvCacheCapacity = 0;
 
     int64_t ElementCount() const {
         int64_t n = 1;
@@ -159,11 +162,14 @@ using OpDispatchFn = std::function<void(
 class GraphExecutor {
 public:
     GPUContext* gpu = nullptr;
+    bool initializersUploaded = true;
 
     ~GraphExecutor();
 
     /// Load and parse an ONNX model. Uploads initializer weights to GPU.
-    bool Load(GPUContext& gpuCtx, const std::string& onnxPath);
+    // With uploadInitializers=false, retain mapped initializer data for CPU
+    // preprocessing only. Such a metadata-only graph cannot be executed.
+    bool Load(GPUContext& gpuCtx, const std::string& onnxPath, bool uploadInitializers = true);
 
     /// Execute the graph with a per-session ExecutionContext.
     void Execute(

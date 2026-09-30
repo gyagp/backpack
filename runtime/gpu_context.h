@@ -12,6 +12,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
+#include <chrono>
 
 // Buffer usage flags (stable WebGPU constants)
 constexpr uint64_t BUF_STORAGE   = 0x0080;
@@ -57,10 +59,12 @@ struct GPUProfiler {
     WGPUInstance instance = nullptr;
     WGPUQueue    queue    = nullptr;
     WGPUQuerySet querySet = nullptr;
+    std::vector<WGPUQuerySet> querySets;
     WGPUBuffer   resolveBuf = nullptr;
     WGPUBuffer   readbackBuf = nullptr;
     uint32_t     nextIndex = 0;
     static constexpr uint32_t MAX_TIMESTAMPS = 16384;
+    static constexpr uint32_t TIMESTAMPS_PER_SET = 4096;
 
     struct Entry {
         std::string name;
@@ -109,6 +113,7 @@ struct GPUContext {
 
     // Device lost detection: set by Dawn device-lost callback
     bool deviceLost = false;
+    std::atomic<bool> executionError{false};
     std::string deviceLostReason;
 
     // --- Lifecycle ---
@@ -131,6 +136,12 @@ struct GPUContext {
     };
     MemoryStats getMemoryStats() const {
         return { totalAllocatedBytes, peakAllocatedBytes, totalAllocCount };
+    }
+    uint64_t pooledBufferBytes() const {
+        uint64_t bytes = 0;
+        for (const auto& bucket : pool_)
+            for (const auto& buffer : bucket) bytes += buffer.size;
+        return bytes;
     }
     GPUBuffer createBuffer(const std::string& name, uint64_t size,
                            uint64_t usage = BUF_DEFAULT,
@@ -236,6 +247,25 @@ struct GPUContext {
         int64_t write_buf_ns = 0;
         int count = 0;
     } timing;
+
+    // Opt-in diagnostics for an explicitly selected workload interval. Keep
+    // these separate from the legacy benchmark accumulators above.
+    struct Diagnostics {
+        uint64_t dispatches=0, flushes=0, submits=0, writes=0, writeBytes=0;
+        uint64_t queueWaits=0, mapWaits=0;
+        int64_t encodeNs=0, submitNs=0, writeNs=0, queueWaitNs=0, mapWaitNs=0;
+    } diagnostics;
+    bool diagnosticsEnabled = false;
+    int64_t diagnosticTimestamp() const {
+        return diagnosticsEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+    }
+    void recordEncode(int64_t start) {
+        if (start) diagnostics.encodeNs += diagnosticTimestamp() - start;
+    }
+    void submitCommandBuffer(WGPUCommandBuffer buffer);
+    void queueWriteBuffer(WGPUBuffer buffer, uint64_t offset, const void* data, uint64_t size);
+    void waitForMap(WGPUFuture future);
 
     /// Get or create a MAP_READ staging buffer of at least 'size' bytes.
     WGPUBuffer getOrCreateReadbackBuf(uint64_t size);

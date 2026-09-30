@@ -14,11 +14,12 @@
 #include "graph_executor.h"
 #include "tokenizer.h"
 #include "onnx_tokenizer.h"
-#include "wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "json_parser.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +59,16 @@ static bool isNonStandardArch(const std::string& path) {
 }
 
 static std::string findOnnxFile(const std::string& dir) {
+    const auto manifest = fs::path(dir) / "genai_config.json";
+    if (fs::exists(manifest)) {
+        std::ifstream input(manifest);
+        const auto config = json_parse(std::string{std::istreambuf_iterator<char>(input), {}});
+        if (config.has("model") && config["model"].has("decoder") && config["model"]["decoder"].has("filename")) {
+            const auto decoder = fs::path(dir) / config["model"]["decoder"]["filename"].as_string();
+            if (!fs::exists(decoder)) throw std::runtime_error("Missing GenAI decoder: " + decoder.string());
+            return decoder.string();
+        }
+    }
     std::string best;
     for (auto& e : fs::directory_iterator(dir)) {
         if (!e.is_regular_file() || e.path().extension() != ".onnx") continue;
@@ -200,6 +211,116 @@ struct GenericOnnxState {
     OnnxTokenizer tokenizer;
     std::string modelPath;
     std::string modelDir;
+    GraphExecutor embeddingMetadata;
+    const OnnxInitData* cpuEmbedding = nullptr;
+    GPUBuffer embeddingsBuf;
+    std::vector<int64_t> mediaTokenIds;
+    TensorDtype logitsDtype = TensorDtype::Float32;
+
+    void LoadCpuEmbedding() {
+        const auto& inputs = executor.GetGraph().inputs;
+        const auto found = std::find_if(inputs.begin(), inputs.end(), [](const auto& input) { return input.name == "inputs_embeds"; });
+        if (found == inputs.end()) return;
+        std::ifstream input(fs::path(modelDir) / "genai_config.json");
+        if (!input) throw std::runtime_error("inputs_embeds requires a GenAI embedding manifest");
+        const auto config = json_parse(std::string{std::istreambuf_iterator<char>(input), {}});
+        const auto& model = config["model"];
+        const auto file = fs::path(modelDir) / model["embedding"]["filename"].as_string();
+        if (!embeddingMetadata.Load(*gpu, file.string(), false)) throw std::runtime_error("Cannot read embedding metadata");
+        const OnnxGraphNode* gather = nullptr;
+        for (const auto& node : embeddingMetadata.GetGraph().nodes) {
+            if (node.opType == "Gather" && node.inputs.size() >= 2 && node.inputs[1] == "input_ids" &&
+                node.GetInt("axis", 0) == 0 && embeddingMetadata.GetInitData(node.inputs[0])) {
+                if (gather) throw std::runtime_error("Ambiguous CPU token embedding graph");
+                gather = &node;
+            }
+        }
+        if (!gather || gather->outputs.size() != 1) throw std::runtime_error("Unsupported CPU embedding graph");
+        // The supported text-only graph is Gather -> ScatterND(media). With no
+        // media placeholders, ScatterND has zero indices and leaves Gather intact.
+        bool outputMatches = false;
+        const auto& graph = embeddingMetadata.GetGraph();
+        if (graph.outputs.size() != 1) throw std::runtime_error("CPU embedding requires one output");
+        for (const auto& output : graph.outputs) {
+            if (output.name == gather->outputs[0]) outputMatches = true;
+            for (const auto& node : graph.nodes) {
+                if (node.opType == "ScatterND" && node.inputs.size() == 3 && node.inputs[0] == gather->outputs[0] &&
+                    !node.outputs.empty() && node.outputs[0] == output.name) {
+                    auto producer = [&](const std::string& name) -> const OnnxGraphNode* {
+                        for (const auto& candidate : graph.nodes)
+                            if (std::find(candidate.outputs.begin(), candidate.outputs.end(), name) != candidate.outputs.end()) return &candidate;
+                        return nullptr;
+                    };
+                    const auto* transpose = producer(node.inputs[1]);
+                    if (!transpose || transpose->opType != "Transpose" || transpose->inputs.size() != 1) continue;
+                    const auto permutation = transpose->attrIntLists.find("perm");
+                    if (permutation != transpose->attrIntLists.end() && permutation->second != std::vector<int64_t>{1,0}) continue;
+                    const auto* condition = producer(transpose->inputs[0]);
+                    if (!condition || condition->opType != "NonZero" || condition->inputs.size() != 1) continue;
+                    condition = producer(condition->inputs[0]);
+                    size_t depth = 0;
+                    while (condition && !condition->inputs.empty() && depth++ < graph.nodes.size() &&
+                           (condition->opType == "Expand" || condition->opType == "Unsqueeze" || condition->opType == "Reshape" || condition->opType == "Identity"))
+                        condition = producer(condition->inputs[0]);
+                    if (!condition || condition->opType != "Equal" || condition->inputs.size() != 2) continue;
+                    const auto constantName = condition->inputs[0] == "input_ids" ? condition->inputs[1] :
+                        condition->inputs[1] == "input_ids" ? condition->inputs[0] : std::string{};
+                    auto* constant = embeddingMetadata.GetWeightTensor(constantName);
+                    if (!constant || constant->ElementCount() != 1) continue;
+                    int64_t mediaToken = -1;
+                    if (constant->dtype == TensorDtype::Int64 && constant->cpuData.size() == 8)
+                        memcpy(&mediaToken, constant->cpuData.data(), 8);
+                    else if (constant->dtype == TensorDtype::Int32 && constant->cpuData.size() == 4) {
+                        int32_t value; memcpy(&value, constant->cpuData.data(), 4); mediaToken = value;
+                    }
+                    if (mediaToken < 0 || mediaToken >= vocabSize) continue;
+                    mediaTokenIds.push_back(mediaToken);
+                    outputMatches = true;
+                }
+            }
+        }
+        if (!outputMatches) throw std::runtime_error("Embedding graph transforms token values after Gather");
+        cpuEmbedding = embeddingMetadata.GetInitData(gather->inputs[0]);
+        if (!cpuEmbedding || !cpuEmbedding->data || cpuEmbedding->shape != std::vector<int64_t>{vocabSize, hiddenSize} ||
+            cpuEmbedding->dtype != found->dtype ||
+            (cpuEmbedding->dtype != TensorDtype::Float16 && cpuEmbedding->dtype != TensorDtype::Float32) ||
+            cpuEmbedding->size != uint64_t(vocabSize) * hiddenSize * GpuTensor::DtypeSizeOf(cpuEmbedding->dtype))
+            throw std::runtime_error("Invalid CPU embedding table");
+        for (const char* name : {"image_token_id", "video_token_id"})
+            if (model.has(name)) mediaTokenIds.push_back(model[name].as_int());
+        fprintf(stderr, "  CPU-mapped embedding: %lld x %lld, %.1f MiB; text rows uploaded on demand\n",
+                static_cast<long long>(vocabSize), static_cast<long long>(hiddenSize), cpuEmbedding->size / 1048576.0);
+    }
+
+    void PrepareEmbeddings(const int32_t* tokens, uint32_t count, GpuTensor& tensor) {
+        if (!cpuEmbedding) return;
+        const size_t rowBytes = hiddenSize * GpuTensor::DtypeSizeOf(cpuEmbedding->dtype);
+        std::vector<uint8_t> rows(size_t(count) * rowBytes);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (tokens[i] < 0 || tokens[i] >= vocabSize ||
+                std::find(mediaTokenIds.begin(), mediaTokenIds.end(), tokens[i]) != mediaTokenIds.end())
+                throw std::runtime_error("CPU embedding accepts in-range text tokens only; media inputs are unsupported");
+            memcpy(rows.data() + i * rowBytes, cpuEmbedding->data + size_t(tokens[i]) * rowBytes, rowBytes);
+        }
+        gpu->writeBuffer(embeddingsBuf, rows.data(), rows.size());
+        tensor.shape = {1, count, hiddenSize}; tensor.dtype = cpuEmbedding->dtype; tensor.buffer = embeddingsBuf;
+    }
+
+    std::vector<float> ReadLogits(uint64_t count) {
+        const auto bytes = gpu->mapReadbackBuffer(count * GpuTensor::DtypeSizeOf(logitsDtype));
+        std::vector<float> values(count);
+        if (logitsDtype == TensorDtype::Float32) memcpy(values.data(), bytes.data(), count * sizeof(float));
+        else if (logitsDtype == TensorDtype::Float16) {
+            const auto* half = reinterpret_cast<const uint16_t*>(bytes.data());
+            for (size_t i = 0; i < count; ++i) {
+                const uint16_t bits = half[i]; const int exponent = (bits >> 10) & 31, mantissa = bits & 1023;
+                const float sign = bits & 0x8000 ? -1.0f : 1.0f;
+                values[i] = exponent == 31 ? (mantissa ? NAN : sign * INFINITY) :
+                    sign * std::ldexp(float(exponent ? 1024 + mantissa : mantissa), exponent ? exponent - 25 : -24);
+            }
+        } else throw std::runtime_error("Unsupported logits dtype");
+        return values;
+    }
 
     int64_t hiddenSize = 0, numLayers = 0, vocabSize = 0;
     int64_t numHeads = 0, numKvHeads = 0, headDim = 0;
@@ -208,6 +329,81 @@ struct GenericOnnxState {
     int64_t intermediateSize = 0;
     int64_t convChannels = 0;
     int64_t recurrentHeads = 0, recurrentKeyDim = 0, recurrentValueDim = 0;
+    uint32_t positionAxes = 1;
+    uint32_t diagnosticStep = 0;
+    void DumpReferenceState() {
+        const char* directory = std::getenv("BP_DUMP_ONNX_STATE_DIR");
+        if (!directory || !*directory) return;
+        const fs::path folder(directory);
+        fs::create_directories(folder);
+        std::ofstream metadata(folder / ("state-" + std::to_string(diagnosticStep) + ".json"));
+        if (!metadata) throw std::runtime_error("Cannot create ONNX state metadata");
+        metadata << "{";
+        bool first = true;
+        auto dump = [&](const std::string& name, const GpuTensor& tensor, bool lastRow = false) {
+            const size_t bytes = tensor.ByteSize();
+            auto data = gpu->readBuffer(tensor.buffer, (bytes + 3) & ~size_t(3));
+            const size_t size = lastRow ? size_t(vocabSize) * tensor.DtypeSize() : bytes;
+            if (size > bytes) throw std::runtime_error("Invalid diagnostic tensor shape");
+            std::ofstream file(folder / (name + "-" + std::to_string(diagnosticStep) + ".bin"),
+                               std::ios::binary);
+            file.write(reinterpret_cast<const char*>(data.data() + bytes - size), size);
+            if (!file) throw std::runtime_error("Cannot write ONNX state tensor");
+            if (!first) metadata << ",";
+            first = false;
+            metadata << "\"" << name << "\":{\"type\":"
+                     << (tensor.dtype == TensorDtype::Float16 ? 10 : 1)
+                     << ",\"count\":" << size / tensor.DtypeSize() << "}";
+        };
+        // Replay uses alternating captured output buffers; tensorStore_ and the
+        // ordinary cache maps no longer identify the current parity's outputs.
+        const bool replay = fastDecodeCaptured && qwenActiveVariant >= 0;
+        GpuTensor logits;
+        logits.buffer = logitsBuf;
+        logits.shape = {1, 1, vocabSize};
+        logits.dtype = logitsDtype;
+        dump("logits", logits);
+        if (replay) {
+            const auto& variant = qwenCaptureVariants[qwenActiveVariant];
+            if (variant.diagnosticConv.IsValid()) dump("present.0.conv", variant.diagnosticConv);
+            if (variant.diagnosticRecurrent.IsValid()) dump("present.0.recurrent", variant.diagnosticRecurrent);
+        } else {
+            auto conv = convState.find("past_key_values.0.conv_state");
+            if (conv != convState.end()) dump("present.0.conv", conv->second);
+            auto recurrent = recurrentState.find("past_key_values.0.recurrent_state");
+            if (recurrent != recurrentState.end()) dump("present.0.recurrent", recurrent->second);
+        }
+        for (const char* kind : {"key", "value"}) {
+            auto it = kvState.find(std::string("past_key_values.3.") + kind);
+            if (it == kvState.end()) continue;
+            GpuTensor cache = it->second;
+            cache.shape = {static_cast<int64_t>(cache.buffer.size / cache.DtypeSize())};
+            dump(std::string("cache.3.") + kind, cache);
+        }
+        metadata << "}\n";
+        ++diagnosticStep;
+    }
+    std::unordered_map<std::string, std::string> cacheAliases;
+
+    void ExecuteGraph(const std::unordered_map<std::string, GpuTensor*>& inputs,
+                      std::unordered_map<std::string, GpuTensor*>& outputs) {
+        if (cacheAliases.empty()) {
+            executor.Execute(execCtx, inputs, outputs);
+            if (outputs.count("logits")) logitsDtype = outputs.at("logits")->dtype;
+            return;
+        }
+        auto rename = [&](const auto& tensors) {
+            std::unordered_map<std::string, GpuTensor*> mapped;
+            for (auto& [name, tensor] : tensors) {
+                auto alias = cacheAliases.find(name);
+                mapped[alias == cacheAliases.end() ? name : alias->second] = tensor;
+            }
+            return mapped;
+        };
+        auto mappedInputs = rename(inputs), mappedOutputs = rename(outputs);
+        executor.Execute(execCtx, mappedInputs, mappedOutputs);
+        if (outputs.count("logits")) logitsDtype = outputs.at("logits")->dtype;
+    }
     int64_t moeIntermediateSize = 0;
     int64_t numExperts = 0, numExpertsPerTok = 0;
     float normEps = 1e-5f;
@@ -216,6 +412,7 @@ struct GenericOnnxState {
     std::string arch;
 
     uint32_t pos = 0;
+    uint32_t prefillChunkSize = 0;
     std::unordered_map<std::string, GpuTensor> convState;
     std::unordered_map<std::string, GpuTensor> recurrentState;
     std::unordered_map<std::string, GpuTensor> kvState;
@@ -242,12 +439,14 @@ struct GenericOnnxState {
     uint32_t convCastWorkgroups = 0;
     struct CaptureVariant {
         std::vector<ExecutionContext::CapturedFlush> flushes;
+        std::vector<GPUBuffer> temporaryBuffers;
         std::vector<ExecutionContext::CapturedWrite> writes;
         std::vector<ExecutionContext::ReplayParamUpdate> params;
         std::vector<ExecutionContext::ReplayScalarUpdate> scalars;
         std::vector<ExecutionContext::CapturedTokenIdBuf> tokenIds;
         std::vector<WGPUBuffer> skipBuffers;
         GPUBuffer logits;
+        GpuTensor diagnosticConv, diagnosticRecurrent;
     } qwenCaptureVariants[4];
     int qwenCapturedVariants = 0;
     int qwenActiveVariant = -1;
@@ -299,12 +498,14 @@ struct GenericOnnxState {
     std::unordered_map<std::string, GpuTensor> resetConvState;
     std::unordered_map<std::string, GpuTensor> resetRecurrentState;
     std::unordered_map<std::string, GpuTensor> resetKvState;
+    bool stateBuffersAllocated = false;
     std::unordered_map<std::string, GpuTensor> capturedPrefillConvState;
     std::unordered_map<std::string, GpuTensor> capturedPrefillRecurrentState;
 
     void SwapCaptureVariant(int index) {
         auto& variant = qwenCaptureVariants[index];
         execCtx.capturedFlushes_.swap(variant.flushes);
+        execCtx.capturedTemporaryBuffers_.swap(variant.temporaryBuffers);
         execCtx.capturedWrites_.swap(variant.writes);
         execCtx.replayParamUpdates_.swap(variant.params);
         execCtx.replayScalarUpdates_.swap(variant.scalars);
@@ -333,6 +534,29 @@ struct GenericOnnxState {
         if (maxSeqOverride > 0) maxSeqLen = maxSeqOverride;
 
         if (!executor.Load(gpuCtx, onnxPath)) return false;
+        // Current exports shorten recurrent cache names, while older exports
+        // use past_key_values.N.conv_state/recurrent_state. Keep internal
+        // state ownership unchanged and bind the graph's actual I/O names.
+        cacheAliases.clear();
+        auto discoverAliases = [&](const auto& entries, bool input) {
+            const std::string prefix = input ? "past." : "present.";
+            for (const auto& entry : entries) {
+                if (entry.name.rfind(prefix, 0) != 0) continue;
+                auto dot = entry.name.find('.', prefix.size());
+                if (dot == std::string::npos) continue;
+                auto layer = entry.name.substr(prefix.size(), dot - prefix.size());
+                auto kind = entry.name.substr(dot + 1);
+                if (kind == "conv") kind = "conv_state";
+                else if (kind == "recurrent") kind = "recurrent_state";
+                else if (kind != "key" && kind != "value") continue;
+                const std::string legacy = (input ? "past_key_values." : "present.") + layer + "." + kind;
+                if (legacy != entry.name) cacheAliases[legacy] = entry.name;
+            }
+        };
+        discoverAliases(executor.GetGraph().inputs, true);
+        discoverAliases(executor.GetGraph().outputs, false);
+        for(const auto& input:executor.GetGraph().inputs)
+            if(input.name=="position_ids" && input.shape.size()==3 && input.shape[0]==3) positionAxes=3;
         if (!tokenizer.load(modelDir)) return false;
 
         std::string cfgPath = (fs::path(modelDir) / "config.json").string();
@@ -353,7 +577,7 @@ struct GenericOnnxState {
         vocabSize = cfg.has("vocab_size") ? cfg["vocab_size"].as_int() : 65536;
         numKvHeads = cfg.has("num_key_value_heads") ? cfg["num_key_value_heads"].as_int() : 8;
         numHeads = cfg.has("num_attention_heads") ? cfg["num_attention_heads"].as_int() : 32;
-        headDim = hiddenSize / numHeads;
+        headDim = cfg.has("head_dim") ? cfg["head_dim"].as_int() : hiddenSize / numHeads;
         convLCache = cfg.has("conv_L_cache") ? cfg["conv_L_cache"].as_int() : 3;
         intermediateSize = cfg.has("intermediate_size") ? cfg["intermediate_size"].as_int() : 7168;
         recurrentHeads = cfg.has("linear_num_value_heads")
@@ -384,6 +608,7 @@ struct GenericOnnxState {
             if (rp.has("rope_theta")) ropeTheta = (float)rp["rope_theta"].as_number();
         }
         arch = cfg.has("model_type") ? cfg["model_type"].as_string() : "onnx";
+        LoadCpuEmbedding();
 
         int64_t modelMaxSeq = cfg.has("max_position_embeddings") ? cfg["max_position_embeddings"].as_int() : 4096;
 
@@ -419,26 +644,28 @@ struct GenericOnnxState {
         return true;
     }
 
+    void RestoreInitialState() {
+        convState = resetConvState;
+        recurrentState = resetRecurrentState;
+        kvState = resetKvState;
+        for (auto* states : {&convState, &recurrentState}) {
+            for (auto& [name, t] : *states) {
+                std::vector<uint8_t> zeros(t.ByteSize(), 0);
+                gpu->writeBuffer(t.buffer, zeros.data(), zeros.size());
+            }
+        }
+        for (auto& [name, t] : kvState)
+            t.shape = {1, numKvHeads, 0, headDim};
+    }
+
     void ResetCaches(bool preserveWarmGraph = false) {
         pos = 0;
         prefillDone = false;
         decodePlanInitialized = false;
         decodeWarmupRemaining = 0;
         nlkWritten = false;
-        if (preserveWarmGraph && !resetConvState.empty()) {
-            convState = resetConvState;
-            recurrentState = resetRecurrentState;
-            kvState = resetKvState;
-            for (auto& [name, t] : convState) {
-                std::vector<uint8_t> zeros(t.ByteSize(), 0);
-                gpu->writeBuffer(t.buffer, zeros.data(), zeros.size());
-            }
-            for (auto& [name, t] : recurrentState) {
-                std::vector<uint8_t> zeros(t.ByteSize(), 0);
-                gpu->writeBuffer(t.buffer, zeros.data(), zeros.size());
-            }
-            for (auto& [name, t] : kvState)
-                t.shape = {1, numKvHeads, 0, headDim};
+        if (preserveWarmGraph && stateBuffersAllocated) {
+            RestoreInitialState();
             return;
         }
         convState.clear();
@@ -454,15 +681,26 @@ struct GenericOnnxState {
         }
         qwenCapturedVariants = 0;
         qwenNextReplayVariant = 0;
-        if (fastDecodeCaptured) {
-            execCtx.ReleaseCaptured();
-            fastDecodeCaptured = false;
-        }
+        execCtx.ReleaseCaptured();
+        fastDecodeCaptured = false;
+        prefillCaptureReady = false;
+        prefillCaptureTokens = 0;
+        capturedPrefillConvState.clear();
+        capturedPrefillRecurrentState.clear();
         // Captured NVIDIA Qwen variants reserve disjoint parameter-pool
         // ranges. They are reusable only after every captured bind group has
         // been released above.
         execCtx.ResetParamPoolCursors();
         execCtx.InvalidateWarmCaches();
+
+        // These input/output allocations belong to the session, not to the
+        // executor's shape-specific tensor plan. A reset restores the initial
+        // state and reuses both output parities instead of losing their handles.
+        // Qwen3.8-27B previously leaked 463 MiB on every conversation reset.
+        if (stateBuffersAllocated) {
+            RestoreInitialState();
+            return;
+        }
 
         for (size_t ci = 0; ci < convLayerIndices.size(); ci++) {
             int idx = convLayerIndices[ci];
@@ -516,14 +754,17 @@ struct GenericOnnxState {
                 GpuTensor t;
                 t.shape = {1, numKvHeads, 0, headDim};
                 t.dtype = TensorDtype::Float32;
+                t.kvCacheCapacity = maxSeqLen;
                 t.buffer = gpu->createBuffer(name, kvBytes);
                 kvState[name] = t;
             }
         }
 
+        if (cpuEmbedding) embeddingsBuf = gpu->createBuffer("text_embeddings",
+            uint64_t(maxSeqLen) * hiddenSize * GpuTensor::DtypeSizeOf(cpuEmbedding->dtype));
         idsBuf = gpu->createBuffer("ids", 8);
         prefillIdsBuf = gpu->createBuffer("prefill_ids", maxSeqLen * 8);
-        positionBuf = gpu->createBuffer("position_ids", maxSeqLen * 8);
+        positionBuf = gpu->createBuffer("position_ids", maxSeqLen * positionAxes * 8);
         nlkBuf = gpu->createBuffer("nlk", 8);
         logitsBuf = gpu->createBuffer("logits_out", vocabSize * 4);
         maskBuf = gpu->createBuffer("mask", maxSeqLen * 8);
@@ -548,6 +789,7 @@ struct GenericOnnxState {
         resetConvState = convState;
         resetRecurrentState = recurrentState;
         resetKvState = kvState;
+        stateBuffersAllocated = true;
     }
 
     std::vector<float> RunPrefillStep(int64_t tokenId) {
@@ -557,6 +799,14 @@ struct GenericOnnxState {
 
     int32_t RunPrefillBatch(const int32_t* tokenIds, uint32_t T) {
         if (T == 0) return -1;
+        if (uint64_t(pos) + T > uint64_t(maxSeqLen))
+            throw std::runtime_error("Prompt exceeds the configured context capacity");
+        if (prefillChunkSize && T > prefillChunkSize) {
+            int32_t next = -1;
+            for (uint32_t offset = 0; offset < T; offset += prefillChunkSize)
+                next = RunPrefillBatch(tokenIds + offset, std::min(prefillChunkSize, T - offset));
+            return next;
+        }
         // Intel's Qwen 4B graph has one known bad dynamic shape at M=4, but
         // the normal 64-token bounded path is conformant. Keep an override for
         // bounded kernel-isolation experiments without penalizing production.
@@ -613,21 +863,26 @@ struct GenericOnnxState {
         idT.cpuData.resize(T * 8);
         memcpy(idT.cpuData.data(), ids64.data(), T * 8);
         inputs["input_ids"] = &idT;
+        GpuTensor embeddings;
+        if (cpuEmbedding) {
+            PrepareEmbeddings(tokenIds, T, embeddings);
+            inputs["inputs_embeds"] = &embeddings;
+        }
 
         const bool intelQwen2 = arch == "qwen3_5_text" && numLayers == 24 &&
             gpu->adapterName.find("Intel") != std::string::npos;
         GpuTensor positionT;
         std::vector<int64_t> positions;
         if (!intelQwen2) {
-            positions.resize(T);
-            for (uint32_t i = 0; i < T; i++)
-                positions[i] = (int64_t)(pos - T + i);
-            positionT.shape = {1, (int64_t)T};
+            positions.resize(T*positionAxes);
+            for (uint32_t i = 0; i < T*positionAxes; i++)
+                positions[i] = (int64_t)(pos - T + i%T);
+            positionT.shape = positionAxes==1 ? std::vector<int64_t>{1,(int64_t)T} : std::vector<int64_t>{positionAxes,1,(int64_t)T};
             positionT.dtype = TensorDtype::Int64;
             positionT.buffer = positionBuf;
-            gpu->writeBuffer(positionBuf, positions.data(), T * 8);
-            positionT.cpuData.resize(T * 8);
-            memcpy(positionT.cpuData.data(), positions.data(), T * 8);
+            gpu->writeBuffer(positionBuf, positions.data(), positions.size() * 8);
+            positionT.cpuData.resize(positions.size() * 8);
+            memcpy(positionT.cpuData.data(), positions.data(), positions.size() * 8);
             inputs["position_ids"] = &positionT;
         }
 
@@ -716,12 +971,10 @@ struct GenericOnnxState {
         const uint64_t logitBytes = (uint64_t)vocabSize * sizeof(float);
         auto readbackHandle = gpu->getOrCreateReadbackBuf(logitBytes);
         execCtx.RequestReadback(logitsBuf, {readbackHandle, logitBytes}, logitBytes);
-        executor.Execute(execCtx, inputs, outputs);
+        ExecuteGraph(inputs, outputs);
 
         int64_t logitNel = logitsOut.ElementCount();
-        std::vector<float> logits(logitNel);
-        auto rb = gpu->mapReadbackBuffer(logitNel * 4);
-        memcpy(logits.data(), rb.data(), logitNel * 4);
+        auto logits = ReadLogits(logitNel);
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
                                  ".conv_state";
@@ -746,6 +999,9 @@ struct GenericOnnxState {
     }
 
     int32_t CapturePrefillBatch(const int32_t* tokenIds, uint32_t T) {
+        // Flat capture restores CPU writes before commands; it cannot preserve
+        // the write/execute interleaving between multiple prompt chunks.
+        if (prefillChunkSize && T > prefillChunkSize) return -1;
         ResetCaches(true);
         execCtx.CaptureBegin();
         int32_t result = RunPrefillBatch(tokenIds, T);
@@ -762,16 +1018,16 @@ struct GenericOnnxState {
         ResetCaches(true);
         pos = T;
 
-        std::vector<int64_t> ids(T), positions(T), mask(T, 1);
+        std::vector<int64_t> ids(T), positions(T*positionAxes), mask(T, 1);
         for (uint32_t i = 0; i < T; ++i) {
             ids[i] = tokenIds[i];
-            positions[i] = i;
+            for(uint32_t axis=0;axis<positionAxes;++axis) positions[axis*T+i] = i;
         }
         gpu->writeBuffer(prefillIdsBuf, ids.data(), T * sizeof(int64_t));
         const bool intelQwen2 = arch == "qwen3_5_text" && numLayers == 24 &&
             gpu->adapterName.find("Intel") != std::string::npos;
         if (!intelQwen2)
-            gpu->writeBuffer(positionBuf, positions.data(), T * sizeof(int64_t));
+            gpu->writeBuffer(positionBuf, positions.data(), positions.size() * sizeof(int64_t));
         gpu->writeBuffer(maskBuf, mask.data(), T * sizeof(int64_t));
         const int64_t nlk = 1;
         gpu->writeBuffer(nlkBuf, &nlk, sizeof(nlk));
@@ -785,14 +1041,16 @@ struct GenericOnnxState {
         }
         gpu->writeBuffer(prefillIdsBuf, ids.data(), T * sizeof(int64_t));
         if (!intelQwen2)
-            gpu->writeBuffer(positionBuf, positions.data(), T * sizeof(int64_t));
+            gpu->writeBuffer(positionBuf, positions.data(), positions.size() * sizeof(int64_t));
         gpu->writeBuffer(maskBuf, mask.data(), T * sizeof(int64_t));
         gpu->writeBuffer(nlkBuf, &nlk, sizeof(nlk));
 
+        if (cpuEmbedding) {
+            GpuTensor embeddings;
+            PrepareEmbeddings(tokenIds, T, embeddings);
+        }
         execCtx.ReplayDispatches();
-        auto rb = gpu->mapReadbackBuffer((uint64_t)vocabSize * sizeof(float));
-        std::vector<float> logits(vocabSize);
-        memcpy(logits.data(), rb.data(), logits.size() * sizeof(float));
+        auto logits = ReadLogits(vocabSize);
 
         convState = capturedPrefillConvState;
         recurrentState = capturedPrefillRecurrentState;
@@ -849,14 +1107,19 @@ struct GenericOnnxState {
             }
             const int64_t replayToken = tokenId;
             const int64_t replayPosition = static_cast<int64_t>(execCtx.replayPosition_);
+            const std::vector<int64_t> replayPositions(positionAxes,replayPosition);
             gpu->writeBufferRaw(idsBuf.handle, idsBuf.offset,
                                 &replayToken, sizeof(replayToken));
             gpu->writeBufferRaw(positionBuf.handle, positionBuf.offset,
-                                &replayPosition, sizeof(replayPosition));
+                                replayPositions.data(), replayPositions.size()*sizeof(int64_t));
             const int64_t maskOne = 1;
             gpu->writeBufferRaw(maskBuf.handle,
                 maskBuf.offset + static_cast<uint64_t>(execCtx.replayPosition_) * 8,
                 &maskOne, sizeof(maskOne));
+            if (cpuEmbedding) {
+                GpuTensor embeddings; const int32_t token = static_cast<int32_t>(tokenId);
+                PrepareEmbeddings(&token, 1, embeddings);
+            }
             execCtx.ReplayWrites();
 
             // The exported Qwen graph selects one 32-float RoPE cache row on
@@ -889,7 +1152,7 @@ struct GenericOnnxState {
             const bool gpuGreedy = requestGpuGreedyToken &&
                 execCtx.fusedLmHeadArgmaxAvailable_ &&
                 execCtx.fusedLmHeadArgmaxResult_.handle;
-            uint64_t readbackBytes = gpuGreedy ? 4u : (uint64_t)vocabSize * 4;
+            uint64_t readbackBytes = gpuGreedy ? 4u : (uint64_t)vocabSize * GpuTensor::DtypeSizeOf(logitsDtype);
             GPUBuffer readbackSrc = gpuGreedy
                 ? execCtx.fusedLmHeadArgmaxResult_ : logitsBuf;
             auto rbHandle = gpu->getOrCreateReadbackBuf(readbackBytes);
@@ -898,12 +1161,11 @@ struct GenericOnnxState {
             execCtx.ReplayDispatches();
 
             std::vector<float> logits;
-            auto rb = gpu->mapReadbackBuffer(readbackBytes);
             if (gpuGreedy) {
+                auto rb = gpu->mapReadbackBuffer(readbackBytes);
                 memcpy(&lastGpuGreedyToken, rb.data(), 4);
             } else {
-                logits.resize(vocabSize);
-                memcpy(logits.data(), rb.data(), vocabSize * 4);
+                logits = ReadLogits(vocabSize);
             }
 
             for (size_t i = 0; i < convLayerIndices.size(); i++) {
@@ -958,6 +1220,19 @@ struct GenericOnnxState {
             if (arch == "qwen3_5_text") {
                 const int variant = qwenCapturedVariants;
                 qwenCaptureVariants[variant].logits = logitsBuf;
+                if (const char* folder = std::getenv("BP_DUMP_ONNX_STATE_DIR")) {
+                    qwenCaptureVariants[variant].diagnosticConv = convState["past_key_values.0.conv_state"];
+                    qwenCaptureVariants[variant].diagnosticRecurrent = recurrentState["past_key_values.0.recurrent_state"];
+                    std::ofstream writes(fs::path(folder) / ("capture-writes-" + std::to_string(variant) + ".txt"));
+                    for (const auto& write : execCtx.capturedWrites_) {
+                        writes << write.opName << "\t" << write.handle << "\t" << write.offset << "\t" << write.data.size();
+                        for (size_t i = 0; i + 4 <= write.data.size() && i < 48; i += 4) {
+                            uint32_t value; memcpy(&value, write.data.data() + i, 4);
+                            writes << "\t" << value;
+                        }
+                        writes << "\n";
+                    }
+                }
                 int nDisp = 0;
                 for (auto& f : execCtx.capturedFlushes_)
                     nDisp += static_cast<int>(f.dispatches.size());
@@ -1184,18 +1459,25 @@ private:
         idT.cpuData.resize(8);
         memcpy(idT.cpuData.data(), &tokenId, 8);
         inputs["input_ids"] = &idT;
+        GpuTensor embeddings;
+        if (cpuEmbedding) {
+            const int32_t token = static_cast<int32_t>(tokenId);
+            PrepareEmbeddings(&token, 1, embeddings);
+            inputs["inputs_embeds"] = &embeddings;
+        }
 
         const bool intelQwen2 = arch == "qwen3_5_text" && numLayers == 24 &&
             gpu->adapterName.find("Intel") != std::string::npos;
         int64_t position = (int64_t)(pos - 1);
+        std::vector<int64_t> positionValues(positionAxes,position);
         GpuTensor positionT;
         if (!intelQwen2) {
-            positionT.shape = {1, 1};
+            positionT.shape = positionAxes==1 ? std::vector<int64_t>{1,1} : std::vector<int64_t>{positionAxes,1,1};
             positionT.dtype = TensorDtype::Int64;
             positionT.buffer = positionBuf;
-            gpu->writeBuffer(positionBuf, &position, sizeof(position));
-            positionT.cpuData.resize(sizeof(position));
-            memcpy(positionT.cpuData.data(), &position, sizeof(position));
+            gpu->writeBuffer(positionBuf, positionValues.data(), positionValues.size()*sizeof(int64_t));
+            positionT.cpuData.resize(positionValues.size()*sizeof(int64_t));
+            memcpy(positionT.cpuData.data(), positionValues.data(), positionT.cpuData.size());
             inputs["position_ids"] = &positionT;
         }
 
@@ -1283,12 +1565,10 @@ private:
         auto rbHandle = gpu->getOrCreateReadbackBuf(logitBytes);
         execCtx.RequestReadback(logitsBuf, {rbHandle, logitBytes}, logitBytes);
 
-        executor.Execute(execCtx, inputs, outputs);
+        ExecuteGraph(inputs, outputs);
 
         int64_t logitNel = logitsOut.ElementCount();
-        std::vector<float> logits(logitNel);
-        auto rb = gpu->mapReadbackBuffer(logitNel * 4);
-        memcpy(logits.data(), rb.data(), logitNel * 4);
+        auto logits = ReadLogits(logitNel);
 
         for (size_t i = 0; i < convLayerIndices.size(); i++) {
             std::string inName = "past_key_values." + std::to_string(convLayerIndices[i]) +
@@ -1332,8 +1612,13 @@ struct StandardState {
     std::string arch, gpuName, backendName;
     uint32_t nLayer=0, nHead=0, nKvHeads=0, nEmbd=0, headDim=0, nVocab=0;
 
-    bool Load(GPUContext& gpuCtx, const std::string& path) {
+    bool Load(GPUContext& gpuCtx, const std::string& path, int64_t maxSeqOverride) {
         gpu = &gpuCtx;
+        if (maxSeqOverride < 0 || maxSeqOverride > UINT32_MAX) {
+            fprintf(stderr, "Invalid context length\n");
+            return false;
+        }
+        if (maxSeqOverride > 0) runner.maxSeqLen = (uint32_t)maxSeqOverride;
         std::string resolved = resolvePath(path, format);
 
         bool ok = (format == "onnx")
@@ -1445,6 +1730,10 @@ struct StandardState {
     }
 
     int32_t Prefill(const int32_t* tokens, uint32_t n) {
+        if (n > runner.maxSeqLen || pos > runner.maxSeqLen - n) {
+            fprintf(stderr, "Prompt exceeds the configured context length (%u)\n", runner.maxSeqLen);
+            return -1;
+        }
         if (std::getenv("BP_DUMP_TOKENS")) {
             fprintf(stderr, "[debug] prompt tokens:");
             for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %d", tokens[i]);
@@ -1455,7 +1744,15 @@ struct StandardState {
         bool pooledPrefill = runner.pleGpuPreprocess || runner.cfg.arch == "qwen35";
         bool qwenBatched = runner.cfg.arch == "qwen35" && n > 16 &&
                            runner.qwen35FastPrefill;
-        if (qwenBatched && !std::getenv("BP_SYNC_PREFILL")) {
+        // This artifact/device pair passed exact serial/ORT continuation checks
+        // and paired application benchmarks. BP_GEMMA_SERIAL_PREFILL retains
+        // the previous route; GGUF continues through its existing selection.
+        const bool gemmaOnnxBatched = format == "onnx" && runner.cfg.arch == "gemma4" &&
+            runner.cfg.nLayer == 35 && runner.cfg.nEmbd == 1536 && runner.cfg.nVocab == 262144 &&
+            runner.hasBatchedPrefill() && n > 16 && gpu->backendType == WGPUBackendType_D3D12 &&
+            gpu->adapterName.find("RTX 5080") != std::string::npos &&
+            !std::getenv("BP_GEMMA_SERIAL_PREFILL");
+        if ((qwenBatched || gemmaOnnxBatched) && !std::getenv("BP_SYNC_PREFILL")) {
             next = runner.prefillBatched(tokens, n, startPos);
         } else if (pooledPrefill && !std::getenv("BP_SYNC_PREFILL")) {
             next = runner.prefillPooledKnown(tokens, n, startPos);
@@ -1465,36 +1762,46 @@ struct StandardState {
             DumpTopLogits("prefill", logits);
             next = ModelRunner::argmax(logits);
         }
+        if (const char* path = std::getenv("BP_DUMP_PREFILL_LOGITS")) {
+            auto bytes = gpu->readBuffer(runner.logitsBuf, uint64_t(nVocab) * sizeof(float));
+            std::ofstream output(path, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
         runner.seedDecodeTokenInputs(next);
         pos += n;
         return next;
     }
 
     int32_t DecodePipelined() {
+        if (pos >= runner.maxSeqLen) return -1;
         int depth = runner.decodePoolDepth;
 
         if (pipelineInFlight == 0) {
-            for (int i = 0; i < depth; i++) {
+            const int available = std::min<uint32_t>(depth, runner.maxSeqLen - pos);
+            for (int i = 0; i < available; i++) {
                 int slot = (pos + i) % depth;
                 runner.submitDecode(pos + i, slot);
             }
-            pipelineInFlight = depth;
-            pipelineNextSubmitPos = pos + depth;
+            pipelineInFlight = available;
+            pipelineNextSubmitPos = pos + available;
         }
 
         int readSlot = pos % depth;
         int32_t tok = runner.readArgmax(readSlot);
         pipelineInFlight--;
 
-        runner.submitDecode(pipelineNextSubmitPos, readSlot);
-        pipelineNextSubmitPos++;
-        pipelineInFlight++;
+        if (pipelineNextSubmitPos < runner.maxSeqLen) {
+            runner.submitDecode(pipelineNextSubmitPos, readSlot);
+            pipelineNextSubmitPos++;
+            pipelineInFlight++;
+        }
 
         pos++;
         return tok;
     }
 
     std::vector<float> DecodeSynchronous(int32_t token) {
+        if (pos >= runner.maxSeqLen) return {};
         auto logits = runner.decode(token, pos);
         DumpTopLogits("decode", logits);
         pos++;
@@ -1502,6 +1809,7 @@ struct StandardState {
     }
 
     int32_t DecodeArgmaxSynchronous(int32_t token) {
+        if (pos >= runner.maxSeqLen) return -1;
         if (std::getenv("BP_DUMP_TOP_LOGITS")) {
             auto logits = DecodeSynchronous(token);
             return ModelRunner::argmax(logits);
@@ -1511,7 +1819,18 @@ struct StandardState {
         return next;
     }
 
-    void Reset() { runner.resetKVCache(); pos = 0; pipelineInFlight = 0; pipelineNextSubmitPos = 0; }
+    void Reset() {
+        // Streaming decode submits ahead of the last token returned to the
+        // caller. Complete those maps before prefill reuses the staging ring.
+        // Queue completion alone does not unmap the buffers.
+        const int depth = std::max(1, runner.decodePoolDepth);
+        for (int i = 0; i < pipelineInFlight; ++i)
+            (void)runner.readArgmax((pos + i) % depth);
+        pipelineInFlight = 0;
+        pipelineNextSubmitPos = 0;
+        runner.resetKVCache();
+        pos = 0;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1570,6 +1889,7 @@ LmSession LmSession::Create(Device& device, const std::string& modelPath,
         }
 
         auto* gen = session.impl_->gen_.get();
+        gen->prefillChunkSize = options.prefillChunkSize;
 
         // Auto-enable fast decode
         if (options.fastDecode) {
@@ -1603,7 +1923,7 @@ LmSession LmSession::Create(Device& device, const std::string& modelPath,
         session.impl_->backend = Impl::Backend::Standard;
         session.impl_->std_ = std::make_unique<StandardState>();
 
-        if (!session.impl_->std_->Load(*gpuCtx, modelPath)) {
+        if (!session.impl_->std_->Load(*gpuCtx, modelPath, options.maxSeqLen)) {
             fprintf(stderr, "bp::LmSession: failed to load model\n");
             return {};
         }
@@ -1619,7 +1939,7 @@ LmSession LmSession::Create(Device& device, const std::string& modelPath,
         cfg.numHeads = (int)std->nHead;
         cfg.numKvHeads = (int)std->nKvHeads;
         cfg.headDim = (int)std->headDim;
-        cfg.maxSeqLen = 0;  // determined by ModelRunner internally
+        cfg.maxSeqLen = std->runner.maxSeqLen;
     }
 
     return session;
@@ -1642,6 +1962,14 @@ std::vector<int32_t> LmSession::Tokenize(const std::string& text) const {
     if (impl_->backend == Impl::Backend::GenericOnnx)
         return impl_->gen_->tokenizer.encode(text);
     return impl_->std_->Tokenize(text);
+}
+
+std::vector<int32_t> LmSession::TokenizeRaw(const std::string& text) const {
+    if (!impl_) return {};
+    if (impl_->backend == Impl::Backend::GenericOnnx)
+        return impl_->gen_->tokenizer.encode(text);
+    auto* state = impl_->std_.get();
+    return state->format == "onnx" ? state->onnxTokenizer.encode(text) : state->ggufTokenizer.encode(text);
 }
 
 std::string LmSession::Detokenize(int32_t tokenId) const {
@@ -1673,14 +2001,20 @@ std::string LmSession::Generate(const std::string& prompt, int maxTokens,
                                  const SamplingParams& sampling,
                                  StreamCallback onToken,
                                  bool resetSession) {
-    if (!impl_) return {};
+    if (!impl_ || maxTokens <= 0) return {};
 
     if (resetSession) Reset();
     auto tokens = Tokenize(prompt);
     if (tokens.empty()) return {};
 
     int32_t next = Prefill(tokens.data(), (uint32_t)tokens.size());
+    if (impl_->gpu->deviceLost) return {};
     int32_t eos = GetEosTokenId();
+    auto isEnd = [&](int32_t token) {
+        if (impl_->backend == Impl::Backend::GenericOnnx) return impl_->gen_->tokenizer.is_end_token(token);
+        if (impl_->std_->format == "onnx") return impl_->std_->onnxTokenizer.is_end_token(token);
+        return token == eos;
+    };
 
     bool useSampling = (sampling.temperature > 0.0f);
     std::mt19937 rng(sampling.seed ? sampling.seed : std::random_device{}());
@@ -1695,7 +2029,7 @@ std::string LmSession::Generate(const std::string& prompt, int maxTokens,
 
     std::string result;
     for (int i = 0; i < maxTokens; i++) {
-        if (next == eos) break;
+        if (impl_->gpu->deviceLost || next < 0 || isEnd(next)) break;
         std::string text = Detokenize(next);
         // Skip special tokens (enclosed in < >)
         if (!(text.size() >= 2 && text[0] == '<' && text.back() == '>')) {
@@ -1727,6 +2061,7 @@ int32_t LmSession::Prefill(const int32_t* tokens, uint32_t count) {
         int32_t next = gen->RunPrefillBatch(tokens, count);
         gen->prefillDone = true;
         impl_->lastToken = next;
+        gen->DumpReferenceState();
         return next;
     }
 
@@ -1741,8 +2076,10 @@ int32_t LmSession::Decode() {
 
     if (impl_->backend == Impl::Backend::GenericOnnx) {
         auto* gen = impl_->gen_.get();
+        if (gen->pos >= gen->maxSeqLen) return -1;
         int32_t next = gen->RunStepGreedy(impl_->lastToken);
         impl_->lastToken = next;
+        gen->DumpReferenceState();
         return next;
     }
 
@@ -1750,6 +2087,7 @@ int32_t LmSession::Decode() {
     // params and GPU embedding gather. Keep a synchronous fallback for
     // validation or bisecting correctness regressions.
     auto* std = impl_->std_.get();
+    if (std->pos >= std->runner.maxSeqLen) return -1;
     int32_t next;
     bool q35Sync = std->runner.cfg.arch == "qwen35" &&
                    std::getenv("BP_Q35_SYNC") != nullptr;
@@ -1772,6 +2110,7 @@ std::vector<float> LmSession::DecodeLogits() {
     if (!impl_) return {};
 
     if (impl_->backend == Impl::Backend::GenericOnnx) {
+        if (impl_->gen_->pos >= impl_->gen_->maxSeqLen) return {};
         auto* gen = impl_->gen_.get();
         auto logits = gen->RunStep(impl_->lastToken);
         return logits;
@@ -1865,150 +2204,122 @@ uint32_t LmSession::GetPosition() const {
     return impl_->std_->pos;
 }
 
+uint64_t LmSession::TrimMemory() {
+    if (!impl_) return 0;
+    impl_->gpu->waitForQueue();
+    const auto bytes = impl_->gpu->pooledBufferBytes();
+    impl_->gpu->flushBufferPool();
+    return bytes;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Benchmarking + Profiling
 // ═══════════════════════════════════════════════════════════════════════════
 
 BenchmarkResult LmSession::Benchmark(int promptLen, int genTokens) {
+    if (!impl_ || promptLen <= 0) return {};
+    if (std::getenv("BP_BENCH_PATTERN_TOKENS")) {
+        std::vector<int32_t> tokens(promptLen);
+        for (int i=0;i<promptLen;++i)
+            tokens[i]=42+(i*7919)%std::max(1,impl_->config.vocabSize-42);
+        return BenchmarkTokens(tokens,genTokens,1);
+    }
+    std::string text = "A";
+    for (int i = 1; i < promptLen; ++i) text += " A";
+    auto tokens = TokenizeRaw(text);
+    if (tokens.size() != static_cast<size_t>(promptLen))
+        throw std::runtime_error("Default benchmark text has a different token count; supply exact prompt tokens");
+    return BenchmarkTokens(tokens, genTokens, 1);
+}
+
+BenchmarkResult LmSession::BenchmarkTokens(const std::vector<int32_t>& promptTokens,
+                                         int genTokens, int warmupRuns) {
     if (!impl_) return {};
-
-    BenchmarkResult result;
-    result.promptLen = promptLen;
-
-    if (impl_->backend == Impl::Backend::GenericOnnx) {
-        auto* gen = impl_->gen_.get();
-
-        // Check capacity
-        int totalNeeded = promptLen + 3 + genTokens;
-        if (totalNeeded > (int)gen->maxSeqLen) return result;
-
-        std::vector<int32_t> prefillTokens(promptLen, 1);
-        if (std::getenv("BP_BENCH_PATTERN_TOKENS")) {
-            for (int i = 0; i < promptLen; ++i)
-                prefillTokens[i] = 42 + (i * 7919) %
-                    std::max<int64_t>(1, gen->vocabSize - 42);
-        }
-        // Match ORT GenAI's reused-generator benchmark semantics: compile the
-        // shape-specific pipelines and materialize the tensor plan before the
-        // timed sample. Otherwise the first prompt reports shader compilation
-        // as inference time and understates steady-state prefill by several x.
-        bool capturePrefill = gen->arch == "qwen3_5_text" &&
-            !std::getenv("BP_QWEN_DISABLE_PREFILL_CAPTURE");
-        gen->ResetCaches();
-        (void)gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
-        if (capturePrefill) {
-            (void)gen->CapturePrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
-            capturePrefill = gen->prefillCaptureReady;
-        }
-        if (!capturePrefill)
-            gen->ResetCaches();
-        gen->benchWarmupDone = true;
-        int32_t tok = 1;
-
-        // Prefill
-        auto pfStart = std::chrono::steady_clock::now();
-        tok = capturePrefill
-            ? gen->ReplayCapturedPrefillBatch(prefillTokens.data(), (uint32_t)promptLen)
-            : gen->RunPrefillBatch(prefillTokens.data(), (uint32_t)promptLen);
-        if (std::getenv("BP_DUMP_BENCH_TOKEN"))
-            fprintf(stderr, "  [benchmark-token] prefill=%d\n", tok);
-        auto pfEnd = std::chrono::steady_clock::now();
-        result.prefillMs = std::chrono::duration<double, std::milli>(pfEnd - pfStart).count();
+    const int promptLen = static_cast<int>(promptTokens.size());
+    if (promptLen <= 0 || genTokens <= 0 || warmupRuns < 0 ||
+        int64_t(promptLen) + genTokens > impl_->config.maxSeqLen)
+        return {};
+    using Clock = std::chrono::steady_clock;
+    auto run = [&]() {
+        Reset();
+        BenchmarkResult result;
+        result.promptLen = promptLen;
+        result.tokenIds.reserve(genTokens);
+        const auto prefillStart = Clock::now();
+        // Use the application's selected prefill implementation and options.
+        // Calling an unrelated batched runner path here can produce timings for
+        // a path that the application never uses (and may not be conformant).
+        int32_t token = Prefill(promptTokens.data(), static_cast<uint32_t>(promptLen));
+        const auto prefillEnd = Clock::now();
+        if (token < 0 || impl_->gpu->deviceLost || impl_->gpu->executionError)
+            throw std::runtime_error("Benchmark prefill failed");
+        result.tokenIds.push_back(token);
+        result.prefillMs = std::chrono::duration<double, std::milli>(prefillEnd - prefillStart).count();
         result.prefillTokPerSec = promptLen * 1000.0 / result.prefillMs;
-        gen->prefillDone = true;
-
-        // TTFT (first decode step)
-        auto ttftStart = std::chrono::steady_clock::now();
-        {
-            tok = gen->RunStepGreedy(tok);
-            if (std::getenv("BP_DUMP_BENCH_TOKEN"))
-                fprintf(stderr, "  [benchmark-token] ttft=%d\n", tok);
+        result.ttftMs = result.prefillMs;
+        const int steps = genTokens - 1;
+        impl_->gpu->timing.wait_ns = 0;
+        const auto decodeStart = Clock::now();
+        if (impl_->backend == Impl::Backend::GenericOnnx) {
+            auto* gen = impl_->gen_.get();
+            // Capture setup belongs to the requested continuation. Do not
+            // consume unreported warmup tokens in the measured conversation.
+            for (int i = 0; i < steps; ++i) {
+                token = gen->RunStepGreedy(token);
+                if (token < 0 || impl_->gpu->deviceLost || impl_->gpu->executionError)
+                    throw std::runtime_error("Benchmark decode failed");
+                result.tokenIds.push_back(token);
+                ++result.decodeSampleTokens;
+            }
+        } else if (steps > 0) {
+            auto* state = impl_->std_.get();
+            const int depth = std::max(1, state->runner.decodePoolDepth);
+            int submitted = 0, completed = 0;
+            auto submit = [&]() {
+                const uint32_t position = static_cast<uint32_t>(promptLen + submitted);
+                state->runner.submitDecode(position, position % depth);
+                ++submitted;
+            };
+            for (int i = 0; i < std::min(depth, steps); ++i) submit();
+            while (completed < submitted) {
+                token = state->runner.readArgmax((promptLen + completed) % depth);
+                if (token < 0 || impl_->gpu->deviceLost || impl_->gpu->executionError)
+                    throw std::runtime_error("Benchmark decode failed");
+                result.tokenIds.push_back(token);
+                ++completed;
+                ++state->pos;
+                ++result.decodeSampleTokens;
+                if (submitted < steps) submit();
+            }
         }
-        auto ttftEnd = std::chrono::steady_clock::now();
-        result.ttftMs = std::chrono::duration<double, std::milli>(ttftEnd - ttftStart).count();
-
-        // Warm up the ordinary decode tensor plan and both Qwen ping-pong
-        // capture variants before timing steady-state decode.  Batched prefill
-        // deliberately invalidates its prompt-shaped tensor plan, so a fixed
-        // two steps left capture work in the timed region while serial prefill
-        // happened to complete it during the prompt loop.
-        for (int i = 0; i < 2; i++) {
-            tok = gen->RunStepGreedy(tok);
-        }
-        for (int i = 0; gen->fastDecodeEnabled && !gen->fastDecodeCaptured && i < 4; i++) {
-            tok = gen->RunStepGreedy(tok);
-        }
-
-        // Timed decode
-        auto dcStart = std::chrono::steady_clock::now();
-        for (int i = 0; i < genTokens; i++) {
-            tok = gen->RunStepGreedy(tok);
-        }
-        auto dcEnd = std::chrono::steady_clock::now();
-        result.decodeMs = std::chrono::duration<double, std::milli>(dcEnd - dcStart).count();
-        result.decodeTokPerSec = genTokens * 1000.0 / result.decodeMs;
-
+        const auto decodeEnd = Clock::now();
+        result.decodeMs = steps ? std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count() : 0;
+        result.decodeTokPerSec = steps ? steps * 1000.0 / result.decodeMs : 0;
+        result.fenceWaitMs = impl_->gpu->timing.wait_ns / 1e6;
+        result.generatedTokens = static_cast<int>(result.tokenIds.size());
+        result.finalPosition = GetPosition();
+        if (result.generatedTokens != genTokens || result.decodeSampleTokens != steps ||
+            result.finalPosition != static_cast<uint32_t>(promptLen + steps))
+            throw std::runtime_error("Benchmark did not execute the exact workload");
         return result;
-    }
-
-    // Standard path
-    auto* st = impl_->std_.get();
-    int DEPTH = st->runner.decodePoolDepth;
-
-    if (!st->benchWarmupDone) {
-        st->Reset();
-        // K-quant serial prefill can crash with large HD on some models,
-        // so use a minimal warmup (single token) when batched prefill is unavailable
-        // Match ORT reused-generator benchmarking: materialize the exact
-        // shape-specific Qwen prefill plan before timing it.
-        int warmupT = st->runner.qwenPrefillPlanCacheEnabled()
-            ? promptLen
-            : (st->runner.hasBatchedPrefill() ? std::min(promptLen, 32) : 1);
-        std::vector<int32_t> w(warmupT, 0);
-        int32_t t = st->runner.prefillBatched(w.data(), (uint32_t)w.size(), 0);
-        st->runner.seedDecodeTokenInputs(t);
-        for (int i = 0; i < DEPTH; i++) {
-            int slot = ((int)w.size() + i) % DEPTH;
-            st->runner.submitDecode((uint32_t)(w.size() + i), slot);
+    };
+    try {
+        std::vector<int32_t> warmupTokens;
+        for (int i = 0; i < warmupRuns; ++i) {
+            auto warm = run();
+            if (i && warm.tokenIds != warmupTokens)
+                throw std::runtime_error("Benchmark warmup continuation is not deterministic");
+            warmupTokens = std::move(warm.tokenIds);
         }
-        for (int i = 0; i < DEPTH; i++)
-            st->runner.readArgmax(((int)w.size() + i) % DEPTH);
-        st->Reset();
-        st->benchWarmupDone = true;
+        auto result = run();
+        if (warmupRuns && result.tokenIds != warmupTokens)
+            throw std::runtime_error("Benchmark continuation differs after warmup/reset");
+        Reset();
+        return result;
+    } catch (...) {
+        Reset();
+        throw;
     }
-
-    st->Reset();
-    std::vector<int32_t> dummy(promptLen, 0);
-    auto t0 = std::chrono::steady_clock::now();
-    int32_t first = st->runner.prefillBatched(dummy.data(), (uint32_t)promptLen, 0);
-    auto t1 = std::chrono::steady_clock::now();
-    result.prefillMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    result.prefillTokPerSec = promptLen * 1000.0 / result.prefillMs;
-
-    st->runner.seedDecodeTokenInputs(first);
-    st->gpu->timing.wait_ns = 0;
-    auto t2 = std::chrono::steady_clock::now();
-    int sub = 0, comp = 0;
-    for (int i = 0; i < std::min(DEPTH, genTokens); i++) {
-        int slot = (promptLen + i) % DEPTH;
-        st->runner.submitDecode((uint32_t)(promptLen + i), slot);
-        sub++;
-    }
-    while (comp < sub) {
-        st->runner.readArgmax((promptLen + comp) % DEPTH);
-        comp++;
-        if (sub < genTokens) {
-            st->runner.submitDecode((uint32_t)(promptLen + sub), (promptLen + sub) % DEPTH);
-            sub++;
-        }
-    }
-    auto t3 = std::chrono::steady_clock::now();
-    result.decodeMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    result.decodeTokPerSec = comp * 1000.0 / result.decodeMs;
-    result.fenceWaitMs = st->gpu->timing.wait_ns / 1e6;
-
-    st->Reset();
-    return result;
 }
 
 void LmSession::EnableProfiling() {
@@ -2017,6 +2328,17 @@ void LmSession::EnableProfiling() {
         impl_->gen_->execCtx.enableGpuProfiling();
     else
         impl_->std_->runner.enableProfiling();
+}
+
+void LmSession::FinishProfiling(const std::string& htmlPath, int measuredTokens, double elapsedMs,
+                               bool prefill) {
+    if (!impl_ || measuredTokens <= 0) return;
+    if (impl_->backend == Impl::Backend::GenericOnnx)
+        impl_->gen_->execCtx.printGpuProfileReport(measuredTokens, elapsedMs, htmlPath);
+    else
+        impl_->std_->runner.printProfileReport(prefill ? 0 : measuredTokens,
+            prefill ? measuredTokens : 0, prefill ? elapsedMs : 0,
+            prefill ? 0 : elapsedMs, htmlPath);
 }
 
 void LmSession::PrintProfileReport(const std::string& htmlPath) {

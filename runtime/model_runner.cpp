@@ -1,7 +1,8 @@
 #include "model_runner.h"
+#include "native_quant.h"
 #include "onnx_loader.h"
 #include "mapped_file.h"
-#include "wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "clock_calibration.h"
 #include "profile_html.h"
 #include <algorithm>
@@ -13,10 +14,26 @@
 #include <filesystem>
 #include <execution>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
 
 namespace {
+
+bool qwen38NativePrefillTarget(const GPUContext& gpu, const GGUFFile& model, const ModelConfig& cfg) {
+    const char* control = std::getenv("BP_NATIVE_QUANT_PREFILL_TILE");
+    return (!control || std::strcmp(control, "0") != 0) &&
+        gpu.adapterName.find("RTX 5080") != std::string::npos &&
+        cfg.arch == "qwen35" && cfg.nLayer == 64 && cfg.nEmbd == 5120 &&
+        model.getString("general.name") == "Qwen3.8-27B" &&
+        model.getU32("general.file_type") == 26;
+}
+
+const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool gather = false, bool prefill = false) {
+    return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) + (gather ? "_gather" : "") + (prefill ? "_prefill16" : ""),
+                                   nativeQuantShader(type, gather, prefill), 5);
+}
 
 std::string deltaNetValueMajorSource(const std::string& source) {
     std::string result(source);
@@ -1066,8 +1083,6 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
         // Unsupported GGUF quant formats (have no dequantizer yet).
         auto quantName = [](uint32_t t) -> const char* {
             switch (t) {
-                case 16: return "IQ2_XXS";  // not yet ported
-                case 19: return "IQ1_S";    // not yet ported
                 case 29: return "IQ1_M";    // not yet ported
                 case 34: return "TQ1_0";    // not yet ported
                 case 35: return "TQ2_0";    // not yet ported
@@ -1844,9 +1859,13 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         fused.K = a.K;
         fused.rowStrideWords = a.rowStrideWords;
         fused.nBlocks = a.nBlocks;
-        fused.data.reserve(a.data.size() + b.data.size());
-        fused.data.insert(fused.data.end(), a.data.begin(), a.data.end());
-        fused.data.insert(fused.data.end(), b.data.begin(), b.data.end());
+        const size_t aWeights = size_t(a.N) * a.rowStrideWords;
+        const size_t bWeights = size_t(b.N) * b.rowStrideWords;
+        fused.data.reserve(a.data.size() + bWeights);
+        fused.data.insert(fused.data.end(), a.data.begin(), a.data.begin() + aWeights);
+        fused.data.insert(fused.data.end(), b.data.begin(), b.data.begin() + bWeights);
+        // A mixed-IQ codebook belongs after the combined rows, once.
+        fused.data.insert(fused.data.end(), a.data.begin() + aWeights, a.data.end());
         return fused;
     };
 
@@ -1901,7 +1920,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             case GGUF_TYPE_Q4_K: return pack_q4k(data, N, K);
             case GGUF_TYPE_Q5_K: return pack_q5k(data, N, K);
             case GGUF_TYPE_Q6_K: return pack_q6k(data, N, K);
-            default: return {};
+            default: return pack_native_quant(data, N, K, type);
         }
     };
     const char* kqName = !isKQuant && cfg.arch == "qwen35" ? "mixed K-quant (per-tensor native)" :
@@ -2046,8 +2065,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                                      GPUBuffer& q8w, GPUBuffer& q8s) {
                     type = (GGUFType)t.type;
                     const uint8_t* src = fileData + gguf.data_offset + t.offset;
-                    if (type == GGUF_TYPE_Q4_K || type == GGUF_TYPE_Q5_K ||
-                        type == GGUF_TYPE_Q6_K) {
+                    if (supportsNativeQuant(type) && type != GGUF_TYPE_Q8_0) {
                         auto packed = packKQ(src, N, cfg.nEmbd, type);
                         nb = packed.nBlocks; rs = packed.rowStrideWords;
                         uploadKQWeight("L" + std::to_string(i) + suffix, packed, kqBuf);
@@ -2080,16 +2098,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& qkvt = gguf.tensors[qkvi_pre->second];
                 uint32_t qkvN = (uint32_t)qkvt.shape[1];  // out-dim = qDim + 2*kvDim
                 bool tensorIsKQ =
-                    (qkvt.type == GGUF_TYPE_Q4_K || qkvt.type == GGUF_TYPE_Q5_K || qkvt.type == GGUF_TYPE_Q6_K);
+                    supportsNativeQuant(qkvt.type) && qkvt.type != GGUF_TYPE_Q8_0;
                 const uint8_t* src = fileData + gguf.data_offset + qkvt.offset;
                 if (tensorIsKQ) {
-                    KQuantPacked kq;
-                    switch ((GGUFType)qkvt.type) {
-                        case GGUF_TYPE_Q4_K: kq = pack_q4k(src, qkvN, cfg.nEmbd); break;
-                        case GGUF_TYPE_Q5_K: kq = pack_q5k(src, qkvN, cfg.nEmbd); break;
-                        case GGUF_TYPE_Q6_K: kq = pack_q6k(src, qkvN, cfg.nEmbd); break;
-                        default: break;
-                    }
+                    auto kq = packKQ(src, qkvN, cfg.nEmbd, qkvt.type);
                     lw.qkvKQType = (GGUFType)qkvt.type;
                     lw.qkvKQNBlocks = kq.nBlocks;
                     lw.qkvKQRowStride = kq.rowStrideWords;
@@ -2153,7 +2165,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
                     bool tensorIsKQ = (isKQuant || cfg.arch == "qwen35") &&
-                        (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                        supportsNativeQuant(ti.type) && ti.type != GGUF_TYPE_Q8_0;
                     if (tensorIsKQ) {
                         auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerQDim, (GGUFType)ti.type);
                         lw.oKQType = (GGUFType)ti.type;
@@ -2179,9 +2191,16 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& gt = gguf.tensors[gi->second];
                 auto& ut = gguf.tensors[ui->second];
                 bool bothKQ = (isKQuant || cfg.arch == "qwen35") && gt.type == ut.type &&
-                    (gt.type == GGUF_TYPE_Q4_K || gt.type == GGUF_TYPE_Q5_K || gt.type == GGUF_TYPE_Q6_K) &&
-                    (ut.type == GGUF_TYPE_Q4_K || ut.type == GGUF_TYPE_Q5_K || ut.type == GGUF_TYPE_Q6_K);
-                if (bothKQ) {
+                    supportsNativeQuant(gt.type) && gt.type != GGUF_TYPE_Q8_0;
+                if (cfg.arch == "qwen35" && gt.type != ut.type &&
+                    supportsNativeQuant(gt.type) && supportsNativeQuant(ut.type)) {
+                    auto gp = pack_native_quant(fileData + gguf.data_offset + gt.offset, layerIM, cfg.nEmbd, gt.type);
+                    auto up = pack_native_quant(fileData + gguf.data_offset + ut.offset, layerIM, cfg.nEmbd, ut.type);
+                    lw.guKQType = gt.type; lw.guKQNBlocks = gp.nBlocks; lw.guKQRowStride = gp.rowStrideWords;
+                    lw.upKQType = ut.type; lw.upKQNBlocks = up.nBlocks; lw.upKQRowStride = up.rowStrideWords;
+                    uploadKQWeight(pfx + "gate_native", gp, lw.guKQ);
+                    uploadKQWeight(pfx + "up_native", up, lw.upKQ);
+                } else if (bothKQ) {
                     auto gp = packKQ(fileData + gguf.data_offset + gt.offset, layerIM, cfg.nEmbd, (GGUFType)gt.type);
                     auto up = packKQ(fileData + gguf.data_offset + ut.offset, layerIM, cfg.nEmbd, (GGUFType)ut.type);
                     auto fused = fuseKQ(gp, up);
@@ -2209,7 +2228,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (it != gguf.tensor_index.end()) {
                 auto& ti = gguf.tensors[it->second];
                 bool tensorIsKQ = (isKQuant || cfg.arch == "qwen35") &&
-                    (ti.type == GGUF_TYPE_Q4_K || ti.type == GGUF_TYPE_Q5_K || ti.type == GGUF_TYPE_Q6_K);
+                    supportsNativeQuant(ti.type) && ti.type != GGUF_TYPE_Q8_0;
                 if (tensorIsKQ) {
                     auto kq = packKQ(fileData + gguf.data_offset + ti.offset, cfg.nEmbd, layerIM, (GGUFType)ti.type);
                     lw.dnKQType = (GGUFType)ti.type;
@@ -2462,8 +2481,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 if (it == gguf.tensor_index.end()) return false;
                 auto& ti = gguf.tensors[it->second];
                 type = (GGUFType)ti.type;
-                if (type != GGUF_TYPE_Q4_K && type != GGUF_TYPE_Q5_K &&
-                    type != GGUF_TYPE_Q6_K) return false;
+                if (!supportsNativeQuant(type) || type == GGUF_TYPE_Q8_0) return false;
                 auto packed = packKQ(fileData + gguf.data_offset + ti.offset, N, K, type);
                 nBlocks = packed.nBlocks;
                 rowStride = packed.rowStrideWords;
@@ -2545,6 +2563,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             for (auto d : ti.shape) nel *= (uint32_t)d;
             const uint8_t* data = fileData + gguf.data_offset + ti.offset;
             const bool needCpuEmbedding = cfg.arch != "qwen35" ||
+                !supportsNativeQuant(ti.type) ||
                 std::getenv("BP_Q35_SYNC") || std::getenv("BP_SYNC_PREFILL") ||
                 std::getenv("BP_DUMP_BUFFER_STATS");
             if (needCpuEmbedding) embeddingCPU.resize(nel);
@@ -2592,9 +2611,18 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                    ti.type == GGUF_TYPE_F16 ? "f16→f32" :
                    ti.type == GGUF_TYPE_BF16 ? "bf16→f32" : "f32");
 
+            if (cfg.arch == "qwen35" && supportsNativeQuant(ti.type) &&
+                (!cfg.tieWordEmbeddings || (ti.type != GGUF_TYPE_Q6_K && ti.type != GGUF_TYPE_Q8_0))) {
+                auto packed = pack_native_quant(data, cfg.nVocab, cfg.nEmbd, ti.type);
+                embeddingNativeType = ti.type;
+                embeddingNativeNBlocks = packed.nBlocks;
+                embeddingNativeRowStride = packed.rowStrideWords;
+                uploadKQWeight("embedding_native", packed, embeddingNative);
+            }
+
             // LM head: use quantized format if embedding is quantized
             if (cfg.tieWordEmbeddings) {
-                if (cfg.arch == "qwen35") {
+                if (cfg.arch == "qwen35" && supportsNativeQuant(ti.type) && ti.type != GGUF_TYPE_Q8_0) {
                     lmHeadKQType = (GGUFType)ti.type;
                     auto kq = packKQ(data, cfg.nVocab, cfg.nEmbd, lmHeadKQType);
                     kqLmNBlocks = kq.nBlocks;
@@ -2665,6 +2693,24 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                            (unsigned long long)(totalBytes / 1048576));
                 }
             }
+        }
+    }
+
+    // Untied output embeddings are an independent trained matrix. In
+    // particular Qwen3.8 uses Q3_K input embeddings and a Q5_K output head.
+    if (!cfg.tieWordEmbeddings) {
+        const auto& ti = gguf.tensors.at(gguf.tensor_index.at("output.weight"));
+        const uint8_t* data = fileData + gguf.data_offset + ti.offset;
+        if (cfg.arch == "qwen35" && supportsNativeQuant(ti.type) && ti.type != GGUF_TYPE_Q8_0) {
+            auto packed = packKQ(data, cfg.nVocab, cfg.nEmbd, ti.type);
+            lmHeadKQType = ti.type; kqLmNBlocks = packed.nBlocks; kqLmRowStride = packed.rowStrideWords;
+            uploadKQWeight("lm_head_separate_native", packed, lmHeadKQ);
+            lmHeadIsKQ = true;
+            fprintf(stderr, "  LM head: separate native type=%u (%zu MB)\n", ti.type, packed.data.size()*4/1048576);
+        } else {
+            auto rep = repackToQ8(data, cfg.nVocab, cfg.nEmbd, ti.type);
+            uploadQ8Weight(*gpu, "lm_head_separate_q8", rep, lmHeadQ8W, lmHeadQ8S);
+            lmHeadIsQ8 = true;
         }
     }
 
@@ -2985,7 +3031,7 @@ void ModelRunner::buildDecodePipeline() {
                 : useQ4KDecode256 ? "q4k_matmul" : "q4k_matmul_128");
             case GGUF_TYPE_Q5_K: return &getKernel("q5k_matmul");
             case GGUF_TYPE_Q6_K: return &getKernel("q6k_matmul");
-            default: return nullptr;
+            default: return supportsNativeQuant(type) ? &nativeQuantPipeline(*gpu, type) : nullptr;
         }
     };
     auto kqTileFor = [&](GGUFType type) {
@@ -3519,6 +3565,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         embedKQParams = gpu->createBuffer("p_embed_kq", sizeof(p));
         gpu->writeBuffer(embedKQParams, p, sizeof(p));
     }
+    GPUBuffer embedNativeParams;
+    if (embeddingNative.handle) {
+        const uint32_t p[] = {cfg.nEmbd, cfg.nVocab, embeddingNativeNBlocks, embeddingNativeRowStride, 0x3f800000u};
+        embedNativeParams = gpu->createBuffer("p_embed_native", sizeof(p));
+        gpu->writeBuffer(embedNativeParams, p, sizeof(p));
+    }
 
     // Upload embedding table to GPU (shared). Two strategies to keep the
     // resident set small enough to stay under the D3D12 per-process memory
@@ -3527,7 +3579,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // silently kills the device):
     //   1. Tied Q8 LM head resident → gather straight from it (no extra buffer).
     //   2. Otherwise store a dedicated fp16 copy (half the fp32 size).
-    if (lmHeadIsKQ && lmHeadKQType == GGUF_TYPE_Q6_K &&
+    if (embeddingNative.handle) {
+        embeddingGpuIsF16 = false;
+        embeddingGpuBuf = GPUBuffer{};
+        fprintf(stderr, "  Embedding gather: independent native type=%u\n", embeddingNativeType);
+    } else if (lmHeadIsKQ && lmHeadKQType == GGUF_TYPE_Q6_K &&
         cfg.tieWordEmbeddings && lmHeadKQ.handle) {
         embeddingGpuIsF16 = false;
         embeddingGatherFromKQ = true;
@@ -4878,7 +4934,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         {
-            if (lw.guKQ.handle) {
+            if (lw.upKQ.handle) {
+                di.gateup = (int)allDecodeDispatches.size();
+                for (uint32_t part = 0; part < 2; ++part) {
+                    const auto type = part ? lw.upKQType : lw.guKQType;
+                    auto& pipeline = nativeQuantPipeline(*gpu, type);
+                    auto p = mkP32("p_split_gu_" + std::to_string(i) + "_" + std::to_string(part),
+                        {cfg.nEmbd, plIM, part ? lw.upKQNBlocks : lw.guKQNBlocks,
+                         part ? lw.upKQRowStride : lw.guKQRowStride, part * plIM, 2 * plIM});
+                    auto bg = makeBG(pipeline, {{0,normOutBuf},{1,part ? lw.upKQ : lw.guKQ},
+                        {2,zeroBiasGU},{3,gateUpBuf},{4,p}});
+                    allDecodeDispatches.push_back({pipeline.pipeline,bg,1,(plIM+7)/8,1,
+                        L + (part ? "native_up" : "native_gate")});
+                }
+            } else if (lw.guKQ.handle) {
                 auto* layerKQ = kqPipelineFor(lw.guKQType);
                 uint32_t layerTile = kqTileFor(lw.guKQType);
                 auto layerParams = makeKQParams("p_kq_gu_" + std::to_string(i),
@@ -5402,7 +5471,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         if (plQ8DecDp4a) {
             // DP4A decode path: Params{M, N, K, pad}, TILE_N=32
             uint32_t pData[4] = {1u, cfg.nVocab, cfg.nEmbd, 0};
-            auto lmDpParams = gpu->createBuffer("p_lmhead_q8_dp4a", 16);
+            auto lmDpParams = gpu->createBuffer("p_lmhead_q8_dp4a", 16,
+                BUF_UNIFORM | BUF_STORAGE | BUF_COPY_DST);
             gpu->writeBuffer(lmDpParams, pData, 16);
             auto bg = makeBG(*plQ8DecDp4a, {
                 {0, normOutBuf}, {1, lmHeadQ8W}, {2, lmHeadQ8S},
@@ -5477,7 +5547,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Gather the token embedding into xBuf (f32). Prefer gathering from the
         // tied Q8 LM head (no extra buffer); otherwise from the fp16 copy.
         std::vector<std::pair<uint32_t, GPUBuffer>> gatherBg =
-            embeddingGatherFromKQ
+            embeddingNative.handle
+            ? std::vector<std::pair<uint32_t, GPUBuffer>>{
+                  {0, argmaxResultBuf}, {1, embeddingNative}, {2, zeroBiasE}, {3, xBuf}, {4, embedNativeParams}}
+            : embeddingGatherFromKQ
             ? std::vector<std::pair<uint32_t, GPUBuffer>>{
                   {0, lmHeadKQ}, {1, argmaxResultBuf}, {2, xBuf}, {3, embedKQParams}}
             : embeddingGatherFromQ8
@@ -5487,7 +5560,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             : std::vector<std::pair<uint32_t, GPUBuffer>>{
                   {0, embeddingGpuBuf}, {1, argmaxResultBuf},
                   {2, xBuf}, {3, embedParams}};
-        auto& plGather = embeddingGatherFromKQ ? plEmbGatherKQ
+        auto& plGather = embeddingNative.handle ? nativeQuantPipeline(*gpu, embeddingNativeType, true)
+            : embeddingGatherFromKQ ? plEmbGatherKQ
             : (embeddingGatherFromQ8 ? plEmbGatherQ8 : plEmbGatherF16);
         auto bg = makeBG(plGather, gatherBg);
         autoDecodeDispatches.clear();
@@ -5601,7 +5675,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         int prefixCount = autoDecodePrefixCount;
         auto& plQ35RopeToQRot = getKernel("qwen35_rope_q_to_qrot");
         auto& plQ35KvWriteRope = getKernel("qwen35_kv_cache_write_rope");
-        if (embeddingGatherFromKQ) {
+        if (embeddingNative.handle) {
+            ps.dispatches[0].bindGroup = makeBG(nativeQuantPipeline(*gpu, embeddingNativeType, true),
+                {{0,ps.tokenInBuf},{1,embeddingNative},{2,zeroBiasE},{3,xBuf},{4,embedNativeParams}});
+        } else if (embeddingGatherFromKQ) {
             ps.dispatches[0].bindGroup = makeBG(plEmbGatherKQ, {
                 {0, lmHeadKQ}, {1, ps.tokenInBuf}, {2, xBuf}, {3, embedKQParams}});
         } else if (embeddingGatherFromQ8) {
@@ -5721,7 +5798,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const bool forceSerial = std::getenv("BP_QWEN35_SERIAL_PREFILL") != nullptr;
         const bool intelAdapter=gpu->adapterName.find("Intel")!=std::string::npos;
         const bool validatedGguf = modelFormat == "gguf" &&
-            ((cfg.ssmTimeStepRank == 32u &&
+            (qwen38NativePrefillTarget(*gpu, gguf, cfg) || (cfg.ssmTimeStepRank == 32u &&
               (gpu->adapterName.find("NVIDIA") != std::string::npos ||
                gpu->adapterName.find("AMD") != std::string::npos || intelAdapter)) ||
              (cfg.ssmTimeStepRank == 16u &&
@@ -5829,7 +5906,10 @@ void ModelRunner::initQwen35PrefillResources() {
         (void)gpu->getOrCreatePipeline("q5k_projection_repack_ort_dense",q5kRepackOrtDenseSource(),4);
         (void)gpu->getOrCreatePipeline("q5k_projection_ort_dense_tile64",q5kOrtRepackedTileSource(),6);
     }
-    qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",256u*1024u,
+    // Mixed 64-layer models need extra split gate/up and large-prefill
+    // repack parameters. Retain the old minimum for the smaller models.
+    const uint64_t parameterSlots = std::max<uint64_t>(1024, uint64_t(cfg.nLayer) * 32 + 64);
+    qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",256u*parameterSlots,
         BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
     (void)getKernel("q4k_matmul_batched4");
@@ -6227,6 +6307,7 @@ void ModelRunner::initPrefillResources() {
 // ─── Pre-record command buffer pool ──────────────────────────────────────────
 
 void ModelRunner::refillCBPool(int slot) {
+    const auto diagnosticStart = gpu->diagnosticTimestamp();
     auto& ps = pool[slot];
 
     // Release any remaining CBs
@@ -6297,9 +6378,11 @@ void ModelRunner::refillCBPool(int slot) {
                 groupStart[g], groupStart[g + 1], isLast);
         }
     }
+    gpu->recordEncode(diagnosticStart);
 }
 
 void ModelRunner::refillKnownPrefillCBPool(int slot) {
+    const auto diagnosticStart = gpu->diagnosticTimestamp();
     auto& ps = pool[slot];
     for (int i = ps.knownPrefillCbIdx;
          i < (int)ps.knownPrefillCBPool.size(); i++)
@@ -6343,6 +6426,7 @@ void ModelRunner::refillKnownPrefillCBPool(int slot) {
         ps.knownPrefillCBPool[batch] = wgpuCommandEncoderFinish(enc, &cbD);
         wgpuCommandEncoderRelease(enc);
     }
+    gpu->recordEncode(diagnosticStart);
 }
 
 void ModelRunner::autotuneDecodeDepth() {
@@ -7184,6 +7268,17 @@ int32_t ModelRunner::prefillPooledKnown(const int32_t* tokenIds, uint32_t count,
                                         uint32_t posOffset) {
     if (count == 0 || pool.empty()) return -1;
     auto& ps = pool[0];
+    const bool profiling = profiler && profiler->enabled();
+    int bodyEnd = static_cast<int>(ps.dispatches.size());
+    for (int i=0;i<bodyEnd;++i)
+        if (ps.dispatches[i].name == "final_rms") { bodyEnd=i; break; }
+    uint64_t dispatchCount=0, submitCount=0;
+    auto submit = [&](WGPUCommandBuffer cb, uint64_t dispatches) {
+        dispatchCount += dispatches; ++submitCount;
+        if(gpu->diagnosticsEnabled){gpu->diagnostics.dispatches+=dispatches;++gpu->diagnostics.flushes;}
+        gpu->submitCommandBuffer(cb);
+        wgpuCommandBufferRelease(cb);
+    };
     for (uint32_t t = 0; t < count; t++) {
         int32_t token = tokenIds[t];
         if (token < 0 || (uint32_t)token >= cfg.nVocab) token = 0;
@@ -7192,18 +7287,63 @@ int32_t ModelRunner::prefillPooledKnown(const int32_t* tokenIds, uint32_t count,
 
         uint32_t cacheLen = kvCache[0].len;
         prepareDecodeParams(posOffset + t, cacheLen, 0);
-        if (t + 1 < count) {
+        if (profiling) {
+            // One timestamp region per existing command-buffer segment keeps
+            // the full 512-token workload bounded without changing pass layout.
+            // It measures each token's decoder body rather than extrapolating
+            // a synthetic decode profile to prefill.
+            const bool finalToken = t + 1 == count;
+            const int total = finalToken ? static_cast<int>(ps.dispatches.size()) : bodyEnd;
+            const int groups = finalToken ? nGroups : 1;
+            for (int group=0;group<groups;++group) {
+                const int begin=group*total/groups, end=(group+1)*total/groups;
+                const auto encodeStart=gpu->diagnosticTimestamp();
+                WGPUCommandEncoderDescriptor descriptor{};
+                auto encoder=wgpuDeviceCreateCommandEncoder(gpu->device,&descriptor);
+                auto [first,last]=profiler->allocate(finalToken?"pooled_prefill/final":"pooled_prefill/body");
+                auto timestamps=profiler->makeTimestampWrites(first,last);
+                auto dispatch=[&](WGPUComputePassEncoder pass,int index){
+                    const auto& d=ps.dispatches[index];
+                    wgpuComputePassEncoderSetPipeline(pass,d.pipeline);
+                    wgpuComputePassEncoderSetBindGroup(pass,0,d.bindGroup,0,nullptr);
+                    wgpuComputePassEncoderDispatchWorkgroups(pass,d.gx,d.gy,d.gz);
+                };
+                if(passPerDispatch){
+                    for(int index=begin;index<end;++index){
+                        auto writes=timestamps;
+                        writes.beginningOfPassWriteIndex=index==begin?first%GPUProfiler::TIMESTAMPS_PER_SET:WGPU_QUERY_SET_INDEX_UNDEFINED;
+                        writes.endOfPassWriteIndex=index+1==end?last%GPUProfiler::TIMESTAMPS_PER_SET:WGPU_QUERY_SET_INDEX_UNDEFINED;
+                        WGPUComputePassDescriptor passDesc{};
+                        if(index==begin || index+1==end)passDesc.timestampWrites=&writes;
+                        auto pass=wgpuCommandEncoderBeginComputePass(encoder,&passDesc);
+                        dispatch(pass,index);wgpuComputePassEncoderEnd(pass);wgpuComputePassEncoderRelease(pass);
+                    }
+                } else {
+                    WGPUComputePassDescriptor passDesc{};passDesc.timestampWrites=&timestamps;
+                    auto pass=wgpuCommandEncoderBeginComputePass(encoder,&passDesc);
+                    for(int index=begin;index<end;++index)dispatch(pass,index);
+                    wgpuComputePassEncoderEnd(pass);wgpuComputePassEncoderRelease(pass);
+                }
+                if(finalToken && group+1==groups){
+                    const int next=1%std::max(1,decodePoolDepth);
+                    if(next<static_cast<int>(pool.size()) && pool[next].tokenInBuf.handle)
+                        wgpuCommandEncoderCopyBufferToBuffer(encoder,ps.tokenOutBuf.handle,0,pool[next].tokenInBuf.handle,0,4);
+                    wgpuCommandEncoderCopyBufferToBuffer(encoder,ps.tokenOutBuf.handle,0,ps.stagingBuf,0,4);
+                    profiler->resolveAndReport(encoder);
+                }
+                WGPUCommandBufferDescriptor cbDesc{};auto cb=wgpuCommandEncoderFinish(encoder,&cbDesc);
+                wgpuCommandEncoderRelease(encoder);gpu->recordEncode(encodeStart);submit(cb,end-begin);
+            }
+        } else if (t + 1 < count) {
             if (ps.knownPrefillCbIdx >= (int)ps.knownPrefillCBPool.size())
                 refillKnownPrefillCBPool(0);
             WGPUCommandBuffer cb = ps.knownPrefillCBPool[ps.knownPrefillCbIdx++];
-            wgpuQueueSubmit(gpu->queue, 1, &cb);
-            wgpuCommandBufferRelease(cb);
+            submit(cb,bodyEnd);
         } else {
             if (ps.cbIdx >= (int)ps.cbPool.size()) refillCBPool(0);
             for (int g = 0; g < nGroups; g++) {
                 WGPUCommandBuffer cb = ps.cbPool[ps.cbIdx++];
-                wgpuQueueSubmit(gpu->queue, 1, &cb);
-                wgpuCommandBufferRelease(cb);
+                submit(cb,((g+1)*ps.dispatches.size()/nGroups)-(g*ps.dispatches.size()/nGroups));
             }
         }
         for (uint32_t i = 0; i < cfg.nLayer; i++) kvCache[i].len++;
@@ -7213,7 +7353,11 @@ int32_t ModelRunner::prefillPooledKnown(const int32_t* tokenIds, uint32_t count,
     mcb.mode = WGPUCallbackMode_WaitAnyOnly;
     mcb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void*, void*) {};
     auto future = wgpuBufferMapAsync(ps.stagingBuf, 1, 0, 4, mcb);
-    return gpu->completeAsyncMapI32(ps.stagingBuf, future);
+    const int32_t next = gpu->completeAsyncMapI32(ps.stagingBuf, future);
+    if(gpu->diagnosticsEnabled || profiling)
+        fprintf(stderr,"[pooled-prefill-profile] tokens=%u dispatches=%llu submits=%llu pass_per_dispatch=%d\n",
+            count,(unsigned long long)dispatchCount,(unsigned long long)submitCount,int(passPerDispatch));
+    return next;
 }
 
 void ModelRunner::submitDecode(uint32_t posOffset, int slot) {
@@ -7307,7 +7451,11 @@ int32_t ModelRunner::prefillQwen35Batched(
     // replaying this large bind-group/dispatch set regresses Intel Arc Qwen
     // 4B prefill substantially, so keep the portable build/submit path on
     // every other adapter until it independently clears the device gate.
-    const bool qwenPlanCacheEnabled = qwenPrefillPlanCacheEnabled();
+    // The 27B mixed-IQ graph can exceed Windows' GPU timeout as one command
+    // buffer. Keep bounded submissions with CPU/GPU overlap; do not replay a
+    // cached suffix after earlier layers have already been submitted.
+    const bool boundedSubmissions = embeddingNative.handle && gpu->backendType == WGPUBackendType_D3D12;
+    const bool qwenPlanCacheEnabled = !boundedSubmissions && qwenPrefillPlanCacheEnabled();
     const uint32_t initialCacheLen=kvCache.empty()?0:kvCache[0].len;
     const bool replayPlan=qwen35PrefillPlan.ready&&
         qwenPlanCacheEnabled&&
@@ -7341,7 +7489,7 @@ int32_t ModelRunner::prefillQwen35Batched(
         gpu->writeBuffer(qwen35Pf.tokens,toks.data(),M*4);
         if(traceQpf){fprintf(stderr,"[qwen-prefill] tokens uploaded M=%u\n",M);fflush(stderr);}
         std::vector<Dispatch> ds;std::vector<WGPUBindGroup>bgs;
-        uint64_t paramCursor=0;
+        uint64_t paramCursor=0, uploadedParams=0;
         std::vector<uint8_t> paramHost(qwen35Pf.paramArena.size,0);
         auto mkp=[&](const std::string&n,std::initializer_list<uint32_t>v,bool uniform=false){
             (void)n;(void)uniform;size_t cnt=v.size();uint64_t bytes=cnt<=4?16:((cnt*4+15)/16)*16;
@@ -7353,7 +7501,11 @@ int32_t ModelRunner::prefillQwen35Batched(
             auto bg=makeBG(pl,std::vector<std::pair<uint32_t,GPUBuffer>>(bind));bgs.push_back(bg);ds.push_back({pl.pipeline,bg,x,y,z,n});
         };
         uint32_t eb;memcpy(&eb,&cfg.rmsNormEps,4);uint32_t cacheLen=kvCache[0].len;
-        if(lmHeadKQ.handle){
+        if(embeddingNative.handle){
+            auto& gather=nativeQuantPipeline(*gpu,embeddingNativeType,true);
+            auto ep=mkp("qpf_ep_native",{E,cfg.nVocab,embeddingNativeNBlocks,embeddingNativeRowStride,0x3f800000u});
+            add(gather,{{0,qwen35Pf.tokens},{1,embeddingNative},{2,zeroBiasE},{3,qwen35Pf.x},{4,ep}},(E+255)/256,M,1,"qpf_embed");
+        }else if(lmHeadKQ.handle){
             auto&gather=getKernel("q6k_gather_batched");auto ep=mkp("qpf_ep",{M,E,kqLmRowStride});
             add(gather,{{0,lmHeadKQ},{1,qwen35Pf.tokens},{2,qwen35Pf.x},{3,ep}},(M*E+255)/256,1,1,"qpf_embed");
         }else{
@@ -7426,7 +7578,8 @@ int32_t ModelRunner::prefillQwen35Batched(
         else deltaKernel=&getKernel(deltaX4?"delta_net_scan_x4":"delta_net_scan_x2");
         auto&normGateKernel=getKernel(exactSingle?"qwen35_norm_gated":"qwen35_norm_gated_batched");
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},preciseQ8?M:(M+3)/4,preciseQ8?(N+7)/8:(N+31)/32,1,n);};
-        auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):getKernel("q6k_matmul");};
+        auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):t==GGUF_TYPE_Q6_K?getKernel("q6k_matmul"):nativeQuantPipeline(*gpu,t);};
+        const bool nativePrefillTile = M >= 16 && qwen38NativePrefillTarget(*gpu, gguf, cfg);
         const char* portableEnv=std::getenv("BP_Q4K_PREFILL_PORTABLE");
         // The override keeps an exact same-binary baseline for A/B validation.
         const bool useAmdPortableQ4=gpu->adapterName.find("AMD")!=std::string::npos&&
@@ -7549,6 +7702,10 @@ int32_t ModelRunner::prefillQwen35Batched(
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&amdPortableQ4){auto p=mkp(n+"_p",{K,N,M,nb,rs});add(*amdPortableQ4,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos&&!useIntelFourRows){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
+            else if(nativePrefillTile && t!=GGUF_TYPE_Q4_K && t!=GGUF_TYPE_Q5_K && t!=GGUF_TYPE_Q6_K){
+                auto p=mkp(n+"_p",{K,N,nb,rs,0,N,M});auto&kp=nativeQuantPipeline(*gpu,t,false,true);
+                add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+15)/16,(N+15)/16,1,n);
+            }
             else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
         auto proj=[&](GPUBuffer x,GPUBuffer kqw,GPUBuffer dense,GPUBuffer scaleMin,GGUFType type,uint32_t nb,uint32_t rs,
                       GPUBuffer q8w,GPUBuffer q8s,GPUBuffer bias,GPUBuffer y,
@@ -7620,7 +7777,16 @@ int32_t ModelRunner::prefillQwen35Batched(
             }
             auto anp=mkp(L+"addnorm_p",{E,E,eb});add(addnorm,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,qwen35Pf.norm},{3,lw.postNorm},{4,qwen35Pf.rstd},{5,anp}},M,1,1,L+"postnorm");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u postnorm built\n",li);fflush(stderr);}
-            uint32_t im=pl.intermediateSize;proj(qwen35Pf.norm,lw.guKQ,lw.guQ4Dense,lw.guQ4ScaleMin,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,lw.guW,lw.guS,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
+            uint32_t im=pl.intermediateSize;
+            if(lw.upKQ.handle){
+                for(uint32_t part=0;part<2;++part){
+                    auto& pipeline=nativeQuantPipeline(*gpu,part?lw.upKQType:lw.guKQType,false,nativePrefillTile);
+                    auto p=mkp(L+"split_gu_"+std::to_string(part),{E,im,part?lw.upKQNBlocks:lw.guKQNBlocks,
+                        part?lw.upKQRowStride:lw.guKQRowStride,part*im,2u*im,M});
+                    add(pipeline,{{0,qwen35Pf.norm},{1,part?lw.upKQ:lw.guKQ},{2,zeroBiasGU},{3,qwen35Pf.gateup},{4,p}},
+                        nativePrefillTile?(M+15)/16:M,nativePrefillTile?(im+15)/16:(im+7)/8,1,L+(part?"up":"gate"));
+                }
+            }else proj(qwen35Pf.norm,lw.guKQ,lw.guQ4Dense,lw.guQ4ScaleMin,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,lw.guW,lw.guS,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u gateup built\n",li);fflush(stderr);}
             auto sap=mkp(L+"silu_p",{M,im});add(silu,{{0,qwen35Pf.gateup},{1,qwen35Pf.act},{2,sap}},(M*im+255)/256,1,1,L+"silu");
             proj(qwen35Pf.act,lw.dnKQ,
@@ -7631,7 +7797,17 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(lw.postFfwNorm.handle){auto nap=mkp(L+"normadd_p",{E,E,eb});add(normadd,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,lw.postFfwNorm},{3,qwen35Pf.rstd},{4,nap}},M,1,1,L+"ffn_add");}
             else{auto ap=mkp(L+"add_p",{M*E});add(addip,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,ap}},(M*E+255)/256,1,1,L+"ffn_add");}
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u build end dispatches=%zu\n",li,ds.size());fflush(stderr);}
-            if(std::getenv("BP_PROFILE_QWEN_PREFILL")){
+            if(const char* directory = std::getenv("BP_DUMP_QWEN_LAYER_DIR")) {
+                gpu->writeBuffer(qwen35Pf.paramArena, paramHost.data(), paramCursor);
+                auto values = gpu->submitAndReadback(ds, qwen35Pf.x, uint64_t(M)*E*sizeof(float), true);
+                std::filesystem::create_directories(directory);
+                auto path = std::filesystem::path(directory) / ("l_out-" + std::to_string(li) + ".bin");
+                std::ofstream file(path, std::ios::binary);
+                file.write(reinterpret_cast<const char*>(values.data()), values.size());
+                ds.clear();
+                for(auto bg:bgs) if(bg) wgpuBindGroupRelease(bg);
+                bgs.clear();
+            } else if(std::getenv("BP_PROFILE_QWEN_PREFILL")){
                 gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
                 for(const auto& d:ds){auto t0=std::chrono::steady_clock::now();
                     fprintf(stderr,"[qwen-prefill] layer=%u dispatch=%s begin\n",li,d.name.c_str());fflush(stderr);
@@ -7639,6 +7815,19 @@ int32_t ModelRunner::prefillQwen35Batched(
                     auto t1=std::chrono::steady_clock::now();fprintf(stderr,"[qwen-prefill] layer=%u dispatch=%s gpu=%.2fms\n",li,d.name.c_str(),std::chrono::duration<double,std::milli>(t1-t0).count());fflush(stderr);}
                 ds.clear();
                 for(auto old:bgs)if(old)wgpuBindGroupRelease(old);bgs.clear();
+            } else if (boundedSubmissions && li + 1 < cfg.nLayer &&
+                       (li + 1) % (M > 64 ? 1u : 4u) == 0) {
+                gpu->writeBuffer(qwen35Pf.paramArena, paramHost.data() + uploadedParams,
+                                 paramCursor - uploadedParams, uploadedParams);
+                uploadedParams = paramCursor;
+                if (profiler && profiler->enabled())
+                    gpu->submitOnlyProfiled(ds, *profiler);
+                else
+                    gpu->submitOnly(ds, false);
+                // submitOnly[Profiled] consumes the caller's bind-group
+                // references; the command buffer retains its GPU resources.
+                bgs.clear();
+                ds.clear();
             }
         }
         bool last=done+M==T;
@@ -7647,10 +7836,10 @@ int32_t ModelRunner::prefillQwen35Batched(
             GPUBuffer lastn=qwen35Pf.norm;lastn.offset=(uint64_t)(M-1)*E*4;lastn.size=E*4;
             if(lmHeadKQ.handle){
                 auto lp=mkp("qpf_lm_p",{E,cfg.nVocab,kqLmNBlocks,kqLmRowStride,0});
-                const bool amdLmHead=gpu->adapterName.find("AMD")!=std::string::npos;
-                auto&lmp=getKernel(amdLmHead?"q6k_matmul":"q6k_matmul_wide");
+                const bool wideLmHead=lmHeadKQType==GGUF_TYPE_Q6_K&&gpu->adapterName.find("AMD")==std::string::npos;
+                auto&lmp=wideLmHead?getKernel("q6k_matmul_wide"):kpl(lmHeadKQType);
                 add(lmp,{{0,lastn},{1,lmHeadKQ},{2,zeroBiasV},{3,logitsBuf},{4,lp}},1,
-                    amdLmHead?(cfg.nVocab+7)/8:(cfg.nVocab+15)/16,1,"qpf_lm");
+                    wideLmHead?(cfg.nVocab+15)/16:(cfg.nVocab+7)/8,1,"qpf_lm");
             }else{
                 auto lp=mkp("qpf_lm_q8_p",{E,cfg.nVocab,1});
                 add(q8,{{0,lastn},{1,lmHeadQ8W},{2,lmHeadQ8S},{3,zeroBiasV},{4,logitsBuf},{5,lp}},1,(cfg.nVocab+31)/32,1,"qpf_lm_q8");
@@ -8481,12 +8670,17 @@ void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
     };
     std::unordered_map<std::string, AggEntry> agg;
     double totalGpuUs = 0;
+    uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max(), lastTimestamp = 0;
+    size_t validTimestamps = 0;
 
     for (auto& e : profiler->entries) {
         uint64_t begin = ptr[e.beginIdx];
         uint64_t end   = ptr[e.endIdx];
         // Skip invalid timestamps (uninitialized or wrapped)
         if (end <= begin || begin == 0) continue;
+        firstTimestamp = std::min(firstTimestamp, begin);
+        lastTimestamp = std::max(lastTimestamp, end);
+        ++validTimestamps;
         double durNs = (double)(end - begin);
         double durUs = durNs / 1000.0;
 
@@ -8509,7 +8703,7 @@ void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
     // Print report
     fprintf(stderr, "\n--- GPU Profile (hardware timestamps) ---\n");
     fprintf(stderr, "%-20s %10s %6s %10s %6s\n",
-           "Kernel", "Total(ms)", "Count", "Avg(us)", "%%");
+           "Region", "Total(ms)", "Count", "Avg(us)", "%%");
     fprintf(stderr, "%-20s %10s %6s %10s %6s\n",
            "--------------------", "----------", "------", "----------", "------");
     for (auto& [name, e] : sorted_agg) {
@@ -8528,6 +8722,21 @@ void ModelRunner::printProfileReport(int nDecodeTokens, int nPrefillTokens,
         auto dir = std::filesystem::path(ggufPath).parent_path();
         htmlPath = (dir / "profile.html").string();
     }
+    std::ofstream json(htmlPath + ".json");
+    json << std::setprecision(12) << "{\"prefill_tokens\":" << nPrefillTokens
+         << ",\"decode_tokens\":" << nDecodeTokens
+         << ",\"wall_ms\":" << prefillMs + decodeMs << ",\"gpu_ms\":" << totalGpuUs / 1000.0
+         << ",\"gpu_span_ms\":" << (validTimestamps ? double(lastTimestamp - firstTimestamp) / 1e6 : 0)
+         << ",\"timestamp_regions\":" << profiler->entries.size()
+         << ",\"valid_timestamp_pairs\":" << validTimestamps << ",\"regions\":[";
+    bool firstRegion = true;
+    for (const auto& [name, entry] : sorted_agg) {
+        json << (firstRegion ? "" : ",") << "{\"name\":" << std::quoted(name)
+             << ",\"total_ms\":" << entry.totalUs / 1000.0 << ",\"calls\":" << entry.count
+             << ",\"average_us\":" << entry.totalUs / entry.count << "}";
+        firstRegion = false;
+    }
+    json << "]}\n";
     generateProfileHTML(*gpu, *profiler, calibration, ptr,
                         nDecodeTokens, nPrefillTokens,
                         prefillMs, decodeMs, htmlPath);

@@ -1330,7 +1330,7 @@ function renderDeviceTaskGroups(a) {
           : blockers.length
             ? `<div class="device-blockers"><strong>Blocked</strong>${blockers.map((x) => `<div><span>${esc(x.task.title)}</span><span class="meta">${esc(x.run.error || x.task.verdict_reason || x.run.phase || "Requires intervention")}</span></div>`).join("")}</div>`
             : '<div class="empty compact">No runnable task; scheduler is waiting for new goal work.</div>';
-      return `<section class="device-task-group"><header><div><strong>${esc(device.name)}</strong><span class="meta">${esc(device.gpu)} · ${paused ? "tasks stopped" : applicable.length ? "working" : "waiting"}</span></div><div>${badge(paused ? "paused" : applicable.length ? "running" : "blocked")} <button class="secondary activity-toggle" data-id="${esc(device.id)}" data-action="${paused ? "resume" : "pause"}">${paused ? "Resume tasks" : "Stop tasks"}</button></div></header>${applicable.length ? applicable.map((t) => renderDeviceTask(t, device)).join("") : empty}</section>`;
+      return `<section class="device-task-group"><header><div><strong>${esc(device.name)}</strong><span class="meta">${esc(device.gpu)} · ${paused ? `tasks stopped: ${device.activity_pause_reason || "reason unavailable"}` : applicable.length ? "working" : "waiting"}</span></div><div>${badge(paused ? "paused" : applicable.length ? "running" : "blocked")} <button class="secondary activity-toggle" data-id="${esc(device.id)}" data-action="${paused ? "resume" : "pause"}">${paused ? "Resume tasks" : "Stop tasks"}</button></div></header>${applicable.length ? applicable.map((t) => renderDeviceTask(t, device)).join("") : empty}</section>`;
     })
     .join("");
 }
@@ -1591,11 +1591,16 @@ function enableColumnResize(table, storageKey) {
 async function toggleDeviceActivity(button) {
   button.disabled = true;
   try {
+    let reason = "";
+    if (button.dataset.action === "pause") {
+      reason = prompt("Record why this cared device cannot take work:", "")?.trim() || "";
+      if (!reason) return;
+    }
     await api(
       `/api/machines/${encodeURIComponent(button.dataset.id)}/activity`,
       {
         method: "POST",
-        body: JSON.stringify({ action: button.dataset.action }),
+        body: JSON.stringify({ action: button.dataset.action, reason }),
       },
     );
     await refresh();

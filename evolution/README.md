@@ -6,6 +6,12 @@ self-evolution framework described in
 It uses only the Python standard library. Runtime state, experiment output, and
 the SQLite database are written beneath `gitignore/evolution/`.
 
+The active goal targets **webgfx-104 / NVIDIA GeForce RTX 5080 only**. The server limits scheduling and
+the current device matrix to that machine, cancels queued work for excluded
+devices, and rejects remote enrollment/provisioning. The agent also checks the
+actual hostname before synchronizing or executing work. Existing fleet history
+is retained; it does not add devices to the active scope.
+
 ## Start the dashboard
 
 From the repository root:
@@ -17,61 +23,74 @@ python -m evolution.server
 Open <http://127.0.0.1:8787>. The server binds only to localhost by default.
 Use `--host` and `--port` to change the listener.
 
-## Register a device
+## Register the local device
 
-On each benchmark machine:
+On webgfx-104:
 
 ```powershell
 $env:BP_EVOLUTION_BACKEND = "webgpu"
-python -m evolution.agent --server http://control-host:8787 register
+python -m evolution.agent --server http://127.0.0.1:8787 register
 ```
 
 `BP_EVOLUTION_GPU` and `BP_EVOLUTION_DRIVER` can override automatic Windows
 GPU discovery. Labels can describe selectors that are not detected directly:
 
 ```powershell
-python -m evolution.agent --server http://control-host:8787 `
+python -m evolution.agent --server http://127.0.0.1:8787 `
   --label gpu_vendor=nvidia --label pool=required register
 ```
 
 The returned machine `id` is used when creating experiment evidence.
 
-Sync all available cared-model formats from the control machine with:
+Populate the local model directory with available cared-model formats from the
+local catalog:
 
 ```powershell
-python -m evolution.agent --server http://control-host:8787 sync-models
+python -m evolution.agent --server http://127.0.0.1:8787 sync-models
 ```
 
-The catalog currently cares about Gemma 4 E2B IT QAT, Qwen 3.5 4B, and Qwen
-3.5 2B. Missing GGUF or ORT formats are reported as unavailable and are not
-treated as failures.
+The catalog cares about Gemma 4 E2B IT QAT, Qwen 3.5 4B, Qwen 3.5 2B,
+Qwen 3.8 27B, and the requested Qwen-Image-3.0 (artifact identity pending).
+Missing artifacts remain pending; catalog membership does not establish support.
 
-After an accepted task becomes an integration milestone, each device can fetch
-the exact new base into an isolated worktree without modifying its developer
-checkout:
+After an accepted task becomes an integration milestone, webgfx-104 can fetch
+the exact new base into an isolated local worktree without modifying the
+developer checkout:
 
 ```powershell
-python -m evolution.agent --server http://control-host:8787 sync-base
+python -m evolution.agent --server http://127.0.0.1:8787 sync-base
 ```
 
 For continuous heartbeat and automatic base synchronization, run the watcher as
-a startup service on every cared device:
+a startup service on webgfx-104:
 
 ```powershell
-python -m evolution.agent --server http://control-host:8787 --label role=required watch
+python -m evolution.agent --server http://127.0.0.1:8787 --label role=required watch
 ```
 
-For first-time Windows worker setup, download and inspect the bootstrap before
-running it in PowerShell on that worker:
+Remote worker provisioning is disabled for this goal. Keep generated agent
+state under `gitignore/` on webgfx-104.
 
-```powershell
-Invoke-WebRequest http://10.172.21.28:8787/api/bootstrap.ps1 -OutFile $env:TEMP\bootstrap-backpack.ps1
-notepad $env:TEMP\bootstrap-backpack.ps1
-powershell -ExecutionPolicy Bypass -File $env:TEMP\bootstrap-backpack.ps1
-```
+## Daily reference cycle
 
-This registers the worker, syncs cared models, installs an `ONLOGON` scheduled
-watcher, and keeps all generated agent state outside the source checkout.
+The control plane creates one dated refresh task for ORT/ORT GenAI and one for
+llama.cpp. `webgfx-104` builds or downloads each x64 artifact once, records its
+source revision and date below `gitignore/evolution/backups/`, and keeps all
+artifacts on this device. Refresh scripts enforce the local hostname. ORT builds use isolated latest-`origin/main`
+worktrees under the deliberately short `gitignore/o/` path (required by
+MSBuild/DXC path limits), leaving developer checkouts
+untouched.
+
+A successful refresh unlocks dated reference jobs for all cared models on
+webgfx-104. Each job runs deterministic conformance first and then the standard
+512-input/128-output, five-repetition benchmark. Qwen exact-answer checks are
+enforced by both reference adapters. The local worker copies the adapters with the
+revisioned runtimes, so measurements do not depend on an older accepted
+Backpack worktree containing the newest orchestration code.
+
+Idle claim polls are heartbeats. A device without a poll for 150 seconds is
+shown as stale and is not counted as online; queued work remains visible until
+the worker returns or an operator records a pause reason.
 
 The integrator automatically pushes the accepted SHA to
 `refs/heads/evolution/base` using `--force-with-lease`. Publication requires an

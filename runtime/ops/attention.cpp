@@ -4,11 +4,12 @@
  */
 
 #include "../graph_executor.h"
-#include "../wgsl_shaders.h"
+#include <wgsl_shaders.h>
 #include "../wgsl_template.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <stdexcept>
 
 static int64_t tensorNel(const GpuTensor* t) {
     if (!t) return 0; int64_t n = 1; for (auto d : t->shape) n *= d; return n;
@@ -414,19 +415,22 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
     }
 
     // Build present KV on GPU: append new K/V to past cache
-    // Static KV cache mode: if the past_key buffer is already f32 and large enough
-    // to hold totalSeq tokens, write the new token in-place (no full copy).
-    // The caller pre-allocates a max-sized f32 buffer and reuses it across steps.
+    // Static KV layout must be declared by the caller. A packed tensor's pooled
+    // allocation can be rounded up, without adding padding between its heads.
     size_t kvSlotBytes = (size_t)(batch * kv_heads * totalSeq * head_dim * 4);
     bool staticKV = (pastKey && pastKey->dtype == TensorDtype::Float32 &&
+                     pastKey->kvCacheCapacity >= totalSeq &&
                      pastKey->buffer.handle && pastKey->buffer.size >= kvSlotBytes &&
                      pastVal && pastVal->dtype == TensorDtype::Float32 &&
+                     pastVal->kvCacheCapacity == pastKey->kvCacheCapacity &&
                      pastVal->buffer.handle && pastVal->buffer.size >= kvSlotBytes);
 
-    // Determine max_seq for static layout (from buffer size)
     int64_t maxSeq = totalSeq;
     if (staticKV) {
-        maxSeq = (int64_t)(pastKey->buffer.size / (batch * kv_heads * head_dim * 4));
+        maxSeq = pastKey->kvCacheCapacity;
+        const uint64_t capacityBytes = uint64_t(batch) * kv_heads * maxSeq * head_dim * 4;
+        if (pastKey->buffer.size < capacityBytes || pastVal->buffer.size < capacityBytes)
+            throw std::runtime_error("Declared static KV capacity exceeds its allocation");
     }
 
     GpuTensor presentKey, presentVal;
@@ -436,9 +440,11 @@ static void opGQA(OpContext& ex, const OnnxGraphNode& n,
         ex.EnsureGpu(*pastVal);
         presentKey.shape = {batch, kv_heads, totalSeq, head_dim};
         presentKey.dtype = TensorDtype::Float32;
+        presentKey.kvCacheCapacity = maxSeq;
         presentKey.buffer = pastKey->buffer;
         presentVal.shape = {batch, kv_heads, totalSeq, head_dim};
         presentVal.dtype = TensorDtype::Float32;
+        presentVal.kvCacheCapacity = maxSeq;
         presentVal.buffer = pastVal->buffer;
 
         // Write new K/V at positions [pastSeq, pastSeq+seqQ)
@@ -864,6 +870,78 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 REGISTER_OP(GroupQueryAttention, opGQA)
 REGISTER_OP(MultiHeadAttention, opMHA)
 REGISTER_OP(RotaryEmbedding, opRotaryEmbedding)
+
+static void opMRotaryEmbedding(OpContext& ex, const OnnxGraphNode& node,
+    const std::vector<GpuTensor*>& in, std::vector<GpuTensor*>& out) {
+    if(in.size()!=4 || out.empty() || !in[0] || !in[1] || !in[2] || !in[3])
+        throw std::runtime_error("MRotaryEmbedding requires input, positions, cosine, and sine");
+    auto& x=*in[0];auto& positions=*in[1];auto& cosine=*in[2];auto& sine=*in[3];
+    const auto dtype=x.dtype;
+    // GPU casts must be part of the captured command stream. The legacy
+    // CPU readback helper would freeze Q/K at their capture-time values.
+    auto promote = [&](GpuTensor& tensor) {
+        ex.EnsureGpu(tensor);
+        if (tensor.dtype != TensorDtype::Float16) return;
+        const uint32_t count = static_cast<uint32_t>(tensor.ElementCount());
+        auto converted = ex.AllocTensor(tensor.shape, TensorDtype::Float32);
+        uint32_t values[4] = {count, 0, 0, 0};
+        auto params = ex.getParamBuffer(sizeof(values));
+        ex.getGpu()->writeBuffer(params, values, sizeof(values));
+        auto& pipeline = ex.GetPipelineT("cast_f16_to_f32", 3,
+            [] { return std::string(WGSL_CAST_F16_TO_F32); });
+        auto group = ex.MakeBindGroup(pipeline,
+            {{0, tensor.buffer}, {1, converted.buffer}, {2, params}});
+        ex.QueueDispatch(pipeline.pipeline, group, (count + 255) / 256, 1, 1, "mrope_input_cast");
+        tensor = std::move(converted);
+    };
+    promote(x); promote(cosine); promote(sine); ex.EnsureGpu(positions);
+    const uint32_t heads=(uint32_t)node.GetInt("num_heads",0);
+    if(x.shape.size()!=3 || !heads || x.shape.back()%heads || positions.shape.size()!=3 ||
+       positions.shape[0]!=3 || positions.shape[1]!=x.shape[0] || positions.shape[2]!=x.shape[1] ||
+       node.GetInt("is_packed_batching",0)!=0 || cosine.shape.size()!=2 || sine.shape!=cosine.shape)
+        throw std::runtime_error("MRotaryEmbedding received unsupported shapes or packed batching");
+    const uint32_t dim=(uint32_t)x.shape.back()/heads, rotary=(uint32_t)node.GetInt("rotary_embedding_dim",dim);
+    const auto sections=node.attrIntLists.find("mrope_section");
+    if(!rotary || rotary>dim || rotary%2 || sections==node.attrIntLists.end() || sections->second.size()!=3 ||
+       sections->second[0]+sections->second[1]+sections->second[2]!=rotary/2 || cosine.shape[1]!=rotary/2 ||
+       (positions.dtype!=TensorDtype::Int64 && positions.dtype!=TensorDtype::Int32))
+        throw std::runtime_error("MRotaryEmbedding received invalid rotary metadata");
+    *out[0]=ex.AllocTensor(x.shape,dtype);
+    std::string source=R"WGSL(
+@group(0) @binding(0) var<storage,read> X:array<f32>;
+@group(0) @binding(1) var<storage,read> Pos:array<u32>;
+@group(0) @binding(2) var<storage,read> Cos:array<f32>;
+@group(0) @binding(3) var<storage,read> Sin:array<f32>;
+@group(0) @binding(4) var<storage,read_write> Y:array<OUT_TYPE>;
+// total,seq,heads,head_dim,rotary_dim,interleaved,layout,batch,pos_stride,s0,s1,s2
+@group(0) @binding(5) var<storage,read> P:array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id:vec3<u32>){
+ let i=id.x;if(i>=P[0]){return;}let hd=P[3];let rd=P[4];let d=i%hd;
+ if(d>=rd){Y[i]=OUT_TYPE(X[i]);return;}
+ let rh=rd/2u;let pair=select(d%rh,d/2u,P[5]!=0u);
+ var axis=0u;
+ if(P[6]==0u){if(pair>=P[9]+P[10]){axis=2u;}else if(pair>=P[9]){axis=1u;}}
+ else{if(pair%3u==1u && pair<3u*P[10]){axis=1u;}else if(pair%3u==2u && pair<3u*P[11]){axis=2u;}}
+ let token=(i/hd)/P[2];let position=Pos[(axis*P[7]*P[1]+token)*P[8]];
+ let c=Cos[position*rh+pair];let s=Sin[position*rh+pair];let base=i-d;
+ var a=base+pair;var b=base+pair+rh;var second=d>=rh;
+ if(P[5]!=0u){a=base+2u*pair;b=a+1u;second=d%2u!=0u;}
+ Y[i]=OUT_TYPE(select(X[a]*c-X[b]*s,X[a]*s+X[b]*c,second));
+}
+)WGSL";
+    const bool half=dtype==TensorDtype::Float16;size_t at=0;
+    while((at=source.find("OUT_TYPE",at))!=std::string::npos){source.replace(at,8,half?"f16":"f32");at+=3;}
+    if(half)source="enable f16;\n"+source;
+    uint32_t values[12]={(uint32_t)x.ElementCount(),(uint32_t)x.shape[1],heads,dim,rotary,
+        (uint32_t)node.GetInt("interleaved",0),(uint32_t)node.GetInt("mrope_layout",0),(uint32_t)x.shape[0],
+        positions.dtype==TensorDtype::Int64?2u:1u,(uint32_t)sections->second[0],(uint32_t)sections->second[1],(uint32_t)sections->second[2]};
+    auto params=ex.getParamBuffer(sizeof(values));ex.getGpu()->writeBuffer(params,values,sizeof(values));
+    auto& pipeline=ex.GetPipeline(half?"mrotary_embedding_f16":"mrotary_embedding_f32",source,6);
+    auto group=ex.MakeBindGroup(pipeline,{{0,x.buffer},{1,positions.buffer},{2,cosine.buffer},{3,sine.buffer},{4,out[0]->buffer},{5,params}});
+    ex.QueueDispatch(pipeline.pipeline,group,(values[0]+255)/256,1,1,"MRotaryEmbedding");
+}
+REGISTER_OP(MRotaryEmbedding, opMRotaryEmbedding)
 
 // ─── GQA with Attention Sink + Sliding Window ──────────────────────────────
 // Custom op for models with attention sinks (learnable logits that absorb

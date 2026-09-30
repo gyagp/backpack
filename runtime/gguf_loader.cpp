@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <stdexcept>
 
 // GGUF metadata value types
 enum GGUFMetaType : uint32_t {
@@ -188,13 +189,21 @@ ModelConfig extractModelConfig(const GGUFFile& gguf) {
     std::string a = cfg.arch;
 
     cfg.nLayer          = gguf.getU32(a + ".block_count");
+    // Qwen GGUF block_count includes appended next-token-prediction blocks.
+    // They are draft-model weights, never part of the target decoder stack.
+    const uint32_t nextnLayers = gguf.getU32(a + ".nextn_predict_layers", 0);
+    if ((a == "qwen35" || a == "qwen35moe") && nextnLayers > 0) {
+        if (nextnLayers >= cfg.nLayer)
+            throw std::runtime_error("GGUF nextn_predict_layers must be smaller than block_count");
+        cfg.nLayer -= nextnLayers;
+    }
     cfg.nEmbd           = gguf.getU32(a + ".embedding_length");
     cfg.intermediateSize = gguf.getU32(a + ".feed_forward_length");
     cfg.nHead           = gguf.getU32(a + ".attention.head_count");
     cfg.nKvHeads        = gguf.getU32(a + ".attention.head_count_kv", cfg.nHead);
     cfg.rmsNormEps      = gguf.getFloat(a + ".attention.layer_norm_rms_epsilon", 1e-6f);
     cfg.ropeTheta       = gguf.getFloat(a + ".rope.freq_base", 1000000.0f);
-    cfg.tieWordEmbeddings = !gguf.hasKey("output.weight");
+    cfg.tieWordEmbeddings = gguf.tensor_index.count("output.weight") == 0;
 
     // attention.key_length is the actual Q/K/V head width for archs with
     // partial RoPE (qwen35 has 256-wide heads and 64 rotated dims).  Do not
@@ -728,14 +737,79 @@ static constexpr int BSZ_IQ3_XXS=  98;  // fp16 + 96
 static constexpr int BSZ_IQ4_XS = 136;  // fp16 + 2 + 4 + 128
 static constexpr int BSZ_IQ4_NL =  18;  // fp16 + 16  (per 32-elem block, not QK_K)
 
+// These mixed Unsloth formats occur inside Qwen3.8 even when the artifact's
+// filename names another quantization. Read fields with memcpy: IQ block
+// strides need not align uint16/uint32 fields on all platforms.
+static uint16_t iq_u16(const uint8_t* p) {
+    uint16_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+static uint32_t iq_u32(const uint8_t* p) {
+    uint32_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+
+static void dq_iq2_xxs(const uint8_t* data, float* y, int64_t k) {
+    for (int64_t b = 0; b < k / QK_K; ++b) {
+        const uint8_t* p = data + b * 66;
+        const float d = fp16_val(iq_u16(p));
+        for (int group = 0; group < 8; ++group) {
+            const uint8_t* qs = p + 2 + group * 8;
+            const uint32_t high = iq_u32(qs + 4);
+            const float scale = d * (0.5f + (high >> 28)) * 0.25f;
+            for (int lane = 0; lane < 4; ++lane) {
+                const uint64_t grid = iq2xxs_grid[qs[lane]];
+                const uint8_t signs = ksigns_iq2xs[(high >> (7 * lane)) & 127];
+                for (int j = 0; j < 8; ++j)
+                    *y++ = scale * float((grid >> (8 * j)) & 255) * ((signs & (1 << j)) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+
+static void dq_iq2_xs(const uint8_t* data, float* y, int64_t k) {
+    for (int64_t b = 0; b < k / QK_K; ++b) {
+        const uint8_t* p = data + b * 74;
+        const float d = fp16_val(iq_u16(p));
+        for (int group = 0; group < 8; ++group) {
+            for (int lane = 0; lane < 4; ++lane) {
+                const uint16_t q = iq_u16(p + 2 + (group * 4 + lane) * 2);
+                const float scale = d * (0.5f + ((p[66 + group] >> (4 * (lane / 2))) & 15)) * 0.25f;
+                const uint64_t grid = iq2xs_grid[q & 511];
+                const uint8_t signs = ksigns_iq2xs[q >> 9];
+                for (int j = 0; j < 8; ++j)
+                    *y++ = scale * float((grid >> (8 * j)) & 255) * ((signs & (1 << j)) ? -1.f : 1.f);
+            }
+        }
+    }
+}
+
+static void dq_iq1_s(const uint8_t* data, float* y, int64_t k) {
+    for (int64_t b = 0; b < k / QK_K; ++b) {
+        const uint8_t* p = data + b * 50;
+        const float d = fp16_val(iq_u16(p));
+        for (int group = 0; group < 8; ++group) {
+            const uint16_t high = iq_u16(p + 34 + group * 2);
+            const float scale = d * (2 * ((high >> 12) & 7) + 1);
+            const float delta = (high & 0x8000) ? -0.125f : 0.125f;
+            for (int lane = 0; lane < 4; ++lane) {
+                const uint32_t index = p[2 + group * 4 + lane] | (((high >> (3 * lane)) & 7) << 8);
+                const uint64_t grid = iq1s_grid[index];
+                for (int j = 0; j < 8; ++j) {
+                    const int value = int((grid >> (8 * j)) & 255);
+                    *y++ = scale * (float(value < 128 ? value : value - 256) + delta);
+                }
+            }
+        }
+    }
+}
+
 static void dq_q2_K(const uint8_t* data, float* y, int64_t k) {
     int64_t nb = k / QK_K;
     for (int64_t i = 0; i < nb; i++) {
         const uint8_t* x = data + i * BSZ_Q2_K;
-        float d   = fp16_val(*(const uint16_t*)(x + 0));
-        float mn  = fp16_val(*(const uint16_t*)(x + 2));
-        const uint8_t* scales = x + 4;
-        const uint8_t* q = x + 4 + 16;
+        float d   = fp16_val(iq_u16(x + 80));
+        float mn  = fp16_val(iq_u16(x + 82));
+        const uint8_t* scales = x;
+        const uint8_t* q = x + 16;
         int is = 0;
         for (int n = 0; n < QK_K; n += 128) {
             int shift = 0;
@@ -762,14 +836,10 @@ static void dq_q3_K(const uint8_t* data, float* y, int64_t k) {
     const int8_t* scales = (const int8_t*)aux;
     for (int64_t i = 0; i < nb; i++) {
         const uint8_t* x = data + i * BSZ_Q3_K;
-        const uint8_t* hm = x + 2;
-        const uint8_t* q  = x + 2 + 32;
-        const uint8_t* sc = x + 2 + 32 + 64;
-        float d_all = fp16_val(*(const uint16_t*)(x + 2 + 32 + 64 + 12 - 2));  // fp16 d at end? No — at start of block
-        d_all = fp16_val(*(const uint16_t*)(x));
-        hm = x + 2;
-        q  = x + 2 + 32;
-        sc = x + 2 + 32 + 64;
+        const uint8_t* hm = x;
+        const uint8_t* q  = x + 32;
+        const uint8_t* sc = x + 96;
+        float d_all = fp16_val(iq_u16(x + 108));
         uint8_t m = 1;
         memcpy(aux, sc, 12);
         uint32_t tmp = aux[2];
@@ -1037,9 +1107,12 @@ void dequant_tensor(const void* raw_data, float* out, uint32_t N, uint32_t K, GG
     if (type == GGUF_TYPE_Q2_K)   { dq_q2_K   (data, out, (int64_t)N * K); return; }
     if (type == GGUF_TYPE_Q3_K)   { dq_q3_K   (data, out, (int64_t)N * K); return; }
     if (type == GGUF_TYPE_IQ2_S)  { dq_iq2_s  (data, out, (int64_t)N * K); return; }
+    if (type == GGUF_TYPE_IQ2_XXS){ dq_iq2_xxs(data, out, (int64_t)N * K); return; }
+    if (type == GGUF_TYPE_IQ2_XS) { dq_iq2_xs (data, out, (int64_t)N * K); return; }
+    if (type == GGUF_TYPE_IQ1_S)  { dq_iq1_s  (data, out, (int64_t)N * K); return; }
     if (type == GGUF_TYPE_IQ3_S)  { dq_iq3_s  (data, out, (int64_t)N * K); return; }
     if (type == GGUF_TYPE_IQ3_XXS){ dq_iq3_xxs(data, out, (int64_t)N * K); return; }
     if (type == GGUF_TYPE_IQ4_XS) { dq_iq4_xs (data, out, (int64_t)N * K); return; }
     if (type == GGUF_TYPE_IQ4_NL) { dq_iq4_nl (data, out, (int64_t)N * K); return; }
-    fprintf(stderr, "dequant_tensor: unsupported type %d\n", (int)type);
+    throw std::runtime_error("dequant_tensor: unsupported type " + std::to_string((int)type));
 }
