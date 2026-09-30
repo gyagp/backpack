@@ -8009,7 +8009,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                 add(*q8quant, {{0,x},{1,gemmaPf.actQ8},{2,gemmaPf.actScale},{3,qp}},
                     (K+255)/256,M,name+"_quant");
                 add(*q4prequant, {{0,gemmaPf.actQ8},{1,gemmaPf.actScale},
-                    {2,w},{3,s},{4,y},{5,p}},
+                    {2,w},{3,s},{4,y},{5,qp}},
                     (M+7)/8,(N+q4PrequantCols-1)/q4PrequantCols,name);
             } else if (weightsAreNativeQ4) {
                 add(q4mm, {{0,x},{1,w},{2,s},{3,y},{4,p}},
