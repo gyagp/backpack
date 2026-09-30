@@ -906,3 +906,50 @@ application-regression protocol.
 Gemma thought-channel text is now excluded from final-answer conformance, and
 an unfinished thought channel cannot satisfy a required fact. All 119 framework
 tests pass. Evidence: `gitignore/logs/llamacpp-latest-20261001/`.
+
+## Matching GGUF application reference
+
+Task #771 adds `benchmarks/llamacpp_state_reference.cpp`, a resident public-C-API
+reference pinned to llama.cpp b11295. The validated executable is
+`gitignore/evolution/backups/llamacpp-application/b11295/llamacpp_state_reference.exe`.
+It rejects a different runtime ABI and selects Vulkan0 / RTX 5080 explicitly.
+The request supplies fixed text/token IDs, one warmup, repeated conversations,
+and output limits. Prefill includes the first prediction; 128 outputs require
+127 further decode/sample calls. Both engines request context640; llama.cpp's
+reported allocation capacity is768 and is recorded separately.
+
+All four models have matching tokenizer IDs, backend-versus-CPU greedy outputs,
+and deterministic resets on the benchmark and a varied chat prompt. Every
+measured 128-token continuation matches Backpack. Five-run application means:
+
+| GGUF model | Backpack prefill | llama.cpp prefill | Backpack decode | llama.cpp decode |
+|---|---:|---:|---:|---:|
+| Gemma 4 E2B QAT | 247.00 | 12033.30 | 205.74 | 194.19 |
+| Qwen3.5-2B | 4918.96 | 16153.23 | 278.85 | 243.40 |
+| Qwen3.5-4B | 2874.63 | 9282.08 | 151.90 | 149.72 |
+| Qwen3.8-27B | 53.79 | 1861.53 | 9.91 | 46.41 |
+
+Units are tokens/s. All raw repetitions remain recorded. The shorter models'
+Backpack decode samples include periodic command-buffer refill costs and have
+high per-run variability; these measurements do not assert a new optimization
+acceptance. The earlier synthetic core results remain a separate protocol.
+Future llama.cpp releases require matching headers and a rebuilt, validated
+helper; the b11295 executable must not silently load newer DLLs.
+
+Example, using the generated Gemma request:
+
+```powershell
+gitignore/evolution/backups/llamacpp-application/b11295/llamacpp_state_reference.exe gitignore/evolution/backups/llamacpp/b11295/vulkan D:/workspace/project/agents/ai-models/gemma-4-E2B-it-qat-GGUF/gemma-4-e2b-it-qat-UD-Q4_K_XL.gguf gitignore/logs/llama-application-reference/measured/gemma-4-e2b-it-qat-llamacpp/request.json gitignore/logs/llama-application-reference/replay.json
+```
+
+Evidence and release-matched header hashes/build commands are under
+`gitignore/logs/llama-application-reference/`. The existing automatic core
+adapter remains available; wiring resident-reference rebuilding into future
+release refreshes remains follow-up work.
+
+Task #772 profiles the largest measured prefill deficit, Gemma GGUF. A warm
+512-token prompt uses307205 dispatches and512 submissions, despite initializing
+the batched path. `StandardState::Prefill` currently enables the batched route
+only for the validated ONNX format. The older GGUF batch shortcut had repeated
+output failures, so that path needs a fresh correctness investigation before
+changing the default. Evidence: `gitignore/logs/gemma-gguf-prefill-gap/`.
