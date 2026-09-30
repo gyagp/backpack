@@ -886,3 +886,23 @@ measurements retain the slow repetition seen in both versions. The default gate
 still marks Qwen baseline decode variability (5.79%) inconclusive. A tested,
 opt-in separated-sample exception is awaiting user approval; production policy
 and Backpack runtime binaries have not changed.
+
+## Latest Vulkan reference
+
+Task #770 selected llama.cpp `b11295` (`3b3d022b823abaa62a467b26a44e10659e080ee7`)
+from the published Windows Vulkan archive after verifying its SHA-256 digest.
+All four GGUF LLMs pass final-answer conformance. Five repetitions of pp512 and
+tg128 with a populated 512-token context run explicitly on Vulkan0 / RTX 5080.
+The previous `b11256` package is preserved.
+
+These are llama-bench core measurements: its pinned source generates random
+token IDs and synchronizes decode without greedy sampling. They are recorded as
+`llama-bench-populated-context-v1`, separately from application generation timing.
+Task #771 will add a resident reference with the same fixed text, first-token
+boundary, 127 subsequent decode/sample calls and reused-session resets as the
+Backpack application. The core figures must not be treated as an identical
+application-regression protocol.
+
+Gemma thought-channel text is now excluded from final-answer conformance, and
+an unfinished thought channel cannot satisfy a required fact. All 119 framework
+tests pass. Evidence: `gitignore/logs/llamacpp-latest-20261001/`.

@@ -15,6 +15,10 @@ def conformance_passed(output: str, required_fact: str, expected_output: str = "
 
 def final_answer(output: str) -> str:
     """Remove an optional reasoning trace and llama.cpp terminal marker."""
+    if re.search(r"<\|channel>(?:thought|analysis)\b", output):
+        if "<channel|>" not in output:
+            return ""
+        output = output.rsplit("<channel|>", 1)[1]
     if "</think>" in output:
         output = output.rsplit("</think>", 1)[1]
     output = re.sub(r"\s*\[end of text\]\s*$", "", output, flags=re.I)

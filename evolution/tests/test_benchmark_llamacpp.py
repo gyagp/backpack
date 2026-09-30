@@ -9,10 +9,20 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from evolution.benchmark_llamacpp import main
+from evolution.benchmark_llamacpp import conformance_passed, final_answer, main
 
 
 class LlamaBenchmarkTest(unittest.TestCase):
+    def test_gemma_reasoning_does_not_satisfy_final_answer_conformance(self):
+        output = "<|channel>thought\nRecall Paris.<channel|>The capital is Lyon. [end of text]"
+        answer = final_answer(output)
+        self.assertEqual("The capital is Lyon.", answer)
+        self.assertFalse(conformance_passed(answer, "Paris"))
+        self.assertEqual("Paris.", final_answer("<|channel>thought\nReasoning.<channel|>Paris. [end of text]"))
+
+    def test_unfinished_gemma_reasoning_has_no_final_answer(self):
+        self.assertEqual("", final_answer("<|channel>thought\nThe answer might be Paris"))
+
     def run_adapter(self, depth: int):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
