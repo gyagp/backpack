@@ -2019,6 +2019,12 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             bool isSWA = !cfg.layerAttnTypes.empty() && i < cfg.layerAttnTypes.size() &&
                          cfg.layerAttnTypes[i] == AttnLayerType::SlidingWindow;
             cfg.perLayer[i].kvSourceLayer = isSWA ? lastSliding : lastGlobal;
+            // Q-only layers have no K tensor from which to infer kvDim. Their
+            // cache stride must match the donor, including narrower SWA heads.
+            // Keeping the global default makes batched attention read the
+            // shared cache with the wrong token and query-row strides.
+            if (cfg.perLayer[i].kvSourceLayer >= 0)
+                cfg.perLayer[i].kvDim = cfg.perLayer[cfg.perLayer[i].kvSourceLayer].kvDim;
         }
         fprintf(stderr, "  Shared KV: %u layers (from layer %u), sliding→L%d, global→L%d\n",
                 cfg.sharedKvLayers, kvStart, lastSliding, lastGlobal);
