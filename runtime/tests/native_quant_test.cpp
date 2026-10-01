@@ -8,7 +8,8 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "Pass independent GGUF reference fixtures\n"); return 2; }
-    const bool tiled32 = std::string(argv[1]) == "--tiled32";
+    const bool staged = std::string(argv[1]) == "--staged";
+    const bool tiled32 = staged || std::string(argv[1]) == "--tiled32";
     const bool tiled = tiled32 || std::string(argv[1]) == "--tiled";
     const uint32_t tileRows=tiled32?32u:16u, tileCols=tiled32?8u:16u;
     const int firstFixture = tiled ? 2 : 1;
@@ -52,10 +53,31 @@ int main(int argc, char** argv) {
                 auto bx=upload("x",x.data(),x.size()*4), bw=upload("w",packed.data.data(),packed.data.size()*4),
                      bb=upload("bias",bias.data(),bias.size()*4), by=upload("y",zeros.data(),zeros.size()*4),
                      bp=upload("params",params,sizeof(params));
-                auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows),5);
-                auto bg=gpu.createBindGroup(pl,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
-                auto result=gpu.submitAndReadback({{pl.pipeline,bg,tiled?(M+tileRows-1)/tileRows:M,tiled?(N+tileCols-1)/tileCols:(N+7)/8,1,"native_quant"}},by,by.size);
-                wgpuBindGroupRelease(bg);
+                std::vector<uint8_t> result;
+                if(staged) {
+                    auto scratch=upload("staged",nullptr,uint64_t(K)*8*4);
+                    auto& decode=gpu.getOrCreatePipeline("native_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
+                    auto& dense=gpu.getOrCreatePipeline("native_dense",nativeQuantDensePrefillShader(),5);
+                    std::vector<GPUBuffer> paramsBuffers;std::vector<WGPUBindGroup> groups;std::vector<Dispatch> dispatches;
+                    for(uint32_t col=0;col<N;col+=8) {
+                        const uint32_t count=std::min(8u,N-col),p[]={K,N,packed.nBlocks,packed.rowStrideWords,col,strided?2*N:N,M,count,(strided?N:0)+col};
+                        auto parameter=upload("slice_params",p,sizeof(p));paramsBuffers.push_back(parameter);
+                        auto dg=gpu.createBindGroup(decode,{{1,bw},{3,scratch},{4,parameter}});
+                        auto mg=gpu.createBindGroup(dense,{{0,bx},{1,scratch},{2,bb},{3,by},{4,parameter}});
+                        groups.push_back(dg);groups.push_back(mg);
+                        dispatches.push_back({decode.pipeline,dg,(K+255)/256,count,1,"decode_slice"});
+                        dispatches.push_back({dense.pipeline,mg,(M+31)/32,(count+7)/8,1,"dense_slice"});
+                    }
+                    result=gpu.submitAndReadback(dispatches,by,by.size);
+                    for(auto group:groups)wgpuBindGroupRelease(group);
+                    for(auto buffer:paramsBuffers)gpu.releaseBuffer(buffer);
+                    gpu.releaseBuffer(scratch);
+                } else {
+                    auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows),5);
+                    auto bg=gpu.createBindGroup(pl,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
+                    result=gpu.submitAndReadback({{pl.pipeline,bg,tiled?(M+tileRows-1)/tileRows:M,tiled?(N+tileCols-1)/tileCols:(N+7)/8,1,"native_quant"}},by,by.size);
+                    wgpuBindGroupRelease(bg);
+                }
                 if(tiled32){
                     auto& legacy=gpu.getOrCreatePipeline("native_quant_legacy_"+std::to_string(type),nativeQuantShader(type,false,true,16),5);
                     auto legacyBg=gpu.createBindGroup(legacy,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});

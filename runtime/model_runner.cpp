@@ -36,6 +36,13 @@ uint32_t qwen38NativePrefillRows(const GPUContext& gpu) {
         gpu.backendType==WGPUBackendType_D3D12 && gpu.adapterName=="NVIDIA GeForce RTX 5080" ? 32u : 16u;
 }
 
+bool qwen38NativeStaging(const GPUContext& gpu,const GGUFFile& model,const ModelConfig& cfg) {
+    const char* control=std::getenv("BP_QWEN38_NATIVE_PREFILL_STAGING");
+    return control && std::strcmp(control,"1")==0 && qwen38NativePrefillTarget(gpu,model,cfg) &&
+        gpu.backendType==WGPUBackendType_D3D12 && gpu.adapterName=="NVIDIA GeForce RTX 5080" &&
+        qwen38NativePrefillRows(gpu)==32;
+}
+
 const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool gather = false, bool prefill = false, uint32_t rows = 16) {
     return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) + (gather ? "_gather" : "") + (prefill ? "_prefill"+std::to_string(rows) : ""),
                                    nativeQuantShader(type, gather, prefill, rows), 5);
@@ -5971,7 +5978,12 @@ void ModelRunner::initQwen35PrefillResources() {
     }
     // Mixed 64-layer models need extra split gate/up and large-prefill
     // repack parameters. Retain the old minimum for the smaller models.
-    const uint64_t parameterSlots = std::max<uint64_t>(1024, uint64_t(cfg.nLayer) * 32 + 64);
+    if(qwen38NativeStaging(*gpu,gguf,cfg) && maxK<=17408) {
+        qwen35Pf.nativeStageScratch=mk("qpf_native_stage",maxK*4096u);
+        fprintf(stderr,"  Native IQ3 prefill staging: opt-in, scratch=%llu MiB, columns=4096\n",
+            (unsigned long long)(qwen35Pf.nativeStageScratch.size/1048576));
+    }
+    const uint64_t parameterSlots = std::max<uint64_t>(1024, uint64_t(cfg.nLayer) * (qwen35Pf.nativeStageScratch.handle?128u:32u) + 64);
     qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",256u*parameterSlots,
         BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
@@ -7643,6 +7655,23 @@ int32_t ModelRunner::prefillQwen35Batched(
         auto mm=[&](GPUBuffer x,GPUBuffer w,GPUBuffer s,GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,const std::string&n){auto p=mkp(n+"_p",{K,N,M});add(q8,{{0,x},{1,w},{2,s},{3,bias},{4,y},{5,p}},preciseQ8?M:(M+3)/4,preciseQ8?(N+7)/8:(N+31)/32,1,n);};
         auto kpl=[&](GGUFType t)->const CompiledPipeline&{return t==GGUF_TYPE_Q4_K?getKernel("q4k_matmul"):t==GGUF_TYPE_Q5_K?getKernel("q5k_matmul"):t==GGUF_TYPE_Q6_K?getKernel("q6k_matmul"):nativeQuantPipeline(*gpu,t);};
         const bool nativePrefillTile = M >= 16 && qwen38NativePrefillTarget(*gpu, gguf, cfg);
+        const bool stagedNativePrefill=M>=128 && qwen35Pf.nativeStageScratch.handle && qwen38NativeStaging(*gpu,gguf,cfg);
+        auto stagedNative=[&](GPUBuffer x,GPUBuffer w,GGUFType type,uint32_t nb,uint32_t rs,
+                              GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,uint32_t outputOffset,uint32_t outputStride,const std::string& name) {
+            // These large IQ3 families retained a material gain with bounded
+            // staging. IQ4_XS did not clear the isolated 2% threshold.
+            if(!stagedNativePrefill || K<5120 || N<4096 || uint64_t(K)*4096*4>qwen35Pf.nativeStageScratch.size ||
+                (type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS))return false;
+            auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
+            auto& dense=gpu->getOrCreatePipeline("native_quant_dense_prefill32",nativeQuantDensePrefillShader(),5);
+            for(uint32_t col=0;col<N;col+=4096) {
+                const uint32_t count=std::min(4096u,N-col);
+                auto p=mkp(name+"_stage_p",{K,N,nb,rs,col,outputStride,M,count,outputOffset+col});
+                add(decode,{{1,w},{3,qwen35Pf.nativeStageScratch},{4,p}},(K+255)/256,count,1,name+"_stage_weights_"+std::to_string(col));
+                add(dense,{{0,x},{1,qwen35Pf.nativeStageScratch},{2,bias},{3,y},{4,p}},(M+31)/32,(count+7)/8,1,name+"_stage_dense_"+std::to_string(col));
+            }
+            return true;
+        };
         const char* portableEnv=std::getenv("BP_Q4K_PREFILL_PORTABLE");
         // The override keeps an exact same-binary baseline for A/B validation.
         const bool useAmdPortableQ4=gpu->adapterName.find("AMD")!=std::string::npos&&
@@ -7766,6 +7795,7 @@ int32_t ModelRunner::prefillQwen35Batched(
             else if(t==GGUF_TYPE_Q4_K&&M>=8&&gpu->adapterName.find("AMD")==std::string::npos&&!useIntelFourRows){auto p=mkp(n+"_p",{K,N,M,nb,rs});auto&kp=getKernel("q4k_matmul_batched8");add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+7)/8,(N+7)/8,1,n);}
             else if((t==GGUF_TYPE_Q4_K||t==GGUF_TYPE_Q5_K||t==GGUF_TYPE_Q6_K)&&M>=4&&gpu->adapterName.find("AMD")==std::string::npos){auto p=mkp(n+"_p",{K,N,M,nb,rs});const char*kn=t==GGUF_TYPE_Q4_K?"q4k_matmul_batched4":t==GGUF_TYPE_Q5_K?"q5k_matmul_batched4":"q6k_matmul_batched4";auto&kp=getKernel(kn);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+3)/4,(N+7)/8,1,n);}
             else if(nativePrefillTile && t!=GGUF_TYPE_Q4_K && t!=GGUF_TYPE_Q5_K && t!=GGUF_TYPE_Q6_K){
+                if(stagedNative(x,w,t,nb,rs,bias,y,K,N,0,N,n))return;
                 const uint32_t rows=qwen38NativePrefillRows(*gpu),cols=256u/rows;
                 auto p=mkp(n+"_p",{K,N,nb,rs,0,N,M});auto&kp=nativeQuantPipeline(*gpu,t,false,true,rows);
                 add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+rows-1)/rows,(N+cols-1)/cols,1,n);
@@ -7845,6 +7875,9 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(lw.upKQ.handle){
                 const uint32_t rows=qwen38NativePrefillRows(*gpu),cols=256u/rows;
                 for(uint32_t part=0;part<2;++part){
+                    if(stagedNative(qwen35Pf.norm,part?lw.upKQ:lw.guKQ,part?lw.upKQType:lw.guKQType,
+                        part?lw.upKQNBlocks:lw.guKQNBlocks,part?lw.upKQRowStride:lw.guKQRowStride,
+                        zeroBiasGU,qwen35Pf.gateup,E,im,part*im,2u*im,L+(part?"up":"gate")))continue;
                     auto& pipeline=nativeQuantPipeline(*gpu,part?lw.upKQType:lw.guKQType,false,nativePrefillTile,rows);
                     auto p=mkp(L+"split_gu_"+std::to_string(part),{E,im,part?lw.upKQNBlocks:lw.guKQNBlocks,
                         part?lw.upKQRowStride:lw.guKQRowStride,part*im,2u*im,M});
