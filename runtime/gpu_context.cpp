@@ -320,7 +320,7 @@ void GPUContext::destroy() {
         wgpuComputePipelineRelease(p.pipeline);
         wgpuShaderModuleRelease(p.shader);
         wgpuBindGroupLayoutRelease(p.bgLayout);
-        wgpuPipelineLayoutRelease(p.pplLayout);
+        if (p.pplLayout) wgpuPipelineLayoutRelease(p.pplLayout);
     }
     if (queue) wgpuQueueRelease(queue);
     if (device) wgpuDeviceRelease(device);
