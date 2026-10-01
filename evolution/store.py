@@ -2024,7 +2024,10 @@ class Store:
                 where.append(f"{key}=?")
                 values.append(canonical_model_format(value) if key == "format" else value)
         sql = "SELECT * FROM observations" + (" WHERE " + " AND ".join(where) if where else "")
-        return self._all(sql + " ORDER BY created_at DESC,id DESC", tuple(values))
+        # utc_now has second precision. IDs are arbitrary labels, not arrival
+        # order; use the insertion order consistently with latest_observations
+        # and the regression guard when several records share a timestamp.
+        return self._all(sql + " ORDER BY created_at DESC,rowid DESC", tuple(values))
 
     def confirmed_regressions(self, threshold_percent: float = 10.0) -> list[dict[str, Any]]:
         rows = self._all("SELECT * FROM observations WHERE validity='valid' ORDER BY created_at,id")

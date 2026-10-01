@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -923,6 +924,20 @@ class FrameworkTest(unittest.TestCase):
         self.assertIn("one-process-five-repeats", cumulative["validity_reason"])
         self.assertEqual("valid", observe("five-process-five-repeats", 50, 5, 5)["validity"])
         self.assertEqual("quarantined", observe("known-schedule-drop", 40, 5, 5)["validity"])
+
+    def test_status_same_second_measurements_follow_insertion_order_not_ids(self) -> None:
+        model = self.store.upsert_model({"id": "same-second", "name": "Same second"})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "gguf", "backend": "webgpu", "conformance": "pass"}
+        with patch("evolution.store.utc_now", return_value="2026-10-01T00:00:00+00:00"):
+            for name, rate in [("z-older", 100), ("a-newer", 101)]:
+                self.store.add_observation({**common, "id": name, "metrics": {
+                    "prefill_tok_s": rate, "prompt_tokens": 512, "generated_tokens": 128}}, "test")
+        rows = self.store.list_observations({"model_id": model["id"]})
+        self.assertEqual(["a-newer", "z-older"], [row["id"] for row in rows])
+        entry = next(r for r in self.store.model_matrix()["models"] if r["model"]["id"] == model["id"])
+        visible = [r for cell in entry["cells"] for r in cell["results"] if r.get("performance_validated")]
+        self.assertEqual(["a-newer"], [row["id"] for row in visible])
 
     def test_unknown_schedule_is_not_inferred_from_total_or_prose(self) -> None:
         model = self.store.upsert_model({"id": "unknown-schedule", "name": "Unknown schedule"})
