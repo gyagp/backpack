@@ -7664,7 +7664,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 (type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS))return false;
             auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
             const char* pairControl=std::getenv("BP_NATIVE_DENSE_PREFILL_PAIR");
-            const bool paired=pairControl && std::strcmp(pairControl,"1")==0;
+            const bool paired=!pairControl || std::strcmp(pairControl,"1")==0;
             auto& dense=gpu->getOrCreatePipeline(paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32",nativeQuantDensePrefillShader(paired),5);
             for(uint32_t col=0;col<N;col+=4096) {
                 const uint32_t count=std::min(4096u,N-col);
