@@ -39,6 +39,16 @@ std::vector<uint64_t> timestamps(GPUContext& gpu,GPUProfiler& profiler) {
 }
 
 int main(int argc,char** argv) {
+    if(argc==2 && std::string(argv[1])=="--cleanup-only") {
+        GPUContext context;if(!context.init(WGPUBackendType_D3D12))return 1;
+        require(context.adapterName=="NVIDIA GeForce RTX 5080","Unexpected cleanup test adapter");
+        context.getOrCreatePipeline("cleanup_probe",R"WGSL(
+@group(0) @binding(0) var<storage,read_write> Y:array<f32>;
+@compute @workgroup_size(1) fn main() { Y[0]=1.0; }
+)WGSL",1);
+        std::cout<<"Releasing an auto-layout pipeline"<<std::endl;
+        context.destroy();std::cout<<"Cleanup passed"<<std::endl;return 0;
+    }
     if(argc!=3) { std::cerr<<"Usage: probe request.json result.json\n";return 2; }
     GPUContext gpu;
     try {
