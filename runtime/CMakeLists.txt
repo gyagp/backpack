@@ -181,6 +181,11 @@ target_include_directories(op_test_runner PRIVATE
 add_executable(backpack_kernel_test tests/kernel_test.cpp $<TARGET_OBJECTS:backpack_core>)
 add_executable(backpack_native_quant_test tests/native_quant_test.cpp $<TARGET_OBJECTS:backpack_core>)
 target_link_libraries(backpack_native_quant_test PRIVATE backpack)
+if(WIN32)
+    add_executable(backpack_native_prefill_staging_probe
+        ../benchmarks/native_prefill_staging_probe.cpp $<TARGET_OBJECTS:backpack_core>)
+    target_link_libraries(backpack_native_prefill_staging_probe PRIVATE backpack)
+endif()
 target_link_libraries(backpack_kernel_test PRIVATE backpack)
 target_include_directories(backpack_kernel_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -228,10 +233,12 @@ if(WIN32)
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     target_link_libraries(backpack_native_quant_test PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
+    target_link_libraries(backpack_native_prefill_staging_probe PRIVATE
+        ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     target_link_libraries(backpack_op_test PRIVATE
         ${DAWN_NATIVE_LIB} d3d12.lib dxgi.lib)
     # Copy DLLs next to executables
-    foreach(_target backpack_runtime backpack_llm backpack_image backpack_asr op_test_runner backpack_kernel_test backpack_native_quant_test backpack_op_test)
+    foreach(_target backpack_runtime backpack_llm backpack_image backpack_asr op_test_runner backpack_kernel_test backpack_native_quant_test backpack_native_prefill_staging_probe backpack_op_test)
         if(TARGET ${_target})
             add_custom_command(TARGET ${_target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
