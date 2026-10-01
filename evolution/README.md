@@ -101,6 +101,13 @@ Idle claim polls are heartbeats. A device without a poll for 150 seconds is
 shown as stale and is not counted as online; queued work remains visible until
 the worker returns or an operator records a pause reason.
 
+Tasks marked `manual_execution` are not claimed automatically, even when they
+include an adapter command. Their failure reports stay failed; they require an
+explicit operator action to resume. Late failures for terminal tasks also stay
+failed. Active automatic runs retain their two repair attempts, while timeouts
+are not retried automatically. Process liveness and device recovery must be
+verified before restarting a stalled GPU workload.
+
 The integrator automatically pushes the accepted SHA to
 `refs/heads/evolution/base` using `--force-with-lease`. Publication requires an
 `accept` verdict and an `integrating` task; a failed push is recorded and the

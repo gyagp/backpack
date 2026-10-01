@@ -1430,7 +1430,10 @@ class Store:
                        r.created_at,r.id""", (machine["id"],)).fetchall()
             chosen = None
             for row in rows:
-                adapter = str(parse_json(row["manifest_json"], {}).get("adapter", ""))
+                manifest = parse_json(row["manifest_json"], {})
+                if manifest.get("manual_execution"):
+                    continue
+                adapter = str(manifest.get("adapter", ""))
                 if adapter and adapter in allowed:
                     chosen = row["id"]
                     break
@@ -1459,10 +1462,13 @@ class Store:
             raise DomainError("invalid run status")
         requested_failure = status == "failed"
         timed_out = str(data.get("error", "")).lower().startswith("timeout:")
+        task = self.get_task(run["task_id"])
+        automatic = bool(task and not task.get("manifest", {}).get("manual_execution")
+                         and task["state"] not in {"integrated", "rejected", "failed", "reverted"})
         prior_failures = self._db.execute(
             "SELECT COUNT(*) FROM audit_events WHERE entity_type='run' AND entity_id=? AND event_type='automatic_retry'",
             (run_id,)).fetchone()[0]
-        if requested_failure and not timed_out and prior_failures < 2:
+        if requested_failure and automatic and not timed_out and prior_failures < 2:
             status = "pending"
             data = {**data, "phase": f"automatic repair/retry {prior_failures + 1}/2", "progress": 0}
         now = utc_now()

@@ -1604,6 +1604,51 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual("running", claimed["status"])
         self.assertIsNone(self.store.claim_run("gpu-1", ["argv"], "gpu-1"))
 
+    def test_manual_adapter_run_requires_explicit_execution_and_does_not_retry(self) -> None:
+        task = self.store.create_task({"title": "Manual GPU diagnostic", "kind": "correctness", "hypothesis": "Manual control",
+            "manifest": {"manual_execution": True, "adapter": "argv", "argv": ["python", "--version"]},
+            "device_policy": {"machine_ids": [self.machine["id"]]}})
+        self.store.ensure_task_runs(); run = self.store.list_runs(task["id"])[0]
+        self.assertIsNone(self.store.claim_run("gpu-1", ["argv"], "agent"))
+        self.assertEqual("pending", self.store.get_run(run["id"])["status"])
+        automatic = self.store.create_task({"title": "Automatic control", "kind": "correctness", "hypothesis": "Keep ordinary claims working",
+            "manifest": {"adapter": "argv", "argv": ["python", "--version"]},
+            "device_policy": {"machine_ids": [self.machine["id"]]}})
+        self.store.ensure_task_runs()
+        claimed = self.store.claim_run("gpu-1", ["argv"], "agent")
+        self.assertEqual(automatic["id"], claimed["task_id"])
+        self.store.update_run(claimed["id"], {"status": "completed"}, "agent")
+        running = self.store.update_run(run["id"], {"status": "running"}, "manual-operator")
+        self.assertEqual("running", running["status"])
+        for _ in range(3):
+            failed = self.store.update_run(run["id"], {"status": "failed", "phase": "driver recovery required", "error": "TDR"}, "manual-operator")
+            self.assertEqual("failed", failed["status"])
+            self.assertEqual("driver recovery required", failed["phase"])
+            self.assertIsNotNone(failed["completed_at"])
+        retries = self.store._db.execute("SELECT COUNT(*) FROM audit_events WHERE entity_type='run' AND entity_id=? AND event_type='automatic_retry'", (run["id"],)).fetchone()[0]
+        self.assertEqual(0, retries)
+
+    def test_active_automatic_runs_keep_two_retries_and_timeouts_do_not_retry(self) -> None:
+        self.store.ensure_task_runs(); run = self.store.list_runs(self.task["id"])[0]
+        for attempt in [1, 2]:
+            failed = self.store.update_run(run["id"], {"status": "failed", "error": "repairable error"}, "agent")
+            self.assertEqual("pending", failed["status"])
+            self.assertEqual(f"automatic repair/retry {attempt}/2", failed["phase"])
+        self.assertEqual("failed", self.store.update_run(run["id"], {"status": "failed", "error": "still failed"}, "agent")["status"])
+        task = self.store.create_task({"title": "Timeout", "kind": "correctness", "hypothesis": "Bounded work"})
+        self.store.ensure_task_runs(); timeout_run = self.store.list_runs(task["id"])[0]
+        self.assertEqual("failed", self.store.update_run(timeout_run["id"], {"status": "failed", "error": "timeout: process remains live"}, "agent")["status"])
+
+    def test_late_failure_report_does_not_requeue_terminal_task(self) -> None:
+        for state in ["integrated", "rejected", "failed", "reverted"]:
+            task = self.store.create_task({"title": "Terminal " + state, "kind": "correctness", "hypothesis": "Preserve terminal state"})
+            self.store.ensure_task_runs(); run = self.store.list_runs(task["id"])[0]
+            with self.store._lock, self.store._db:
+                self.store._db.execute("UPDATE tasks SET state=? WHERE id=?", (state, task["id"]))
+            result = self.store.update_run(run["id"], {"status": "failed", "error": "late failure report"}, "agent")
+            self.assertEqual("failed", result["status"])
+            self.assertEqual(0, self.store._db.execute("SELECT COUNT(*) FROM audit_events WHERE entity_type='run' AND entity_id=? AND event_type='automatic_retry'", (run["id"],)).fetchone()[0])
+
     def test_terminal_task_cancels_pending_runs_and_cannot_be_claimed(self) -> None:
         task = self.store.create_task({
             "title": "Discarded diagnostic", "kind": "correctness", "hypothesis": "Run",
