@@ -90,7 +90,9 @@ int main(int argc,char** argv) {
                  bb=upload("bias",bias.data(),bias.size()*4),bp=upload("params",params,sizeof(params)),
                  by=upload("output",nullptr,uint64_t(M)*N*4),bs=upload("scratch",nullptr,scratchBytes);
             packed.data.clear();packed.data.shrink_to_fit();
-            auto source=nativeQuantShader(type,false,true,32),dense=nativeQuantDensePrefillShader(),decode=nativeQuantDecodeSliceShader(type);
+            const char* pairControl=std::getenv("BP_NATIVE_DENSE_PREFILL_PAIR");
+            const bool paired=pairControl && std::strcmp(pairControl,"1")==0;
+            auto source=nativeQuantShader(type,false,true,32),dense=nativeQuantDensePrefillShader(paired),decode=nativeQuantDecodeSliceShader(type);
             const auto suffix=std::to_string(type);
             auto& fusedPipeline=gpu.getOrCreatePipeline("probe_fused_"+suffix,source,5);
             auto& densePipeline=gpu.getOrCreatePipeline("probe_dense_"+suffix,dense,5);
