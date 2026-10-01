@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 int main(int argc, char** argv) {
@@ -27,12 +28,12 @@ int main(int argc, char** argv) {
             if (!file) throw std::runtime_error("Truncated fixture");
             const auto originalRaw = raw;
             const auto originalValues = values;
-            while (values.size() < 19u * 5120u) {
+            while (values.size() < 19u * 17408u) {
                 raw.insert(raw.end(), originalRaw.begin(), originalRaw.end());
                 values.insert(values.end(), originalValues.begin(), originalValues.end());
             }
             const auto type = GGUFType(header[0]);
-            for (uint32_t K : {256u, 768u, 5120u}) {
+            for (uint32_t K : {256u, 768u, 5120u, 17408u}) {
              for (uint32_t M : tiled32 ? std::vector<uint32_t>{3,16,17,31,32,33,35,64} : tiled ? std::vector<uint32_t>{3,35} : std::vector<uint32_t>{3}) {
               for (bool strided : {false, true}) {
                 const uint32_t N = tiled ? 19u : K == 256u ? 13u : 5u;
@@ -65,11 +66,21 @@ int main(int argc, char** argv) {
                 const float* actual=reinterpret_cast<const float*>(result.data());
                 double maxError=0;
                 for(uint32_t m=0;m<M;++m) for(uint32_t n=0;n<N;++n) {
-                    double expected=bias[n];
-                    for(uint32_t k=0;k<K;++k) expected+=double(x[m*K+k])*values[n*K+k];
+                    double expected=bias[n],sumAbs=std::abs(double(bias[n]));
+                    for(uint32_t k=0;k<K;++k){const double product=double(x[m*K+k])*values[n*K+k];expected+=product;sumAbs+=std::abs(product);}
                     const uint32_t index = strided ? m*N*2+N+n : m*N+n;
                     const double error=std::abs(actual[index]-expected);
-                    if(!std::isfinite(actual[index]) || error>2e-4+2e-5*std::abs(expected) || (strided && actual[m*N*2+n]!=0)) {
+                    double tolerance=2e-4+2e-5*std::abs(expected);
+                    if(K>5120){
+                        // New long-dot coverage can exceed the old absolute
+                        // tolerance even for the bit-identical 16-row result.
+                        // Bound FP32 rounding along a lane's multiply/adds,
+                        // five reduction stages, and the bias addition.
+                        const double u=std::numeric_limits<float>::epsilon()/2.0;
+                        const double depth=2.0*((K+31u)/32u)+6.0;
+                        tolerance=std::max(tolerance,(depth*u/(1.0-depth*u))*sumAbs);
+                    }
+                    if(!std::isfinite(actual[index]) || error>tolerance || (strided && actual[m*N*2+n]!=0)) {
                         std::fprintf(stderr,"FAIL type=%u K=%u m=%u n=%u got=%.9g expected=%.9g\n",type,K,m,n,actual[index],expected);
                         return 1;
                     }

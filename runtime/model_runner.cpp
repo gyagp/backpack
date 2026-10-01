@@ -32,7 +32,7 @@ bool qwen38NativePrefillTarget(const GPUContext& gpu, const GGUFFile& model, con
 
 uint32_t qwen38NativePrefillRows(const GPUContext& gpu) {
     const char* control=std::getenv("BP_QWEN38_NATIVE_PREFILL_ROWS");
-    return control && std::strcmp(control,"32")==0 &&
+    return (!control || std::strcmp(control,"32")==0) &&
         gpu.backendType==WGPUBackendType_D3D12 && gpu.adapterName=="NVIDIA GeForce RTX 5080" ? 32u : 16u;
 }
 
