@@ -100,3 +100,32 @@ std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t
     }
     return source;
 }
+
+std::string nativeQuantDecodeSliceShader(GGUFType type) {
+    auto source=nativeQuantShader(type,false,true,32);
+    const auto end=source.find("var<workgroup> tileA:");
+    if(end==std::string::npos)throw std::runtime_error("Native decode slice splice failed");
+    source.erase(end);
+    source+=R"WGSL(
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+    let k=gid.x; let row=gid.y;
+    if(k<P[0] && row<P[7]) { Y[row*P[0]+k]=decode(row+P[4],k); }
+}
+)WGSL";
+    return source;
+}
+
+std::string nativeQuantDensePrefillShader() {
+    auto source=nativeQuantShader(GGUF_TYPE_IQ3_S,false,true,32);
+    auto replace=[&](const std::string& from,const std::string& to) {
+        const auto pos=source.find(from);
+        if(pos==std::string::npos)throw std::runtime_error("Native dense prefill splice failed");
+        source.replace(pos,from.size(),to);
+    };
+    replace("b=decode(wid.y*8u+br,k0+bk);","b=bitcast<f32>(W[(wid.y*8u+br)*K+k0+bk]);");
+    replace("let N=P[1];","let N=P[7];");
+    replace("Bias[col]","Bias[col+P[4]]");
+    replace("Y[row*stride+col+P[4]]","Y[row*stride+col+P[8]]");
+    return source;
+}
