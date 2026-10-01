@@ -112,6 +112,11 @@ def main() -> int:
     if not prefill or not decode:
         raise SystemExit("llama-bench did not return the requested prefill and populated-context decode records")
     metrics = {
+        # Prefill and populated-context decode each run in their own process.
+        # Counts describe the samples contributing to each reported metric.
+        "measured_processes": 1,
+        "measured_repetitions_per_process": args.repetitions,
+        "measured_repetitions": args.repetitions,
         "prompt_tokens": args.prompt_tokens,
         "generation_tokens": args.generation_tokens,
         "decode_context_tokens": args.prompt_tokens,

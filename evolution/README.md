@@ -73,6 +73,15 @@ state under `gitignore/` on webgfx-104.
 
 ## Daily reference cycle
 
+Performance records include `measured_processes` and
+`measured_repetitions_per_process`, along with per-process `warmup_runs` and
+`reuse_generator`. Status compares regression evidence only within the same
+recorded schedule: reset/allocator state can differ between two conversations
+per process and five. Missing historical counts remain unknown; total samples
+and prose descriptions do not establish process boundaries. Both observation
+quarantine and confirmed-regression grouping use these fields. The numerical
+regression thresholds and optimization CV policy are unchanged.
+
 The control plane creates one dated refresh task for ORT/ORT GenAI and one for
 llama.cpp. `webgfx-104` builds or downloads each x64 artifact once, records its
 source revision and date below `gitignore/evolution/backups/`, and keeps all

@@ -46,7 +46,9 @@ def validate_results(data: dict, prompt_tokens: int, outputs: int, repetitions: 
                 raise RuntimeError("Invalid benchmark duration")
         if run["prefill_ms"] <= 0 or (outputs > 1 and run["decode_ms"] <= 0):
             raise RuntimeError("Benchmark reported zero elapsed time")
-    return {"prefill_tok_s": prompt_tokens * repetitions * 1000 / sum(r["prefill_ms"] for r in runs),
+    return {"measured_processes": 1, "measured_repetitions_per_process": repetitions,
+            "measured_repetitions": repetitions,
+            "prefill_tok_s": prompt_tokens * repetitions * 1000 / sum(r["prefill_ms"] for r in runs),
             "decode_tok_s": ((outputs - 1) * repetitions * 1000 / sum(r["decode_ms"] for r in runs)
                              if outputs > 1 else 0.0),
             "prefill_samples": [prompt_tokens * 1000 / r["prefill_ms"] for r in runs],

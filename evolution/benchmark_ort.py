@@ -272,7 +272,9 @@ def parse_comparable_benchmark(output: str, prompt_tokens: int, generation_token
         raise RuntimeError("Native timed call counts differ from the requested workload")
     if prompt_us + sample_us <= 0 or (generation_tokens > 1 and decode_us <= 0):
         raise RuntimeError("Native benchmark reported zero elapsed time")
-    return {"prefill_tok_s": prompt_tokens * 1e6 / (prompt_us + sample_us),
+    return {"measured_processes": 1, "measured_repetitions_per_process": repetitions,
+            "measured_repetitions": repetitions,
+            "prefill_tok_s": prompt_tokens * 1e6 / (prompt_us + sample_us),
             "decode_tok_s": 1e6 / decode_us if generation_tokens > 1 else 0.0,
             "prompt_processing_ms": prompt_us / 1000,
             "first_token_sample_ms": sample_us / 1000}

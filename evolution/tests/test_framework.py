@@ -905,6 +905,58 @@ class FrameworkTest(unittest.TestCase):
                 "graph_capture": True, "artifact_fingerprint": "new"}}, "test")
         self.assertEqual(["p4", "p5"], self.store.confirmed_regressions()[0]["confirmed_by"])
 
+    def test_reset_schedules_separate_series_and_preserve_cumulative_guard(self) -> None:
+        model = self.store.upsert_model({"id": "reset-schedule", "name": "Reset schedule"})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "onnx", "backend": "webgpu", "conformance": "pass"}
+        def observe(name, rate, processes, repetitions):
+            return self.store.add_observation({**common, "id": name, "metrics": {
+                "decode_tok_s": rate, "prompt_tokens": 512, "generated_tokens": 128,
+                "graph_capture": "not_applicable", "warmup_runs": 1, "reuse_generator": True,
+                "measured_processes": processes, "measured_repetitions_per_process": repetitions}}, "test")
+        observe("five-process-two-repeats", 100, 5, 2)
+        # Later reset positions are represented only in the five-repeat run.
+        self.assertEqual("valid", observe("one-process-five-repeats", 60, 1, 5)["validity"])
+        self.assertEqual("valid", observe("same-schedule-small-drop", 59, 1, 5)["validity"])
+        cumulative = observe("same-schedule-cumulative-drop", 58, 1, 5)
+        self.assertEqual("quarantined", cumulative["validity"])
+        self.assertIn("one-process-five-repeats", cumulative["validity_reason"])
+        self.assertEqual("valid", observe("five-process-five-repeats", 50, 5, 5)["validity"])
+        self.assertEqual("quarantined", observe("known-schedule-drop", 40, 5, 5)["validity"])
+
+    def test_unknown_schedule_is_not_inferred_from_total_or_prose(self) -> None:
+        model = self.store.upsert_model({"id": "unknown-schedule", "name": "Unknown schedule"})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "backpack", "format": "ort", "backend": "webgpu", "conformance": "pass"}
+        def observe(name, rate, schedule, details=None):
+            return self.store.add_observation({**common, "id": name, "conformance_details": details or {},
+                "metrics": {"decode_tok_s": rate, "prompt_tokens": 512, "generated_tokens": 128,
+                            "graph_capture": "not_applicable", **schedule}}, "test")
+        known = {"measured_processes": 1, "measured_repetitions_per_process": 5}
+        observe("known", 100, known)
+        for name, schedule in [("unknown", {"measured_repetitions": 5, "sample_method": "five repeats in one process"}),
+                               ("partial", {"measured_repetitions_per_process": 5})]:
+            self.assertEqual("valid", observe(name, 50, schedule)["validity"])
+        # Canonical metadata in conformance_details has the same identity.
+        self.assertEqual("quarantined", observe("known-in-details", 40, {}, known)["validity"])
+
+    def test_confirmed_regression_respects_process_reset_schedules(self) -> None:
+        model = self.store.upsert_model({"id": "confirmed-schedule", "name": "Confirmed schedule"})
+        common = {"model_id": model["id"], "machine_id": self.machine["id"],
+                  "framework": "ort", "format": "onnx", "backend": "webgpu", "conformance": "pass"}
+        def observe(name, rate, processes, repetitions):
+            self.store.add_observation({**common, "id": name, "metrics": {
+                "prefill_tok_s": rate, "prompt_tokens": 128, "generation_tokens": 64,
+                "graph_capture": True, "measured_processes": processes,
+                "measured_repetitions_per_process": repetitions}}, "test")
+        observe("s1", 100, 5, 2)
+        observe("s2", 60, 1, 5)
+        observe("s3", 59, 1, 5)
+        self.assertEqual([], self.store.confirmed_regressions())
+        observe("s4", 40, 1, 5)
+        observe("s5", 39, 1, 5)
+        self.assertEqual(["s4", "s5"], self.store.confirmed_regressions()[0]["confirmed_by"])
+
     def test_backpack_ort_regression_guard_does_not_require_graph_capture(self) -> None:
         model = self.store.upsert_model({"id": "backpack-ort-guard", "name": "Backpack ORT Guard",
                                          "files": {"ort": {}}})

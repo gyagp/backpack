@@ -59,6 +59,9 @@ class LlamaBenchmarkTest(unittest.TestCase):
                                   if line.startswith("EVOLUTION_METRICS ")))
         self.assertEqual(512, metrics["decode_context_tokens"])
         self.assertEqual([45], metrics["decode_samples_tok_s"])
+        repetitions = int(prefill[prefill.index("-r") + 1])
+        self.assertEqual((1, repetitions, repetitions), (metrics["measured_processes"],
+            metrics["measured_repetitions_per_process"], metrics["measured_repetitions"]))
 
     def test_empty_context_result_is_rejected(self):
         with self.assertRaisesRegex(SystemExit, "populated-context"):

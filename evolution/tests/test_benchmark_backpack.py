@@ -24,6 +24,8 @@ class ExactBenchmarkTest(unittest.TestCase):
         rates = self.validate(self.fixture())
         self.assertEqual(100, rates["prefill_tok_s"])
         self.assertEqual(250, rates["decode_tok_s"])
+        self.assertEqual((1, 2, 2), (rates["measured_processes"],
+            rates["measured_repetitions_per_process"], rates["measured_repetitions"]))
 
     def test_hidden_warmup_and_extra_decode_are_rejected(self):
         for key, value in [("decode_sample_tokens", 3), ("final_position", 5),

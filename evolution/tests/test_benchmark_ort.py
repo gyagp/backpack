@@ -24,6 +24,8 @@ Token sampling:
         self.assertAlmostEqual(512000 / 100.5, result["prefill_tok_s"])
         self.assertEqual(100, result["decode_tok_s"])
         self.assertEqual(0.5, result["first_token_sample_ms"])
+        self.assertEqual((1, 5, 5), (result["measured_processes"],
+            result["measured_repetitions_per_process"], result["measured_repetitions"]))
         with self.assertRaisesRegex(RuntimeError, "counts differ"):
             parse_comparable_benchmark(output.replace("635 *", "640 *"), 512, 128, 5)
         with self.assertRaisesRegex(RuntimeError, "Missing"):

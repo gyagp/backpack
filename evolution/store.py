@@ -1786,7 +1786,13 @@ class Store:
         # package at the same mutable path. Two legacy rows remain comparable;
         # new collectors attach these identities to establish stricter series.
         keys = ("artifact_fingerprint", "prompt_sha256", "benchmark_protocol",
-                "warmup_runs", "max_seq_len", "decode_sample_tokens", "reuse_generator")
+                "warmup_runs", "max_seq_len", "decode_sample_tokens", "reuse_generator",
+                # Reset position within a process can affect allocator/cache
+                # state. Five conversations in one process are a different
+                # sample schedule from five processes with two conversations.
+                # Unknown legacy counts remain unknown: neither total sample
+                # count nor free-form sample_method proves process boundaries.
+                "measured_processes", "measured_repetitions_per_process")
         metrics, details = row.get("metrics") or {}, row.get("conformance_details") or {}
         return json_text({key: metrics.get(key, details.get(key)) for key in keys})
 
