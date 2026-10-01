@@ -38,7 +38,7 @@ uint32_t qwen38NativePrefillRows(const GPUContext& gpu) {
 
 bool qwen38NativeStaging(const GPUContext& gpu,const GGUFFile& model,const ModelConfig& cfg) {
     const char* control=std::getenv("BP_QWEN38_NATIVE_PREFILL_STAGING");
-    return control && std::strcmp(control,"1")==0 && qwen38NativePrefillTarget(gpu,model,cfg) &&
+    return (!control || std::strcmp(control,"1")==0) && qwen38NativePrefillTarget(gpu,model,cfg) &&
         gpu.backendType==WGPUBackendType_D3D12 && gpu.adapterName=="NVIDIA GeForce RTX 5080" &&
         qwen38NativePrefillRows(gpu)==32;
 }
@@ -5980,7 +5980,7 @@ void ModelRunner::initQwen35PrefillResources() {
     // repack parameters. Retain the old minimum for the smaller models.
     if(qwen38NativeStaging(*gpu,gguf,cfg) && maxK<=17408) {
         qwen35Pf.nativeStageScratch=mk("qpf_native_stage",maxK*4096u);
-        fprintf(stderr,"  Native IQ3 prefill staging: opt-in, scratch=%llu MiB, columns=4096\n",
+        fprintf(stderr,"  Native IQ3 prefill staging: scratch=%llu MiB, columns=4096\n",
             (unsigned long long)(qwen35Pf.nativeStageScratch.size/1048576));
     }
     const uint64_t parameterSlots = std::max<uint64_t>(1024, uint64_t(cfg.nLayer) * (qwen35Pf.nativeStageScratch.handle?128u:32u) + 64);
