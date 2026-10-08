@@ -942,6 +942,71 @@ TEST(fused_temporary_ownership) {
     fs::remove(dir);
 }
 
+TEST(quantized_embedding_temporary_ownership) {
+    constexpr int V = 4, K = 32;
+    std::vector<uint8_t> weights(V * K);
+    for (int row = 0; row < V; ++row)
+        for (int k = 0; k < K; ++k) weights[row * K + k] = uint8_t(128 + row + k % 7);
+    const auto model = buildOnnxModel(
+        {{"GatherBlockQuantized", {"embed_tokens.weight", "ids", "scales"}, {"Y"},
+          {{"bits", AttrDef::INT, 8}, {"block_size", AttrDef::INT, K}}}},
+        {{"ids", ONNX_INT64, {-1}}}, {{"Y", ONNX_FLOAT, {-1, K}}},
+        {{"embed_tokens.weight", ONNX_UINT8, {V, 1, K}, weights},
+         makeInitF16("scales", {V, 1}, std::vector<float>(V, 0.25f))});
+    const auto dir = fs::current_path() / "gitignore/runtime/op-tests" /
+        ("embedding_ownership_" + std::to_string(g_tempCounter++));
+    fs::create_directories(dir);
+    const auto path = dir / "model.onnx";
+    { std::ofstream file(path, std::ios::binary);
+      file.write(reinterpret_cast<const char*>(model.data()), model.size()); }
+    {
+        GraphExecutor graph;
+        if (!graph.Load(gpu, path.string())) throw std::runtime_error("Cannot load embedding graph");
+        GpuTensor ids, output;
+        ids.dtype = TensorDtype::Int64;
+        ids.buffer = gpu.createBuffer("embedding_test_ids", 24);
+        output.dtype = TensorDtype::Float32;
+        output.buffer = gpu.createBuffer("embedding_test_output", 3 * K * 4);
+        {
+            ExecutionContext context;
+            std::unordered_map<std::string, GpuTensor*> inputs{{"ids", &ids}}, outputs{{"Y", &output}};
+            auto execute = [&](std::vector<int64_t> values) {
+                ids.shape = {int64_t(values.size())};
+                ids.cpuData.resize(values.size() * 8);
+                memcpy(ids.cpuData.data(), values.data(), ids.cpuData.size());
+                gpu.writeBuffer(ids.buffer, values.data(), ids.cpuData.size());
+                output.shape = {int64_t(values.size()), K};
+                graph.Execute(context, inputs, outputs);
+            };
+            uint64_t steadyBytes = 0;
+            for (int repetition = 0; repetition < 3; ++repetition) {
+                execute({0, 1, 2});
+                execute({1});
+                context.CaptureBegin();
+                execute({2});
+                context.CaptureEnd();
+                context.replayTokenId_ = 3;
+                context.ReplayWrites();
+                context.ReplayDispatches();
+                const auto raw = gpu.readBuffer(output.buffer, K * 4);
+                std::vector<float> actual(K), expected(K);
+                memcpy(actual.data(), raw.data(), raw.size());
+                for (int k = 0; k < K; ++k) expected[k] = float(3 + k % 7) * 0.25f;
+                assertCloseVec(actual, expected, 0, 0, "quantized embedding replay after index change");
+                context.ReleaseCaptured();
+                context.InvalidateWarmCaches();
+                if (repetition && gpu.totalAllocatedBytes != steadyBytes)
+                    throw std::runtime_error("Quantized embedding index buffers leaked across graph resets");
+                steadyBytes = gpu.totalAllocatedBytes;
+            }
+        }
+        gpu.releaseBuffer(ids.buffer);
+        gpu.releaseBuffer(output.buffer);
+    }
+    fs::remove(path);
+    fs::remove(dir);
+}
+
 TEST(relu) {
     std::vector<float> x = {-2, -1, 0, 1, 2};
     std::vector<float> expected = {0, 0, 0, 1, 2};
@@ -2754,6 +2819,7 @@ int main(int argc, char** argv) {
     RUN(fused_silu);
     RUN(fused_silu_broadcast);
     RUN(fused_temporary_ownership);
+    RUN(quantized_embedding_temporary_ownership);
     RUN(relu);
     RUN(neg);
 

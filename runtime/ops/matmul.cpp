@@ -1159,7 +1159,9 @@ static void opGatherBlockQuantized(OpContext& ex, const OnnxGraphNode& n,
                 int64_t v; memcpy(&v, idxPtr + i * 8, 8);
                 i32[i] = (int32_t)v;
             }
-            idxBuf = ex.getGpu()->createBuffer("gbq_idx32", nIdx * 4);
+            // The graph owns this conversion until execution completes; captured
+            // variants retain it until their commands are released.
+            idxBuf = ex.CreateTemporaryBuffer("gbq_idx32", nIdx * 4);
             ex.getGpu()->writeBuffer(idxBuf, i32.data(), nIdx * 4);
             // Only a scalar token-embedding gather follows the generated token.
             // Fixed int64 gathers (for example LM-head pruning tables) must not
