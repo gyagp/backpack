@@ -306,7 +306,8 @@ struct GenericOnnxState {
         tensor.shape = {1, count, hiddenSize}; tensor.dtype = cpuEmbedding->dtype; tensor.buffer = embeddingsBuf;
     }
 
-    std::vector<float> ConvertLogits(const std::vector<uint8_t>& bytes, uint64_t count) const {
+    std::vector<float> ReadLogits(uint64_t count) {
+        const auto bytes = gpu->mapReadbackBuffer(count * GpuTensor::DtypeSizeOf(logitsDtype));
         std::vector<float> values(count);
         if (logitsDtype == TensorDtype::Float32) memcpy(values.data(), bytes.data(), count * sizeof(float));
         else if (logitsDtype == TensorDtype::Float16) {
@@ -321,13 +322,22 @@ struct GenericOnnxState {
         return values;
     }
 
-    std::vector<float> ReadLogits(uint64_t count) {
-        return ConvertLogits(gpu->mapReadbackBuffer(count * GpuTensor::DtypeSizeOf(logitsDtype)), count);
-    }
-
+    // Sampling reads the already computed logits without advancing model state.
     std::vector<float> CurrentLogits() {
-        return ConvertLogits(gpu->readBuffer(logitsBuf,
-            uint64_t(vocabSize) * GpuTensor::DtypeSizeOf(logitsDtype)), vocabSize);
+        const uint64_t count = vocabSize;
+        const auto bytes = gpu->readBuffer(logitsBuf, count * GpuTensor::DtypeSizeOf(logitsDtype));
+        std::vector<float> values(count);
+        if (logitsDtype == TensorDtype::Float32) memcpy(values.data(), bytes.data(), count * sizeof(float));
+        else if (logitsDtype == TensorDtype::Float16) {
+            const auto* half = reinterpret_cast<const uint16_t*>(bytes.data());
+            for (size_t i = 0; i < count; ++i) {
+                const uint16_t bits = half[i]; const int exponent = (bits >> 10) & 31, mantissa = bits & 1023;
+                const float sign = bits & 0x8000 ? -1.0f : 1.0f;
+                values[i] = exponent == 31 ? (mantissa ? NAN : sign * INFINITY) :
+                    sign * std::ldexp(float(exponent ? 1024 + mantissa : mantissa), exponent ? exponent - 25 : -24);
+            }
+        } else throw std::runtime_error("Unsupported logits dtype");
+        return values;
     }
 
     int64_t hiddenSize = 0, numLayers = 0, vocabSize = 0;

@@ -2143,6 +2143,77 @@ TEST(skip_rms_norm_fp16_outputs) {
     }
 }
 
+TEST(sampled_generation_uses_prompt_logits_and_selected_history) {
+    constexpr int V = 8;
+    for (bool fp16 : {false, true}) {
+        const auto dir = fs::current_path() / "gitignore/runtime/op-tests" /
+            ("sampling_state_" + std::to_string(g_tempCounter++));
+        fs::create_directories(dir);
+        const int dtype = fp16 ? ONNX_FLOAT16 : ONNX_FLOAT;
+        std::vector<float> table(V * V, 0), weights(V * V, -100);
+        for (int i = 0; i < V; ++i) table[i * V + i] = 1;
+        for (int i = 0; i < V - 1; ++i) {
+            weights[i * V + (i + 1) % 7] = 0;
+            weights[i * V + (i + 3) % 7] = -0.1f;
+        }
+        weights[7 * V + 7] = 0;
+        auto init = [&](const std::string& name, const std::vector<float>& values) {
+            return fp16 ? makeInitF16(name, {V, V}, values) : makeInitF32(name, {V, V}, values);
+        };
+        auto embedding = buildOnnxModel({{"Gather", {"table", "input_ids"}, {"inputs_embeds"}, {{"axis", AttrDef::INT, 0}}}},
+            {{"input_ids", ONNX_INT64, {1, -1}}}, {{"inputs_embeds", dtype, {1, -1, V}}}, {init("table", table)});
+        auto decoder = buildOnnxModel({
+            {"Gather", {"inputs_embeds", "last"}, {"last_hidden"}, {{"axis", AttrDef::INT, 1}}},
+            {"MatMul", {"last_hidden", "weights"}, {"logits"}, {}}},
+            {{"inputs_embeds", dtype, {1, -1, V}}}, {{"logits", dtype, {1, V}}},
+            {makeInitI64("last", {}, {-1}), init("weights", weights)});
+        for (const auto& pair : std::vector<std::pair<std::string, std::vector<uint8_t>>>{{"embedding.onnx", embedding}, {"text.onnx", decoder}}) {
+            std::ofstream out(dir / pair.first, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(pair.second.data()), pair.second.size());
+        }
+        { std::ofstream f(dir / "config.json"); f << R"({"model_type":"qwen3_5_text","hidden_size":8,"num_hidden_layers":0,"vocab_size":8,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":8,"max_position_embeddings":32,"layer_types":[],"eos_token_id":7})"; }
+        { std::ofstream f(dir / "genai_config.json"); f << R"({"model":{"decoder":{"filename":"text.onnx"},"embedding":{"filename":"embedding.onnx"}}})"; }
+        { std::ofstream f(dir / "tokenizer.json"); f << R"({"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]}})"; }
+        {
+            auto device = app::createDevice("d3d12");
+            bp::LmOptions options; options.maxSeqLen = 32; options.fastDecode = false;
+            auto session = bp::LmSession::Create(device, dir.string(), options);
+            if (!session.IsValid()) throw std::runtime_error("Cannot load sampling fixture");
+            for (int count : {1, 6, 20, 31}) {
+                std::string expected;
+                for (int i = 0; i < count; ++i) expected += char('a' + (i + 1) % 7);
+                for (float temperature : {0.f, 1.f}) {
+                    bp::SamplingParams sampling{temperature, 1, 1234};
+                    if (session.Generate("a", count, sampling) != expected || session.GetPosition() != uint32_t(count + 1))
+                        throw std::runtime_error("Top-k1 skipped prompt prediction or changed history/position");
+                }
+            }
+            bp::SamplingParams sampling{1.f, 2, 1234};
+            const auto sampled = session.Generate("a", 20, sampling);
+            if (sampled.size() != 20 || session.GetPosition() != 21)
+                throw std::runtime_error("Sampled generation count/position mismatch");
+            int previous = 0, alternatives = 0;
+            for (char token : sampled) {
+                const int id = token - 'a';
+                if (id != (previous + 1) % 7 && id != (previous + 3) % 7)
+                    throw std::runtime_error("Sampled token was not used by the next forward step");
+                alternatives += id != (previous + 1) % 7;
+                previous = id;
+            }
+            if (!alternatives || session.Generate("a", 20, sampling) != sampled)
+                throw std::runtime_error("Sampling lost alternatives or seeded repeatability");
+            const auto stopped = session.Generate("a", 20, sampling, [](const std::string&) { return false; });
+            if (stopped.size() != 1 || session.GetPosition() != 1)
+                throw std::runtime_error("Stream cancellation advanced beyond the emitted prediction");
+            if (session.Decode() < 0 || session.GetPosition() != 2)
+                throw std::runtime_error("Sampled continuation state is invalid after stream cancellation");
+        }
+        for (const char* name : {"embedding.onnx", "text.onnx", "config.json", "genai_config.json", "tokenizer.json"})
+            fs::remove(dir / name);
+        fs::remove(dir);
+    }
+}
+
 TEST(cpu_embedding_and_fp16_logits_session) {
     constexpr int V=8, D=64;
     const auto dir=fs::current_path()/"gitignore/runtime/op-tests"/("embedding_session_"+std::to_string(g_tempCounter++));
@@ -2708,6 +2779,7 @@ int main(int argc, char** argv) {
     RUN(lp_normalization_fp16);
     RUN(direct_dispatch_capture_updates);
     RUN(skip_rms_norm_fp16_outputs);
+    RUN(sampled_generation_uses_prompt_logits_and_selected_history);
     RUN(cpu_embedding_and_fp16_logits_session);
     RUN(matmul_nbits_blocked_q4);
     RUN(gemma_onnx_transformer_and_cache_layers);
