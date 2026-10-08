@@ -7885,7 +7885,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                     (portableCausal?"causal_attn_portable":"causal_attn"),hd);
                 add(att,{{0,qwen35Pf.qrot},{1,kvCache[li].K},{2,kvCache[li].V},{3,qwen35Pf.attn},{4,ap}},cfg.nHead,
                     portableCausal?M:(M+(mmaAttn?15u:3u))/(mmaAttn?16u:4u),1,L+"attn");
-                auto gp=mkp(L+"gate_p",{M*qd});auto&go=getKernel("gated_output_batched");add(go,{{0,qwen35Pf.attn},{1,qwen35Pf.ag},{2,qwen35Pf.aout},{3,gp}},(M*qd+255)/256,1,1,L+"gate");
+                auto gp=mkp(L+"gate_p",{M*qd});auto&go=getKernel("gated_output_batched");add(go,{{0,qwen35Pf.attn},{1,qwen35Pf.ag},{2,qwen35Pf.aout},{3,gp}},(M*qd+255)/256,1,1,L+"attn_gate");
                 proj(qwen35Pf.aout,lw.oKQ,lw.oQ4Dense,lw.oQ4ScaleMin,lw.oKQType,lw.oKQNBlocks,lw.oKQRowStride,lw.oW,lw.oS,zeroBiasE,qwen35Pf.proj,qd,E,L+"oproj");
             }
             auto anp=mkp(L+"addnorm_p",{E,E,eb});add(addnorm,{{0,qwen35Pf.x},{1,qwen35Pf.proj},{2,qwen35Pf.norm},{3,lw.postNorm},{4,qwen35Pf.rstd},{5,anp}},M,1,1,L+"postnorm");
@@ -7896,12 +7896,12 @@ int32_t ModelRunner::prefillQwen35Batched(
                 for(uint32_t part=0;part<2;++part){
                     if(stagedNative(qwen35Pf.norm,part?lw.upKQ:lw.guKQ,part?lw.upKQType:lw.guKQType,
                         part?lw.upKQNBlocks:lw.guKQNBlocks,part?lw.upKQRowStride:lw.guKQRowStride,
-                        zeroBiasGU,qwen35Pf.gateup,E,im,part*im,2u*im,L+(part?"up":"gate")))continue;
+                        zeroBiasGU,qwen35Pf.gateup,E,im,part*im,2u*im,L+(part?"up":"ffn_gate")))continue;
                     auto& pipeline=nativeQuantPipeline(*gpu,part?lw.upKQType:lw.guKQType,false,nativePrefillTile,rows);
                     auto p=mkp(L+"split_gu_"+std::to_string(part),{E,im,part?lw.upKQNBlocks:lw.guKQNBlocks,
                         part?lw.upKQRowStride:lw.guKQRowStride,part*im,2u*im,M});
                     add(pipeline,{{0,qwen35Pf.norm},{1,part?lw.upKQ:lw.guKQ},{2,zeroBiasGU},{3,qwen35Pf.gateup},{4,p}},
-                        nativePrefillTile?(M+rows-1)/rows:M,nativePrefillTile?(im+cols-1)/cols:(im+7)/8,1,L+(part?"up":"gate"));
+                        nativePrefillTile?(M+rows-1)/rows:M,nativePrefillTile?(im+cols-1)/cols:(im+7)/8,1,L+(part?"up":"ffn_gate"));
                 }
             }else proj(qwen35Pf.norm,lw.guKQ,lw.guQ4Dense,lw.guQ4ScaleMin,lw.guKQType,lw.guKQNBlocks,lw.guKQRowStride,lw.guW,lw.guS,zeroBiasGU,qwen35Pf.gateup,E,2u*im,L+"gateup");
             if(traceQpf){fprintf(stderr,"[qwen-prefill] layer=%u gateup built\n",li);fflush(stderr);}
