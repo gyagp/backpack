@@ -20,6 +20,12 @@ void replace(std::string& text,const std::string& from,const std::string& to) {
 }
 uint32_t blockBytes(GGUFType type) {
     switch(type) {
+        case GGUF_TYPE_Q2_K:return 84;
+        case GGUF_TYPE_Q3_K:return 110;
+        case GGUF_TYPE_IQ2_XXS:return 66;
+        case GGUF_TYPE_IQ2_XS:return 74;
+        case GGUF_TYPE_IQ1_S:return 50;
+        case GGUF_TYPE_IQ2_S:return 82;
         case GGUF_TYPE_IQ3_S:return 110;
         case GGUF_TYPE_IQ3_XXS:return 98;
         case GGUF_TYPE_IQ4_XS:return 136;
