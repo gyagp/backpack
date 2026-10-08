@@ -1,4 +1,11 @@
-// Resident, fixed-text reference for the pinned llama.cpp b11295 public C ABI.
+// Resident fixed-text reference. The build must use public headers matching
+// these revision pins; a mismatched runtime is rejected before loading its ABI.
+#ifndef BP_LLAMA_REFERENCE_RELEASE
+#define BP_LLAMA_REFERENCE_RELEASE "b11295"
+#endif
+#ifndef BP_LLAMA_REFERENCE_COMMIT
+#define BP_LLAMA_REFERENCE_COMMIT "3b3d022b823abaa62a467b26a44e10659e080ee7"
+#endif
 #define NOMINMAX
 #include <windows.h>
 #include <llama.h>
@@ -17,7 +24,8 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-static constexpr const char* kCommit = "3b3d022b823abaa62a467b26a44e10659e080ee7";
+static constexpr const char* kCommit = BP_LLAMA_REFERENCE_COMMIT;
+static constexpr const char* kRelease = BP_LLAMA_REFERENCE_RELEASE;
 static bool verboseLogging = false;
 static void logMessage(ggml_log_level level, const char* text, void*) {
     if (verboseLogging || level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) std::fputs(text, stderr);
@@ -63,7 +71,7 @@ int main(int argc, char** argv) {
     try {
         const fs::path runtime = fs::absolute(argv[1]);
         const auto manifest = readJson(runtime / "build-manifest.json");
-        if (manifest["release"].as_string() != "b11295" || manifest["source_commit"].as_string() != kCommit)
+        if (manifest["release"].as_string() != kRelease || manifest["source_commit"].as_string() != kCommit)
             throw std::runtime_error("Runtime differs from this helper's pinned public C ABI");
         const auto request = readJson(argv[3]);
         verboseLogging = request.has("verbose") && request["verbose"].as_bool();
