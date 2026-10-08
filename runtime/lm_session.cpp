@@ -499,13 +499,15 @@ struct GenericOnnxState {
                 }
             }
         }
-        size_t captured = a.size() + b.size();
-        size_t replayed = 0;
-        for (const auto& w : a) replayed += w.replay;
-        for (const auto& w : b) replayed += w.replay;
-        fprintf(stderr,
-            "  [fast decode writes] %zu captured, %zu replayed, %zu immutable\n",
-            captured, replayed, captured - replayed);
+        if (std::getenv("BP_EXEC_STATS")) {
+            size_t captured = a.size() + b.size();
+            size_t replayed = 0;
+            for (const auto& w : a) replayed += w.replay;
+            for (const auto& w : b) replayed += w.replay;
+            fprintf(stderr,
+                "  [fast decode writes] %zu captured, %zu replayed, %zu immutable\n",
+                captured, replayed, captured - replayed);
+        }
     }
 
     // Shape-specialized prefill capture used by reused-generator benchmarks.
@@ -1251,16 +1253,18 @@ struct GenericOnnxState {
                         writes << "\n";
                     }
                 }
-                int nDisp = 0;
-                for (auto& f : execCtx.capturedFlushes_)
-                    nDisp += static_cast<int>(f.dispatches.size());
-                fprintf(stderr,
-                    "  [fast decode capture %d/2] %zu flushes, %d dispatches, %zu param updates, Q4 quantize=%u reuse=%u\n",
-                    variant + 1,
-                    execCtx.capturedFlushes_.size(), nDisp,
-                    execCtx.replayParamUpdates_.size(),
-                    execCtx.q4DecodeQuantizeDispatches_,
-                    execCtx.q4DecodeReuseHits_);
+                if (std::getenv("BP_EXEC_STATS")) {
+                    int nDisp = 0;
+                    for (auto& f : execCtx.capturedFlushes_)
+                        nDisp += static_cast<int>(f.dispatches.size());
+                    fprintf(stderr,
+                        "  [fast decode capture %d/2] %zu flushes, %d dispatches, %zu param updates, Q4 quantize=%u reuse=%u\n",
+                        variant + 1,
+                        execCtx.capturedFlushes_.size(), nDisp,
+                        execCtx.replayParamUpdates_.size(),
+                        execCtx.q4DecodeQuantizeDispatches_,
+                        execCtx.q4DecodeReuseHits_);
+                }
                 StoreCurrentQwenCapture(variant);
                 qwenCapturedVariants++;
                 // NVIDIA fast decode freezes invariant CPU-produced constants.
@@ -1303,7 +1307,7 @@ struct GenericOnnxState {
                 }
             }
 
-            {
+            if (std::getenv("BP_EXEC_STATS")) {
                 int nDisp = 0;
                 for (auto& f : execCtx.capturedFlushes_) nDisp += (int)f.dispatches.size();
                 fprintf(stderr, "  [fast decode capture] %zu flushes, %d dispatches, %zu param updates, %zu token inputs\n",

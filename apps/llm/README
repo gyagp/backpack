@@ -6,6 +6,10 @@ All commands for the active goal run on webgfx-104 (RTX 5080) only.
 Generation honors the model's end-of-sequence, end-of-turn, and end-of-message
 markers. Benchmarks continue to produce the exact requested token count.
 
+Ordinary chat output omits internal capture summaries. Set `BP_EXEC_STATS=1`
+when diagnosing capture, replay parameters, or graph execution; this diagnostic
+mode includes internal statistics and is not a clean answer or timing run.
+
 Build from the repository root:
 
 ```powershell
