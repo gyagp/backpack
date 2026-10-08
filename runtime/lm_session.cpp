@@ -306,8 +306,7 @@ struct GenericOnnxState {
         tensor.shape = {1, count, hiddenSize}; tensor.dtype = cpuEmbedding->dtype; tensor.buffer = embeddingsBuf;
     }
 
-    std::vector<float> ReadLogits(uint64_t count) {
-        const auto bytes = gpu->mapReadbackBuffer(count * GpuTensor::DtypeSizeOf(logitsDtype));
+    std::vector<float> ConvertLogits(const std::vector<uint8_t>& bytes, uint64_t count) const {
         std::vector<float> values(count);
         if (logitsDtype == TensorDtype::Float32) memcpy(values.data(), bytes.data(), count * sizeof(float));
         else if (logitsDtype == TensorDtype::Float16) {
@@ -320,6 +319,15 @@ struct GenericOnnxState {
             }
         } else throw std::runtime_error("Unsupported logits dtype");
         return values;
+    }
+
+    std::vector<float> ReadLogits(uint64_t count) {
+        return ConvertLogits(gpu->mapReadbackBuffer(count * GpuTensor::DtypeSizeOf(logitsDtype)), count);
+    }
+
+    std::vector<float> CurrentLogits() {
+        return ConvertLogits(gpu->readBuffer(logitsBuf,
+            uint64_t(vocabSize) * GpuTensor::DtypeSizeOf(logitsDtype)), vocabSize);
     }
 
     int64_t hiddenSize = 0, numLayers = 0, vocabSize = 0;
@@ -2025,12 +2033,23 @@ std::string LmSession::Generate(const std::string& prompt, int maxTokens,
     bool useSampling = (sampling.temperature > 0.0f);
     std::mt19937 rng(sampling.seed ? sampling.seed : std::random_device{}());
 
-    // Re-sample from prefill logits if sampling enabled
+    // Prefill already produced the first prediction. Reading its logits must
+    // not consume that greedy prediction before the sampled token is selected.
     if (useSampling) {
-        auto logits = DecodeLogits();
-        if (!logits.empty())
-            next = sampleToken(logits.data(), (uint32_t)logits.size(),
-                               sampling.temperature, sampling.topK, rng);
+        std::vector<float> logits;
+        if (impl_->backend == Impl::Backend::GenericOnnx) {
+            logits = impl_->gen_->CurrentLogits();
+        } else {
+            auto* state = impl_->std_.get();
+            const auto bytes = impl_->gpu->readBuffer(state->runner.logitsBuf,
+                                                     uint64_t(state->nVocab) * sizeof(float));
+            logits.resize(state->nVocab);
+            memcpy(logits.data(), bytes.data(), bytes.size());
+        }
+        if (logits.empty()) return {};
+        next = sampleToken(logits.data(), (uint32_t)logits.size(),
+                           sampling.temperature, sampling.topK, rng);
+        impl_->lastToken = next;
     }
 
     std::string result;
@@ -2048,6 +2067,7 @@ std::string LmSession::Generate(const std::string& prompt, int maxTokens,
             if (logits.empty()) break;
             next = sampleToken(logits.data(), (uint32_t)logits.size(),
                                sampling.temperature, sampling.topK, rng);
+            impl_->lastToken = next;
         } else {
             next = Decode();
         }
