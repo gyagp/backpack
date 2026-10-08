@@ -8,7 +8,8 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "Pass independent GGUF reference fixtures\n"); return 2; }
-    const bool alignedWeights = std::string(argv[1]) == "--staged-pair-vec2";
+    const bool alignedActivations = std::string(argv[1]) == "--staged-pair-vec2-a36";
+    const bool alignedWeights = alignedActivations || std::string(argv[1]) == "--staged-pair-vec2";
     const bool paired = alignedWeights || std::string(argv[1]) == "--staged-pair";
     const bool staged = paired || std::string(argv[1]) == "--staged";
     const bool tiled32 = staged || std::string(argv[1]) == "--tiled32";
@@ -59,7 +60,7 @@ int main(int argc, char** argv) {
                 if(staged) {
                     auto scratch=upload("staged",nullptr,uint64_t(K)*8*4);
                     auto& decode=gpu.getOrCreatePipeline("native_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
-                    auto& dense=gpu.getOrCreatePipeline("native_dense",nativeQuantDensePrefillShader(paired,alignedWeights),5);
+                    auto& dense=gpu.getOrCreatePipeline("native_dense",nativeQuantDensePrefillShader(paired,alignedWeights,alignedActivations),5);
                     std::vector<GPUBuffer> paramsBuffers;std::vector<WGPUBindGroup> groups;std::vector<Dispatch> dispatches;
                     for(uint32_t col=0;col<N;col+=8) {
                         const uint32_t count=std::min(8u,N-col),p[]={K,N,packed.nBlocks,packed.rowStrideWords,col,strided?2*N:N,M,count,(strided?N:0)+col};

@@ -116,8 +116,21 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return source;
 }
 
-std::string nativeQuantDensePrefillShader(bool columnPair, bool alignedWeights) {
-    if(columnPair)return alignedWeights ? NATIVE_DENSE_PREFILL_PAIR_VEC2_SOURCE : NATIVE_DENSE_PREFILL_PAIR_SOURCE;
+std::string nativeQuantDensePrefillShader(bool columnPair, bool alignedWeights, bool alignedActivations) {
+    if(columnPair) {
+        if(!alignedWeights)return NATIVE_DENSE_PREFILL_PAIR_SOURCE;
+        std::string source=NATIVE_DENSE_PREFILL_PAIR_VEC2_SOURCE;
+        // Stride36 preserves the scalar load mapping and exact partial sums.
+        // Explicit vector loaders were slower in the same real-weight probes.
+        for(const auto& entry : {std::pair<std::string,std::string>{"__A_ELEMENTS__",alignedActivations?"1152":"1056"},
+                                {"__A_STRIDE__",alignedActivations?"36":"33"}}) {
+            size_t offset=0;
+            while((offset=source.find(entry.first,offset))!=std::string::npos) {
+                source.replace(offset,entry.first.size(),entry.second);offset+=entry.second.size();
+            }
+        }
+        return source;
+    }
     auto source=nativeQuantShader(GGUF_TYPE_IQ3_S,false,true,32);
     auto replace=[&](const std::string& from,const std::string& to) {
         const auto pos=source.find(from);
