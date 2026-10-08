@@ -7658,13 +7658,18 @@ int32_t ModelRunner::prefillQwen35Batched(
         const bool stagedNativePrefill=M>=128 && qwen35Pf.nativeStageScratch.handle && qwen38NativeStaging(*gpu,gguf,cfg);
         auto stagedNative=[&](GPUBuffer x,GPUBuffer w,GGUFType type,uint32_t nb,uint32_t rs,
                               GPUBuffer bias,GPUBuffer y,uint32_t K,uint32_t N,uint32_t outputOffset,uint32_t outputStride,const std::string& name) {
-            // These large IQ3 families retained a material gain with bounded
-            // staging. IQ4_XS did not clear the isolated 2% threshold.
-            if(!stagedNativePrefill || K<5120 || N<4096 || uint64_t(K)*4096*4>qwen35Pf.nativeStageScratch.size ||
-                (type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS))return false;
-            auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
+            if(!stagedNativePrefill || K<5120 || N<4096 || uint64_t(K)*4096*4>qwen35Pf.nativeStageScratch.size)return false;
             const char* pairControl=std::getenv("BP_NATIVE_DENSE_PREFILL_PAIR");
             const bool paired=!pairControl || std::strcmp(pairControl,"1")==0;
+            // IQ4_XS missed the staging threshold with the original dense
+            // shader. The paired shader makes its seven real-weight shape
+            // groups profitable within the same 4096-column scratch bound.
+            // Keep the original fused route when that paired shader is off.
+            const char* iq4Control=std::getenv("BP_QWEN38_STAGE_IQ4_XS");
+            const bool stageIq4=paired && (!iq4Control || std::strcmp(iq4Control,"0")!=0);
+            if(type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS &&
+                !(type==GGUF_TYPE_IQ4_XS && stageIq4))return false;
+            auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
             auto& dense=gpu->getOrCreatePipeline(paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32",nativeQuantDensePrefillShader(paired),5);
             for(uint32_t col=0;col<N;col+=4096) {
                 const uint32_t count=std::min(4096u,N-col);
