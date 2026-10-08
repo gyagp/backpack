@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -66,7 +67,7 @@ def main() -> int:
                                 "<|im_start|>assistant\n<think>\n\n</think>\n\n")
             chat_flags = ["--no-conversation"]
         check_command = [str(completion), "-m", str(args.model), "-p", formatted_prompt,
-                         "--temp", "0", "-ngl", "99", "--no-display-prompt",
+                         "--temp", "0", "-ngl", "99", "--device", "Vulkan0", "--no-display-prompt",
                          *chat_flags, "-c", str(max(1024, args.prompt_tokens + args.generation_tokens)),
                          "-n", str(args.conformance_tokens)]
         # Conversation mode reads stdin when a turn ends without stopping. An
@@ -92,7 +93,7 @@ def main() -> int:
     # context depth zero. Populate P tokens outside the timed decode region
     # so the result can be compared with Backpack's decode after prefill.
     common = [str(executable), "-m", str(args.model), "-r", str(args.repetitions),
-              "-ngl", "99", "-o", "json"]
+              "-ngl", "99", "--device", "Vulkan0", "-o", "json"]
     commands = [common + ["-p", str(args.prompt_tokens), "-n", "0", "-d", "0"],
                 common + ["-p", "0", "-n", str(args.generation_tokens), "-d", str(args.prompt_tokens)]]
     rows = []
@@ -111,12 +112,19 @@ def main() -> int:
                    == (0, args.generation_tokens, args.prompt_tokens)), None)
     if not prefill or not decode:
         raise SystemExit("llama-bench did not return the requested prefill and populated-context decode records")
+    with args.model.open("rb") as model_file:
+        fingerprint = hashlib.file_digest(model_file, "sha256").hexdigest()
     metrics = {
         # Prefill and populated-context decode each run in their own process.
         # Counts describe the samples contributing to each reported metric.
         "measured_processes": 1,
         "measured_repetitions_per_process": args.repetitions,
         "measured_repetitions": args.repetitions,
+        "benchmark_protocol": "llama-bench-populated-context-v1",
+        "sample_method": "synthetic prefill and populated-context decode; excludes application greedy sampling",
+        "artifact_fingerprint": fingerprint,
+        "device": "Vulkan0",
+        "graph_capture": "not_applicable",
         "prompt_tokens": args.prompt_tokens,
         "generation_tokens": args.generation_tokens,
         "decode_context_tokens": args.prompt_tokens,
