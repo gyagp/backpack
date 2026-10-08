@@ -116,8 +116,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return source;
 }
 
-std::string nativeQuantDensePrefillShader(bool columnPair) {
-    if(columnPair)return NATIVE_DENSE_PREFILL_PAIR_SOURCE;
+std::string nativeQuantDensePrefillShader(bool columnPair, bool alignedWeights) {
+    if(columnPair)return alignedWeights ? NATIVE_DENSE_PREFILL_PAIR_VEC2_SOURCE : NATIVE_DENSE_PREFILL_PAIR_SOURCE;
     auto source=nativeQuantShader(GGUF_TYPE_IQ3_S,false,true,32);
     auto replace=[&](const std::string& from,const std::string& to) {
         const auto pos=source.find(from);

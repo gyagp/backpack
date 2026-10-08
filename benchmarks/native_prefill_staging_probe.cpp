@@ -92,7 +92,9 @@ int main(int argc,char** argv) {
             packed.data.clear();packed.data.shrink_to_fit();
             const char* pairControl=std::getenv("BP_NATIVE_DENSE_PREFILL_PAIR");
             const bool paired=pairControl && std::strcmp(pairControl,"1")==0;
-            auto source=nativeQuantShader(type,false,true,32),dense=nativeQuantDensePrefillShader(paired),decode=nativeQuantDecodeSliceShader(type);
+            const char* alignedControl=std::getenv("BP_NATIVE_DENSE_PREFILL_VEC2");
+            const bool alignedWeights=paired && (!alignedControl || std::strcmp(alignedControl,"0")!=0);
+            auto source=nativeQuantShader(type,false,true,32),dense=nativeQuantDensePrefillShader(paired,alignedWeights),decode=nativeQuantDecodeSliceShader(type);
             const auto suffix=std::to_string(type);
             auto& fusedPipeline=gpu.getOrCreatePipeline("probe_fused_"+suffix,source,5);
             auto& densePipeline=gpu.getOrCreatePipeline("probe_dense_"+suffix,dense,5);

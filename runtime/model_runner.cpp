@@ -7670,7 +7670,11 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS &&
                 !(type==GGUF_TYPE_IQ4_XS && stageIq4))return false;
             auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
-            auto& dense=gpu->getOrCreatePipeline(paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32",nativeQuantDensePrefillShader(paired),5);
+            const char* alignedControl=std::getenv("BP_NATIVE_DENSE_PREFILL_VEC2");
+            const bool alignedWeights=paired && (!alignedControl || std::strcmp(alignedControl,"0")!=0);
+            auto& dense=gpu->getOrCreatePipeline(alignedWeights?"native_quant_dense_prefill32_pair_vec2":
+                (paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32"),
+                nativeQuantDensePrefillShader(paired,alignedWeights),5);
             for(uint32_t col=0;col<N;col+=4096) {
                 const uint32_t count=std::min(4096u,N-col);
                 auto p=mkp(name+"_stage_p",{K,N,nb,rs,col,outputStride,M,count,outputOffset+col});

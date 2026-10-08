@@ -91,8 +91,10 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_quant.wgsl" _nati
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_quant_prefill.wgsl" _native_quant_prefill_wgsl)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_dense_prefill_pair.wgsl")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_dense_prefill_pair.wgsl" _native_dense_prefill_pair_wgsl)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_dense_prefill_pair_vec2.wgsl")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quant_kq/native_dense_prefill_pair_vec2.wgsl" _native_dense_prefill_pair_vec2_wgsl)
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/native_quant_source.h"
-    CONTENT "#pragma once\ninline constexpr char NATIVE_QUANT_SOURCE[] = R\"BPWGSL(${_native_quant_wgsl})BPWGSL\";\ninline constexpr char NATIVE_QUANT_PREFILL_SOURCE[] = R\"BPWGSL(${_native_quant_prefill_wgsl})BPWGSL\";\ninline constexpr char NATIVE_DENSE_PREFILL_PAIR_SOURCE[] = R\"BPWGSL(${_native_dense_prefill_pair_wgsl})BPWGSL\";\n")
+    CONTENT "#pragma once\ninline constexpr char NATIVE_QUANT_SOURCE[] = R\"BPWGSL(${_native_quant_wgsl})BPWGSL\";\ninline constexpr char NATIVE_QUANT_PREFILL_SOURCE[] = R\"BPWGSL(${_native_quant_prefill_wgsl})BPWGSL\";\ninline constexpr char NATIVE_DENSE_PREFILL_PAIR_SOURCE[] = R\"BPWGSL(${_native_dense_prefill_pair_wgsl})BPWGSL\";\ninline constexpr char NATIVE_DENSE_PREFILL_PAIR_VEC2_SOURCE[] = R\"BPWGSL(${_native_dense_prefill_pair_vec2_wgsl})BPWGSL\";\n")
 target_include_directories(backpack_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(backpack_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
