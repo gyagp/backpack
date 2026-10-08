@@ -7661,17 +7661,25 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(!stagedNativePrefill || K<5120 || N<4096 || uint64_t(K)*4096*4>qwen35Pf.nativeStageScratch.size)return false;
             const char* pairControl=std::getenv("BP_NATIVE_DENSE_PREFILL_PAIR");
             const bool paired=!pairControl || std::strcmp(pairControl,"1")==0;
+            const char* alignedControl=std::getenv("BP_NATIVE_DENSE_PREFILL_VEC2");
+            const bool alignedWeights=paired && (!alignedControl || std::strcmp(alignedControl,"0")!=0);
             // IQ4_XS missed the staging threshold with the original dense
             // shader. The paired shader makes its seven real-weight shape
             // groups profitable within the same 4096-column scratch bound.
             // Keep the original fused route when that paired shader is off.
             const char* iq4Control=std::getenv("BP_QWEN38_STAGE_IQ4_XS");
             const bool stageIq4=paired && (!iq4Control || std::strcmp(iq4Control,"0")!=0);
+            // The aligned kernel makes the remaining native low-bit families
+            // profitable without increasing the existing staging allocation.
+            const char* lowBitControl=std::getenv("BP_QWEN38_STAGE_LOWBIT");
+            const bool lowBitType=type==GGUF_TYPE_Q2_K || type==GGUF_TYPE_Q3_K ||
+                type==GGUF_TYPE_IQ1_S || type==GGUF_TYPE_IQ2_XXS ||
+                type==GGUF_TYPE_IQ2_XS || type==GGUF_TYPE_IQ2_S;
+            const bool stageLowBit=alignedWeights && lowBitType &&
+                (!lowBitControl || std::strcmp(lowBitControl,"0")!=0);
             if(type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS &&
-                !(type==GGUF_TYPE_IQ4_XS && stageIq4))return false;
+                !(type==GGUF_TYPE_IQ4_XS && stageIq4) && !stageLowBit)return false;
             auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
-            const char* alignedControl=std::getenv("BP_NATIVE_DENSE_PREFILL_VEC2");
-            const bool alignedWeights=paired && (!alignedControl || std::strcmp(alignedControl,"0")!=0);
             auto& dense=gpu->getOrCreatePipeline(alignedWeights?"native_quant_dense_prefill32_pair_vec2":
                 (paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32"),
                 nativeQuantDensePrefillShader(paired,alignedWeights),5);
