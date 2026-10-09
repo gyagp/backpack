@@ -36,6 +36,9 @@ struct ModelRunner {
         uint64_t usage = BUF_DEFAULT, bool mappedAtCreation = false);
     void releaseOwnedBuffer(GPUBuffer buffer);
     void releaseOwnedBindGroup(WGPUBindGroup group);
+    WGPUBindGroup makeBG(const CompiledPipeline& pl,
+                         const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
+
     void submitOwned(const std::vector<Dispatch>& dispatches, bool singlePass,
         bool profiling, bool retainForReplay);
     std::unordered_map<WGPUBuffer, GPUBuffer> ownedBuffers_;
@@ -505,8 +508,6 @@ private:
     const CompiledPipeline& getKernelGelu(const std::string& siluName);
     std::string patchShaderHD(const char* source) const;
     std::string patchShaderHD(const char* source, uint32_t headDim) const;
-    WGPUBindGroup makeBG(const CompiledPipeline& pl,
-                         const std::vector<std::pair<uint32_t, GPUBuffer>>& bindings);
     void applyDecodeKernelSelection(bool useFastQkv, bool useFastOproj,
                                     bool useFastGateup);
     double benchmarkDecodeConfig(int depth, int nTokens, int repeats = 1);
