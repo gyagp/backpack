@@ -43,6 +43,17 @@ bool qwen38NativeStaging(const GPUContext& gpu,const GGUFFile& model,const Model
         qwen38NativePrefillRows(gpu)==32;
 }
 
+bool nativePackedIq4(const GPUContext& gpu, GGUFType type, bool gather=false, bool prefill=false) {
+    const char* option=std::getenv("BP_NATIVE_QUANT_IQ4_PACKED_LUT");
+    return !gather && !prefill && type==GGUF_TYPE_IQ4_XS &&
+        gpu.backendType==WGPUBackendType_D3D12 && gpu.adapterName=="NVIDIA GeForce RTX 5080" &&
+        (!option || std::strcmp(option,"0")!=0);
+}
+
+uint32_t nativeIq4ProductMask(const GPUContext& gpu, GGUFType type, bool prefill=false) {
+    return nativePackedIq4(gpu,type,false,prefill) ? 0xffffffffu : 0u;
+}
+
 const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool gather = false, bool prefill = false, uint32_t rows = 16) {
     // Qualify scalar matrix loads separately from tiled/staged prefill and
     // gathering. IQ4_NL regressed; IQ4_XS and Q5_K were neutral in both orders.
@@ -58,11 +69,13 @@ const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool
     const char* blockOption = std::getenv("BP_NATIVE_QUANT_IQ3_BLOCK_SCALE");
     const bool cacheBlockScale = alignedU16 && type == GGUF_TYPE_IQ3_S &&
         (!blockOption || std::strcmp(blockOption, "0") != 0);
+    const bool packedIq4Lut=nativePackedIq4(gpu,type,gather,prefill);
     return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) +
+        (packedIq4Lut ? "_packed_lut" : "") +
         (alignedU16 ? "_aligned_u16" : "") + (cacheBlockScale ? "_block_scale" : "") +
         (gather ? "_gather" : "") +
         (prefill ? "_prefill"+std::to_string(rows) : ""),
-        nativeQuantShader(type, gather, prefill, rows, alignedU16, cacheBlockScale), 5);
+        nativeQuantShader(type, gather, prefill, rows, alignedU16, cacheBlockScale, packedIq4Lut), 5);
 }
 
 std::string deltaNetValueMajorSource(const std::string& source) {
@@ -3611,24 +3624,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // K-quant param buffers: [K, N, n_blocks, row_stride_words]
     auto makeKQParams = [&](const std::string& name, uint32_t K, uint32_t N,
-                            uint32_t nBlocks, uint32_t rowStride) -> GPUBuffer {
+                            uint32_t nBlocks, uint32_t rowStride, GGUFType type) -> GPUBuffer {
         // Q5_K/Q6_K kernels also consume word 4 as an output offset. Keep one
         // common ABI for all K-quant kernels so Dawn's inferred minimum binding
         // size is satisfied even when the offset is zero.
-        uint32_t data[5] = {K, N, nBlocks, rowStride, 0};
-        auto buf = createOwnedBuffer(name, sizeof(data));
-        gpu->writeBuffer(buf, data, sizeof(data));
+        const uint32_t mask=nativeIq4ProductMask(*gpu,type);
+        // The IQ4 rounding guard reads an explicit word7. Never rely on
+        // allocation padding: other K-quant bindings retain their20-byte ABI.
+        uint32_t data[8] = {K, N, nBlocks, rowStride, 0, 0, 0, mask};
+        const size_t bytes=mask ? sizeof(data) : 5*sizeof(uint32_t);
+        auto buf = createOwnedBuffer(name, bytes);
+        gpu->writeBuffer(buf, data, bytes);
         return buf;
     };
     GPUBuffer kqQkvParams, kqOprojParams, kqGuParams, kqDnParams, kqLmParams;
     if (useKQ) {
-        kqQkvParams   = makeKQParams("p_kq_qkv", cfg.nEmbd, qkvParamOut, kqQkvNBlocks, kqQkvRowStride);
-        kqOprojParams = makeKQParams("p_kq_oproj", qDim, cfg.nEmbd, kqONBlocks, kqORowStride);
-        kqGuParams    = makeKQParams("p_kq_gu", cfg.nEmbd, 2 * cfg.intermediateSize, kqGuNBlocks, kqGuRowStride);
-        kqDnParams    = makeKQParams("p_kq_dn", cfg.intermediateSize, cfg.nEmbd, kqDnNBlocks, kqDnRowStride);
+        kqQkvParams   = makeKQParams("p_kq_qkv", cfg.nEmbd, qkvParamOut, kqQkvNBlocks, kqQkvRowStride, weightQuantType);
+        kqOprojParams = makeKQParams("p_kq_oproj", qDim, cfg.nEmbd, kqONBlocks, kqORowStride, weightQuantType);
+        kqGuParams    = makeKQParams("p_kq_gu", cfg.nEmbd, 2 * cfg.intermediateSize, kqGuNBlocks, kqGuRowStride, weightQuantType);
+        kqDnParams    = makeKQParams("p_kq_dn", cfg.intermediateSize, cfg.nEmbd, kqDnNBlocks, kqDnRowStride, weightQuantType);
     }
     if (lmHeadIsKQ)
-        kqLmParams = makeKQParams("p_kq_lm", cfg.nEmbd, cfg.nVocab, kqLmNBlocks, kqLmRowStride);
+        kqLmParams = makeKQParams("p_kq_lm", cfg.nEmbd, cfg.nVocab, kqLmNBlocks, kqLmRowStride, lmHeadKQType);
 
     GPUBuffer rmsParams;
     {
@@ -4071,7 +4088,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 auto* layerKQ = kqPipelineFor(lw.qkvKQType);
                 uint32_t layerTile = kqTileFor(lw.qkvKQType);
                 auto layerParams = makeKQParams("p_kq_ssm_qkv_" + std::to_string(i),
-                    cfg.nEmbd, convChannels, lw.qkvKQNBlocks, lw.qkvKQRowStride);
+                    cfg.nEmbd, convChannels, lw.qkvKQNBlocks, lw.qkvKQRowStride, lw.qkvKQType);
                 auto bg = makeBG(*layerKQ, {
                     {0, normOutBuf}, {1, lw.qkvKQ}, {2, zeroBiasQKV},
                     {3, qkvBuf}, {4, layerParams}});
@@ -4092,7 +4109,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     uint32_t tile = kqTileFor(lw.attnGateKQType);
                     auto p = makeKQParams("p_kq_ssm_z_" + std::to_string(i),
                         cfg.nEmbd, cfg.ssmInnerSize, lw.attnGateKQNBlocks,
-                        lw.attnGateKQRowStride);
+                        lw.attnGateKQRowStride, lw.attnGateKQType);
                     auto bg = makeBG(*layerKQ, {{0,normOutBuf},{1,lw.attnGateKQ},
                         {2,zeroBiasQKV},{3,q35SsmZBuf},{4,p}});
                     allDecodeDispatches.push_back({layerKQ->pipeline,bg,1,
@@ -4293,7 +4310,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                     uint32_t tile = kqTileFor(lw.ssmOutKQType);
                     auto p = makeKQParams("p_kq_ssm_out_" + std::to_string(i),
                         cfg.ssmInnerSize, cfg.nEmbd, lw.ssmOutKQNBlocks,
-                        lw.ssmOutKQRowStride);
+                        lw.ssmOutKQRowStride, lw.ssmOutKQType);
                     auto bg = makeBG(*layerKQ, {{0,q35SsmNormBuf},{1,lw.ssmOutKQ},
                         {2,zeroBiasE},{3,projOutBuf},{4,p}});
                     allDecodeDispatches.push_back({layerKQ->pipeline,bg,1,
@@ -4342,7 +4359,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             {
                 if (lwQ35.qjKQ.handle) {
                     auto* kp=kqPipelineFor(lwQ35.qjKQType);auto tile=kqTileFor(lwQ35.qjKQType);
-                    auto p=makeKQParams("p_kq_q35_q_"+std::to_string(i),cfg.nEmbd,qOutDim,lwQ35.qjKQNBlocks,lwQ35.qjKQRowStride);
+                    auto p=makeKQParams("p_kq_q35_q_"+std::to_string(i),cfg.nEmbd,qOutDim,lwQ35.qjKQNBlocks,lwQ35.qjKQRowStride, lwQ35.qjKQType);
                     auto bg=makeBG(*kp,{{0,normOutBuf},{1,lwQ35.qjKQ},{2,zeroBiasV},{3,q35QjBuf},{4,p}});
                     allDecodeDispatches.push_back({kp->pipeline,bg,1,(qOutDim+tile-1)/tile,1,L+"q35_q"});
                 } else {
@@ -4355,7 +4372,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             {
                 if (lwQ35.kSepKQ.handle) {
                     auto* kp=kqPipelineFor(lwQ35.kSepKQType);auto tile=kqTileFor(lwQ35.kSepKQType);
-                    auto p=makeKQParams("p_kq_q35_k_"+std::to_string(i),cfg.nEmbd,kvDimAct,lwQ35.kSepKQNBlocks,lwQ35.kSepKQRowStride);
+                    auto p=makeKQParams("p_kq_q35_k_"+std::to_string(i),cfg.nEmbd,kvDimAct,lwQ35.kSepKQNBlocks,lwQ35.kSepKQRowStride, lwQ35.kSepKQType);
                     auto bg=makeBG(*kp,{{0,normOutBuf},{1,lwQ35.kSepKQ},{2,zeroBiasV},{3,q35KBuf},{4,p}});
                     allDecodeDispatches.push_back({kp->pipeline,bg,1,(kvDimAct+tile-1)/tile,1,L+"q35_k"});
                 } else {
@@ -4368,7 +4385,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             {
                 if (lwQ35.vSepKQ.handle) {
                     auto* kp=kqPipelineFor(lwQ35.vSepKQType);auto tile=kqTileFor(lwQ35.vSepKQType);
-                    auto p=makeKQParams("p_kq_q35_v_"+std::to_string(i),cfg.nEmbd,kvDimAct,lwQ35.vSepKQNBlocks,lwQ35.vSepKQRowStride);
+                    auto p=makeKQParams("p_kq_q35_v_"+std::to_string(i),cfg.nEmbd,kvDimAct,lwQ35.vSepKQNBlocks,lwQ35.vSepKQRowStride, lwQ35.vSepKQType);
                     auto bg=makeBG(*kp,{{0,normOutBuf},{1,lwQ35.vSepKQ},{2,zeroBiasV},{3,q35VBuf},{4,p}});
                     allDecodeDispatches.push_back({kp->pipeline,bg,1,(kvDimAct+tile-1)/tile,1,L+"q35_v"});
                 } else {
@@ -4457,7 +4474,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             // performs the residual add and post-attention norm.
             if (lwQ35.oKQ.handle) {
                 auto* kp=kqPipelineFor(lwQ35.oKQType);auto tile=kqTileFor(lwQ35.oKQType);
-                auto p=makeKQParams("p_kq_q35_o_"+std::to_string(i),qDimAct,cfg.nEmbd,lwQ35.oKQNBlocks,lwQ35.oKQRowStride);
+                auto p=makeKQParams("p_kq_q35_o_"+std::to_string(i),qDimAct,cfg.nEmbd,lwQ35.oKQNBlocks,lwQ35.oKQRowStride, lwQ35.oKQType);
                 auto bg = makeBG(*kp, {
                     {0, q35AttnOutBuf}, {1, lwQ35.oKQ}, {2, zeroBiasE},
                     {3, projOutBuf}, {4, p}});
@@ -5051,7 +5068,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     auto& pipeline = nativeQuantPipeline(*gpu, type);
                     auto p = mkP32("p_split_gu_" + std::to_string(i) + "_" + std::to_string(part),
                         {cfg.nEmbd, plIM, part ? lw.upKQNBlocks : lw.guKQNBlocks,
-                         part ? lw.upKQRowStride : lw.guKQRowStride, part * plIM, 2 * plIM});
+                         part ? lw.upKQRowStride : lw.guKQRowStride, part * plIM, 2 * plIM,
+                         0, nativeIq4ProductMask(*gpu,type)});
                     auto bg = makeBG(pipeline, {{0,normOutBuf},{1,part ? lw.upKQ : lw.guKQ},
                         {2,zeroBiasGU},{3,gateUpBuf},{4,p}});
                     allDecodeDispatches.push_back({pipeline.pipeline,bg,1,(plIM+7)/8,1,
@@ -5061,7 +5079,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 auto* layerKQ = kqPipelineFor(lw.guKQType);
                 uint32_t layerTile = kqTileFor(lw.guKQType);
                 auto layerParams = makeKQParams("p_kq_gu_" + std::to_string(i),
-                    cfg.nEmbd, 2 * plIM, lw.guKQNBlocks, lw.guKQRowStride);
+                    cfg.nEmbd, 2 * plIM, lw.guKQNBlocks, lw.guKQRowStride, lw.guKQType);
                 const bool prequantQ4K = useQ4KDp4a && lw.guKQType == GGUF_TYPE_Q4_K;
                 if (prequantQ4K) {
                     const bool packedByPostNorm = cfg.arch == "qwen35" &&
@@ -5121,7 +5139,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 auto* layerKQ = kqPipelineFor(lw.dnKQType);
                 uint32_t layerTile = kqTileFor(lw.dnKQType);
                 auto layerParams = makeKQParams("p_kq_dn_" + std::to_string(i),
-                    plIM, cfg.nEmbd, lw.dnKQNBlocks, lw.dnKQRowStride);
+                    plIM, cfg.nEmbd, lw.dnKQNBlocks, lw.dnKQRowStride, lw.dnKQType);
                 auto& plActMul = useGelu ? getKernel("gelu_mul_fused")
                                           : getKernel("silu_mul_fused");
                 GPUBuffer siluParams;
@@ -7825,7 +7843,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 auto p=mkp(n+"_p",{K,N,nb,rs,0,N,M});auto&kp=nativeQuantPipeline(*gpu,t,false,true,rows);
                 add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},(M+rows-1)/rows,(N+cols-1)/cols,1,n);
             }
-            else{auto p=mkp(n+"_p",{K,N,nb,rs,0});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
+            else{auto p=mkp(n+"_p",{K,N,nb,rs,0,0,0,nativeIq4ProductMask(*gpu,t)});auto&kp=kpl(t);add(kp,{{0,x},{1,w},{2,bias},{3,y},{4,p}},M,(N+7)/8,1,n);}};
         auto proj=[&](GPUBuffer x,GPUBuffer kqw,GPUBuffer dense,GPUBuffer scaleMin,GGUFType type,uint32_t nb,uint32_t rs,
                       GPUBuffer q8w,GPUBuffer q8s,GPUBuffer bias,GPUBuffer y,
                       uint32_t K,uint32_t N,const std::string&n){
@@ -7905,7 +7923,8 @@ int32_t ModelRunner::prefillQwen35Batched(
                         zeroBiasGU,qwen35Pf.gateup,E,im,part*im,2u*im,L+(part?"up":"ffn_gate")))continue;
                     auto& pipeline=nativeQuantPipeline(*gpu,part?lw.upKQType:lw.guKQType,false,nativePrefillTile,rows);
                     auto p=mkp(L+"split_gu_"+std::to_string(part),{E,im,part?lw.upKQNBlocks:lw.guKQNBlocks,
-                        part?lw.upKQRowStride:lw.guKQRowStride,part*im,2u*im,M});
+                        part?lw.upKQRowStride:lw.guKQRowStride,part*im,2u*im,M,
+                        nativeIq4ProductMask(*gpu,part?lw.upKQType:lw.guKQType,nativePrefillTile)});
                     add(pipeline,{{0,qwen35Pf.norm},{1,part?lw.upKQ:lw.guKQ},{2,zeroBiasGU},{3,qwen35Pf.gateup},{4,p}},
                         nativePrefillTile?(M+rows-1)/rows:M,nativePrefillTile?(im+cols-1)/cols:(im+7)/8,1,L+(part?"up":"ffn_gate"));
                 }

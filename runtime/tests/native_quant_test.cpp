@@ -32,11 +32,26 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {if(id.x<P[0]){Y[id.x]=f32(
     std::puts("2046 generic aligned/odd/cross-word u16 outputs exact");
 }
 
+static void checkLookup(GPUContext& gpu) {
+    const float expected[]={-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+    auto y=gpu.createBuffer("lookup_values",sizeof(expected));
+    for(bool packed:{false,true}) {
+        auto source=nativeQuantShader(GGUF_TYPE_IQ4_XS,false,false,16,false,false,packed);
+        const auto end=source.find("var<workgroup> sums:");if(end==std::string::npos)throw std::runtime_error("Lookup splice failed");source.erase(end);
+        source+=R"WGSL(@compute @workgroup_size(32) fn main(@builtin(global_invocation_id) id:vec3<u32>){if(id.x<16u){Y[id.x]=iq4_value(id.x);}})WGSL";
+        auto& pl=gpu.getOrCreatePipeline(packed?"packed_lut_values":"original_lut_values",source,5);
+        auto group=gpu.createBindGroup(pl,{{3,y}});auto result=gpu.submitAndReadback({{pl.pipeline,group,1,1,1,"lookup_values"}},y,sizeof(expected));
+        if(std::memcmp(result.data(),expected,sizeof(expected)))throw std::runtime_error("IQ4 lookup entries differ");wgpuBindGroupRelease(group);
+    }
+    gpu.releaseBuffer(y);std::puts("32 original/packed lookup entries bit-exact against CPU");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "Pass independent GGUF reference fixtures\n"); return 2; }
+    const bool packedIq4 = std::string(argv[1]) == "--iq4-packed-lut";
     const bool cacheIQ3 = std::string(argv[1]) == "--iq3-block-scale";
     const bool alignedU16 = cacheIQ3 || std::string(argv[1]) == "--aligned-u16";
-    const int modeArg = alignedU16 ? 2 : 1;
+    const int modeArg = (alignedU16 || packedIq4) ? 2 : 1;
     if(argc <= modeArg){std::fprintf(stderr,"Pass a mode and/or GGUF fixtures after --aligned-u16\n");return 2;}
     const bool alignedActivations = std::string(argv[modeArg]) == "--staged-pair-vec2-a36";
     const bool alignedWeights = alignedActivations || std::string(argv[modeArg]) == "--staged-pair-vec2";
@@ -48,9 +63,10 @@ int main(int argc, char** argv) {
     const int firstFixture = tiled ? modeArg + 1 : modeArg;
     GPUContext gpu;
     if (!gpu.init(WGPUBackendType_D3D12)) return 1;
-    if(alignedU16 && (gpu.adapterName!="NVIDIA GeForce RTX 5080" || gpu.supportsSubgroupMatrix))return 2;
+    if((alignedU16 || packedIq4) && (gpu.adapterName!="NVIDIA GeForce RTX 5080" || gpu.supportsSubgroupMatrix))return 2;
     unsigned tests = 0,paddedGather = 0;
     try {
+        if(packedIq4)checkLookup(gpu);
         if(alignedU16 && !tiled)checkFields(gpu);
         for (int arg = firstFixture; arg < argc; ++arg) {
             std::ifstream file(argv[arg], std::ios::binary);
@@ -70,7 +86,7 @@ int main(int argc, char** argv) {
             }
             const auto type = GGUFType(header[0]);
             for (uint32_t K : {256u, 768u, 5120u, 17408u}) {
-             for (uint32_t M : tiled32 ? std::vector<uint32_t>{3,16,17,31,32,33,35,64} : tiled ? std::vector<uint32_t>{3,35} : cacheIQ3 ? std::vector<uint32_t>{1,2,3,7,8,9,17} : alignedU16 ? std::vector<uint32_t>{1,3} : std::vector<uint32_t>{3}) {
+             for (uint32_t M : tiled32 ? std::vector<uint32_t>{3,16,17,31,32,33,35,64} : tiled ? std::vector<uint32_t>{3,35} : (cacheIQ3 || packedIq4) ? std::vector<uint32_t>{1,2,3,7,8,9,17} : alignedU16 ? std::vector<uint32_t>{1,3} : std::vector<uint32_t>{3}) {
               for (bool strided : {false, true}) {
                 const uint32_t N = tiled ? 19u : K == 256u ? 13u : 5u;
                 if (size_t(N) * K > values.size()) continue;
@@ -85,7 +101,7 @@ int main(int argc, char** argv) {
                 for (uint32_t i = 0; i < N; ++i) bias[i] = float(i) / 997;
                 for(uint32_t m=0;m<M;++m)for(uint32_t n=0;n<N;++n)zeros[m*(strided?2*N:N)+(strided?N:0)+n]=std::numeric_limits<float>::quiet_NaN();
                 const uint32_t params[] = {K, N, packed.nBlocks, packed.rowStrideWords,
-                                           strided ? N : 0, strided ? 2*N : 0, M, 0};
+                                           strided ? N : 0, strided ? 2*N : 0, M, packedIq4 && type==GGUF_TYPE_IQ4_XS && !tiled ? 0xffffffffu : 0u};
                 auto bx=upload("x",x.data(),x.size()*4), bw=upload("w",packed.data.data(),packed.data.size()*4),
                      bb=upload("bias",bias.data(),bias.size()*4), by=upload("y",zeros.data(),zeros.size()*4),
                      bp=upload("params",params,sizeof(params));
@@ -109,12 +125,12 @@ int main(int argc, char** argv) {
                     for(auto buffer:paramsBuffers)gpu.releaseBuffer(buffer);
                     gpu.releaseBuffer(scratch);
                 } else {
-                    auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows,alignedU16,cacheIQ3 && type==GGUF_TYPE_IQ3_S && !tiled),5);
+                    auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows,alignedU16,cacheIQ3 && type==GGUF_TYPE_IQ3_S && !tiled,packedIq4 && type==GGUF_TYPE_IQ4_XS && !tiled),5);
                     auto bg=gpu.createBindGroup(pl,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
                     result=gpu.submitAndReadback({{pl.pipeline,bg,tiled?(M+tileRows-1)/tileRows:M,tiled?(N+tileCols-1)/tileCols:(N+7)/8,1,"native_quant"}},by,zeros.size()*4);
                     wgpuBindGroupRelease(bg);
                 }
-                if(alignedU16 && !tiled32){
+                if((alignedU16 || packedIq4) && !tiled32){
                     auto& original=gpu.getOrCreatePipeline("native_original_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows,cacheIQ3 && alignedU16,false),5);
                     auto originalGroup=gpu.createBindGroup(original,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
                     gpu.writeBuffer(by,zeros.data(),zeros.size()*4);
