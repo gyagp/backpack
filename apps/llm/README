@@ -38,14 +38,14 @@ compressed on the GPU and loads the model's separate output head. The appended
 MTP block is excluded from the 64-layer target decoder; speculative MTP is not
 enabled by this command.
 
-Batched prefill with a native quantized tile is selected automatically for
-this artifact on RTX 5080. At revision `a3d1cc8`, five alternating measurements
-showed 53.90 prefill
-tokens/s and 9.93 decode tokens/s under the earlier 512-input/128-decode-call
-protocol: 4.67x the
-initial prefill rate, with neutral decode and unchanged allocation peak. Both
-serial and batched prefill match the six-prompt llama.cpp conformance corpus.
-The broader performance targets remain open; see `docs/webgfx-104-enablement.md`.
+Batched prefill with bounded native weight staging is selected automatically
+for this artifact on RTX 5080. The accepted `428350b` application measurement
+records 142.46 prefill tokens/s and 9.93 decode tokens/s for 512 input tokens,
+128 generated tokens and context 640. Prefill includes the first prediction;
+the remaining 127 decode calls are timed separately. Later Qwen3.5 and Gemma
+milestones retain this 27B path and its fixed-output checks. Shared chat,
+sampling and benchmark flows are validated, but the large gap to llama.cpp
+remains open. See `docs/webgfx-104-enablement.md` for revision-linked evidence.
 
 ## Qwen3.8-27B ONNX on webgfx-104
 
@@ -76,7 +76,12 @@ not establish full physical residency. Three complete short sky responses have
 stable live allocations and identical output. The sky response matches the
 higher-accuracy ORT CPU diagnostic; the published accuracy-level-4 reference
 chooses different wording. See `gitignore/logs/qwen38-onnx/` for exact evidence.
-Comparable throughput measurements and performance acceptance remain pending.
+A matched 512-input/128-output baseline is recorded at accepted revision
+`ebbf8db`: 20.19 prefill tokens/s and 0.816 decode tokens/s. Its decode CV is
+8.07%, above the unchanged 5% acceptance limit; all samples remain recorded.
+Newer memory/default and generic-session-ownership candidates remain unselected.
+These historical rates do not claim current timing from a correctness-only run.
+See `docs/webgfx-104-enablement.md` for the selected runtime and pending work.
 
 ## Benchmarks and validation
 

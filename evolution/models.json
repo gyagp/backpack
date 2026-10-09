@@ -30,7 +30,13 @@
       },
       "ort": {
         "path": "D:/workspace/project/agents/ai-models/Qwen3.5-4B/onnx-webgpu",
-        "relative_dir": "Qwen3.5-4B/onnx-webgpu"
+        "relative_dir": "Qwen3.5-4B/onnx-webgpu",
+        "native_reference": {
+          "path": "D:/workspace/project/backpack/gitignore/models/qwen3.5-4b-native-capture-20261008",
+          "bin_dir": "D:/workspace/project/backpack/gitignore/evolution/backups/ort/20261008-070250-ort-8fe8c86a34-genai-2459675ea7",
+          "graph_capture": true
+        },
+        "reference_note": "Native WebGPU capture validated with stable rank3 position/mask buffers, changing prompts and full resets on RTX5080; original graphs, weights and tokenizer preserved."
       }
     },
     "conformance_spec": {
@@ -51,7 +57,13 @@
       },
       "ort": {
         "path": "D:/workspace/project/agents/ai-models/Qwen3.5-2B/onnx-webgpu",
-        "relative_dir": "Qwen3.5-2B/onnx-webgpu"
+        "relative_dir": "Qwen3.5-2B/onnx-webgpu",
+        "native_reference": {
+          "path": "D:/workspace/project/backpack/gitignore/models/qwen3.5-2b-native-capture-20261008",
+          "bin_dir": "D:/workspace/project/backpack/gitignore/evolution/backups/ort/20261008-070250-ort-8fe8c86a34-genai-2459675ea7",
+          "graph_capture": true
+        },
+        "reference_note": "Native WebGPU capture validated with stable rank3 position/mask buffers, changing prompts and full resets on RTX5080; original graphs, weights and tokenizer preserved."
       }
     },
     "conformance_spec": {
@@ -86,7 +98,7 @@
         "reference_note": "Original graph and weights have a validated captured native reference at batch1/context640/chunk32; CPU embedding rows are copied to stable GPU inputs.",
         "native_reference": {
           "path": "D:/workspace/project/backpack/gitignore/models/Qwen3.8-27B-ORT-WebGPU",
-          "bin_dir": "D:/workspace/project/backpack/gitignore/evolution/backups/ort/20260930-183323-ort-9a60fe69d9-genai-19a003a751",
+          "bin_dir": "D:/workspace/project/backpack/gitignore/evolution/backups/ort/20261008-070250-ort-8fe8c86a34-genai-2459675ea7",
           "qwen_static_capture": true
         }
       }
@@ -106,8 +118,9 @@
     "conformance_spec": {
       "workload": "text-to-image",
       "status": "artifact_identity_pending",
-      "reason": "No exact public release found in refreshed Hugging Face exact-name, official Qwen, or Unsloth catalogs on 2026-10-01. The similarly named community repository has no weights. Exact repository/revision clarification remains pending.",
-      "identity_evidence": "gitignore/logs/image-identity-20261001/summary.json"
+      "reason": "No exact public Qwen-Image-3.0 release or usable weights identified in refreshed Qwen/Unsloth catalogs or exact-name search at 11:39 UTC on 2026-10-09. Direct401 responses are ambiguous, not proof of absence. The community repository remains metadata-only. Exact repository/revision clarification remains pending; no substitute selected.",
+      "identity_evidence": "gitignore/logs/image-identity-20261009/refresh-after-q8-mask/summary.json",
+      "identity_checked_utc": "2026-10-09T11:39:13.355254+00:00"
     }
   }
 ]

@@ -1,7 +1,490 @@
 # webgfx-104 model enablement
 
-Status as of 2026-10-01. The active scope in `goal.md` is this device only;
+Status as of 2026-10-09. The active scope in `goal.md` is this device only;
 neither model enablement nor acceptance requires another machine.
+
+## Current accepted state
+
+The active runtime milestone is `6a82100b2db94cbdba428c2e9a344295eb43c990`
+(task #877, exact Q8 product bit identities). It retains task #875's packed
+Gemma cache reads, task #873's short-K Q8 half shared storage, task #867's
+wide-grid fallback and task #866's eight-row/two-column geometry.
+The chronology below retains earlier experiments and limitations;
+their measurements are not the current default performance.
+
+Dashboard transport fix #868 is deployed at control-plane source `201657f`.
+HTTP and SSE encode non-finite percentages as `null`, allowing browser JSON
+parsing while preserving stored policy values, counts and verdicts. All129 CPU
+framework tests and live HTTP/SSE checks pass. Task #873 carries this exact
+controller patch in the selected source ancestry. See
+`gitignore/logs/json-policy-serialization-20261009/RESULT.md`.
+
+The independent GGUF reference was refreshed to official llama.cpp **b11515**
+on 2026-10-09 (task #857, source `3d65c90d04d337e88f2b1f7f0061f40a5324e662`).
+Its release-matched helper passes four final-answer checks, eight changing-prompt,
+reset and backend/CPU greedy cases, and all 10,240 measured tokens on Vulkan0 /
+RTX 5080. Gemma and Qwen3.5 references now match the accepted Backpack
+five-process/five-conversation schedule, retaining every conversation's cost.
+Qwen3.8 retains the matching one-process/five-conversation schedule. Requested
+context is 640; llama.cpp's effective allocation is 768. Prefill/decode rates are
+12,753.26/196.44 (Gemma), 16,349.36/239.61 (2B), 9,365.70/148.65 (4B), and
+1,879.63/47.01 tokens/s (27B). The original reference method remains separately
+recorded for release-to-release comparisons; no timing sample was removed.
+The current matched GGUF ranking still puts Qwen3.8 prefill first: 142.46 versus
+1,879.63 tokens/s, a 92.42% deficit. This reference refresh changes no Backpack
+runtime or policy. Evidence, exact artifacts, and comparison contracts:
+`gitignore/logs/llamacpp-latest-20261009/RESULT.md` and
+`gitignore/logs/llamacpp-latest-20261009/current-gguf-gap-ranking.json`.
+
+Task #858 has rebuilt newer native ORT/GenAI sources in isolated caches:
+ORT `4124d64a` from upstream `8fe86b17`, and GenAI `df50b45e` from upstream
+`6649291d`. Six CPU-side API compatibility checks pass after adapting GenAI to
+ORT's stable model-package API. Model validation has not run: automatic approval
+review rejected its launch before execution with only "blocked by policy".
+The run is recorded as blocked, and the new build is unselected. The validated
+October8 native reference remains in use. Source bundles, build failures and
+corrections, exact caches, and the review constraint are preserved in
+`gitignore/logs/native-latest-refresh-20261009/RESULT.md`.
+
+- Task #877 preserves Q8 product rounding with a dynamic all-ones bit identity
+  before the existing scale FMA, replacing the adjacent-lane product shuffle.
+  Mean ONNX prefill improves **1760.44 -> 1925.96 tokens/s (+9.40%)** for 2B
+  and **1258.08 -> 1314.29 tokens/s (+4.47%)** for 4B, with neutral decode
+  and maximum CV1.12% under unchanged policy. All71 operators,eight formats,
+  12 chat/reset cases,2600 direct masked cases,60 short-K controls in both
+  orders,1024 diagnostic tokens and5120 measured tokens pass. Explicitly
+  forcing the forbidden `x*(q*scale)` association fails both layouts; the
+  separate bare-product controls pass on this compiler and remain unselected.
+  `BP_QWEN35_Q8_PREFILL_PRODUCT_MASK=0` restores the shuffle-based kernels.
+  Geometry,reduction,half/full storage,wide-grid fallback,decode,submission
+  counts and pooled-memory counters are unchanged. See
+  `gitignore/logs/qwen35-q8-product-mask-20261009/RESULT.md`.
+- Task #875 loads adjacent fp16 K/V cache values through packed pairs while
+  preserving Gemma's scalar arithmetic, per-key online softmax, masking and
+  four-query workgroup layout. Mean GGUF prefill improves **2071.60 -> 2186.44
+  tokens/s (+5.54%)**, with neutral decode under unchanged policy; maximum CV
+  is0.87%. Final model profiles reduce attention from60.90 to43.72ms across140
+  calls, with unchanged2541 dispatches and buffer allocation. All70 operators,
+  48 window-kernel cases,136 exact/CPU cases,27 natural reset generations,
+  eight boundary shapes,eight model/format checks and6400 measured tokens pass.
+  The selector covers only Gemma GGUF HD256/512 on RTX5080/D3D12;
+  `BP_GEMMA_DISABLE_PACKED_CAUSAL_KV=1` retains the original shader. Historical
+  task #666's different block-four attention algorithm was not imported. See
+  `gitignore/logs/gemma-attention-packed-20261009/RESULT.md`.
+- Task #873 halves shared partial storage from 16KiB to 8KiB for Q8 prefill
+  with K<=2048, preserving the existing 8x2 geometry and every product/reduction
+  pairing. Qwen3.5-2B mean prefill improves **1662.10 -> 1761.50 tokens/s
+  (+5.98%)**; decode and both 4B guards are neutral under unchanged policy.
+  All70 operators, eight model/format checks,12 chat/reset cases,1300 direct
+  exact cases,60 short-K qualification shapes in both orders,1024 diagnostic
+  tokens and5120 clean measured tokens pass. Larger-K short prompts remain on
+  the original path because isolated controls regressed. The override
+  `BP_QWEN35_Q8_PREFILL_HALF_SHARED=0` restores the original shared layout.
+  Five device-scope tests pass; only webgfx-104 receives execution work. See
+  `gitignore/logs/qwen35-q8-shared-half8x2-20261009/RESULT.md`.
+- Task #866 introduced the eight-row/two-column Qwen3.5 ONNX Q8 prefill tile on RTX5080/D3D12,
+  preserving 256 lanes, 16 accumulators per thread, 16KiB shared memory and the
+  original product rounding/reduction. Task #866 improves mean prefill from
+  **1415.92 to 1661.73 tokens/s (+17.36%)** for 2B and **1121.37 to 1259.39
+  tokens/s (+12.31%)** for 4B. Decode is neutral, with maximum CV0.83%.
+  Six hundred direct shape/tail cases, five real-weight projections in both
+  orders, all68 then-current operators, eight model/format checks,12 natural
+  prompt/reset cases and5120 measured tokens pass. See
+  `gitignore/logs/qwen35-q8-tile8x2-20261009/RESULT.md`.
+- Task #867 repairs the new tile's grid limit for wide multi-row projections.
+  At N131071,8x2 requests65536 X workgroups, above this device's65535 limit;
+  current chat vocabulary heads run at M1, but general operator coverage must
+  remain intact. The selector now falls back to4x4 when8x2 cannot fit. Five
+  identical ONNX controls reproduce the baseline error and return every exact
+  output with the repair. All69 operators, eight formats,12 chat/reset cases and
+  another5120 measured tokens pass; all four performance guards are neutral.
+  `BP_QWEN35_Q8_PREFILL_ROWS=4` keeps the previous tile, and0 selects scalar
+  prefill. Explicit8x2 requests also honor the safe fallback. See
+  `gitignore/logs/qwen35-q8-grid-guard-20261009/RESULT.md`.
+- Current-source diagnostic #869 confirms Q8 remains82.9%/61.8% of2B/4B
+  prefill GPU time after8x2. Follow-up #870 tests16x1 with the same16 outputs,
+  256 threads and16KiB shared memory. All780 poisoned-output/CPU-reference cases
+  pass, but all five full-size projections are18.9–54.8% slower in both orders;
+  all28 short/tail workloads also regress. All2080 measured intervals remain.
+  The shader is rejected before runtime routing or model timing. The carried
+  JSON fix201657f remains independently accepted. See
+  `gitignore/logs/qwen35-q8-tile16x1-20261009/RESULT.md`.
+- Standard LLM sessions now release their GPU model allocations at destruction,
+  including queued decode maps and cached bind groups. Five native inventory pairs
+  show Gemma's post-release model bytes falling from 3.608 GB to zero; all 315
+  layer buffers disappear while device-internal/readback buffers remain. The five
+  standard configurations, cancelled reloads, concurrent sessions, borrowed views
+  and partial initialization pass. All 68 operators, eight final-artifact format
+  pairs and 26,880 measured tokens pass, with all ten performance guards neutral
+  under unchanged policy. Generic ONNX residual session allocations remain a
+  separate audit; this milestone does not claim to release them. See
+  `gitignore/logs/standard-session-owner-20261009/RESULT.md`.
+- Gemma GGUF gate/up projection now shares activation reads across paired gate
+  and up columns and writes the existing GELU result directly on RTX 5080/D3D12.
+  Mean prefill improves **1949.39 -> 2064.05 tokens/s (+5.88%)**; decode is neutral
+  at 207.08 -> 207.15 tokens/s. Five independent processes per variant retain all
+  five conversation costs, including periodic refill overhead, and all 6,400
+  measured tokens match. Both protected metrics pass unchanged policy; maximum
+  CV is 0.93%. All 68 operators, 36 rounding-regression cases, nine natural
+  prompts across 27 reset generations, eight boundary shapes and eight model/format
+  checks pass. No weight memory is added; 140 prefill dispatches are removed.
+  `BP_GEMMA_DISABLE_EXACT_GATEUP_GELU=1` selects the original separate path.
+  See `gitignore/logs/gemma-gateup-gelu-20261009/RESULT.md`.
+- The earlier Qwen3.5 ONNX Q8 milestone shared weight and scale loads across four prompt
+  rows on RTX 5080/D3D12. A neighboring-lane product shuffle preserves FP32
+  rounding before scaling, and the original 256-lane reduction order is retained.
+  Mean prefill throughput improves **783.08 -> 1413.96 tokens/s (+80.56%)** for
+  2B and **689.30 -> 1124.70 tokens/s (+63.17%)** for 4B. Decode is neutral under
+  the unchanged policy. All 68 operators, eight model/format fixed-output checks,
+  12 natural-prompt/reset comparisons, and 5,120 measured tokens pass; the highest
+  measured CV is 1.26%. The default uses the original Dawn DLL and preserves
+  decode, fences and CPU/GPU overlap. `BP_QWEN35_Q8_PREFILL_ROWS=0` selects the
+  scalar fallback. See `gitignore/logs/qwen35-q8-prefill-rows-20261009/RESULT.md`.
+- Qwen3.5 ONNX embedding-index conversions now belong to the execution context,
+  which retains captured buffers through replay and releases them at reset.
+  The accepted predecessor leaked 256-336 tracked live-buffer bytes per tested
+  conversation; the repair has zero growth with identical text, streamed pieces
+  and positions. All 67 operators, 36 reset/cancellation comparisons, eight
+  fixed128 model/format pairs, and 8,960 measured performance tokens pass.
+  Gemma ONNX and both Qwen3.5 ONNX sizes pass all six performance guards under
+  the unchanged policy. This adopts only the ownership/test patch from #828;
+  its broader continuation-state repair remains unselected. See
+  `gitignore/logs/embedding-ownership-only-20261009/RESULT.md`.
+- Ordinary chat answers omit internal capture summaries; `BP_EXEC_STATS=1`
+  retains them for diagnostics. All eight model/format raw answers and all 66
+  operator/session tests pass. See
+  `gitignore/logs/chat-capture-diagnostics-20261008/RESULT.md`.
+- Shared LLM sampling now uses the correct first prediction and sampled token
+  history. Top-k1 matches greedy across all eight cared LLM model/format pairs;
+  fixed-seed Qwen3.8 GGUF and ONNX sampling is reproducible. Float32/float16,
+  context-boundary and stream-cancellation checks pass. See
+  `gitignore/logs/llm-sampling-state-audit-20261008/RESULT.md`.
+- Qwen3.8-27B GGUF uses the exact Unsloth IQ3_S artifact and the shared LLM
+  application. Clean 512/128 application means are **142.4514 prefill tokens/s
+  and 9.9136 decode tokens/s**. Task #818 improved prefill 31.45% with neutral
+  decode under the unchanged policy; all five samples per variant are retained.
+- Exact FP32 staging now covers the validated large IQ3, IQ4, Q2_K, Q3_K,
+  IQ1_S and IQ2 projections, with aligned paired dense kernels. Scratch remains
+  capped at 272 MiB, with 3,015 dispatches and 64 bounded submissions on this model.
+  Activation rows use scalar stride 36; stride 33 remains available with
+  `BP_NATIVE_DENSE_PREFILL_ALIGNED_A=0`. Workgroup storage is 5,888 bytes.
+  Attention and FFN gate profile labels are distinct.
+  Chunk fences and CPU/GPU overlap remain intact. See
+  `gitignore/logs/qwen38-dense-a-vectors-20261008/RESULT.md`.
+- Windows reported an NVIDIA UCodeReset TDR during an earlier final test on
+  October 1. That run was not accepted. After a confirmed reboot, seven control
+  runs and the complete dated validation/timing campaign passed without new
+  NVIDIA events. One recovery profile slowed when its GPU budget fell below
+  reported local usage. The TDR cause remains unresolved; all failed and slow
+  runs are retained. GPU budget varied from about 12.9 to 15.9 GB during recovery,
+  so allocation counters must not be treated as proof of stable residency.
+- The milestone passed 1088 native slice/stride cases with exact GPU output,
+  15 prompt/shape cases across both modes and resets, all eight cared LLM
+  model-format fixed128 outputs, four shared applications, and 65 D3D12 operators.
+- Gemma E2B GGUF batched prefill is also enabled on this RTX 5080/D3D12 target
+  (task #777). Five independent processes per variant measured mean prefill
+  247.19 -> 1910.55 tokens/s and decode 204.40 -> 204.85 tokens/s. Real chat
+  stops at the model's EOS/EOT/EOM markers; forced generation beyond EOT is
+  retained as a diagnostic limitation, not claimed as passing chat behavior.
+- Qwen3.8 ONNX support and exact128 conformance pass. Its separate memory
+  bundle (#766) and acceptance-policy proposal (#768) remain unapproved and
+  unintegrated. Task #787 measured the accepted runtime at **20.19 prefill
+  tokens/s and 0.816 decode tokens/s**, using one warmup and five complete
+  512/128 runs with context640 and chunk32. Decode CV is 8.07%; all samples
+  are retained, and this baseline does not relax the 5% acceptance threshold.
+  The matching native ORT reference is 210.66/39.69 tokens/s. Capture remains
+  runtime-specific: Backpack uses its decode replay, ORT uses graph capture.
+- Task #830's opt-in blocked-Q4 immediate constants pass 68 operators, the
+  fixed Qwen3.8 ONNX fixture, and six natural-prompt/reset checks against the
+  accepted runtime. They remove 497 captured parameter references
+  without reducing the parameter-buffer allocations. The clean candidate run
+  exceeded 800 seconds after four of five samples, so it remains unselected.
+  Production is unchanged. See
+  `gitignore/logs/qwen38-immediate-params-20261009/RESULT.md`.
+  Follow-up diagnostics and prompt checks are recorded under
+  `gitignore/logs/qwen38-immediate-stalls-20261009/RESULT.md`.
+- Task #832 reconciles free-pool and capture ownership on the accepted runtime.
+  Its broadcast-routing follow-up #833 saves exactly256MiB and passes67 operators
+  plus all2560 measured tokens, but both clean comparison orders remain too
+  variable for performance acceptance. The candidate is rejected and archived;
+  production is unchanged. See
+  `gitignore/logs/qwen38-flat-broadcast-20261009/RESULT.md`.
+- Task #834 proves the initial recurrent templates remain zero, correcting an
+  earlier source-audit concern about an unreachable one-token alias branch.
+  Follow-up #835 removes144MiB of uploads per reset and passes16 state cases,
+  six natural-prompt cases and66 operators. Its clean prefill gain is below2%
+  and decode remains too variable; the candidate is rejected and archived.
+  See `gitignore/logs/qwen38-recurrent-reset-20261009/RESULT.md`.
+- Native heap inventory #836 shows that captured Qwen3.8 ONNX heaps exceed the
+  actual Dawn budget despite lower buffer-byte totals. Runtime pool separation
+  #837 alone is insufficient. Native heap-class follow-up #838 brings required
+  heaps below budget in the original native inventory. Its current pairing,
+  runtime `3c440cc` and Dawn `267b75b`, is rebased onto accepted `e949776` and
+  preserves the embedding-ownership repair. It honors the allocation hint by
+  default and passes the disable override. Both clean ONNX comparison orders
+  show faster decode: combined means are 5.7547 -> 7.3296 tokens/s (+27.37%),
+  with 0.37% candidate CV; prefill changes by -0.61%. All 68 operators, six
+  natural-prompt/reset cases, 36 ownership/reset comparisons, eight cared LLM
+  model/format pairs, and 32,000 measured tokens pass. Five complete sessions
+  per version resolve the four periodic cases' variability while retaining every
+  measured repetition's cost. Only Qwen3.8 baseline decode CV (11.06%) still
+  blocks the unchanged 5% policy. The worst candidate decode sample exceeds the
+  best baseline by 12.68%; the existing task-scoped exception passes in read-only
+  replay but remains unapproved. The rebuilt package, source bundles, allocation
+  contract, native inputs and deployment plan are ready for review. Production
+  was `e949776` for that review; no policy exception or heap-candidate selection
+  occurred. After milestone #854, this pending candidate requires another rebase
+  and validation before publication. Its approval remains pending.
+  See `gitignore/logs/qwen38-prefill-heaps-rebase-20261009/RESULT.md`
+  and `gitignore/logs/qwen38-prefill-heaps-rebase-20261009/ACCEPTANCE-PROPOSAL.md`.
+  The previous `d235cf8` runtime's 32,000-token default-native campaign remains
+  separate in `gitignore/logs/qwen38-prefill-heap-class-20261009/finalization/RESULT.md`.
+  The earlier explicit-flag DLL's 12,800-token evidence and instrumented heap
+  findings remain separate in `gitignore/logs/qwen38-prefill-heap-class-20261009/RESULT.md`.
+- Qwen-Image-3.0 and its application remain incomplete. The 2026-10-09 official
+  Qwen, Unsloth, and exact-name catalog recheck did not identify the requested
+  release. A published model link is pending; no other release is substituted. The latest
+  exact-name/official-catalog refresh at 09:30 UTC is recorded under
+  `gitignore/logs/image-identity-20261009/refresh-after-q8-grid-and-json/summary.json`.
+
+Current follow-up work: diagnostic task #840 confirms that blocked-Q4 dispatches
+account for about 97% of sampled Qwen3.8 prefill GPU intervals on both accepted
+and heap-candidate artifacts. Host submission time alone was not proof of a
+host-only prefill bottleneck. See
+`gitignore/logs/qwen38-prefill-after-heaps-20261009/RESULT.md`.
+
+Task #841's unselected candidate `9e56147` packs logical reduction lanes while
+retaining the original FP32 accumulation tree. A real-weight rounding failure
+was fixed and covered by an adversarial/capture test. All 68 operators, nine real
+projection shapes in both orders, eight fixed-output model/format pairs and six
+natural-prompt/reset cases pass. Seven large prefill shapes have 44-49% shorter
+isolated GPU intervals; the small regressing shape stays on the original path.
+Two clean model comparison orders show +14.72% mean prefill throughput, nearly
+unchanged mean decode, but -3.38% decode median with 10-15% variability. The fixed
+five-complete-session study is now complete, retaining all 25 conversations per
+variant and all 6,400 measured tokens. Session prefill improves 16.02%; decode
+mean changes by -3.92% and median by -2.20%, with 13.08% candidate session CV.
+The single large slow pair did not reproduce in the final pair, so no confirmed
+large regression is claimed; the unchanged policy still blocks decode acceptance.
+Task #841 is blocked and unselected. Repeating the unchanged workload until a
+gate passes is not the next action; decode cost/variability needs resolution or
+a justified new baseline followed by revalidation. Production and policy are
+unchanged. Evidence and the sealed review package:
+`gitignore/logs/qwen38-q4-prefill-pack4-20261009/RESULT.md`.
+
+Task #842 verifies matching 512/128/context640 reference workloads and profiles
+the accepted Qwen3.5 ONNX runtime. Q8 prefill accounts for 574.52 of 622.94 ms GPU
+time on 2B (72 calls, 92.2%) and 559.02 of 698.83 ms on 4B (48 calls, 80.0%).
+Q4 already uses DP4A; LinearAttention is a smaller contributor. All 1,024
+diagnostic tokens match. See `gitignore/logs/qwen35-prefill-gap-20261009/RESULT.md`.
+
+Its narrow follow-up #843 preserves the Q8 products and 256-lane reduction tree
+while replacing only the final within-warp shared reductions with shuffles.
+All 16 synthetic cases and five real projection shapes are bitwise conformant,
+but every real shape is slower in both timing orders. The experiment is rejected
+at the kernel gate, with no whole-model performance claim or production change.
+Further Q8 work must address the larger scalar workload/reuse issue instead of
+repeating this tail replacement. Task #733's separate LinearAttention proposal
+also remains unapproved. Evidence:
+`gitignore/logs/qwen35-q8-prefill-shuffle-20261009/RESULT.md`.
+
+Task #844's four-row weight reuse addresses that larger workload. Its first
+vector-FMA revision passed all FP16 cases but failed every FP32 case: 104 CPU
+samples identified reassociation from `(x*q)*scale` to `x*(q*scale)`. The corrected
+product shuffle and uniform masked loops pass all 24 synthetic cases and every
+output of all five real projection shapes in both timing orders. Q8 GPU intervals
+fall by 49.3-50.9%; final-artifact profiles confirm the affected 72/48 calls and
+another 512 exact tokens. The clean application gains reported above are separate
+from those profiles. Both run orders and all samples pass the existing policy.
+The milestone is selected and backed up locally; the initial arithmetic and WGSL
+uniformity failures are retained. No other device or pending approval is involved.
+Evidence: `gitignore/logs/qwen35-q8-prefill-rows-20261009/RESULT.md` and
+`gitignore/logs/qwen35-q8-prefill-rows-20261009/integration.json`.
+
+Task #845 refreshes Qwen3.8 GGUF attribution on accepted `8faa8d1`: staged dense
+multiplication costs 3,184.14 of 3,582.76 ms GPU time (88.87%). The separate host
+run measures 11.14 ms encoding; 3,015 dispatches and 64 submissions remain.
+All 512 diagnostic tokens match. Saved Q8 measurement metadata was also completed
+from raw results so the live dashboard recognizes the new validated throughput.
+See `gitignore/logs/qwen38-dense-refresh-20261009/RESULT.md`.
+
+Follow-up #846 keeps eight activation values per thread and exchanges them
+within the four-thread output-row group, replacing shared A storage. It preserves
+the original 128 threads, 32x8/K32 tile, partial sums and reduction, reducing
+shared storage from 5,888 to 1,280 bytes. All 1,088 native correctness cases pass,
+but all three representative real projections cost 73.9-74.3% more GPU time in
+both run orders. It is rejected at the isolated-kernel gate; no runtime selector,
+full-model performance claim or production change follows. The saved evidence
+does not isolate shuffle cost, global load distribution or physical occupancy.
+See `gitignore/logs/qwen38-dense-a-shuffle-20261009/RESULT.md`.
+
+Tasks #847 and #848 preserve all 1,088 native correctness cases but also fail
+the real-projection performance gate in both orders. Next-K32 register prefetch
+is 50.1-50.9% slower despite unchanged shared storage and arithmetic. Packing
+adjacent K values into shared vec4 weight entries is 3.6-4.2% slower despite
+retaining thread ownership, accumulator count and the 5,888-byte footprint.
+Both prototypes are archived and rejected; no runtime selector was added.
+Evidence: `gitignore/logs/qwen38-dense-prefetch-20261009/RESULT.md` and
+`gitignore/logs/qwen38-dense-b-kpair-20261009/RESULT.md`.
+
+Task #859 refreshes the profile on selected `428350b` after the b11515 reference
+refresh. All 512 diagnostic tokens match. Dense multiplication still accounts
+for 3,183.45 of 3,582.18 ms GPU prefill (88.87%), with 3,015 dispatches and
+64 submissions. Host encoding is 4.38 ms; submission time overlaps GPU work.
+The proposed explicit shared-A vec4 variant was found in task #818's records:
+it was already 18.3–19.3% slower than the current scalar stride36 control, so
+that idea was discarded before implementation.
+
+Task #864 instead tests pair-interleaved **global** FP32 weight staging at
+`1ef3fca`, leaving shared layout, arithmetic, scratch capacity and runtime routing
+unchanged. All 1,088 native cases and 204 direct slice checks pass, including
+independent CPU weights, original GPU decode bits and zero-filled odd partners.
+Both real-weight comparison orders improve combined GPU cost only 0.69–0.98%.
+Weight decoding improves 13.8–18.0%, while dense multiplication is essentially
+unchanged. It misses the 2% isolated admission threshold and is rejected; no
+full-model candidate timing or production update followed. Evidence:
+`gitignore/logs/qwen38-dense-current-20261009/RESULT.md` and
+`gitignore/logs/qwen38-global-weight-pairs-20261009/RESULT.md`.
+
+Task #849 profiles Gemma GGUF on the current accepted runtime. Its 241.76 ms of
+prefill GPU intervals contain 83.64 ms gate/up projection (34.60%), 60.24 ms
+causal attention (24.92%) and 37.03 ms down projection (15.32%). Four 128-row
+chunks use 2,681 dispatches and four submissions; the separate host run spends
+2.84 ms encoding. All 512 diagnostic tokens match. Captured decode produces
+host counters but no new GPU timestamp regions, so no decode GPU-time claim is
+made. Prior Gemma sixteen-row reuse attempts are rejected. Historical packed-K/V
+and expanded-i8 candidates recorded local gains but remained blocked by a
+multi-device/prerequisite chain; those other-device requirements are outside the
+current goal, while their old source and arithmetic dependencies still need
+fresh validation. No old candidate or pending review is selected. See
+`gitignore/logs/gemma-gguf-refresh-20261009/RESULT.md` and `prior-gemma-work.json`.
+
+Task #850 isolates historical packed-i8 weight expansion on the current unfused
+Gemma path. All 30 synthetic cases and three real layers are exact, but the real
+projection gain is only 0.5-1.1% in both orders, below admission, while full-model
+caching would add 990 MiB. It is rejected without adding runtime memory or routing.
+See `gitignore/logs/gemma-gateup-i8-20261009/RESULT.md`.
+
+Task #851 independently revalidates gate/up GELU fusion on the current source.
+The old shader first changed scale multiplication association; after that repair,
+compiler output showed reassociation of the final GELU/up product. Dynamic
+all-ones bit identities preserve both FP32 rounding boundaries. The repaired
+kernel is bitwise exact on 45 synthetic cases and all three real layers in both
+orders, with 10.8-11.3% shorter projection/GELU GPU intervals. A runtime regression
+test also demonstrates that removing the GELU boundary reproduces the error.
+The clean application gain above uses separate measurements. This adoption
+imports no old attention, i8-expansion or ping-pong bundle, and requires no other
+device. Historical task #664 is linked to the fresh adaptation; its old candidate
+remains unselected. Pending review #674 and all previously pending approvals stay
+unapproved. Source, failures, compiler evidence and selection are recorded under
+`gitignore/logs/gemma-gateup-gelu-20261009/`.
+
+Task #852 tests exact i8 weights on the newly accepted fused Gemma path. The
+isolated projection improves about 10%, and all correctness, ownership and local
+budget checks pass. However, five complete processes per variant measure only
+0.58% mean prefill improvement with neutral decode, while the cache adds 990 MiB.
+All 6,400 measured tokens match. Policy returns all-neutral; the experiment author
+withdraws the candidate, with no user decision claimed. It is archived and rejected.
+The profile pair shows attention adding 5.14 ms, offsetting most of the target
+gain; no hardware cache explanation is proven. Production remains `eccabde`.
+See `gitignore/logs/gemma-fused-i8-20261009/RESULT.md`.
+
+Task #853 confirms a standard-session lifecycle defect in accepted `eccabde`.
+After a Gemma session leaves scope, all 1,580 native buffer objects and 3.608 GB
+of tracked model allocations remain; 315 layer buffers contain 1.101 GB of that
+total. A 4 MiB Tensor release control disappears correctly, distinguishing live
+objects from allocator-reserved heaps. Eight known output tokens match. See
+`gitignore/logs/standard-session-lifetime-20261009/RESULT.md`.
+
+The ownership repair #854 (`428350b`) is selected. It owns model
+allocations and bind groups at creation, preserves replay references, retires
+one-shot resources, and drains pending decode maps at destruction. Its focused
+ownership test and all 68 operators pass. All eight model/format fixed128 outputs
+remain exact; all five standard configurations return tracked bytes to zero after
+session release. Gemma and Qwen3.5-2B also pass two cancelled-generation reloads
+each on the same device. Final coverage also checks borrowed views, exception
+unwinding and concurrent cancelled models; destroying one preserves the other's
+buffers and exact outputs. Five independent native-object pairs reproduce the
+accepted leak and repaired cleanup. Natural/reset and boundary checks pass;
+the GGUF sky fixture was corrected to accepted ONNX text for ONNX validation.
+All five configurations complete their predetermined performance campaign with
+26,880 exact measured tokens and ten neutral performance metrics. The unchanged
+policy accepts the measured resource-release improvement. The unaffected generic
+ONNX path retains allocations after release; this repair does not claim to fix it. See
+`gitignore/logs/standard-session-owner-20261009/final-correctness.json`.
+
+Task #855 confirms the generic ONNX defect on selected `428350b`: Qwen3.5-2B
+retains 144 state buffers totaling 92,307,488 bytes after reset and session
+destruction. Native object labels account for all retained tracked bytes; the
+Tensor release control and eight known tokens pass. This is a fresh baseline
+check of 2B only; previous 4B/27B residual inventories remain separate. Generic
+ownership repair #856 remains unselected after its completed validation and
+performance campaign. See
+`gitignore/logs/generic-session-lifetime-20261009/RESULT.md`.
+
+Task #856's isolated candidate `7c3921b` owns direct generic session allocations
+separately from executor temporaries and releases captures before those buffers.
+Its new release regression fails on the accepted base and passes on the candidate.
+A queued-execution failure initially exposed double cleanup of borrowed session
+input aliases; the repaired destructor removes those aliases before context
+destruction. All 68 operators, eight fixed-output format pairs and all eight
+post-release tracked-byte checks pass. Twelve eager/captured cancelled reloads,
+captured 27B cancellation and concurrent generic sessions also pass. The
+coexistence helper was corrected to account for prompt-dependent capture memory;
+runtime semantics and tolerances were unchanged. The fixed campaign is complete,
+retaining all 11,520 exact measured tokens. 2B/4B prefill and decode are neutral.
+For 27B, prefill is neutral, but decode mean changes by -4.24%, median by -2.77%,
+and candidate process CV is 6.30%, above the unchanged 5% limit. Policy marks the
+candidate blocked; no large-regression or hardware-cause claim is inferred from
+the variable samples. The source and exact binaries are sealed for review without
+selection or another clean timing attempt. Production stays `428350b`. Evidence:
+`gitignore/logs/generic-session-owner-20261009/RESULT.md` and `acceptance.json`.
+The unselected package is under
+`gitignore/evolution/candidates/backpack/20261009-generic-owner-7c3921b05d/`.
+A separate diagnostic task could not be queued because automatic approval review
+rejected its creation with "blocked by policy"; only an offline diagnostic plan
+was saved, without using another write path to bypass that rejection.
+
+Read-only attribution subsequently ran within existing task #856 using its
+unchanged public helper, with no new dashboard task, helper build or privileged
+counter access. All 1,024 diagnostic tokens match. Sampled decode uses identical
+2,167 dispatches, 22 submissions and 84 writes; GPU intervals are 121.513 ms base
+and 121.444 ms candidate, while GPU spans are 309.921 and 284.055 ms. Separate
+host-counter runs show about 2 ms encoding and much larger submission/wait time.
+Tracked allocation totals also match. The candidate is faster in these particular
+decode samples, but the profiles do not override the slower/noisier clean campaign
+or prove a hardware cause. Prefill intervals vary, reinforcing that this is
+attribution rather than acceptance timing. The repair remains blocked. See
+`gitignore/logs/generic-session-owner-20261009/attribution/RESULT.md`.
+Post-generation local usage is 94.896-95.005% of the DXGI-reported budget in those
+runs. The immutable original Dawn source documents its internal 95% cap. This is
+consistent with existing budget-pressure findings, but does not prove evictions
+or a candidate-specific cause. The cap and residency settings are unchanged;
+old free-pool trimming failures and pending task #838 still constrain follow-up.
+
+Current evidence: `gitignore/logs/qwen38-dense-a-vectors-20261008/RESULT.md`,
+`gitignore/logs/gemma-gguf-default/`, and
+`gitignore/logs/model-identity-20261008/finding.json`.
+The accepted ONNX baseline and its full sample set are under
+`gitignore/logs/qwen38-onnx-accepted-baseline/`.
+
+The October 8 reference refresh selected llama.cpp **b11476** (commit
+`988190680d5a89fce97de3c20df2c2813731fd61`) and a helper built against that exact
+public C ABI. All four GGUF LLMs passed answer, tokenizer, reset, and sampling
+checks. Five measured conversations are retained for each model; Gemma also
+has five independent processes to match its Backpack comparison schedule.
+See `gitignore/logs/llamacpp-latest-20261008/RESULT.md`.
+
+The native reference now uses ORT `8fe8c86a340c338b40f1fd515474d17992232918`
+and GenAI `2459675ea71f781d81d99c74fa8e68833d3b9905`. Task #816 fixes Qwen3.5
+captured position/mask input lifetimes and resets; all four cared LLM native
+references now run with capture enabled. Both Qwen3.5 sizes pass changing
+prompts, natural stopping, full resets, context 128/640 tests and the automation
+adapter's context 1024 conformance. Original graphs, weights and tokenizers are
+unchanged. Clean 512/128 means are 5898.23/224.77 tokens/s for 2B and
+3139.66/141.57 for 4B (prefill/decode). Capture replay and heavy-node execution
+are verified on the native RTX5080 process. See
+`gitignore/logs/qwen35-native-capture-20261008/RESULT.md`.
 
 ## Device and execution scope
 
@@ -742,6 +1225,14 @@ The daily upstream refresh helper's missing external script is a separate
 remaining maintenance task; model routing does not bypass that refresh gate.
 
 ## Qwen3.8 parameter packing with resource priming
+
+The 2026-10-09 read-only history review rechecked 5,120 saved output tokens and
+the original commands/source for tasks #746 and #760. Task #746's ten-iteration
+same-session study completed with 7.52%/10.75% baseline/candidate decode CV;
+its old live-job notes are stale. Task #760's final candidate decode CV is 5.24%;
+the 5.98%/7.22% figures refer to precursor #754. None of these results establishes
+acceptance on the current baseline or a new parameter-packing premise. See
+`gitignore/logs/generic-session-owner-20261009/attribution/parameter-history-review/RESULT.md`.
 
 Task #760 combines the existing opt-in parameter arenas with the unaccepted
 rows4, decode priming, and reset cleanup candidate. Source

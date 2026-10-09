@@ -46,10 +46,23 @@ KQuantPacked pack_native_quant(const void* raw, uint32_t rows, uint32_t cols, GG
     return out;
 }
 
-std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows) {
+std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows, bool alignedU16) {
     const auto spec = layout(type);
     if (!spec.bytes) throw std::runtime_error("Unsupported native quantization shader");
     std::string source = NATIVE_QUANT_SOURCE;
+    if (alignedU16) {
+        const std::string old = "fn u16(offset: u32) -> u32 { return u8(offset) | (u8(offset + 1u) << 8u); }";
+        const std::string replacement = R"WGSL(fn u16(offset: u32) -> u32 {
+    if ((offset & 1u) == 0u) {
+        return (W[offset / 4u] >> (8u * (offset & 2u))) & 65535u;
+    }
+    return u8(offset) | (u8(offset + 1u) << 8u);
+})WGSL";
+        const auto position = source.find(old);
+        if (position == std::string::npos) throw std::runtime_error("Native u16 helper not found");
+        source.replace(position, old.size(), replacement);
+    }
+
     if (prefill) {
         const auto main = source.find("\nvar<workgroup> sums:");
         if (gather || main == std::string::npos)
@@ -101,8 +114,8 @@ std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t
     return source;
 }
 
-std::string nativeQuantDecodeSliceShader(GGUFType type) {
-    auto source=nativeQuantShader(type,false,true,32);
+std::string nativeQuantDecodeSliceShader(GGUFType type, bool alignedU16) {
+    auto source=nativeQuantShader(type,false,true,32,alignedU16);
     const auto end=source.find("var<workgroup> tileA:");
     if(end==std::string::npos)throw std::runtime_error("Native decode slice splice failed");
     source.erase(end);
