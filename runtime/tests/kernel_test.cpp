@@ -598,9 +598,9 @@ TEST(gemma_gateup_gelu_exact) {
         auto fg=gpu.createBindGroup(fused,{{0,bx},{1,bs},{2,bw},{3,bws},{4,by},{5,bp}});
         auto cg=gpu.createBindGroup(counter,{{0,bx},{1,bs},{2,bw},{3,bws},{4,by},{5,bp}});
         auto expected=gpu.submitAndReadback({{base.pipeline,bg,(M+7)/8,(N+7)/8,1,"reference_projection"},
-            {gelu.pipeline,gg,(M*H+255)/256,1,1,"reference_gelu"}},by,by.size);
-        auto actual=gpu.submitAndReadback({{fused.pipeline,fg,(M+7)/8,(H+7)/8,1,"fused_gelu"}},by,by.size);
-        auto broken=gpu.submitAndReadback({{counter.pipeline,cg,(M+7)/8,(H+7)/8,1,"without_rounding_boundary"}},by,by.size);
+            {gelu.pipeline,gg,(M*H+255)/256,1,1,"reference_gelu"}},by,uint64_t(M)*H*4);
+        auto actual=gpu.submitAndReadback({{fused.pipeline,fg,(M+7)/8,(H+7)/8,1,"fused_gelu"}},by,uint64_t(M)*H*4);
+        auto broken=gpu.submitAndReadback({{counter.pipeline,cg,(M+7)/8,(H+7)/8,1,"without_rounding_boundary"}},by,uint64_t(M)*H*4);
         roundingFailureExposed |= broken != expected;
         const auto* values=reinterpret_cast<const float*>(actual.data());
         bool valid=actual==expected && !gpu.executionError && !gpu.deviceLost;
@@ -618,6 +618,21 @@ TEST(gemma_gateup_gelu_exact) {
             const double g=dot(m,n),u=dot(m,n+H);
             const double cpu=0.5*g*(1+std::tanh(0.7978845608*(g+0.044715*g*g*g)))*u;
             valid &= std::abs(values[size_t(m)*H+n]-cpu)<=2e-4+2e-5*std::abs(cpu);
+        }
+        if(!valid) {
+            std::fprintf(stderr,"Fusion diagnostic exact=%d gpu_error=%d lost=%d M=%u H=%u K=%u\n",int(actual==expected),int(gpu.executionError),int(gpu.deviceLost),M,H,K);
+            const float* reference=reinterpret_cast<const float*>(expected.data());
+            for(size_t i=0;i<actual.size()/4;++i)if(values[i]!=reference[i]) {
+                std::fprintf(stderr," first mismatch %zu base=%.12g fused=%.12g\n",i,reference[i],values[i]);break;
+            }
+            auto referenceGu=gpu.readBuffer(bgu,uint64_t(M)*N*4);
+            std::string debug=fusedSource;const auto store=debug.find(boundary);
+            debug.replace(store,boundary.size(),"Y[row*N+col]=gv;Y[row*N+col+H]=uv;");
+            auto& debugPipeline=gpu.getOrCreatePipeline("test_gemma_paired_gu_debug",debug,6);
+            auto debugGroup=gpu.createBindGroup(debugPipeline,{{0,bx},{1,bs},{2,bw},{3,bws},{4,bgu},{5,bp}});
+            auto pairedGu=gpu.submitAndReadback({{debugPipeline.pipeline,debugGroup,(M+7)/8,(H+7)/8,1,"debug_gu"}},bgu,uint64_t(M)*N*4);
+            wgpuBindGroupRelease(debugGroup);
+            std::fprintf(stderr," paired projections exact=%d\n",int(referenceGu==pairedGu));
         }
         for(auto group:{bg,gg,fg,cg})wgpuBindGroupRelease(group);
         for(auto buffer:{bx,bs,bw,bws,bgu,by,bp,bgp})gpu.releaseBuffer(buffer);
