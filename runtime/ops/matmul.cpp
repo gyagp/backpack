@@ -442,11 +442,13 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
     outShape.back() = N;
     *out[0] = ex.AllocTensor(outShape, outDtype);
 
-    uint32_t params[4] = {(uint32_t)M, N, K, 0};
+    const int64_t bits = n.GetInt("bits", 4);
+    // Q8 prefill's reserved word preserves product rounding via a bit identity.
+    // Other operators and single-token decode retain the original parameters.
+    uint32_t params[4] = {(uint32_t)M, N, K, bits == 8 && M > 1 ? 0xffffffffu : 0u};
     auto paramBuf = ex.getParamBuffer(16);
     ex.getGpu()->writeBuffer(paramBuf, params, 16);
 
-    const int64_t bits = n.GetInt("bits", 4);
     if (bits == 8) {
         // ORT blockwise Q8 stores unsigned bytes with an implicit zero point
         // of 128 and one fp16 scale per 32 values.
@@ -484,6 +486,10 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         // Longer K keeps the previous path, including short prompts.
         const bool useHalfSharedPrefill = useRows8x2Prefill && K <= 2048u && [] {
             const char* option=std::getenv("BP_QWEN35_Q8_PREFILL_HALF_SHARED");
+            return !option || std::strcmp(option,"0")!=0;
+        }();
+        const bool useProductMaskPrefill = useRows8x2Prefill && [] {
+            const char* option=std::getenv("BP_QWEN35_Q8_PREFILL_PRODUCT_MASK");
             return !option || std::strcmp(option,"0")!=0;
         }();
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
@@ -557,6 +563,12 @@ if (lid.x == 0u) {
         } else if (useSubgroupDecode) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
                 []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); });
+        } else if (useProductMaskPrefill && useHalfSharedPrefill) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows8x2_half_mask",5,
+                [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS8X2_HALF_MASK); });
+        } else if (useProductMaskPrefill) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows8x2_mask",5,
+                [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS8X2_MASK); });
         } else if (useHalfSharedPrefill) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows8x2_half",5,
                 [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS8X2_HALF); });
@@ -596,6 +608,8 @@ if (lid.x == 0u) {
                          useRows4Prefill ? (static_cast<uint32_t>(M)+3u)/4u : static_cast<uint32_t>(M), 1,
                          fuseGreedyArgmax ? "matmul_q8_block32_fused_argmax" :
                          useSubgroupDecode ? "matmul_q8_block32_subgroup" :
+                         useProductMaskPrefill && useHalfSharedPrefill ? "matmul_q8_block32_prefill_rows8x2_half_mask" :
+                         useProductMaskPrefill ? "matmul_q8_block32_prefill_rows8x2_mask" :
                          useHalfSharedPrefill ? "matmul_q8_block32_prefill_rows8x2_half" :
                          useRows8x2Prefill ? "matmul_q8_block32_prefill_rows8x2" :
                          useRows4Prefill ? "matmul_q8_block32_prefill_rows4" : "matmul_q8_block32");

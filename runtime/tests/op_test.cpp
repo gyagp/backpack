@@ -2015,8 +2015,10 @@ TEST(matmul_q8_prefill_rows4) {
             if(reference.at("Y").data!=actual.at("Y").data)throw std::runtime_error("Q8 prefill tile changed output bits at K="+std::to_string(K)+" M="+std::to_string(M)+" half="+std::to_string(half));
             const char* halfOption=std::getenv("BP_QWEN35_Q8_PREFILL_HALF_SHARED");
             const bool expectedHalf=K<=2048 && (!halfOption || std::strcmp(halfOption,"0")!=0);
-            const char* pipeline=std::strcmp(option,"4")==0?"matmul_q8_block32_prefill_rows4":
+            std::string pipeline=std::strcmp(option,"4")==0?"matmul_q8_block32_prefill_rows4":
                 expectedHalf?"matmul_q8_block32_prefill_rows8x2_half":"matmul_q8_block32_prefill_rows8x2";
+            const char* maskOption=std::getenv("BP_QWEN35_Q8_PREFILL_PRODUCT_MASK");
+            if(std::strcmp(option,"4")!=0 && (!maskOption || std::strcmp(maskOption,"0")!=0))pipeline+="_mask";
             if(!gpu.hasPipeline(pipeline))throw std::runtime_error("Requested Q8 prefill route was not selected");
         }
     }
@@ -2053,8 +2055,47 @@ TEST(matmul_q8_prefill_shared_half) {
         set(halfName,"1");auto actual=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
         if(gpu.executionError || gpu.deviceLost || actual.at("Y").data!=reference.at("Y").data)
             throw std::runtime_error("Q8 shared-half output or validation mismatch");
-        const char* pipeline=K<=2048?"matmul_q8_block32_prefill_rows8x2_half":"matmul_q8_block32_prefill_rows8x2";
+        std::string pipeline=K<=2048?"matmul_q8_block32_prefill_rows8x2_half":"matmul_q8_block32_prefill_rows8x2";
+        const char* maskOption=std::getenv("BP_QWEN35_Q8_PREFILL_PRODUCT_MASK");
+        if(!maskOption || std::strcmp(maskOption,"0")!=0)pipeline+="_mask";
         if(!gpu.hasPipeline(pipeline))throw std::runtime_error("Q8 shared-half route missing");
+    }
+}
+
+TEST(matmul_q8_product_mask) {
+    const char* rowName="BP_QWEN35_Q8_PREFILL_ROWS";
+    const char* halfName="BP_QWEN35_Q8_PREFILL_HALF_SHARED";
+    const char* maskName="BP_QWEN35_Q8_PREFILL_PRODUCT_MASK";
+    const std::string savedRow=std::getenv(rowName)?std::getenv(rowName):"";
+    const std::string savedHalf=std::getenv(halfName)?std::getenv(halfName):"";
+    const std::string savedMask=std::getenv(maskName)?std::getenv(maskName):"";
+    auto set=[](const char* name,const char* value) {
+#ifdef _WIN32
+        _putenv_s(name,value);
+#else
+        if(*value)setenv(name,value,1);else unsetenv(name);
+#endif
+    };
+    struct Restore {std::function<void()> action;~Restore(){action();}} restore{[&]{set(rowName,savedRow.c_str());set(halfName,savedHalf.c_str());set(maskName,savedMask.c_str());}};
+    set(rowName,"8x2");
+    for(int K:{32,96,256,2048,2080,6144,9216})for(int M:{2,7,8,9,32})for(bool half:{false,true})for(const char* shared:{"0","1"}) {
+        constexpr int N=13;Rng rng(uint32_t(K+M+103));
+        std::vector<float> x(M*K),scales(N*K/32);
+        for(auto& v:x)v=rng.uniform(-1.0f,1.0f);
+        for(auto& v:scales)v=rng.uniform(0.001f,0.01f);
+        std::vector<uint8_t> weights(N*K);for(auto& v:weights)v=uint8_t(rng.next());
+        const auto type=half?ONNX_FLOAT16:ONNX_FLOAT;
+        const auto model=buildOnnxModel({{"MatMulNBits",{"X","W","scales"},{"Y"},
+            {{"K",AttrDef::INT,K},{"N",AttrDef::INT,N},{"bits",AttrDef::INT,8},{"block_size",AttrDef::INT,32}}}},
+            {{"X",type,{1,M,K}}},{{"Y",ONNX_FLOAT,{1,M,N}}},
+            {{"W",ONNX_UINT8,{N,K/32,32},weights},makeInitF16("scales",{N,K/32},scales)});
+        const auto input=half?makeInputF16("X",{1,M,K},x):makeInputF32("X",{1,M,K},x);
+        set(halfName,shared);set(maskName,"0");auto reference=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
+        set(maskName,"1");auto actual=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
+        if(gpu.executionError || gpu.deviceLost || actual.at("Y").data!=reference.at("Y").data)
+            throw std::runtime_error("Q8 product-mask output or validation mismatch");
+        const char* pipeline=K<=2048 && std::strcmp(shared,"1")==0?"matmul_q8_block32_prefill_rows8x2_half_mask":"matmul_q8_block32_prefill_rows8x2_mask";
+        if(!gpu.hasPipeline(pipeline))throw std::runtime_error("Q8 product-mask route missing");
     }
 }
 
@@ -2952,6 +2993,7 @@ int main(int argc, char** argv) {
     RUN(matmul_nbits_q8_decode);
     RUN(matmul_q8_prefill_rows4);
     RUN(matmul_q8_prefill_shared_half);
+    RUN(matmul_q8_product_mask);
     RUN(matmul_q8_wide_grid_fallback);
     RUN(linear_attention_gated_delta_vec4);
     RUN(causal_conv_state_fp16);

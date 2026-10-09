@@ -1,4 +1,3 @@
-// @meta noregistry=true
 // P._pad must be all ones: preserve FP32 product rounding before scale FMA.
 enable subgroups;
 
