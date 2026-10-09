@@ -1983,6 +1983,39 @@ TEST(matmul_nbits_q8_decode) {
                    "matmul_nbits_q8_decode");
 }
 
+TEST(matmul_q8_prefill_rows4) {
+    const char* name="BP_QWEN35_Q8_PREFILL_ROWS";
+    const char* old=std::getenv(name);const std::string saved=old?old:"";
+    auto set=[&](const char* value) {
+#ifdef _WIN32
+        _putenv_s(name,value);
+#else
+        if(*value)setenv(name,value,1);else unsetenv(name);
+#endif
+    };
+    struct Restore {std::function<void()> action;~Restore(){action();}} restore{[&]{set(saved.c_str());}};
+    if(gpu.adapterName!="NVIDIA GeForce RTX 5080" || gpu.backendType!=WGPUBackendType_D3D12)
+        throw std::runtime_error("Q8 prefill test requires selected RTX5080/D3D12");
+    for(int K:{32,256,2048,6144})for(int M:{2,5,32})for(bool half:{false,true}) {
+        constexpr int N=13;Rng rng(uint32_t(K+M+23));
+        std::vector<float> x(M*K),scales(N*K/32);
+        for(auto& v:x)v=rng.uniform(-1.0f,1.0f);
+        for(auto& v:scales)v=rng.uniform(0.001f,0.01f);
+        std::vector<uint8_t> weights(N*K);for(auto& v:weights)v=uint8_t(rng.next());
+        const auto type=half?ONNX_FLOAT16:ONNX_FLOAT;
+        const auto model=buildOnnxModel({{"MatMulNBits",{"X","W","scales"},{"Y"},
+            {{"K",AttrDef::INT,K},{"N",AttrDef::INT,N},{"bits",AttrDef::INT,8},{"block_size",AttrDef::INT,32}}}},
+            {{"X",type,{1,M,K}}},{{"Y",ONNX_FLOAT,{1,M,N}}},
+            {{"W",ONNX_UINT8,{N,K/32,32},weights},makeInitF16("scales",{N,K/32},scales)});
+        const auto input=half?makeInputF16("X",{1,M,K},x):makeInputF32("X",{1,M,K},x);
+        set("0");auto reference=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
+        set("4");auto actual=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
+        if(reference.at("Y").data!=actual.at("Y").data)throw std::runtime_error("Q8 prefill row reuse changed output bits");
+        if(!gpu.hasPipeline("matmul_q8_block32_prefill_rows4"))throw std::runtime_error("Q8 prefill route was not selected");
+    }
+}
+
+
 TEST(linear_attention_gated_delta_vec4) {
     constexpr int T = 1, DK = 128, DV = 8;
     std::vector<float> q(T * DK), k(T * DK), v(T * DV);
@@ -2839,6 +2872,7 @@ int main(int argc, char** argv) {
     RUN(matmul);
     RUN(matmul_nbits_q4_decode);
     RUN(matmul_nbits_q8_decode);
+    RUN(matmul_q8_prefill_rows4);
     RUN(linear_attention_gated_delta_vec4);
     RUN(causal_conv_state_fp16);
     RUN(linear_attention_state_fp16);

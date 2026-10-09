@@ -465,6 +465,13 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             outDtype = TensorDtype::Float32;
             *out[0] = ex.AllocTensor(outShape, outDtype);
         }
+        const bool useRows4Prefill = M > 1 && (K % 32u) == 0u &&
+            ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
+            ex.getGpu()->adapterName == "NVIDIA GeForce RTX 5080" &&
+            effectiveLimits(*ex.getGpu()).maxComputeWorkgroupStorageSize >= 16384u && [] {
+                const char* option=std::getenv("BP_QWEN35_Q8_PREFILL_ROWS");
+                return option && std::strcmp(option,"4")==0;
+            }();
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
@@ -536,6 +543,9 @@ if (lid.x == 0u) {
         } else if (useSubgroupDecode) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
                 []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); });
+        } else if (useRows4Prefill) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows4",5,
+                [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS4); });
         } else {
             pipelinePtr = &ex.GetPipeline("matmul_q8_block32", kMatMulQ8Block32, 5);
         }
@@ -562,9 +572,10 @@ if (lid.x == 0u) {
                 {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pipeline.pipeline, group,
                          useSubgroupDecode ? numWg : (N + 3) / 4,
-                         static_cast<uint32_t>(M), 1,
+                         useRows4Prefill ? (static_cast<uint32_t>(M)+3u)/4u : static_cast<uint32_t>(M), 1,
                          fuseGreedyArgmax ? "matmul_q8_block32_fused_argmax" :
-                         useSubgroupDecode ? "matmul_q8_block32_subgroup" : "matmul_q8_block32");
+                         useSubgroupDecode ? "matmul_q8_block32_subgroup" :
+                         useRows4Prefill ? "matmul_q8_block32_prefill_rows4" : "matmul_q8_block32");
         if (fuseGreedyArgmax) {
             uint32_t reduceParams[4] = {numWg, 0, 0, 0};
             auto reduceParamBuf = ex.getParamBuffer(16);
