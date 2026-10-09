@@ -583,6 +583,12 @@ std::string backendName(WGPUBackendType backendType) {
 
 }  // namespace
 
+std::string gemmaQ4PrefillSource(bool fusedGateupGelu) {
+    return fusedGateupGelu ? std::string(WGSL_GEMMA_GATEUP_GELU_PREFILL)
+                          : q4PrequantBatchedNvidiaSource();
+}
+
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 WGPUBindGroup ModelRunner::makeBG(
@@ -8128,6 +8134,13 @@ int32_t ModelRunner::prefillGemmaBatched(
                         ? q4PrequantBatchedNvidiaSource()
                         : std::string(q4PrequantBatchedSource())), 6)
             : nullptr;
+        const CompiledPipeline* q4prequantGateupGelu = prequantQ4 &&
+            modelFormat == "gguf" && gpu->backendType == WGPUBackendType_D3D12 &&
+            gpu->adapterName == "NVIDIA GeForce RTX 5080" && gpu->supportsSubgroups &&
+            !std::getenv("BP_GEMMA_DISABLE_NVIDIA_SUBGROUP_REDUCE") &&
+            !std::getenv("BP_GEMMA_DISABLE_EXACT_GATEUP_GELU")
+            ? &gpu->getOrCreatePipeline("gemma_gateup_gelu_exact",
+                gemmaQ4PrefillSource(true), 6) : nullptr;
         const uint32_t q4PrequantCols =
             gpu->adapterName.find("AMD") != std::string::npos ? 4u : 8u;
         auto mm = [&](GPUBuffer x, GPUBuffer w, GPUBuffer s, GPUBuffer y,
@@ -8141,12 +8154,20 @@ int32_t ModelRunner::prefillGemmaBatched(
                     gemmaQ4PleBatchedSource(), 5);
                 add(ple, {{0,x},{1,w},{2,s},{3,y},{4,p}}, (N+3)/4,M,name);
             } else if (prequantQ4) {
-                auto qp = mkP(name + "_quant_p", {K,N,M});
+                const bool fused = q4prequantGateupGelu && name == "gpf_gateup" &&
+                    K % 256u == 0u && N > 0u && N % 2u == 0u;
+                // The fourth word is an exact bit identity that preserves the
+                // baseline scale/GELU rounding boundaries in the fused shader.
+                auto qp = fused ? mkP(name + "_quant_p", {K,N,M,0xffffffffu})
+                                : mkP(name + "_quant_p", {K,N,M});
                 add(*q8quant, {{0,x},{1,gemmaPf.actQ8},{2,gemmaPf.actScale},{3,qp}},
                     (K+255)/256,M,name+"_quant");
-                add(*q4prequant, {{0,gemmaPf.actQ8},{1,gemmaPf.actScale},
-                    {2,w},{3,s},{4,y},{5,qp}},
-                    (M+7)/8,(N+q4PrequantCols-1)/q4PrequantCols,name);
+                const auto& projection = fused ? *q4prequantGateupGelu : *q4prequant;
+                add(projection, {{0,gemmaPf.actQ8},{1,gemmaPf.actScale},
+                    {2,w},{3,s},{4,fused ? gemmaPf.act : y},{5,qp}},
+                    (M+7)/8, fused ? (N/2u+7u)/8u : (N+q4PrequantCols-1)/q4PrequantCols,
+                    fused ? "gpf_gateup_gelu_exact" : name);
+                return fused;
             } else if (weightsAreNativeQ4) {
                 add(q4mm, {{0,x},{1,w},{2,s},{3,y},{4,p}},
                     (N+31)/32,(M+3)/4,name);
@@ -8155,6 +8176,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                 add(q8mm, {{0,x},{1,w},{2,s},{3,zeroBiasQKV},{4,y},{5,q8p}},
                     (M+(useDP4A?3u:7u))/(useDP4A?4u:8u),(N+31)/32,name);
             }
+            return false;
         };
         if (cfg.pleSize > 0 && pleGpuPreprocess) {
             uint32_t totalPle = cfg.pleSize * cfg.nLayer;
@@ -8273,6 +8295,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                           {3,lw.ffnNorm},{4,gemmaPf.norm},{5,gemmaPf.rstd},{6,sp}},
                 M,1,"gpf_sandwich");
 
+            bool gateupGeluFused = false;
             auto gp=mkP("gpf_gu_"+std::to_string(li),{M,2u*im,cfg.nEmbd});
             if (lw.guQ4W.handle && !std::getenv("BP_GEMMA_Q8_GATEUP")) {
                 const auto& guKernel=q4zpRows8?*q4zpRows8:q4zp;
@@ -8280,12 +8303,14 @@ int32_t ModelRunner::prefillGemmaBatched(
                            {3,gemmaPf.gateup},{4,gp},{5,lw.guQ4Z}},
                     (2u*im+31)/32,(M+(q4zpRows8?7u:3u))/(q4zpRows8?8u:4u),"gpf_gateup_q4");
             } else {
-                mm(gemmaPf.norm,lw.guW,lw.guS,gemmaPf.gateup,
+                gateupGeluFused = mm(gemmaPf.norm,lw.guW,lw.guS,gemmaPf.gateup,
                    cfg.nEmbd,2u*im,"gpf_gateup");
             }
-            auto gap=mkP("gpf_gelu_"+std::to_string(li),{M,im});
-            add(geluMul,{{0,gemmaPf.gateup},{1,gemmaPf.act},{2,gap}},
-                (M*im+255)/256,1,"gpf_gelu");
+            if (!gateupGeluFused) {
+                auto gap=mkP("gpf_gelu_"+std::to_string(li),{M,im});
+                add(geluMul,{{0,gemmaPf.gateup},{1,gemmaPf.act},{2,gap}},
+                    (M*im+255)/256,1,"gpf_gelu");
+            }
             auto dp=mkP("gpf_down_"+std::to_string(li),{M,cfg.nEmbd,im});
             if (lw.dnQ4W.handle && !std::getenv("BP_GEMMA_Q8_DOWN")) {
                 add(q4zp, {{0,gemmaPf.act},{1,lw.dnQ4W},{2,lw.dnQ4S},

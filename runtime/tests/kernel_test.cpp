@@ -12,6 +12,7 @@
  */
 
 #include "gpu_context.h"
+#include "model_runner.h"
 #include "wgsl_template.h"
 #include "graph_executor.h"  // for TensorDtype enum
 #include "gguf_loader.h"
@@ -556,6 +557,76 @@ TEST(gemma_rope_reduction_reuse) {
     }
     return {true,""};
 }
+
+TEST(gemma_gateup_gelu_exact) {
+    if (gpu.adapterName != "NVIDIA GeForce RTX 5080" || g_backend != WGPUBackendType_D3D12)
+        return {false, "Gemma exact fusion test requires RTX 5080 / D3D12"};
+    auto fusedSource = gemmaQ4PrefillSource(true);
+    auto reassociatedSource = fusedSource;
+    const std::string boundary = "let orderedGelu=bitcast<f32>(bitcast<u32>(gelu)&P[3]);Y[row*H+col]=orderedGelu*uv;";
+    const auto at = reassociatedSource.find(boundary);
+    if (at == std::string::npos) return {false, "GELU rounding boundary missing"};
+    reassociatedSource.replace(at, boundary.size(), "Y[row*H+col]=gelu*uv;");
+    auto& base = gpu.getOrCreatePipeline("test_gemma_q4_reference", gemmaQ4PrefillSource(false), 6);
+    auto& fused = gpu.getOrCreatePipeline("test_gemma_gu_exact", fusedSource, 6);
+    auto& counter = gpu.getOrCreatePipeline("test_gemma_gu_reassociated", reassociatedSource, 6);
+    auto& gelu = gpu.getOrCreatePipeline("test_gemma_separate_gelu", getEmbeddedKernels().at("gelu_mul_batched").source, 3);
+    bool roundingFailureExposed = false;
+    for (uint32_t K : {256u, 768u, 1536u}) for (uint32_t M : {1u, 3u, 9u, 128u}) for (uint32_t H : {1u, 8u, 19u}) {
+        const uint32_t N = H * 2;
+        std::vector<uint32_t> xq(size_t(M)*K/4), weights(size_t(N)*K/8);
+        std::vector<float> xs(size_t(M)*K/32);
+        std::vector<uint16_t> halfScales(size_t(N)*K/32);
+        std::vector<uint32_t> scales((halfScales.size()+1)/2);
+        for (size_t i=0;i<xq.size();++i) xq[i]=uint32_t(i*2246822519ull)^0x517cc1b7u;
+        for (size_t i=0;i<weights.size();++i) weights[i]=uint32_t(i*2654435761ull)^0x89abcdefu;
+        for (size_t i=0;i<xs.size();++i) xs[i]=0.001f+float(i%13)*0.000013f;
+        for (size_t i=0;i<halfScales.size();++i) {
+            halfScales[i]=uint16_t(0x2400+(i%1024))|((i%3==0)?0x8000:0);
+            scales[i/2]|=uint32_t(halfScales[i])<<((i%2)*16);
+        }
+        auto bx=makeBufferU32(gpu,"gu_xq",xq.data(),int(xq.size()));
+        auto bs=makeBuffer(gpu,"gu_xs",xs.data(),int(xs.size()));
+        auto bw=makeBufferU32(gpu,"gu_w",weights.data(),int(weights.size()));
+        auto bws=makeBufferU32(gpu,"gu_ws",scales.data(),int(scales.size()));
+        auto bgu=makeBuffer(gpu,"gu_reference",nullptr,int(M*N));
+        auto by=makeBuffer(gpu,"gu_result",nullptr,int(M*H));
+        auto bp=makeParams(gpu,"gu_params",{K,N,M,0xffffffffu});
+        auto bgp=makeParams(gpu,"gelu_params",{M,H});
+        auto bg=gpu.createBindGroup(base,{{0,bx},{1,bs},{2,bw},{3,bws},{4,bgu},{5,bp}});
+        auto gg=gpu.createBindGroup(gelu,{{0,bgu},{1,by},{2,bgp}});
+        auto fg=gpu.createBindGroup(fused,{{0,bx},{1,bs},{2,bw},{3,bws},{4,by},{5,bp}});
+        auto cg=gpu.createBindGroup(counter,{{0,bx},{1,bs},{2,bw},{3,bws},{4,by},{5,bp}});
+        auto expected=gpu.submitAndReadback({{base.pipeline,bg,(M+7)/8,(N+7)/8,1,"reference_projection"},
+            {gelu.pipeline,gg,(M*H+255)/256,1,1,"reference_gelu"}},by,by.size);
+        auto actual=gpu.submitAndReadback({{fused.pipeline,fg,(M+7)/8,(H+7)/8,1,"fused_gelu"}},by,by.size);
+        auto broken=gpu.submitAndReadback({{counter.pipeline,cg,(M+7)/8,(H+7)/8,1,"without_rounding_boundary"}},by,by.size);
+        roundingFailureExposed |= broken != expected;
+        const auto* values=reinterpret_cast<const float*>(actual.data());
+        bool valid=actual==expected && !gpu.executionError && !gpu.deviceLost;
+        for (size_t i=0;i<actual.size()/4;++i) valid &= std::isfinite(values[i]);
+        auto dot=[&](uint32_t m,uint32_t n) {
+            double sum=0;
+            for(uint32_t k=0;k<K;++k) {
+                const int a=int(int8_t((xq[size_t(m)*K/4+k/4]>>((k%4)*8))&255));
+                const int q=int((weights[size_t(n)*K/8+k/8]>>((k%8)*4))&15)-8;
+                sum+=double(a*q)*xs[size_t(m)*K/32+k/32]*f16ToF32(halfScales[size_t(n)*K/32+k/32]);
+            }
+            return sum;
+        };
+        for(uint32_t m:{0u,M-1})for(uint32_t n:{0u,H-1}) {
+            const double g=dot(m,n),u=dot(m,n+H);
+            const double cpu=0.5*g*(1+std::tanh(0.7978845608*(g+0.044715*g*g*g)))*u;
+            valid &= std::abs(values[size_t(m)*H+n]-cpu)<=2e-4+2e-5*std::abs(cpu);
+        }
+        for(auto group:{bg,gg,fg,cg})wgpuBindGroupRelease(group);
+        for(auto buffer:{bx,bs,bw,bws,bgu,by,bp,bgp})gpu.releaseBuffer(buffer);
+        if(!valid)return {false,"Fused/CPU parity failed at M="+std::to_string(M)+" H="+std::to_string(H)+" K="+std::to_string(K)};
+    }
+    if(!roundingFailureExposed)return {false,"Counterfactual GELU reassociation was not exposed"};
+    return {true,""};
+}
+
 
 TEST(causal_attention_sliding_window_rows) {
     // With Q=K=0 the expected result is the mean of the visible V rows.

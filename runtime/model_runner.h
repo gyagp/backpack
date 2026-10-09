@@ -19,6 +19,9 @@
 #include <unordered_map>
 #include <vector>
 
+// Native Gemma Q4 prefill sources, shared by runtime dispatch and parity tests.
+std::string gemmaQ4PrefillSource(bool fusedGateupGelu);
+
 struct ModelRunner {
     GPUContext* gpu = nullptr;
     ModelConfig cfg;
