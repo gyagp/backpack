@@ -23,6 +23,24 @@
 std::string gemmaQ4PrefillSource(bool fusedGateupGelu);
 
 struct ModelRunner {
+    ModelRunner() = default;
+    ~ModelRunner();
+    ModelRunner(const ModelRunner&) = delete;
+    ModelRunner& operator=(const ModelRunner&) = delete;
+    ModelRunner(ModelRunner&&) = delete;
+    ModelRunner& operator=(ModelRunner&&) = delete;
+
+    // The device outlives the model. Only creation owns a resource; field copies
+    // and views borrow it. Transient parameters retire before model teardown.
+    GPUBuffer createOwnedBuffer(const std::string& name, uint64_t size,
+        uint64_t usage = BUF_DEFAULT, bool mappedAtCreation = false);
+    void releaseOwnedBuffer(GPUBuffer buffer);
+    void releaseOwnedBindGroup(WGPUBindGroup group);
+    void submitOwned(const std::vector<Dispatch>& dispatches, bool singlePass,
+        bool profiling, bool retainForReplay);
+    std::unordered_map<WGPUBuffer, GPUBuffer> ownedBuffers_;
+    std::unordered_map<WGPUBindGroup, bool> ownedBindGroups_;
+
     GPUContext* gpu = nullptr;
     ModelConfig cfg;
     GGUFFile gguf;  // retained for tokenizer access

@@ -607,7 +607,9 @@ WGPUBindGroup ModelRunner::makeBG(
     d.layout = pl.bgLayout;
     d.entryCount = (uint32_t)bindings.size();
     d.entries = entries;
-    return wgpuDeviceCreateBindGroup(gpu->device, &d);
+    auto group = wgpuDeviceCreateBindGroup(gpu->device, &d);
+    if (group) ownedBindGroups_.emplace(group, true);
+    return group;
 }
 
 const CompiledPipeline& ModelRunner::getKernel(const std::string& name) {
@@ -1052,13 +1054,14 @@ static uint16_t f32_to_fp16(float v) {
 
 // ─── Upload Q8 weight pair ──────────────────────────────────────────────────
 
-static void uploadQ8Weight(GPUContext& gpu, const std::string& name,
+static void uploadQ8Weight(ModelRunner& owner, const std::string& name,
                            const Q8Repacked& rep,
                            GPUBuffer& wBuf, GPUBuffer& sBuf) {
+    auto& gpu = *owner.gpu;
     uint64_t wSize = rep.weights.size() * 4;
     uint64_t sSize = rep.scales.size() * 4;
-    wBuf = gpu.createBuffer(name + ".w", wSize);
-    sBuf = gpu.createBuffer(name + ".s", sSize);
+    wBuf = owner.createOwnedBuffer(name + ".w", wSize);
+    sBuf = owner.createOwnedBuffer(name + ".s", sSize);
     constexpr uint64_t CHUNK = 64ull * 1024 * 1024;
     for (uint64_t off = 0; off < wSize; off += CHUNK)
         gpu.writeBuffer(wBuf, reinterpret_cast<const uint8_t*>(rep.weights.data()) + off,
@@ -1068,10 +1071,11 @@ static void uploadQ8Weight(GPUContext& gpu, const std::string& name,
                         std::min(CHUNK, sSize - off), off);
 }
 
-static GPUBuffer uploadBytes(GPUContext& gpu, const std::string& name,
+static GPUBuffer uploadBytes(ModelRunner& owner, const std::string& name,
                              const std::vector<uint8_t>& data) {
+    auto& gpu = *owner.gpu;
     if (data.empty()) return {};
-    auto out = gpu.createBuffer(name, std::max<size_t>(4, data.size()));
+    auto out = owner.createOwnedBuffer(name, std::max<size_t>(4, data.size()));
     constexpr uint64_t CHUNK = 64ull * 1024 * 1024;
     for (uint64_t off = 0; off < data.size(); off += CHUNK)
         gpu.writeBuffer(out, data.data() + off,
@@ -1262,8 +1266,8 @@ bool ModelRunner::load(GPUContext& ctx, const std::string& path) {
     if (cfg.numExperts > 0) {
         uint32_t cb3_n = 0; const uint32_t* cb3 = getIq3sGrid(&cb3_n);
         uint32_t cb2_n = 0; const uint32_t* cb2 = getIq2sGridU32(&cb2_n);
-        iq3sCodebookBuf = gpu->createBuffer("iq3s_codebook", cb3_n * 4);
-        iq2sCodebookBuf = gpu->createBuffer("iq2s_codebook", cb2_n * 4);
+        iq3sCodebookBuf = createOwnedBuffer("iq3s_codebook", cb3_n * 4);
+        iq2sCodebookBuf = createOwnedBuffer("iq2s_codebook", cb2_n * 4);
         gpu->writeBuffer(iq3sCodebookBuf, cb3, cb3_n * 4);
         gpu->writeBuffer(iq2sCodebookBuf, cb2, cb2_n * 4);
         fprintf(stderr, "  IQ codebooks uploaded: iq3s=%u u32, iq2s=%u u32\n", cb3_n, cb2_n);
@@ -1466,10 +1470,10 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
     fprintf(stderr, "  zero-bias sizing: nEmbd=%u maxQkvOut=%u maxIntermediateSize=%u maxBias=%u\n",
             cfg.nEmbd, maxQkvOut, maxIntermediateSize, maxBias);
     std::vector<float> zeros(maxBias, 0.0f);
-    zeroBiasE   = gpu->createBuffer("zero_bias_E", cfg.nEmbd * 4);
-    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", maxQkvOut * 4);
-    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * maxIntermediateSize * 4);
-    zeroBiasV   = gpu->createBuffer("zero_bias_V", cfg.nVocab * 4);
+    zeroBiasE   = createOwnedBuffer("zero_bias_E", cfg.nEmbd * 4);
+    zeroBiasQKV = createOwnedBuffer("zero_bias_QKV", maxQkvOut * 4);
+    zeroBiasGU  = createOwnedBuffer("zero_bias_GU", 2 * maxIntermediateSize * 4);
+    zeroBiasV   = createOwnedBuffer("zero_bias_V", cfg.nVocab * 4);
     gpu->writeBuffer(zeroBiasE,   zeros.data(), cfg.nEmbd * 4);
     gpu->writeBuffer(zeroBiasQKV, zeros.data(), maxQkvOut * 4);
     gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * maxIntermediateSize * 4);
@@ -1488,8 +1492,8 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         } else {
             uint32_t layerKvDim = pl.kvDim > 0 ? pl.kvDim : cfg.nKvHeads * cfg.headDim;
             uint64_t kvSize = (uint64_t)maxSeqLen * layerKvDim * 2;  // fp16
-            kvCache[i].K = gpu->createBuffer("kv_K_" + std::to_string(i), kvSize);
-            kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
+            kvCache[i].K = createOwnedBuffer("kv_K_" + std::to_string(i), kvSize);
+            kvCache[i].V = createOwnedBuffer("kv_V_" + std::to_string(i), kvSize);
             kvCache[i].len = 0;
             totalKvBytes += kvSize * 2;
         }
@@ -1504,16 +1508,16 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         auto& ld = onnx.layers[i];
 
         if (cfg.arch == "qwen35" && cfg.isAttentionLayer(i)) {
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_qj",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_qj",
                            ld.qwenAttnQ, lw.qjW, lw.qjS);
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_k",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_k",
                            ld.qwenAttnK, lw.kSepW, lw.kSepS);
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_v",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_v",
                            ld.qwenAttnV, lw.vSepW, lw.vSepS);
         } else if (cfg.arch == "qwen35") {
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_qkv",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_ssm_qkv",
                            ld.qwenSsmQkv, lw.qkvW, lw.qkvS);
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_z",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_ssm_z",
                            ld.qwenSsmZ, lw.attnGateW, lw.attnGateS);
             Q8Repacked betaAlpha;
             betaAlpha.N = ld.qwenSsmBeta.N + ld.qwenSsmAlpha.N;
@@ -1524,13 +1528,13 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             betaAlpha.scales = ld.qwenSsmBeta.scales;
             betaAlpha.scales.insert(betaAlpha.scales.end(),
                 ld.qwenSsmAlpha.scales.begin(), ld.qwenSsmAlpha.scales.end());
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_beta_alpha",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_ssm_beta_alpha",
                            betaAlpha, lw.ssmBetaAlphaW, lw.ssmBetaAlphaS);
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qwen_ssm_out",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qwen_ssm_out",
                            ld.qwenSsmOut, lw.ssmOutW, lw.ssmOutS);
             auto uploadRaw = [&](const std::string& name, const std::vector<float>& src,
                                  GPUBuffer& dst) {
-                dst = gpu->createBuffer(name, src.size() * sizeof(float));
+                dst = createOwnedBuffer(name, src.size() * sizeof(float));
                 gpu->writeBuffer(dst, src.data(), src.size() * sizeof(float));
             };
             const std::string p = "L" + std::to_string(i) + ".qwen_ssm_";
@@ -1542,75 +1546,75 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         }
 
         if (ld.qkv.N > 0) {
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".qkv",
                            ld.qkv, lw.qkvW, lw.qkvS);
         } else if (ld.qOnly.N > 0) {
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".q_only",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".q_only",
                            ld.qOnly, lw.qOnlyW, lw.qOnlyS);
             lw.qOnly = true;
         }
         if (ld.qkvQ4.N > 0) {
             const auto p="L"+std::to_string(i)+".qkv_q4";
-            lw.qkvQ4W=uploadBytes(*gpu,p+".w",ld.qkvQ4.weights);lw.qkvQ4S=uploadBytes(*gpu,p+".s",ld.qkvQ4.scales);lw.qkvQ4Z=uploadBytes(*gpu,p+".z",ld.qkvQ4.zeroPoints);
+            lw.qkvQ4W=uploadBytes(*this,p+".w",ld.qkvQ4.weights);lw.qkvQ4S=uploadBytes(*this,p+".s",ld.qkvQ4.scales);lw.qkvQ4Z=uploadBytes(*this,p+".z",ld.qkvQ4.zeroPoints);
         }
         if (ld.qOnlyQ4.N > 0) {
             const auto p="L"+std::to_string(i)+".qonly_q4";
-            lw.qOnlyQ4W=uploadBytes(*gpu,p+".w",ld.qOnlyQ4.weights);lw.qOnlyQ4S=uploadBytes(*gpu,p+".s",ld.qOnlyQ4.scales);lw.qOnlyQ4Z=uploadBytes(*gpu,p+".z",ld.qOnlyQ4.zeroPoints);
+            lw.qOnlyQ4W=uploadBytes(*this,p+".w",ld.qOnlyQ4.weights);lw.qOnlyQ4S=uploadBytes(*this,p+".s",ld.qOnlyQ4.scales);lw.qOnlyQ4Z=uploadBytes(*this,p+".z",ld.qOnlyQ4.zeroPoints);
         }
         if (ld.o.N > 0)
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
-        if(ld.oQ4.N>0){const auto p="L"+std::to_string(i)+".o_q4";lw.oQ4W=uploadBytes(*gpu,p+".w",ld.oQ4.weights);lw.oQ4S=uploadBytes(*gpu,p+".s",ld.oQ4.scales);lw.oQ4Z=uploadBytes(*gpu,p+".z",ld.oQ4.zeroPoints);}
-        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".o", ld.o, lw.oW, lw.oS);
+        if(ld.oQ4.N>0){const auto p="L"+std::to_string(i)+".o_q4";lw.oQ4W=uploadBytes(*this,p+".w",ld.oQ4.weights);lw.oQ4S=uploadBytes(*this,p+".s",ld.oQ4.scales);lw.oQ4Z=uploadBytes(*this,p+".z",ld.oQ4.zeroPoints);}
+        uploadQ8Weight(*this, "L" + std::to_string(i) + ".gu", ld.gateup, lw.guW, lw.guS);
         if (ld.gateupQ4.N > 0) {
             const auto p = "L" + std::to_string(i) + ".gu_q4";
-            lw.guQ4W = uploadBytes(*gpu, p + ".w", ld.gateupQ4.weights);
-            lw.guQ4S = uploadBytes(*gpu, p + ".s", ld.gateupQ4.scales);
-            lw.guQ4Z = uploadBytes(*gpu, p + ".z", ld.gateupQ4.zeroPoints);
+            lw.guQ4W = uploadBytes(*this, p + ".w", ld.gateupQ4.weights);
+            lw.guQ4S = uploadBytes(*this, p + ".s", ld.gateupQ4.scales);
+            lw.guQ4Z = uploadBytes(*this, p + ".z", ld.gateupQ4.zeroPoints);
         }
-        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", ld.down, lw.dnW, lw.dnS);
+        uploadQ8Weight(*this, "L" + std::to_string(i) + ".dn", ld.down, lw.dnW, lw.dnS);
         if (ld.downQ4.N > 0) {
             const auto p = "L" + std::to_string(i) + ".dn_q4";
-            lw.dnQ4W = uploadBytes(*gpu, p + ".w", ld.downQ4.weights);
-            lw.dnQ4S = uploadBytes(*gpu, p + ".s", ld.downQ4.scales);
-            lw.dnQ4Z = uploadBytes(*gpu, p + ".z", ld.downQ4.zeroPoints);
+            lw.dnQ4W = uploadBytes(*this, p + ".w", ld.downQ4.weights);
+            lw.dnQ4S = uploadBytes(*this, p + ".s", ld.downQ4.scales);
+            lw.dnQ4Z = uploadBytes(*this, p + ".z", ld.downQ4.zeroPoints);
         }
         if (ld.pleInputGate.N > 0)
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_gate",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".ple_gate",
                            ld.pleInputGate, lw.pleInpGateW, lw.pleInpGateS);
-        if(ld.pleInputGateQ4.N>0){const auto p="L"+std::to_string(i)+".ple_gate_q4";lw.pleInpGateQ4W=uploadBytes(*gpu,p+".w",ld.pleInputGateQ4.weights);lw.pleInpGateQ4S=uploadBytes(*gpu,p+".s",ld.pleInputGateQ4.scales);lw.pleInpGateQ4Z=uploadBytes(*gpu,p+".z",ld.pleInputGateQ4.zeroPoints);}
+        if(ld.pleInputGateQ4.N>0){const auto p="L"+std::to_string(i)+".ple_gate_q4";lw.pleInpGateQ4W=uploadBytes(*this,p+".w",ld.pleInputGateQ4.weights);lw.pleInpGateQ4S=uploadBytes(*this,p+".s",ld.pleInputGateQ4.scales);lw.pleInpGateQ4Z=uploadBytes(*this,p+".z",ld.pleInputGateQ4.zeroPoints);}
         if (ld.pleProjection.N > 0)
-            uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".ple_proj",
+            uploadQ8Weight(*this, "L" + std::to_string(i) + ".ple_proj",
                            ld.pleProjection, lw.pleProjW, lw.pleProjS);
-        if(ld.pleProjectionQ4.N>0){const auto p="L"+std::to_string(i)+".ple_proj_q4";lw.pleProjQ4W=uploadBytes(*gpu,p+".w",ld.pleProjectionQ4.weights);lw.pleProjQ4S=uploadBytes(*gpu,p+".s",ld.pleProjectionQ4.scales);lw.pleProjQ4Z=uploadBytes(*gpu,p+".z",ld.pleProjectionQ4.zeroPoints);}
+        if(ld.pleProjectionQ4.N>0){const auto p="L"+std::to_string(i)+".ple_proj_q4";lw.pleProjQ4W=uploadBytes(*this,p+".w",ld.pleProjectionQ4.weights);lw.pleProjQ4S=uploadBytes(*this,p+".s",ld.pleProjectionQ4.scales);lw.pleProjQ4Z=uploadBytes(*this,p+".z",ld.pleProjectionQ4.zeroPoints);}
 
         // Norm weights
         if (!ld.inputNorm.empty()) {
-            lw.inputNorm = gpu->createBuffer("L" + std::to_string(i) + ".inorm",
+            lw.inputNorm = createOwnedBuffer("L" + std::to_string(i) + ".inorm",
                                               ld.inputNorm.size() * 4);
             gpu->writeBuffer(lw.inputNorm, ld.inputNorm.data(), ld.inputNorm.size() * 4);
         }
         if (!ld.postAttnNorm.empty()) {
             GPUBuffer& dst = (cfg.arch == "gemma4" || cfg.arch == "qwen35")
                 ? lw.postNorm : lw.postAttnNorm;
-            dst = gpu->createBuffer("L" + std::to_string(i) + ".panorm",
+            dst = createOwnedBuffer("L" + std::to_string(i) + ".panorm",
                                                  ld.postAttnNorm.size() * 4);
             gpu->writeBuffer(dst, ld.postAttnNorm.data(), ld.postAttnNorm.size() * 4);
         }
         // QK norm (optional)
         if (!ld.qNorm.empty()) {
-            lw.qNorm = gpu->createBuffer("L" + std::to_string(i) + ".qnorm",
+            lw.qNorm = createOwnedBuffer("L" + std::to_string(i) + ".qnorm",
                                           ld.qNorm.size() * 4);
             gpu->writeBuffer(lw.qNorm, ld.qNorm.data(), ld.qNorm.size() * 4);
         }
         if (!ld.kNorm.empty()) {
-            lw.kNorm = gpu->createBuffer("L" + std::to_string(i) + ".knorm",
+            lw.kNorm = createOwnedBuffer("L" + std::to_string(i) + ".knorm",
                                           ld.kNorm.size() * 4);
             gpu->writeBuffer(lw.kNorm, ld.kNorm.data(), ld.kNorm.size() * 4);
         }
         auto uploadNorm = [&](const std::string& name, const std::vector<float>& src,
                               GPUBuffer& dst) {
             if (src.empty()) return;
-            dst = gpu->createBuffer(name, src.size() * 4);
+            dst = createOwnedBuffer(name, src.size() * 4);
             gpu->writeBuffer(dst, src.data(), src.size() * 4);
         };
         uploadNorm("L" + std::to_string(i) + ".ffn_norm", ld.preFfnNorm, lw.ffnNorm);
@@ -1624,7 +1628,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
 
     // Final norm
     if (!onnx.finalNorm.empty()) {
-        finalNormW = gpu->createBuffer("final_norm", onnx.finalNorm.size() * 4);
+        finalNormW = createOwnedBuffer("final_norm", onnx.finalNorm.size() * 4);
         gpu->writeBuffer(finalNormW, onnx.finalNorm.data(), onnx.finalNorm.size() * 4);
     }
 
@@ -1634,7 +1638,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
 
     if (cfg.pleSize > 0 && onnx.pleEmbedding.layers == cfg.nLayer) {
         auto uploadRaw = [&](const std::string& name, const std::vector<uint8_t>& src) {
-            GPUBuffer b = gpu->createBuffer(name, src.size());
+            GPUBuffer b = createOwnedBuffer(name, src.size());
             constexpr uint64_t CHUNK = 64ull * 1024 * 1024;
             for (uint64_t off = 0; off < src.size(); off += CHUNK)
                 gpu->writeBuffer(b, src.data() + off,
@@ -1646,10 +1650,10 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         pleTokenEmbZ = uploadRaw("ple_token_zero_points", onnx.pleEmbedding.zeroPoints);
         pleTokenEmbAsymmetric = true;
         if (onnx.pleModelProjection.N > 0)
-            uploadQ8Weight(*gpu, "ple_model_projection", onnx.pleModelProjection,
+            uploadQ8Weight(*this, "ple_model_projection", onnx.pleModelProjection,
                            pleModelProjW, pleModelProjS);
         if (!onnx.pleProjectionNorm.empty()) {
-            pleProjNormW = gpu->createBuffer("ple_projection_norm",
+            pleProjNormW = createOwnedBuffer("ple_projection_norm",
                                              onnx.pleProjectionNorm.size() * 4);
             gpu->writeBuffer(pleProjNormW, onnx.pleProjectionNorm.data(),
                              onnx.pleProjectionNorm.size() * 4);
@@ -1664,8 +1668,8 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
 
     // LM head
     if (onnx.hasLmHeadQ8) {
-        uploadQ8Weight(*gpu, "lm_head_q8", onnx.lmHeadQ8, lmHeadQ8W, lmHeadQ8S);
-        if(onnx.lmHeadQ4.N>0){lmHeadQ4W=uploadBytes(*gpu,"lm_head_q4_prefill.w",onnx.lmHeadQ4.weights);lmHeadQ4S=uploadBytes(*gpu,"lm_head_q4_prefill.s",onnx.lmHeadQ4.scales);lmHeadQ4Z=uploadBytes(*gpu,"lm_head_q4_prefill.z",onnx.lmHeadQ4.zeroPoints);}
+        uploadQ8Weight(*this, "lm_head_q8", onnx.lmHeadQ8, lmHeadQ8W, lmHeadQ8S);
+        if(onnx.lmHeadQ4.N>0){lmHeadQ4W=uploadBytes(*this,"lm_head_q4_prefill.w",onnx.lmHeadQ4.weights);lmHeadQ4S=uploadBytes(*this,"lm_head_q4_prefill.s",onnx.lmHeadQ4.scales);lmHeadQ4Z=uploadBytes(*this,"lm_head_q4_prefill.z",onnx.lmHeadQ4.zeroPoints);}
         lmHeadIsQ8 = true;
         fprintf(stderr, "  LM head: separate (Q8)\n");
     } else if (cfg.tieWordEmbeddings) {
@@ -1702,7 +1706,7 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
             }
         }
         auto rep = repack_q8_0(blocks.data(), cfg.nVocab, nBlocksPerRow * 32);
-        uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
+        uploadQ8Weight(*this, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
         lmHeadIsQ8 = true;
         fprintf(stderr, "  LM head: tied embeddings (Q8)\n");
     }
@@ -1717,8 +1721,8 @@ bool ModelRunner::loadOnnx(GPUContext& ctx, const std::string& onnxDir) {
         uint32_t ropeHalf = onnx.ropeHalfDim;
         uint32_t maxPos = std::min(onnx.ropeMaxPositions, maxSeqLen);
         uint64_t ropeBytes = (uint64_t)maxPos * ropeHalf * 4;
-        ropeCosBuf = gpu->createBuffer("rope_cos", ropeBytes);
-        ropeSinBuf = gpu->createBuffer("rope_sin", ropeBytes);
+        ropeCosBuf = createOwnedBuffer("rope_cos", ropeBytes);
+        ropeSinBuf = createOwnedBuffer("rope_sin", ropeBytes);
         // Only upload up to maxSeqLen positions
         if (onnx.ropeMaxPositions > maxSeqLen) {
             // Truncate
@@ -1788,10 +1792,10 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     fprintf(stderr, "  zero-bias sizing (GGUF): nEmbd=%u effQkvOut=%u effIntermediate=%u maxBias=%u\n",
             cfg.nEmbd, effQkvOut, effIntermediate, maxBias);
     std::vector<float> zeros(maxBias, 0.0f);
-    zeroBiasE   = gpu->createBuffer("zero_bias_E", cfg.nEmbd * 4);
-    zeroBiasQKV = gpu->createBuffer("zero_bias_QKV", effQkvOut * 4);
-    zeroBiasGU  = gpu->createBuffer("zero_bias_GU", 2 * effIntermediate * 4);
-    zeroBiasV   = gpu->createBuffer("zero_bias_V", cfg.nVocab * 4);
+    zeroBiasE   = createOwnedBuffer("zero_bias_E", cfg.nEmbd * 4);
+    zeroBiasQKV = createOwnedBuffer("zero_bias_QKV", effQkvOut * 4);
+    zeroBiasGU  = createOwnedBuffer("zero_bias_GU", 2 * effIntermediate * 4);
+    zeroBiasV   = createOwnedBuffer("zero_bias_V", cfg.nVocab * 4);
     gpu->writeBuffer(zeroBiasE,   zeros.data(), cfg.nEmbd * 4);
     gpu->writeBuffer(zeroBiasQKV, zeros.data(), effQkvOut * 4);
     gpu->writeBuffer(zeroBiasGU,  zeros.data(), 2 * effIntermediate * 4);
@@ -1801,8 +1805,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     kvCache.resize(cfg.nLayer);
     uint64_t kvSize = (uint64_t)maxSeqLen * cfg.nKvHeads * cfg.headDim * 2;  // 2 bytes per f16
     for (uint32_t i = 0; i < cfg.nLayer; i++) {
-        kvCache[i].K = gpu->createBuffer("kv_K_" + std::to_string(i), kvSize);
-        kvCache[i].V = gpu->createBuffer("kv_V_" + std::to_string(i), kvSize);
+        kvCache[i].K = createOwnedBuffer("kv_K_" + std::to_string(i), kvSize);
+        kvCache[i].V = createOwnedBuffer("kv_V_" + std::to_string(i), kvSize);
         kvCache[i].len = 0;
     }
     fprintf(stderr, "  KV cache: %.0f MB (fp16)\n", cfg.nLayer * 2.0 * kvSize / 1048576.0);
@@ -1833,7 +1837,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
         if (gemmaNormBias) {
             for (uint32_t j = 0; j < nel; j++) fp32[j] += 1.0f;
         }
-        buf = gpu->createBuffer(ggufName, nel * 4);
+        buf = createOwnedBuffer(ggufName, nel * 4);
         gpu->writeBuffer(buf, fp32.data(), nel * 4);
     };
 
@@ -1841,7 +1845,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
     auto uploadKQWeight = [&](const std::string& name, const KQuantPacked& kq,
                               GPUBuffer& buf) {
         uint64_t bytes = (uint64_t)kq.data.size() * 4;
-        buf = gpu->createBuffer(name, bytes);
+        buf = createOwnedBuffer(name, bytes);
         gpu->writeBuffer(buf, kq.data.data(), bytes);
     };
 
@@ -1855,8 +1859,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             std::getenv("BP_Q4K_DISABLE_LOADTIME_LAYOUT") != nullptr)
             return;
         auto dense = repack_q4k_dense(kq.data.data(), kq.N, kq.K);
-        weights = gpu->createBuffer(name + ".weights", dense.weights.size() * sizeof(uint32_t));
-        scalesMins = gpu->createBuffer(name + ".scale_min", dense.scalesMins.size() * sizeof(float));
+        weights = createOwnedBuffer(name + ".weights", dense.weights.size() * sizeof(uint32_t));
+        scalesMins = createOwnedBuffer(name + ".scale_min", dense.scalesMins.size() * sizeof(float));
         gpu->writeBuffer(weights, dense.weights.data(), dense.weights.size() * sizeof(uint32_t));
         gpu->writeBuffer(scalesMins, dense.scalesMins.data(), dense.scalesMins.size() * sizeof(float));
     };
@@ -1880,8 +1884,8 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                              uint32_t N, uint32_t K, GPUBuffer& weights, GPUBuffer& scales) {
         if (!q6PersistentSafe) return;
         auto dense = repack_q6k_dense(raw, N, K);
-        weights = gpu->createBuffer(name + ".weights", dense.weights.size() * sizeof(uint32_t));
-        scales = gpu->createBuffer(name + ".scales", dense.scales.size() * sizeof(float));
+        weights = createOwnedBuffer(name + ".weights", dense.weights.size() * sizeof(uint32_t));
+        scales = createOwnedBuffer(name + ".scales", dense.scales.size() * sizeof(float));
         gpu->writeBuffer(weights, dense.weights.data(), dense.weights.size() * sizeof(uint32_t));
         gpu->writeBuffer(scales, dense.scales.data(), dense.scales.size() * sizeof(float));
     };
@@ -2149,7 +2153,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                             uploadQ4Dense("L" + std::to_string(i) + suffix + ".ort", packed, q4Dense, q4ScaleMin);
                     } else {
                         auto rep = repackToQ8(src, N, cfg.nEmbd, type);
-                        uploadQ8Weight(*gpu, "L" + std::to_string(i) + suffix, rep, q8w, q8s);
+                        uploadQ8Weight(*this, "L" + std::to_string(i) + suffix, rep, q8w, q8s);
                     }
                 };
                 loadExact(qt,qOutDim,".qj_kq",lw.qjKQ,lw.qjQ4Dense,lw.qjQ4ScaleMin,lw.qjKQType,lw.qjKQNBlocks,lw.qjKQRowStride,lw.qjW,lw.qjS);
@@ -2187,7 +2191,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         uploadQ4Dense("L" + std::to_string(i) + ".qkv_ort", kq, lw.qkvQ4Dense, lw.qkvQ4ScaleMin);
                 } else {
                     auto rep = repackToQ8(src, qkvN, cfg.nEmbd, (GGUFType)qkvt.type);
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", rep, lw.qkvW, lw.qkvS);
+                    uploadQ8Weight(*this, "L" + std::to_string(i) + ".qkv", rep, lw.qkvW, lw.qkvS);
                 }
                 if (i == 0) {
                     fprintf(stderr, "  Pre-fused attn_qkv loaded: %u x %u, type=%u, %s path\n",
@@ -2203,7 +2207,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     uint32_t qN = (uint32_t)qt.shape[1];
                     auto qr = repackPrimary(fileData + gguf.data_offset + qt.offset,
                                          qN, cfg.nEmbd, (GGUFType)qt.type);
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qonly",
+                    uploadQ8Weight(*this, "L" + std::to_string(i) + ".qonly",
                                    qr, lw.qOnlyW, lw.qOnlyS);
                     lw.qOnly = true;
                 } else {
@@ -2228,7 +2232,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         auto kr = repackPrimary(fileData + gguf.data_offset + kt.offset, layerKvDim, cfg.nEmbd, (GGUFType)kt.type);
                         auto vr = repackPrimary(fileData + gguf.data_offset + vt.offset, layerKvDim, cfg.nEmbd, (GGUFType)vt.type);
                         auto fused = concatRepacked(concatRepacked(qr, kr), vr);
-                        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
+                        uploadQ8Weight(*this, "L" + std::to_string(i) + ".qkv", fused, lw.qkvW, lw.qkvS);
                     }
                 }
             }
@@ -2254,7 +2258,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     } else {
                         auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
                                                 cfg.nEmbd, layerQDim, (GGUFType)ti.type);
-                        uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
+                        uploadQ8Weight(*this, "L" + std::to_string(i) + ".o", rep, lw.oW, lw.oS);
                     }
             }
         }
@@ -2293,7 +2297,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     auto ur = repackPrimary(fileData + gguf.data_offset + ut.offset,
                                            layerIM, cfg.nEmbd, (GGUFType)ut.type);
                     auto fused = concatRepacked(gr, ur);
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
+                    uploadQ8Weight(*this, "L" + std::to_string(i) + ".gu", fused, lw.guW, lw.guS);
                 }
             }
         }
@@ -2321,7 +2325,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 } else {
                     auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
                                             cfg.nEmbd, layerIM, (GGUFType)ti.type);
-                    uploadQ8Weight(*gpu, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
+                    uploadQ8Weight(*this, "L" + std::to_string(i) + ".dn", rep, lw.dnW, lw.dnS);
                 }
             }
         }
@@ -2365,12 +2369,12 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         !std::getenv("BP_Q8_PLE")) {
                         auto rep = repackQ4_0Native(
                             fileData + gguf.data_offset + ti.offset, N, K);
-                        uploadQ8Weight(*gpu, name + ".q4", rep, wBuf, sBuf);
+                        uploadQ8Weight(*this, name + ".q4", rep, wBuf, sBuf);
                         pleWeightsUseFp16 = true;
                     } else {
                         auto rep = repackPrimary(fileData + gguf.data_offset + ti.offset,
                                                N, K, (GGUFType)ti.type);
-                        uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                        uploadQ8Weight(*this, name, rep, wBuf, sBuf);
                     }
                 }
             };
@@ -2419,7 +2423,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 // depth and produces garbage, and disabling it also breaks output;
                 // the raw value is correct. NOT the (real-1) convention despite the
                 // small magnitude.
-                lw.outScale = gpu->createBuffer("L" + std::to_string(i) + ".out_scale", 4);
+                lw.outScale = createOwnedBuffer("L" + std::to_string(i) + ".out_scale", 4);
                 gpu->writeBuffer(lw.outScale, &scale, 4);
             }
         }
@@ -2439,7 +2443,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& ti = gguf.tensors[it->second];
                 auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
                                        N, K, (GGUFType)ti.type);
-                uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                uploadQ8Weight(*this, name, rep, wBuf, sBuf);
                 return true;
             };
             // Router: [nExperts, E]
@@ -2499,7 +2503,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         return false;
                 }
                 size_t bytes = (size_t)packed.data.size() * 4;
-                wBuf = gpu->createBuffer(name, bytes);
+                wBuf = createOwnedBuffer(name, bytes);
                 gpu->writeBuffer(wBuf, packed.data.data(), bytes);
                 if (i == 0) {
                     fprintf(stderr, "    %s: %u rows × %u cols, type=%u, %.1f MB on GPU\n",
@@ -2536,7 +2540,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 dequant_tensor(fileData + gguf.data_offset + ti.offset,
                                fp32.data(), 1, nel, (GGUFType)ti.type);
                 size_t bytes = (size_t)nel * 4;
-                buf = gpu->createBuffer(name, bytes);
+                buf = createOwnedBuffer(name, bytes);
                 gpu->writeBuffer(buf, fp32.data(), bytes);
                 return true;
             };
@@ -2547,7 +2551,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 auto& ti = gguf.tensors[it->second];
                 auto rep = repackToQ8(fileData + gguf.data_offset + ti.offset,
                                       N, K, (GGUFType)ti.type);
-                uploadQ8Weight(*gpu, name, rep, wBuf, sBuf);
+                uploadQ8Weight(*this, name, rep, wBuf, sBuf);
                 return true;
             };
             auto loadProjKQ = [&](const std::string& name, uint32_t N, uint32_t K,
@@ -2593,17 +2597,17 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 fused.scales.reserve(betaRep.scales.size() + alphaRep.scales.size());
                 fused.scales.insert(fused.scales.end(), betaRep.scales.begin(), betaRep.scales.end());
                 fused.scales.insert(fused.scales.end(), alphaRep.scales.begin(), alphaRep.scales.end());
-                uploadQ8Weight(*gpu, pfx + "ssm_beta_alpha.weight", fused,
+                uploadQ8Weight(*this, pfx + "ssm_beta_alpha.weight", fused,
                                lw.ssmBetaAlphaW, lw.ssmBetaAlphaS);
                 loaded += 2;
             } else {
                 if (haveBeta) {
-                    uploadQ8Weight(*gpu, pfx + "ssm_beta.weight", betaRep,
+                    uploadQ8Weight(*this, pfx + "ssm_beta.weight", betaRep,
                                    lw.ssmBetaW, lw.ssmBetaS);
                     loaded++;
                 }
                 if (haveAlpha) {
-                    uploadQ8Weight(*gpu, pfx + "ssm_alpha.weight", alphaRep,
+                    uploadQ8Weight(*this, pfx + "ssm_alpha.weight", alphaRep,
                                    lw.ssmAlphaW, lw.ssmAlphaS);
                     loaded++;
                 }
@@ -2720,7 +2724,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                 } else if (ti.type == GGUF_TYPE_Q8_0) {
                     // Keep as Q8 on GPU — no dequant needed
                     auto rep = repack_q8_0(data, cfg.nVocab, cfg.nEmbd);
-                    uploadQ8Weight(*gpu, "lm_head_q8", rep,
+                    uploadQ8Weight(*this, "lm_head_q8", rep,
                                    lmHeadQ8W, lmHeadQ8S);
                     lmHeadIsQ8 = true;
                     uint64_t wBytes = (uint64_t)rep.weights.size() * 4;
@@ -2731,7 +2735,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                            ti.type == GGUF_TYPE_Q5_0 || ti.type == GGUF_TYPE_Q5_1) {
                     if (weightsAreNativeQ4 && ti.type == GGUF_TYPE_Q4_0) {
                         auto rep = repackQ4_0Native(data, cfg.nVocab, cfg.nEmbd);
-                        uploadQ8Weight(*gpu, "lm_head_q4", rep, lmHeadQ8W, lmHeadQ8S);
+                        uploadQ8Weight(*this, "lm_head_q4", rep, lmHeadQ8W, lmHeadQ8S);
                         lmHeadIsQ4 = true;
                         fprintf(stderr, "  LM head: tied embeddings (native Q4_0, %llu MB)\n",
                             (unsigned long long)((rep.weights.size() * 4 + rep.scales.size() * 4) / 1048576));
@@ -2742,7 +2746,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     // big-vocab model, which on D3D12+Dawn destabilizes the
                     // queue (small subsequent writeBuffer calls silently no-op).
                     auto rep = repackToQ8(data, cfg.nVocab, cfg.nEmbd, (GGUFType)ti.type);
-                    uploadQ8Weight(*gpu, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
+                    uploadQ8Weight(*this, "lm_head_q8", rep, lmHeadQ8W, lmHeadQ8S);
                     lmHeadIsQ8 = true;
                     uint64_t wBytes = (uint64_t)rep.weights.size() * 4;
                     uint64_t sBytes = (uint64_t)rep.scales.size() * 4;
@@ -2758,7 +2762,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                     for (uint32_t j = 0; j < nel; j++)
                         fp16[j] = f32_to_fp16(embeddingCPU[j]);
                     uint64_t totalBytes = (uint64_t)nel * 2;
-                    lmHeadW = gpu->createBuffer("lm_head_fp16", totalBytes);
+                    lmHeadW = createOwnedBuffer("lm_head_fp16", totalBytes);
                     const uint64_t CHUNK = 128 * 1024 * 1024;
                     for (uint64_t off = 0; off < totalBytes; off += CHUNK) {
                         uint64_t sz = std::min(CHUNK, totalBytes - off);
@@ -2785,7 +2789,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             fprintf(stderr, "  LM head: separate native type=%u (%zu MB)\n", ti.type, packed.data.size()*4/1048576);
         } else {
             auto rep = repackToQ8(data, cfg.nVocab, cfg.nEmbd, ti.type);
-            uploadQ8Weight(*gpu, "lm_head_separate_q8", rep, lmHeadQ8W, lmHeadQ8S);
+            uploadQ8Weight(*this, "lm_head_separate_q8", rep, lmHeadQ8W, lmHeadQ8S);
             lmHeadIsQ8 = true;
         }
     }
@@ -2805,7 +2809,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
             if (requestGpuPle && ti.type == GGUF_TYPE_Q4_0 && cols % 32 == 0) {
                 auto rep = repackQ4_0Native(fileData + gguf.data_offset + ti.offset,
                                             rows, cols);
-                uploadQ8Weight(*gpu, "ple_token_emb_q4", rep,
+                uploadQ8Weight(*this, "ple_token_emb_q4", rep,
                                pleTokenEmbW, pleTokenEmbS);
                 fprintf(stderr, "  PLE embedding: %u × %u (native Q4 GPU, %zu MB)\n",
                         rows, cols, (rep.weights.size() + rep.scales.size()) * 4 / 1048576);
@@ -2831,7 +2835,7 @@ void ModelRunner::loadWeights(const GGUFFile& gguf,
                         ? repackQ4_0Native(fileData + gguf.data_offset + ti.offset, N, K)
                         : repackToQ8(fileData + gguf.data_offset + ti.offset,
                                      N, K, (GGUFType)ti.type);
-                    uploadQ8Weight(*gpu, "ple_model_proj", rep, pleModelProjW, pleModelProjS);
+                    uploadQ8Weight(*this, "ple_model_proj", rep, pleModelProjW, pleModelProjS);
                     if (!requestGpuPle) {
                         pleModelProjCPU.resize((size_t)N * K);
                         dequant_tensor(fileData + gguf.data_offset + ti.offset,
@@ -2931,8 +2935,8 @@ void ModelRunner::computeRopeTables() {
                 sinTable[pos * ropeHalf + i] = sinf(angle);
             }
         }
-        cosBuf = gpu->createBuffer(cosName, maxSeqLen * ropeHalf * 4);
-        sinBuf = gpu->createBuffer(sinName, maxSeqLen * ropeHalf * 4);
+        cosBuf = createOwnedBuffer(cosName, maxSeqLen * ropeHalf * 4);
+        sinBuf = createOwnedBuffer(sinName, maxSeqLen * ropeHalf * 4);
         gpu->writeBuffer(cosBuf, cosTable.data(), maxSeqLen * ropeHalf * 4);
         gpu->writeBuffer(sinBuf, sinTable.data(), maxSeqLen * ropeHalf * 4);
     };
@@ -3512,13 +3516,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Static params (shared between both sets — read-only)
     auto makeQ8Params = [&](const std::string& name, uint32_t K, uint32_t N) -> GPUBuffer {
         uint32_t data[4] = {K, N, 0, 0};
-        auto buf = gpu->createBuffer(name, 16);
+        auto buf = createOwnedBuffer(name, 16);
         gpu->writeBuffer(buf, data, 16);
         return buf;
     };
     auto makeQ4Params = [&](const std::string& name, uint32_t K, uint32_t N) -> GPUBuffer {
         uint32_t data[4] = {0, N, K, 0};
-        auto buf = gpu->createBuffer(name, 16);
+        auto buf = createOwnedBuffer(name, 16);
         gpu->writeBuffer(buf, data, 16);
         return buf;
     };
@@ -3531,7 +3535,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     {
         uint32_t data[4] = {cfg.nEmbd, qkvParamOut, 0, 0};
         float eps = cfg.rmsNormEps; memcpy(&data[3], &eps, 4);
-        q8QkvNormParams = gpu->createBuffer("p_qkv_norm", 16);
+        q8QkvNormParams = createOwnedBuffer("p_qkv_norm", 16);
         gpu->writeBuffer(q8QkvNormParams, data, 16);
     }
     auto q8OprojParams = makeQ8Params("p_oproj", qDim, cfg.nEmbd);
@@ -3554,14 +3558,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             {
                 uint32_t data[4] = {cfg.nEmbd, plQkvOut, 0, 0};
                 float eps = cfg.rmsNormEps; memcpy(&data[3], &eps, 4);
-                perLayerQkvNormParams[li] = gpu->createBuffer("p_qkv_norm_" + std::to_string(li), 16);
+                perLayerQkvNormParams[li] = createOwnedBuffer("p_qkv_norm_" + std::to_string(li), 16);
                 gpu->writeBuffer(perLayerQkvNormParams[li], data, 16);
             }
             perLayerOprojParams[li] = makeQ8Params("p_oproj_" + std::to_string(li), pl.qDim, cfg.nEmbd);
             perLayerGuParams[li] = makeQ8Params("p_gu_" + std::to_string(li), cfg.nEmbd, 2 * pl.intermediateSize);
             {
                 uint32_t data[4] = {pl.intermediateSize, cfg.nEmbd, pl.intermediateSize, 0};
-                perLayerDnSiluParams[li] = gpu->createBuffer(
+                perLayerDnSiluParams[li] = createOwnedBuffer(
                     "p_dn_silu_" + std::to_string(li), 16, BUF_UNIFORM | BUF_COPY_DST);
                 gpu->writeBuffer(perLayerDnSiluParams[li], data, 16);
             }
@@ -3571,7 +3575,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     GPUBuffer q8DnSiluParams;
     {
         uint32_t data[4] = {cfg.intermediateSize, cfg.nEmbd, cfg.intermediateSize, 0};
-        q8DnSiluParams = gpu->createBuffer("p_dn_silu", 16, BUF_UNIFORM | BUF_COPY_DST);
+        q8DnSiluParams = createOwnedBuffer("p_dn_silu", 16, BUF_UNIFORM | BUF_COPY_DST);
         gpu->writeBuffer(q8DnSiluParams, data, 16);
     }
 
@@ -3582,7 +3586,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // common ABI for all K-quant kernels so Dawn's inferred minimum binding
         // size is satisfied even when the offset is zero.
         uint32_t data[5] = {K, N, nBlocks, rowStride, 0};
-        auto buf = gpu->createBuffer(name, sizeof(data));
+        auto buf = createOwnedBuffer(name, sizeof(data));
         gpu->writeBuffer(buf, data, sizeof(data));
         return buf;
     };
@@ -3602,14 +3606,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rn[0] = cfg.nEmbd; rn[1] = cfg.nEmbd;
         float eps = cfg.rmsNormEps; memcpy(&rn[2], &eps, 4);
         rn[3] = 0;
-        rmsParams = gpu->createBuffer("p_rms", 16);
+        rmsParams = createOwnedBuffer("p_rms", 16);
         gpu->writeBuffer(rmsParams, rn, 16);
     }
 
     GPUBuffer lmheadParams;
     {
         uint32_t fp[4] = {cfg.nEmbd, cfg.nVocab, 0, 0};
-        lmheadParams = gpu->createBuffer("p_lmhead", 16);
+        lmheadParams = createOwnedBuffer("p_lmhead", 16);
         gpu->writeBuffer(lmheadParams, fp, 16);
     }
 
@@ -3617,13 +3621,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     GPUBuffer argmaxParams;
     {
         uint32_t p[4] = {cfg.nVocab, argmaxNumWg, 0, 0};
-        argmaxParams = gpu->createBuffer("p_argmax", 16);
+        argmaxParams = createOwnedBuffer("p_argmax", 16);
         gpu->writeBuffer(argmaxParams, p, 16);
     }
     GPUBuffer argmaxReduceParams;
     {
         uint32_t p[4] = {argmaxNumWg, 0, 0, 0};
-        argmaxReduceParams = gpu->createBuffer("p_argmax_reduce", 16);
+        argmaxReduceParams = createOwnedBuffer("p_argmax_reduce", 16);
         gpu->writeBuffer(argmaxReduceParams, p, 16);
     }
 
@@ -3632,19 +3636,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uint32_t p[4] = {cfg.nEmbd, 0, 0, 0};
         float normalizer = 1.0f;
         memcpy(&p[1], &normalizer, 4);
-        embedParams = gpu->createBuffer("p_embed", 16);
+        embedParams = createOwnedBuffer("p_embed", 16);
         gpu->writeBuffer(embedParams, p, 16);
     }
     GPUBuffer embedKQParams;
     if (lmHeadIsKQ && lmHeadKQType == GGUF_TYPE_Q6_K) {
         uint32_t p[2] = {cfg.nEmbd, kqLmRowStride};
-        embedKQParams = gpu->createBuffer("p_embed_kq", sizeof(p));
+        embedKQParams = createOwnedBuffer("p_embed_kq", sizeof(p));
         gpu->writeBuffer(embedKQParams, p, sizeof(p));
     }
     GPUBuffer embedNativeParams;
     if (embeddingNative.handle) {
         const uint32_t p[] = {cfg.nEmbd, cfg.nVocab, embeddingNativeNBlocks, embeddingNativeRowStride, 0x3f800000u};
-        embedNativeParams = gpu->createBuffer("p_embed_native", sizeof(p));
+        embedNativeParams = createOwnedBuffer("p_embed_native", sizeof(p));
         gpu->writeBuffer(embedNativeParams, p, sizeof(p));
     }
 
@@ -3676,7 +3680,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         std::vector<uint16_t> f16(nEl);
         for (uint64_t j = 0; j < nEl; j++) f16[j] = f32_to_fp16(embeddingCPU[j]);
         uint64_t embBytes = nEl * 2;
-        embeddingGpuBuf = gpu->createBuffer("embedding_gpu", embBytes);
+        embeddingGpuBuf = createOwnedBuffer("embedding_gpu", embBytes);
         const uint64_t CHUNK = 128 * 1024 * 1024;
         for (uint64_t off = 0; off < embBytes; off += CHUNK) {
             uint64_t sz = std::min(CHUNK, embBytes - off);
@@ -3720,9 +3724,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uint32_t q[8] = {cfg.nHead, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], 0u, ropeHalf};
         uint32_t k[8] = {cfg.nKvHeads, cfg.headDim, (uint32_t)cfg.ropeSections[0], (uint32_t)cfg.ropeSections[1], (uint32_t)cfg.ropeSections[2], (uint32_t)cfg.ropeSections[3], 0u, ropeHalf};
         uint32_t kv[8] = {cfg.nKvHeads * cfg.headDim, 0u, 0, 0, 0, 0, 0, 0};
-        q35RopeQParamsBuf = gpu->createBuffer("p_q35_rope_q", 32);
-        q35RopeKParamsBuf = gpu->createBuffer("p_q35_rope_k", 32);
-        q35KvWriteParamsBuf = gpu->createBuffer("p_q35_kv_write", 32);
+        q35RopeQParamsBuf = createOwnedBuffer("p_q35_rope_q", 32);
+        q35RopeKParamsBuf = createOwnedBuffer("p_q35_rope_k", 32);
+        q35KvWriteParamsBuf = createOwnedBuffer("p_q35_kv_write", 32);
         gpu->writeBuffer(q35RopeQParamsBuf, q, 32);
         gpu->writeBuffer(q35RopeKParamsBuf, k, 32);
         gpu->writeBuffer(q35KvWriteParamsBuf, kv, 32);
@@ -3733,28 +3737,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         auto& lw = layerWeights[i];
         if (!lw.qNorm.handle) {
             std::vector<float> ones(cfg.headDim, 1.0f);
-            lw.qNorm = gpu->createBuffer("qnorm_id_" + std::to_string(i), cfg.headDim * 4);
+            lw.qNorm = createOwnedBuffer("qnorm_id_" + std::to_string(i), cfg.headDim * 4);
             gpu->writeBuffer(lw.qNorm, ones.data(), cfg.headDim * 4);
         }
         if (!lw.kNorm.handle) {
             std::vector<float> ones(cfg.headDim, 1.0f);
-            lw.kNorm = gpu->createBuffer("knorm_id_" + std::to_string(i), cfg.headDim * 4);
+            lw.kNorm = createOwnedBuffer("knorm_id_" + std::to_string(i), cfg.headDim * 4);
             gpu->writeBuffer(lw.kNorm, ones.data(), cfg.headDim * 4);
         }
     }
 
     // Shared argmax result buffer
-    argmaxResultBuf = gpu->createBuffer("argmax_result", 4);
-    argmaxPartialsBuf = gpu->createBuffer("argmax_partials", argmaxNumWg * 2u * 4u);
+    argmaxResultBuf = createOwnedBuffer("argmax_result", 4);
+    argmaxPartialsBuf = createOwnedBuffer("argmax_partials", argmaxNumWg * 2u * 4u);
 
     // PLE buffers
     if (cfg.pleSize > 0) {
         uint32_t totalPleDim = cfg.pleSize * cfg.nLayer;
-        pleInputBuf = gpu->createBuffer("ple_input", totalPleDim * 4);
+        pleInputBuf = createOwnedBuffer("ple_input", totalPleDim * 4);
         if (pleGpuPreprocess)
-            pleProjRawBuf = gpu->createBuffer("ple_proj_raw", totalPleDim * 4);
-        pleBuf = gpu->createBuffer("ple_buf", cfg.pleSize * 4);
-        pleOutBuf = gpu->createBuffer("ple_out", cfg.nEmbd * 4);
+            pleProjRawBuf = createOwnedBuffer("ple_proj_raw", totalPleDim * 4);
+        pleBuf = createOwnedBuffer("ple_buf", cfg.pleSize * 4);
+        pleOutBuf = createOwnedBuffer("ple_out", cfg.nEmbd * 4);
     }
 
     // ─── Single set of intermediate buffers ───────────────────────────────
@@ -3776,33 +3780,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (pl.headDim > maxHeadDimBuf) maxHeadDimBuf = pl.headDim;
         if (pl.intermediateSize > maxIMBuf) maxIMBuf = pl.intermediateSize;
     }
-    xBuf          = gpu->createBuffer("x", cfg.nEmbd * 4);
-    normOutBuf    = gpu->createBuffer("norm_out", cfg.nEmbd * 4);
-    qkvBuf        = gpu->createBuffer("qkv_out", maxQkvOutBuf * 4);
-    qRotBuf       = gpu->createBuffer("q_rot", maxQDimBuf * 4);
-    attnOutBuf    = gpu->createBuffer("attn_out", maxQDimBuf * 4);
-    projOutBuf    = gpu->createBuffer("proj_out", cfg.nEmbd * 4);
-    gateUpBuf     = gpu->createBuffer("gate_up", 2 * maxIMBuf * 4);
+    xBuf          = createOwnedBuffer("x", cfg.nEmbd * 4);
+    normOutBuf    = createOwnedBuffer("norm_out", cfg.nEmbd * 4);
+    qkvBuf        = createOwnedBuffer("qkv_out", maxQkvOutBuf * 4);
+    qRotBuf       = createOwnedBuffer("q_rot", maxQDimBuf * 4);
+    attnOutBuf    = createOwnedBuffer("attn_out", maxQDimBuf * 4);
+    projOutBuf    = createOwnedBuffer("proj_out", cfg.nEmbd * 4);
+    gateUpBuf     = createOwnedBuffer("gate_up", 2 * maxIMBuf * 4);
     // Scratch K/V write targets for shared-KV (Q-only) layers: the fused-rope
     // kernel always writes K/V somewhere; for those layers we discard its K/V
     // and read the real K/V from the source layer's cache instead.
     if (cfg.sharedKvLayers > 0) {
         uint32_t kvScratchDim = maxSeqLen * cfg.nKvHeads * cfg.headDim * 2; // fp16
-        qOnlyScratchK = gpu->createBuffer("qonly_scratch_k", kvScratchDim);
-        qOnlyScratchV = gpu->createBuffer("qonly_scratch_v", kvScratchDim);
+        qOnlyScratchK = createOwnedBuffer("qonly_scratch_k", kvScratchDim);
+        qOnlyScratchV = createOwnedBuffer("qonly_scratch_v", kvScratchDim);
     }
 
     // MoE intermediate buffers (allocate when MoE arch detected)
     if (cfg.numExperts > 0) {
-        moeRouterOutBuf  = gpu->createBuffer("moe_router_out", cfg.numExperts * 4);
-        moeIndicesBuf    = gpu->createBuffer("moe_indices",    cfg.numExpertsPerTok * 4);
-        moeWeightsBuf    = gpu->createBuffer("moe_weights",    cfg.numExpertsPerTok * 4);
-        moeExpertOutBuf  = gpu->createBuffer("moe_expert_out", cfg.nEmbd * 4);
-        moeShexpGateUpBuf= gpu->createBuffer("moe_shexp_gu",   2 * cfg.moeIntermediateSize * 4);
-        moeShexpActBuf   = gpu->createBuffer("moe_shexp_act",  cfg.moeIntermediateSize * 4);
-        moeRoutedGateBuf = gpu->createBuffer("moe_routed_gate", cfg.moeIntermediateSize * 4);
-        moeRoutedUpBuf   = gpu->createBuffer("moe_routed_up",   cfg.moeIntermediateSize * 4);
-        moeRoutedActBuf  = gpu->createBuffer("moe_routed_act",  cfg.moeIntermediateSize * 4);
+        moeRouterOutBuf  = createOwnedBuffer("moe_router_out", cfg.numExperts * 4);
+        moeIndicesBuf    = createOwnedBuffer("moe_indices",    cfg.numExpertsPerTok * 4);
+        moeWeightsBuf    = createOwnedBuffer("moe_weights",    cfg.numExpertsPerTok * 4);
+        moeExpertOutBuf  = createOwnedBuffer("moe_expert_out", cfg.nEmbd * 4);
+        moeShexpGateUpBuf= createOwnedBuffer("moe_shexp_gu",   2 * cfg.moeIntermediateSize * 4);
+        moeShexpActBuf   = createOwnedBuffer("moe_shexp_act",  cfg.moeIntermediateSize * 4);
+        moeRoutedGateBuf = createOwnedBuffer("moe_routed_gate", cfg.moeIntermediateSize * 4);
+        moeRoutedUpBuf   = createOwnedBuffer("moe_routed_up",   cfg.moeIntermediateSize * 4);
+        moeRoutedActBuf  = createOwnedBuffer("moe_routed_act",  cfg.moeIntermediateSize * 4);
         fprintf(stderr, "  MoE intermediate buffers allocated: router=%uB indices=%uB weights=%uB expert_out=%uB shexp_gu=%uB shexp_act=%uB routed=3x%uB\n",
                 cfg.numExperts * 4u, cfg.numExpertsPerTok * 4u, cfg.numExpertsPerTok * 4u,
                 cfg.nEmbd * 4u, 2 * cfg.moeIntermediateSize * 4u, cfg.moeIntermediateSize * 4u,
@@ -3825,8 +3829,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uint32_t ssmLayerCount = 0;
         for (uint32_t li = 0; li < cfg.nLayer; li++) {
             if (cfg.isAttentionLayer(li)) continue;
-            ssmConvState[li] = gpu->createBuffer("ssm_conv_state_L" + std::to_string(li), convBytes);
-            ssmHState[li]    = gpu->createBuffer("ssm_h_state_L"    + std::to_string(li), hBytes);
+            ssmConvState[li] = createOwnedBuffer("ssm_conv_state_L" + std::to_string(li), convBytes);
+            ssmHState[li]    = createOwnedBuffer("ssm_h_state_L"    + std::to_string(li), hBytes);
             ssmLayerCount++;
         }
         fprintf(stderr, "  SSM state buffers: %u SSM layers x (conv=%zuB + h=%zuB) = %zu MB total\n",
@@ -3835,16 +3839,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (cfg.arch == "qwen35") {
             uint32_t convChannels = cfg.ssmInnerSize + 2u * cfg.ssmGroupCount * cfg.ssmStateSize;
             uint32_t qkDim = cfg.ssmGroupCount * cfg.ssmStateSize;
-            q35ConvOutBuf  = gpu->createBuffer("q35_ssm_conv_out", convChannels * 4);
-            q35SsmQBuf     = gpu->createBuffer("q35_ssm_q", qkDim * 4);
-            q35SsmKBuf     = gpu->createBuffer("q35_ssm_k", qkDim * 4);
-            q35SsmVBuf     = gpu->createBuffer("q35_ssm_v", cfg.ssmInnerSize * 4);
-            q35SsmBetaBuf  = gpu->createBuffer("q35_ssm_beta", cfg.ssmTimeStepRank * 4);
-            q35SsmAlphaBuf = gpu->createBuffer("q35_ssm_alpha", cfg.ssmTimeStepRank * 4);
-            q35SsmGateBuf  = gpu->createBuffer("q35_ssm_gate", cfg.ssmTimeStepRank * 4);
-            q35SsmYBuf     = gpu->createBuffer("q35_ssm_y", cfg.ssmInnerSize * 4);
-            q35SsmNormBuf  = gpu->createBuffer("q35_ssm_normed", cfg.ssmInnerSize * 4);
-            q35SsmZBuf     = gpu->createBuffer("q35_ssm_z", cfg.ssmInnerSize * 4);
+            q35ConvOutBuf  = createOwnedBuffer("q35_ssm_conv_out", convChannels * 4);
+            q35SsmQBuf     = createOwnedBuffer("q35_ssm_q", qkDim * 4);
+            q35SsmKBuf     = createOwnedBuffer("q35_ssm_k", qkDim * 4);
+            q35SsmVBuf     = createOwnedBuffer("q35_ssm_v", cfg.ssmInnerSize * 4);
+            q35SsmBetaBuf  = createOwnedBuffer("q35_ssm_beta", cfg.ssmTimeStepRank * 4);
+            q35SsmAlphaBuf = createOwnedBuffer("q35_ssm_alpha", cfg.ssmTimeStepRank * 4);
+            q35SsmGateBuf  = createOwnedBuffer("q35_ssm_gate", cfg.ssmTimeStepRank * 4);
+            q35SsmYBuf     = createOwnedBuffer("q35_ssm_y", cfg.ssmInnerSize * 4);
+            q35SsmNormBuf  = createOwnedBuffer("q35_ssm_normed", cfg.ssmInnerSize * 4);
+            q35SsmZBuf     = createOwnedBuffer("q35_ssm_z", cfg.ssmInnerSize * 4);
         }
     }
 
@@ -3857,14 +3861,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uint32_t maxQjDim = 4u * cfg.nEmbd;          // bound on 2*qDim_actual
         uint32_t maxQDim  = maxQjDim / 2u;
         uint32_t maxKvDim = 2u * cfg.nEmbd;          // bound on kvDim_actual
-        q35QjBuf      = gpu->createBuffer("q35_qj", maxQjDim * 4);
-        q35QBuf       = gpu->createBuffer("q35_q",  maxQDim * 4);
-        q35GateBuf    = gpu->createBuffer("q35_gate", maxQDim * 4);
-        q35KBuf       = gpu->createBuffer("q35_k",  maxKvDim * 4);
-        q35VBuf       = gpu->createBuffer("q35_v",  maxKvDim * 4);
-        q35AttnOutBuf = gpu->createBuffer("q35_attn_out", maxQDim * 4);
+        q35QjBuf      = createOwnedBuffer("q35_qj", maxQjDim * 4);
+        q35QBuf       = createOwnedBuffer("q35_q",  maxQDim * 4);
+        q35GateBuf    = createOwnedBuffer("q35_gate", maxQDim * 4);
+        q35KBuf       = createOwnedBuffer("q35_k",  maxKvDim * 4);
+        q35VBuf       = createOwnedBuffer("q35_v",  maxKvDim * 4);
+        q35AttnOutBuf = createOwnedBuffer("q35_attn_out", maxQDim * 4);
         // Cos/sin table for MRoPE: 4 sections × max 16 pairs × 2 (cos,sin) = 128 floats
-        q35CosSinBuf  = gpu->createBuffer("q35_cossin", 128 * 4);
+        q35CosSinBuf  = createOwnedBuffer("q35_cossin", 128 * 4);
         fprintf(stderr, "  qwen35 attn buffers: qj=%uB q=%uB gate=%uB k=%uB v=%uB attn=%uB\n",
                 maxQjDim*4u, maxQDim*4u, maxQDim*4u, maxKvDim*4u, maxKvDim*4u, maxQDim*4u);
     }
@@ -3877,7 +3881,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (lw.dnKQ.handle) { hasNativeKQDown = true; break; }
     }
     if (hasNativeKQDown) {
-        siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
+        siluMulOutBuf = createOwnedBuffer("silu_mul_out", maxIMBuf * 4);
         siluMulDebugBuf = siluMulOutBuf;
     }
     // llama.cpp quantizes the activation once before quantized matvec and
@@ -3885,26 +3889,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // dispatches consume it sequentially.
     GPUBuffer kqActQ8Buf, kqActScaleBuf;
     if (useQ4KDp4a) {
-        kqActQ8Buf = gpu->createBuffer("kq_act_q8", maxIMBuf);
-        kqActScaleBuf = gpu->createBuffer("kq_act_scales", maxIMBuf / 8);
+        kqActQ8Buf = createOwnedBuffer("kq_act_q8", maxIMBuf);
+        kqActScaleBuf = createOwnedBuffer("kq_act_scales", maxIMBuf / 8);
     }
 
-    rstdBuf       = gpu->createBuffer("rstd", 16);
-    logitsBuf     = gpu->createBuffer("logits", cfg.nVocab * 4);
-    attnPartialsBuf = gpu->createBuffer("attn_partials",
+    rstdBuf       = createOwnedBuffer("rstd", 16);
+    logitsBuf     = createOwnedBuffer("logits", cfg.nVocab * 4);
+    attnPartialsBuf = createOwnedBuffer("attn_partials",
         cfg.nHead * maxChunks * (maxHeadDimBuf + 2) * 4);
 
     // Single set of dynamic params (writeBuffer is queue-sequenced)
-    fusedRopeParamsBuf = gpu->createBuffer("p_frope", 32);
+    fusedRopeParamsBuf = createOwnedBuffer("p_frope", 32);
     gpu->writeBuffer(fusedRopeParamsBuf, ropeParamData.data(), 32);
-    chunkedAttnParamsBuf = gpu->createBuffer("p_cattn", 32);
+    chunkedAttnParamsBuf = createOwnedBuffer("p_cattn", 32);
     gpu->writeBuffer(chunkedAttnParamsBuf, chunkedAttnParamData.data(), 32);
 
     // Sliding window attention: separate param buffer with clamped T_total
     bool hasSWA = !cfg.layerAttnTypes.empty() && cfg.slidingWindow > 0
                   && !std::getenv("BP_NO_SWA");
     if (hasSWA) {
-        chunkedAttnParamsBufSWA = gpu->createBuffer("p_cattn_swa", 32);
+        chunkedAttnParamsBufSWA = createOwnedBuffer("p_cattn_swa", 32);
         gpu->writeBuffer(chunkedAttnParamsBufSWA, chunkedAttnParamData.data(), 32);
     }
 
@@ -3921,8 +3925,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         perLayerRopeParamBufs.resize(cfg.nLayer);
         perLayerAttnParamBufs.resize(cfg.nLayer);
         for (uint32_t li = 0; li < cfg.nLayer; li++) {
-            perLayerRopeParamBufs[li] = gpu->createBuffer("p_frope_" + std::to_string(li), 32);
-            perLayerAttnParamBufs[li] = gpu->createBuffer("p_cattn_" + std::to_string(li), 32);
+            perLayerRopeParamBufs[li] = createOwnedBuffer("p_frope_" + std::to_string(li), 32);
+            perLayerAttnParamBufs[li] = createOwnedBuffer("p_cattn_" + std::to_string(li), 32);
         }
         fprintf(stderr, "  Variable head dims: per-layer rope/attn params (%u layers)\n", cfg.nLayer);
     }
@@ -3946,12 +3950,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uint32_t gatherData[4] = {totalPleDim, 0, cfg.nVocab, cfg.pleSize};
         float tokenScale = sqrtf((float)cfg.pleSize);
         memcpy(&gatherData[1], &tokenScale, 4);
-        pleTokenGatherParams = gpu->createBuffer("p_ple_token_gather", 16);
+        pleTokenGatherParams = createOwnedBuffer("p_ple_token_gather", 16);
         gpu->writeBuffer(pleTokenGatherParams, gatherData, 16);
         pleModelProjParams = makeQ4Params("p_ple_model_proj", cfg.nEmbd, totalPleDim);
         uint32_t combineData[4] = {cfg.pleSize, cfg.nLayer, 0, 0};
         memcpy(&combineData[2], &cfg.rmsNormEps, 4);
-        pleCombineParams = gpu->createBuffer("p_ple_combine", 16);
+        pleCombineParams = createOwnedBuffer("p_ple_combine", 16);
         gpu->writeBuffer(pleCombineParams, combineData, 16);
 
         auto bgGather = pleTokenEmbAsymmetric
@@ -4013,7 +4017,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         auto mkP32 = [&](const std::string& name, std::initializer_list<uint32_t> data) -> GPUBuffer {
             uint32_t buf[8] = {0};
             size_t i2 = 0; for (uint32_t v : data) { buf[i2++] = v; }
-            auto b = gpu->createBuffer(name, 32);
+            auto b = createOwnedBuffer(name, 32);
             gpu->writeBuffer(b, buf, 32);
             return b;
         };
@@ -4709,7 +4713,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 GPUBuffer fusedP;
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                 memcpy(&data[1], &cfg.rmsNormEps, 4);
-                fusedP = gpu->createBuffer("p_fused_sandwich_" + std::to_string(i), 16);
+                fusedP = createOwnedBuffer("p_fused_sandwich_" + std::to_string(i), 16);
                 gpu->writeBuffer(fusedP, data, 16);
                 auto bg = makeBG(plFusedSandwich, {
                     {0, xBuf}, {1, projOutBuf}, {2, lw.postNorm},
@@ -4751,7 +4755,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             {
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                 float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
-                rmsIPParams = gpu->createBuffer("p_rmsip_post_" + std::to_string(i), 16);
+                rmsIPParams = createOwnedBuffer("p_rmsip_post_" + std::to_string(i), 16);
                 gpu->writeBuffer(rmsIPParams, data, 16);
             }
             // Post-attention sandwich norm (in-place on projOutBuf)
@@ -4776,7 +4780,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             GPUBuffer addParams;
             {
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
-                addParams = gpu->createBuffer("p_add_post_" + std::to_string(i), 16);
+                addParams = createOwnedBuffer("p_add_post_" + std::to_string(i), 16);
                 gpu->writeBuffer(addParams, data, 16);
             }
             auto bgAdd = makeBG(plAddIP, {
@@ -4818,15 +4822,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             uint32_t topk = cfg.numExpertsPerTok;
 
             // 3 per-direction offset buffers (k slots each, u32 each = 4*k bytes)
-            GPUBuffer gateOffsets = gpu->createBuffer("moe_gate_off_L"+std::to_string(i), topk*4);
-            GPUBuffer upOffsets   = gpu->createBuffer("moe_up_off_L"+std::to_string(i),   topk*4);
-            GPUBuffer downOffsets = gpu->createBuffer("moe_down_off_L"+std::to_string(i), topk*4);
+            GPUBuffer gateOffsets = createOwnedBuffer("moe_gate_off_L"+std::to_string(i), topk*4);
+            GPUBuffer upOffsets   = createOwnedBuffer("moe_up_off_L"+std::to_string(i),   topk*4);
+            GPUBuffer downOffsets = createOwnedBuffer("moe_down_off_L"+std::to_string(i), topk*4);
 
             // Param buffers (16 B each)
             auto mkP = [&](const std::string& name, std::initializer_list<uint32_t> data) -> GPUBuffer {
                 uint32_t buf[8] = {0};
                 size_t i2 = 0; for (uint32_t v : data) { buf[i2++] = v; }
-                auto b = gpu->createBuffer(name, 32);
+                auto b = createOwnedBuffer(name, 32);
                 gpu->writeBuffer(b, buf, 32);
                 return b;
             };
@@ -4997,7 +5001,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 auto pAdd = mkP("p_sh_add_L"+std::to_string(i), {cfg.nEmbd, 0u});
                 // Reuse plWAcc but with a "weights" buffer that's 1.0 at index 0.
                 // For simplicity create a tiny [1] buffer with value 1.0.
-                GPUBuffer one = gpu->createBuffer("one_L"+std::to_string(i), 4);
+                GPUBuffer one = createOwnedBuffer("one_L"+std::to_string(i), 4);
                 float oneF = 1.0f;
                 gpu->writeBuffer(one, &oneF, 4);
                 auto bgAdd = makeBG(plWAcc,
@@ -5093,7 +5097,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 GPUBuffer siluParams;
                 {
                     uint32_t data[4] = {cfg.intermediateSize, 0, 0, 0};
-                    siluParams = gpu->createBuffer("p_silu_" + std::to_string(i), 16);
+                    siluParams = createOwnedBuffer("p_silu_" + std::to_string(i), 16);
                     gpu->writeBuffer(siluParams, data, 16);
                 }
                 auto bgSilu = makeBG(plActMul, {
@@ -5141,7 +5145,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 GPUBuffer addIPParams;
                 {
                     uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
-                    addIPParams = gpu->createBuffer("p_addip_" + std::to_string(i), 16);
+                    addIPParams = createOwnedBuffer("p_addip_" + std::to_string(i), 16);
                     gpu->writeBuffer(addIPParams, data, 16);
                 }
                 // Post-FFN sandwich norm (before residual add)
@@ -5171,7 +5175,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                     {
                         uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                         float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
-                        rmsP = gpu->createBuffer("p_rmsip_ffw_" + std::to_string(i), 16);
+                        rmsP = createOwnedBuffer("p_rmsip_ffw_" + std::to_string(i), 16);
                         gpu->writeBuffer(rmsP, data, 16);
                     }
                     auto bgFfwNorm = makeBG(plRmsIP2, {
@@ -5188,14 +5192,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 // Sandwich norm Q8 path: split into act → matmul → norm → add
                 // 1. Activation: gateUpBuf → siluMulOutBuf (reuse K-quant temp buffer)
                 if (!siluMulOutBuf.handle)
-                    siluMulOutBuf = gpu->createBuffer("silu_mul_out", maxIMBuf * 4);
+                    siluMulOutBuf = createOwnedBuffer("silu_mul_out", maxIMBuf * 4);
                 siluMulDebugBuf = siluMulOutBuf;
                 auto& plActMulSW = useGelu ? getKernel("gelu_mul_fused")
                                             : getKernel("silu_mul_fused");
                 GPUBuffer actParams;
                 {
                     uint32_t data[4] = {plIM, 0, 0, 0};
-                    actParams = gpu->createBuffer("p_act_sw_" + std::to_string(i), 16);
+                    actParams = createOwnedBuffer("p_act_sw_" + std::to_string(i), 16);
                     gpu->writeBuffer(actParams, data, 16);
                 }
                 auto bgAct = makeBG(plActMulSW, {
@@ -5244,7 +5248,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 if (plRmsNormAdd && lw.postFfwNorm.handle) {
                     uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                     memcpy(&data[1], &cfg.rmsNormEps, 4);
-                    auto p = gpu->createBuffer("p_ffw_norm_add_" + std::to_string(i), 16);
+                    auto p = createOwnedBuffer("p_ffw_norm_add_" + std::to_string(i), 16);
                     gpu->writeBuffer(p, data, 16);
                     auto bg = makeBG(*plRmsNormAdd, {
                         {0, xBuf}, {1, projOutBuf}, {2, lw.postFfwNorm}, {3, p}});
@@ -5276,7 +5280,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 {
                     uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                     float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
-                    rmsP2 = gpu->createBuffer("p_rmsip_ffw2_" + std::to_string(i), 16);
+                    rmsP2 = createOwnedBuffer("p_rmsip_ffw2_" + std::to_string(i), 16);
                     gpu->writeBuffer(rmsP2, data, 16);
                 }
                 auto bgFfwNorm = makeBG(plRmsIPfw, {
@@ -5299,7 +5303,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 GPUBuffer addP2;
                 {
                     uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
-                    addP2 = gpu->createBuffer("p_add_ffw_" + std::to_string(i), 16);
+                    addP2 = createOwnedBuffer("p_add_ffw_" + std::to_string(i), 16);
                     gpu->writeBuffer(addP2, data, 16);
                 }
                 auto bgAdd2 = makeBG(plAddIPsw, {
@@ -5322,7 +5326,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             GPUBuffer geluP;
             {
                 uint32_t data[4] = {pleDim, i * pleDim, 0, 0};
-                geluP = gpu->createBuffer("p_ple_gelu_" + std::to_string(i), 16);
+                geluP = createOwnedBuffer("p_ple_gelu_" + std::to_string(i), 16);
                 gpu->writeBuffer(geluP, data, 16);
             }
             // 1. inp_gate matmul: xBuf [E] → pleBuf [pleSize]
@@ -5370,7 +5374,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (plRmsNormAdd && lw.plePostNorm.handle) {
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                 memcpy(&data[1], &cfg.rmsNormEps, 4);
-                auto p = gpu->createBuffer("p_ple_norm_add_" + std::to_string(i), 16);
+                auto p = createOwnedBuffer("p_ple_norm_add_" + std::to_string(i), 16);
                 gpu->writeBuffer(p, data, 16);
                 auto bg = makeBG(*plRmsNormAdd, {
                     {0, xBuf}, {1, pleOutBuf}, {2, lw.plePostNorm}, {3, p}});
@@ -5403,7 +5407,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 {
                     uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                     float eps = cfg.rmsNormEps; memcpy(&data[1], &eps, 4);
-                    rmsPlP = gpu->createBuffer("p_ple_norm_" + std::to_string(i), 16);
+                    rmsPlP = createOwnedBuffer("p_ple_norm_" + std::to_string(i), 16);
                     gpu->writeBuffer(rmsPlP, data, 16);
                 }
                 auto bgPleNorm = makeBG(plRmsIPple, {
@@ -5427,7 +5431,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             GPUBuffer addPleP;
             {
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
-                addPleP = gpu->createBuffer("p_ple_add_" + std::to_string(i), 16);
+                addPleP = createOwnedBuffer("p_ple_add_" + std::to_string(i), 16);
                 gpu->writeBuffer(addPleP, data, 16);
             }
             auto bgPleAdd = makeBG(plAddPLE, {
@@ -5455,7 +5459,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             GPUBuffer scaleParams;
             {
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
-                scaleParams = gpu->createBuffer("p_scale_" + std::to_string(i), 16);
+                scaleParams = createOwnedBuffer("p_scale_" + std::to_string(i), 16);
                 gpu->writeBuffer(scaleParams, data, 16);
             }
             auto bgScale = makeBG(plScale, {
@@ -5547,7 +5551,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         if (plQ8DecDp4a) {
             // DP4A decode path: Params{M, N, K, pad}, TILE_N=32
             uint32_t pData[4] = {1u, cfg.nVocab, cfg.nEmbd, 0};
-            auto lmDpParams = gpu->createBuffer("p_lmhead_q8_dp4a", 16,
+            auto lmDpParams = createOwnedBuffer("p_lmhead_q8_dp4a", 16,
                 BUF_UNIFORM | BUF_STORAGE | BUF_COPY_DST);
             gpu->writeBuffer(lmDpParams, pData, 16);
             auto bg = makeBG(*plQ8DecDp4a, {
@@ -5593,7 +5597,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         {
             uint32_t data[4] = {cfg.nVocab, 0, 0, 0};
             memcpy(&data[1], &cfg.logitSoftcap, 4);
-            softcapParams = gpu->createBuffer("p_softcap", 16);
+            softcapParams = createOwnedBuffer("p_softcap", 16);
             gpu->writeBuffer(softcapParams, data, 16);
         }
         auto bg = makeBG(plSoftcap, {
@@ -5664,7 +5668,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             {
                 uint32_t data[4] = {cfg.nEmbd, 0, 0, 0};
                 memcpy(&data[1], &cfg.embeddingScale, 4);
-                scaleParams = gpu->createBuffer("p_emb_scale", 16);
+                scaleParams = createOwnedBuffer("p_emb_scale", 16);
                 gpu->writeBuffer(scaleParams, data, 16);
             }
             auto scaleBg = makeBG(plScale, {
@@ -5690,18 +5694,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         char label[32]; snprintf(label, 32, "staging_%d", s);
         bd.label = {label, (uint32_t)strlen(label)};
         ps.stagingBuf = wgpuDeviceCreateBuffer(gpu->device, &bd);
-        ps.tokenInBuf = gpu->createBuffer("decode_token_in_" + std::to_string(s), 4);
-        ps.tokenOutBuf = gpu->createBuffer("decode_token_out_" + std::to_string(s), 4);
+        ps.tokenInBuf = createOwnedBuffer("decode_token_in_" + std::to_string(s), 4);
+        ps.tokenOutBuf = createOwnedBuffer("decode_token_out_" + std::to_string(s), 4);
         int32_t zeroToken = 0;
         gpu->writeBuffer(ps.tokenInBuf, &zeroToken, 4);
         gpu->writeBuffer(ps.tokenOutBuf, &zeroToken, 4);
 
         // Per-slot param buffers
         char rl[32]; snprintf(rl, 32, "p_frope_%d", s);
-        ps.ropeParamsBuf = gpu->createBuffer(std::string(rl), 32);
+        ps.ropeParamsBuf = createOwnedBuffer(std::string(rl), 32);
         gpu->writeBuffer(ps.ropeParamsBuf, ropeParamData.data(), 32);
         char al[32]; snprintf(al, 32, "p_cattn_%d", s);
-        ps.attnParamsBuf = gpu->createBuffer(std::string(al), 32);
+        ps.attnParamsBuf = createOwnedBuffer(std::string(al), 32);
         gpu->writeBuffer(ps.attnParamsBuf, chunkedAttnParamData.data(), 32);
 
         if (q35RopeQParamsBuf.handle) {
@@ -5712,9 +5716,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             char ql[32]; snprintf(ql, 32, "p_q35_rope_q_%d", s);
             char kl[32]; snprintf(kl, 32, "p_q35_rope_k_%d", s);
             char vl[32]; snprintf(vl, 32, "p_q35_kv_write_%d", s);
-            ps.q35RopeQParamsBuf = gpu->createBuffer(std::string(ql), 32);
-            ps.q35RopeKParamsBuf = gpu->createBuffer(std::string(kl), 32);
-            ps.q35KvWriteParamsBuf = gpu->createBuffer(std::string(vl), 32);
+            ps.q35RopeQParamsBuf = createOwnedBuffer(std::string(ql), 32);
+            ps.q35RopeKParamsBuf = createOwnedBuffer(std::string(kl), 32);
+            ps.q35KvWriteParamsBuf = createOwnedBuffer(std::string(vl), 32);
             gpu->writeBuffer(ps.q35RopeQParamsBuf, q, 32);
             gpu->writeBuffer(ps.q35RopeKParamsBuf, k, 32);
             gpu->writeBuffer(ps.q35KvWriteParamsBuf, kv, 32);
@@ -5723,7 +5727,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // SWA per-slot param buffer
         if (hasSWA) {
             char sl[32]; snprintf(sl, 32, "p_cattn_swa_%d", s);
-            ps.attnParamsBufSWA = gpu->createBuffer(std::string(sl), 32);
+            ps.attnParamsBufSWA = createOwnedBuffer(std::string(sl), 32);
             gpu->writeBuffer(ps.attnParamsBufSWA, chunkedAttnParamData.data(), 32);
         }
 
@@ -5731,9 +5735,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ps.layerRopeParamsBufs.resize(cfg.nLayer);
             ps.layerAttnParamsBufs.resize(cfg.nLayer);
             constexpr uint64_t kParamStride = 256;
-            ps.layerRopeParamsPacked = gpu->createBuffer(
+            ps.layerRopeParamsPacked = createOwnedBuffer(
                 "p_frope_packed_" + std::to_string(s), cfg.nLayer * kParamStride);
-            ps.layerAttnParamsPacked = gpu->createBuffer(
+            ps.layerAttnParamsPacked = createOwnedBuffer(
                 "p_cattn_packed_" + std::to_string(s), cfg.nLayer * kParamStride);
             for (uint32_t li = 0; li < cfg.nLayer; li++) {
                 ps.layerRopeParamsBufs[li] = {ps.layerRopeParamsPacked.handle, 32,
@@ -5918,7 +5922,7 @@ void ModelRunner::initQwen35PrefillResources() {
     const uint32_t convChannels=cfg.ssmInnerSize+2u*cfg.ssmGroupCount*cfg.ssmStateSize;
     const uint32_t qdim=cfg.nHead*cfg.headDim,kvdim=cfg.nKvHeads*cfg.headDim;
     const uint32_t im=cfg.intermediateSize;
-    auto mk=[&](const char* n,uint64_t elems){return gpu->createBuffer(n,std::max<uint64_t>(4,elems*4));};
+    auto mk=[&](const char* n,uint64_t elems){return createOwnedBuffer(n,std::max<uint64_t>(4,elems*4));};
     qwen35Pf.tokens=mk("qpf_tokens",C);qwen35Pf.x=mk("qpf_x",(uint64_t)C*E);
     qwen35Pf.norm=mk("qpf_norm",(uint64_t)C*E);qwen35Pf.proj=mk("qpf_proj",(uint64_t)C*E);
     qwen35Pf.gateup=mk("qpf_gateup",(uint64_t)C*2u*im);qwen35Pf.act=mk("qpf_act",(uint64_t)C*im);
@@ -5939,7 +5943,7 @@ void ModelRunner::initQwen35PrefillResources() {
     const bool enableQ6Batched=
         gpu->adapterName.find("NVIDIA")!=std::string::npos||
         gpu->adapterName.find("Intel")!=std::string::npos;
-    qwen35Pf.kqActQ8=gpu->createBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
+    qwen35Pf.kqActQ8=createOwnedBuffer("qpf_kq_act_q8",std::max<uint64_t>(4,(uint64_t)C*maxK));
     // Q6_K prefill uses one activation scale per packed i8 word to preserve
     // recurrent continuation parity; Q4_K/Q5_K continue to consume the prefix
     // corresponding to their 32-value scale layout.
@@ -5962,8 +5966,8 @@ void ModelRunner::initQwen35PrefillResources() {
             maxWeightElems=std::max(maxWeightElems,(uint64_t)2u*pl.intermediateSize*E);
             maxWeightElems=std::max(maxWeightElems,(uint64_t)E*pl.intermediateSize);
         }
-        qwen35Pf.q4DenseScratch=gpu->createBuffer("qpf_q4_dense_scratch",std::max<uint64_t>(4,(maxWeightElems+1)/2));
-        qwen35Pf.q4ScaleMinScratch=gpu->createBuffer("qpf_q4_sm_scratch",std::max<uint64_t>(4,(maxWeightElems/32)*8));
+        qwen35Pf.q4DenseScratch=createOwnedBuffer("qpf_q4_dense_scratch",std::max<uint64_t>(4,(maxWeightElems+1)/2));
+        qwen35Pf.q4ScaleMinScratch=createOwnedBuffer("qpf_q4_sm_scratch",std::max<uint64_t>(4,(maxWeightElems/32)*8));
         (void)gpu->getOrCreatePipeline("q4k_repack_ort_dense",q4kRepackOrtDenseSource(),4);
         (void)gpu->getOrCreatePipeline("q4k_ort_dense_tile64",q4kOrtRepackedTileSource(),6);
     }
@@ -5977,8 +5981,8 @@ void ModelRunner::initQwen35PrefillResources() {
             maxProjectionElems=std::max(maxProjectionElems,(uint64_t)pl.kvDim*E);
             maxProjectionElems=std::max(maxProjectionElems,(uint64_t)pl.qDim*E);
         }
-        qwen35Pf.q5ProjectionDenseScratch=gpu->createBuffer("qpf_q5_projection_dense",std::max<uint64_t>(4,maxProjectionElems));
-        qwen35Pf.q5ProjectionScaleMinScratch=gpu->createBuffer("qpf_q5_projection_scale_min",std::max<uint64_t>(4,(maxProjectionElems/32)*8));
+        qwen35Pf.q5ProjectionDenseScratch=createOwnedBuffer("qpf_q5_projection_dense",std::max<uint64_t>(4,maxProjectionElems));
+        qwen35Pf.q5ProjectionScaleMinScratch=createOwnedBuffer("qpf_q5_projection_scale_min",std::max<uint64_t>(4,(maxProjectionElems/32)*8));
         (void)gpu->getOrCreatePipeline("q5k_projection_repack_ort_dense",q5kRepackOrtDenseSource(),4);
         (void)gpu->getOrCreatePipeline("q5k_projection_ort_dense_tile64",q5kOrtRepackedTileSource(),6);
     }
@@ -5990,7 +5994,7 @@ void ModelRunner::initQwen35PrefillResources() {
             (unsigned long long)(qwen35Pf.nativeStageScratch.size/1048576));
     }
     const uint64_t parameterSlots = std::max<uint64_t>(1024, uint64_t(cfg.nLayer) * (qwen35Pf.nativeStageScratch.handle?128u:32u) + 64);
-    qwen35Pf.paramArena=gpu->createBuffer("qpf_param_arena",256u*parameterSlots,
+    qwen35Pf.paramArena=createOwnedBuffer("qpf_param_arena",256u*parameterSlots,
         BUF_STORAGE|BUF_UNIFORM|BUF_COPY_DST);
     (void)getKernel("q6k_gather_batched");(void)getKernel("q8_matmul_batched_dp4a");
     (void)getKernel("q4k_matmul_batched4");
@@ -6033,7 +6037,7 @@ void ModelRunner::initGemmaPrefillResources() {
         maxIM = std::max(maxIM, pl.intermediateSize);
     }
     auto mk = [&](const char* name, uint64_t elems, uint64_t bytes = 4) {
-        return gpu->createBuffer(name, std::max<uint64_t>(4, elems * bytes));
+        return createOwnedBuffer(name, std::max<uint64_t>(4, elems * bytes));
     };
     gemmaPf.tokens = mk("gpf_tokens", C);
     gemmaPf.x      = mk("gpf_x", C * cfg.nEmbd);
@@ -6046,7 +6050,7 @@ void ModelRunner::initGemmaPrefillResources() {
     gemmaPf.act    = mk("gpf_act", C * maxIM);
     gemmaPf.rstd   = mk("gpf_rstd", C);
     if (!std::getenv("BP_GEMMA_DISABLE_PARAM_ARENA")) {
-        gemmaPf.paramArena = gpu->createBuffer("gpf_param_arena", 512u * 1024u,
+        gemmaPf.paramArena = createOwnedBuffer("gpf_param_arena", 512u * 1024u,
             BUF_STORAGE | BUF_UNIFORM | BUF_COPY_DST);
     }
     const uint32_t maxK = std::max({cfg.nEmbd, maxIM, maxQkv});
@@ -6116,37 +6120,37 @@ void ModelRunner::initPrefillResources() {
     uint32_t Q8_TILE = 8;
 
     // Intermediate buffers sized to maxSeqLen
-    pfCache.pX    = gpu->createBuffer("pf_x",    T * cfg.nEmbd * 4);
-    pfCache.pNorm = gpu->createBuffer("pf_norm", T * cfg.nEmbd * 4);
-    pfCache.pQkv  = gpu->createBuffer("pf_qkv",  T * qkvOutL * 4);
-    pfCache.pQRot = gpu->createBuffer("pf_qrot", T * qDimL * 4);
-    pfCache.pAttn = gpu->createBuffer("pf_attn", T * qDimL * 4);
-    pfCache.pProj = gpu->createBuffer("pf_proj", T * cfg.nEmbd * 4);
-    pfCache.pGU   = gpu->createBuffer("pf_gu",   T * 2 * cfg.intermediateSize * 4);
-    pfCache.pRstd = gpu->createBuffer("pf_rstd", T * 4);
-    pfCache.pNormQ  = gpu->createBuffer("pf_norm_q",  T * cfg.nEmbd);
-    pfCache.pNormQS = gpu->createBuffer("pf_norm_qs", T * (cfg.nEmbd / 32) * 4);
-    pfCache.pAttnQ  = gpu->createBuffer("pf_attn_q",  T * qDimL);
-    pfCache.pAttnQS = gpu->createBuffer("pf_attn_qs", T * (qDimL / 32) * 4);
-    pfCache.pGUQ    = gpu->createBuffer("pf_gu_q",    T * cfg.intermediateSize);
-    pfCache.pGUQS   = gpu->createBuffer("pf_gu_qs",   T * (cfg.intermediateSize / 32) * 4);
+    pfCache.pX    = createOwnedBuffer("pf_x",    T * cfg.nEmbd * 4);
+    pfCache.pNorm = createOwnedBuffer("pf_norm", T * cfg.nEmbd * 4);
+    pfCache.pQkv  = createOwnedBuffer("pf_qkv",  T * qkvOutL * 4);
+    pfCache.pQRot = createOwnedBuffer("pf_qrot", T * qDimL * 4);
+    pfCache.pAttn = createOwnedBuffer("pf_attn", T * qDimL * 4);
+    pfCache.pProj = createOwnedBuffer("pf_proj", T * cfg.nEmbd * 4);
+    pfCache.pGU   = createOwnedBuffer("pf_gu",   T * 2 * cfg.intermediateSize * 4);
+    pfCache.pRstd = createOwnedBuffer("pf_rstd", T * 4);
+    pfCache.pNormQ  = createOwnedBuffer("pf_norm_q",  T * cfg.nEmbd);
+    pfCache.pNormQS = createOwnedBuffer("pf_norm_qs", T * (cfg.nEmbd / 32) * 4);
+    pfCache.pAttnQ  = createOwnedBuffer("pf_attn_q",  T * qDimL);
+    pfCache.pAttnQS = createOwnedBuffer("pf_attn_qs", T * (qDimL / 32) * 4);
+    pfCache.pGUQ    = createOwnedBuffer("pf_gu_q",    T * cfg.intermediateSize);
+    pfCache.pGUQS   = createOwnedBuffer("pf_gu_qs",   T * (cfg.intermediateSize / 32) * 4);
 
     // Global param buffers (written per-call with actual T)
     // Both backends use var<uniform> for early loop exit
     bool isVulkan = (gpu->backendType != WGPUBackendType_D3D12);
     uint64_t paramUsage = BUF_UNIFORM | BUF_COPY_DST;
-    pfCache.pQkvP = gpu->createBuffer("pp_qkv", 16, paramUsage);
-    pfCache.pOpP  = gpu->createBuffer("pp_op",  16, paramUsage);
-    pfCache.pGuP  = gpu->createBuffer("pp_gu",  16, paramUsage);
-    pfCache.pDnP  = gpu->createBuffer("pp_dn",  16, paramUsage);
-    pfCache.pNormQP = gpu->createBuffer("pp_norm_q", 16, paramUsage);
-    pfCache.pAttnQP = gpu->createBuffer("pp_attn_q", 16, paramUsage);
-    pfCache.pGUQP   = gpu->createBuffer("pp_gu_q",   16, paramUsage);
-    pfCache.pLmP  = gpu->createBuffer("pp_lm",  16);
+    pfCache.pQkvP = createOwnedBuffer("pp_qkv", 16, paramUsage);
+    pfCache.pOpP  = createOwnedBuffer("pp_op",  16, paramUsage);
+    pfCache.pGuP  = createOwnedBuffer("pp_gu",  16, paramUsage);
+    pfCache.pDnP  = createOwnedBuffer("pp_dn",  16, paramUsage);
+    pfCache.pNormQP = createOwnedBuffer("pp_norm_q", 16, paramUsage);
+    pfCache.pAttnQP = createOwnedBuffer("pp_attn_q", 16, paramUsage);
+    pfCache.pGUQP   = createOwnedBuffer("pp_gu_q",   16, paramUsage);
+    pfCache.pLmP  = createOwnedBuffer("pp_lm",  16);
     {
         uint32_t d[4] = {cfg.nEmbd, cfg.nEmbd, 0, 0};
         float eps = cfg.rmsNormEps; memcpy(&d[2], &eps, 4);
-        pfCache.pRmsP = gpu->createBuffer("pp_rms", 16);
+        pfCache.pRmsP = createOwnedBuffer("pp_rms", 16);
         gpu->writeBuffer(pfCache.pRmsP, d, 16);
     }
 
@@ -6154,10 +6158,10 @@ void ModelRunner::initPrefillResources() {
     pfCache.ropeParams.resize(cfg.nLayer);
     pfCache.attnParams.resize(cfg.nLayer);
     for (uint32_t li = 0; li < cfg.nLayer; li++) {
-        pfCache.ropeParams[li] = gpu->createBuffer(
+        pfCache.ropeParams[li] = createOwnedBuffer(
             "pp_rope_L" + std::to_string(li), 32);
         // Attention params always uniform (enables early exit on both backends)
-        pfCache.attnParams[li] = gpu->createBuffer(
+        pfCache.attnParams[li] = createOwnedBuffer(
             "pp_attn_L" + std::to_string(li), 32,
             BUF_UNIFORM | BUF_COPY_DST);
     }
@@ -6331,7 +6335,7 @@ void ModelRunner::initPrefillResources() {
     // Partials scratch buffer used by the multi-WG decode path); the prefill
     // single-WG dispatch still needs to bind all four or Dawn rejects the BG.
     {
-        GPUBuffer argmaxP = gpu->createBuffer("pf_argmax_p", 16);
+        GPUBuffer argmaxP = createOwnedBuffer("pf_argmax_p", 16);
         uint32_t p[4] = {cfg.nVocab, 1u, 0, 0};
         gpu->writeBuffer(argmaxP, p, 16);
         pfCache.argmaxBG = makeBG(getKernel("argmax"), {
@@ -6378,7 +6382,7 @@ void ModelRunner::initPrefillResources() {
         }
 
         // Create the indirect buffer: [gx, gy, gz] × nDispatches
-        pfCache.indirectBuf = gpu->createBuffer("pf_indirect",
+        pfCache.indirectBuf = createOwnedBuffer("pf_indirect",
             nDispatches * 12, BUF_INDIRECT | BUF_COPY_DST);
     }
 
@@ -6780,114 +6784,70 @@ void ModelRunner::printActiveDecodeTuning(const char* prefix) const {
            decodeCbPoolBatch);
 }
 
+ModelRunner::~ModelRunner() { destroy(); }
+
+GPUBuffer ModelRunner::createOwnedBuffer(const std::string& name, uint64_t size,
+        uint64_t usage, bool mappedAtCreation) {
+    auto buffer = gpu->createBuffer(name, size, usage, mappedAtCreation);
+    if (buffer.handle) ownedBuffers_.emplace(buffer.handle, buffer);
+    return buffer;
+}
+
+void ModelRunner::releaseOwnedBuffer(GPUBuffer buffer) {
+    auto found = ownedBuffers_.find(buffer.handle);
+    if (found == ownedBuffers_.end()) return;
+    gpu->releaseBuffer(found->second);
+    ownedBuffers_.erase(found);
+}
+
+void ModelRunner::releaseOwnedBindGroup(WGPUBindGroup group) {
+    if (group && ownedBindGroups_.erase(group)) wgpuBindGroupRelease(group);
+}
+
+void ModelRunner::submitOwned(const std::vector<Dispatch>& dispatches,
+        bool singlePass, bool profiling, bool retainForReplay) {
+    // GPUContext::submitOnly consumes one caller reference per dispatch. Retain
+    // cached groups for replay; one-shot prefill transfers its references.
+    for (const auto& dispatch : dispatches) {
+        if (retainForReplay) wgpuBindGroupAddRef(dispatch.bindGroup);
+        else ownedBindGroups_.erase(dispatch.bindGroup);
+    }
+    if (profiling) gpu->submitOnlyProfiled(dispatches, *profiler);
+    else gpu->submitOnly(dispatches, singlePass);
+}
+
 void ModelRunner::destroy() {
     if (!gpu) return;
-
-    std::unordered_set<void*> releasedBindGroups;
-    auto releaseBG = [&](WGPUBindGroup& bg) {
-        if (!bg) return;
-        void* key = reinterpret_cast<void*>(bg);
-        if (releasedBindGroups.insert(key).second)
-            wgpuBindGroupRelease(bg);
-        bg = nullptr;
-    };
-
-    for (auto& d : allDecodeDispatches)
-        releaseBG(d.bindGroup);
-    for (auto& d : autoDecodeDispatches)
-        releaseBG(d.bindGroup);
-
-    for (auto& bg : decodeVariantBGs) {
-        releaseBG(bg.qkvBase);
-        releaseBG(bg.qkvFast);
-        releaseBG(bg.oprojBase);
-        releaseBG(bg.oprojFast);
-        releaseBG(bg.gateupBase);
-        releaseBG(bg.gateupFast);
-    }
-
-    for (auto& bg : pfCache.layerBGs) {
-        releaseBG(bg.rms);
-        releaseBG(bg.qnorm);
-        releaseBG(bg.qkv);
-        releaseBG(bg.rope);
-        releaseBG(bg.attn);
-        releaseBG(bg.attnq);
-        releaseBG(bg.oproj);
-        releaseBG(bg.addrms);
-        releaseBG(bg.gateup);
-        releaseBG(bg.siluq);
-        releaseBG(bg.downsilu);
-    }
-    releaseBG(pfCache.finalRmsBG);
-    releaseBG(pfCache.lmBG);
-    releaseBG(pfCache.argmaxBG);
-
-    for (auto& bg : qwen35PrefillPlan.bindGroups)
-        releaseBG(bg);
-    qwen35PrefillPlan.bindGroups.clear();
-    qwen35PrefillPlan.dispatches.clear();
-    qwen35PrefillPlan.ready = false;
-
+    // Streaming decode may leave maps pending after cancellation or the final
+    // returned token. Complete and unmap each before retiring its staging ring.
     for (auto& slot : pool) {
-        for (int i = slot.cbIdx; i < (int)slot.cbPool.size(); i++) {
-            if (slot.cbPool[i])
-                wgpuCommandBufferRelease(slot.cbPool[i]);
+        if (slot.pendingFuture.id) {
+            gpu->completeAsyncMapI32(slot.stagingBuf, slot.pendingFuture);
+            slot.pendingFuture = {};
         }
-        slot.cbPool.clear();
-        slot.cbIdx = 0;
-        for (int i = slot.knownPrefillCbIdx;
-             i < (int)slot.knownPrefillCBPool.size(); i++) {
-            if (slot.knownPrefillCBPool[i])
-                wgpuCommandBufferRelease(slot.knownPrefillCBPool[i]);
-        }
-        slot.knownPrefillCBPool.clear();
-        slot.knownPrefillCbIdx = 0;
+    }
+    gpu->waitForQueue();
+    for (auto& slot : pool) {
+        for (size_t i = size_t(slot.cbIdx); i < slot.cbPool.size(); ++i)
+            if (slot.cbPool[i]) wgpuCommandBufferRelease(slot.cbPool[i]);
+        for (size_t i = size_t(slot.knownPrefillCbIdx); i < slot.knownPrefillCBPool.size(); ++i)
+            if (slot.knownPrefillCBPool[i]) wgpuCommandBufferRelease(slot.knownPrefillCBPool[i]);
         if (slot.stagingBuf) {
+            wgpuBufferDestroy(slot.stagingBuf);
             wgpuBufferRelease(slot.stagingBuf);
-            slot.stagingBuf = nullptr;
         }
-        if (slot.ropeParamsBuf.handle) {
-            wgpuBufferRelease(slot.ropeParamsBuf.handle);
-            slot.ropeParamsBuf.handle = nullptr;
-        }
-        if (slot.attnParamsBuf.handle) {
-            wgpuBufferRelease(slot.attnParamsBuf.handle);
-            slot.attnParamsBuf.handle = nullptr;
-        }
-        if (slot.attnParamsBufSWA.handle) {
-            wgpuBufferRelease(slot.attnParamsBufSWA.handle);
-            slot.attnParamsBufSWA.handle = nullptr;
-        }
-        if (slot.q35RopeQParamsBuf.handle) {
-            wgpuBufferRelease(slot.q35RopeQParamsBuf.handle);
-            slot.q35RopeQParamsBuf.handle = nullptr;
-        }
-        if (slot.q35RopeKParamsBuf.handle) {
-            wgpuBufferRelease(slot.q35RopeKParamsBuf.handle);
-            slot.q35RopeKParamsBuf.handle = nullptr;
-        }
-        if (slot.q35KvWriteParamsBuf.handle) {
-            wgpuBufferRelease(slot.q35KvWriteParamsBuf.handle);
-            slot.q35KvWriteParamsBuf.handle = nullptr;
-        }
-        if (slot.tokenInBuf.handle) {
-            wgpuBufferRelease(slot.tokenInBuf.handle);
-            slot.tokenInBuf.handle = nullptr;
-        }
-        if (slot.tokenOutBuf.handle) {
-            wgpuBufferRelease(slot.tokenOutBuf.handle);
-            slot.tokenOutBuf.handle = nullptr;
-        }
-        slot.dispatches.clear();
     }
     pool.clear();
-
-    if (profiler) {
-        profiler->destroy();
-        delete profiler;
-        profiler = nullptr;
-    }
+    for (const auto& entry : ownedBindGroups_) wgpuBindGroupRelease(entry.first);
+    ownedBindGroups_.clear();
+    allDecodeDispatches.clear();autoDecodeDispatches.clear();
+    qwen35PrefillPlan.bindGroups.clear();qwen35PrefillPlan.dispatches.clear();
+    qwen35PrefillPlan.ready = false;
+    if (profiler) { profiler->destroy();delete profiler;profiler=nullptr; }
+    if (calibration) { delete calibration;calibration=nullptr; }
+    for (const auto& entry : ownedBuffers_) gpu->releaseBuffer(entry.second);
+    ownedBuffers_.clear();
+    gpu = nullptr;
 }
 
 bool ModelRunner::qwenPrefillPlanCacheEnabled() const {
@@ -7479,7 +7439,9 @@ void ModelRunner::submitDecode(uint32_t posOffset, int slot) {
 
 int32_t ModelRunner::readArgmax(int slot) {
     auto& ps = pool[slot];
-    return gpu->completeAsyncMapI32(ps.stagingBuf, ps.pendingFuture);
+    const int32_t result = gpu->completeAsyncMapI32(ps.stagingBuf, ps.pendingFuture);
+    ps.pendingFuture = {};
+    return result;
 }
 
 void ModelRunner::seedDecodeTokenInputs(int32_t tokenId) {
@@ -7497,7 +7459,7 @@ void ModelRunner::prefillStep(int32_t tokenId, uint32_t posOffset) {
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
-    gpu->submitOnly(allDecodeDispatches, !passPerDispatch);
+    submitOwned(allDecodeDispatches, !passPerDispatch, false, true);
 
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len++;
@@ -7931,7 +7893,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 std::ofstream file(path, std::ios::binary);
                 file.write(reinterpret_cast<const char*>(values.data()), values.size());
                 ds.clear();
-                for(auto bg:bgs) if(bg) wgpuBindGroupRelease(bg);
+                for(auto bg:bgs) if(bg) releaseOwnedBindGroup(bg);
                 bgs.clear();
             } else if(std::getenv("BP_PROFILE_QWEN_PREFILL")){
                 gpu->writeBuffer(qwen35Pf.paramArena,paramHost.data(),paramCursor);
@@ -7940,16 +7902,13 @@ int32_t ModelRunner::prefillQwen35Batched(
                     std::vector<Dispatch> one{d};(void)gpu->submitAndReadback(one,qwen35Pf.x,4,passPerDispatch);
                     auto t1=std::chrono::steady_clock::now();fprintf(stderr,"[qwen-prefill] layer=%u dispatch=%s gpu=%.2fms\n",li,d.name.c_str(),std::chrono::duration<double,std::milli>(t1-t0).count());fflush(stderr);}
                 ds.clear();
-                for(auto old:bgs)if(old)wgpuBindGroupRelease(old);bgs.clear();
+                for(auto old:bgs)if(old)releaseOwnedBindGroup(old);bgs.clear();
             } else if (boundedSubmissions && li + 1 < cfg.nLayer &&
                        (li + 1) % (M > 64 ? 1u : 4u) == 0) {
                 gpu->writeBuffer(qwen35Pf.paramArena, paramHost.data() + uploadedParams,
                                  paramCursor - uploadedParams, uploadedParams);
                 uploadedParams = paramCursor;
-                if (profiler && profiler->enabled())
-                    gpu->submitOnlyProfiled(ds, *profiler);
-                else
-                    gpu->submitOnly(ds, false);
+                submitOwned(ds, false, profiler && profiler->enabled(), false);
                 // submitOnly[Profiled] consumes the caller's bind-group
                 // references; the command buffer retains its GPU resources.
                 bgs.clear();
@@ -7977,7 +7936,7 @@ int32_t ModelRunner::prefillQwen35Batched(
                 !profiler&&done==0&&M==T&&posOffset==0&&cacheLen==0;
             if(capturePlan){
                 for(auto bg:qwen35PrefillPlan.bindGroups)
-                    if(bg)wgpuBindGroupRelease(bg);
+                    if(bg)releaseOwnedBindGroup(bg);
                 qwen35PrefillPlan.ready=true;
                 qwen35PrefillPlan.tokens=T;
                 qwen35PrefillPlan.posOffset=posOffset;
@@ -8011,7 +7970,7 @@ int32_t ModelRunner::prefillQwen35Batched(
         }
         for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=M;
         auto cleanupStart=QwenPrefillClock::now();
-        for(auto bg:bgs)if(bg)wgpuBindGroupRelease(bg);
+        for(auto bg:bgs)if(bg)releaseOwnedBindGroup(bg);
         cleanupMs+=std::chrono::duration<double,std::milli>(QwenPrefillClock::now()-cleanupStart).count();
         done+=M;
     }
@@ -8059,7 +8018,7 @@ int32_t ModelRunner::prefillGemmaBatched(
                 paramCursor += 256;
                 return b;
             }
-            auto b = gpu->createBuffer(name, bytes,
+            auto b = createOwnedBuffer(name, bytes,
                 uniform ? (BUF_UNIFORM | BUF_COPY_DST) : (BUF_STORAGE | BUF_COPY_DST));
             gpu->writeBuffer(b, d, bytes); params.push_back(b); return b;
         };
@@ -8414,8 +8373,8 @@ int32_t ModelRunner::prefillGemmaBatched(
         }
         for(uint32_t li=0;li<cfg.nLayer;li++)kvCache[li].len+=M;
         auto cleanupStart = PrefillClock::now();
-        for(auto bg:bgs)if(bg)wgpuBindGroupRelease(bg);
-        for(auto p:params)if(p.handle)wgpuBufferRelease(p.handle);
+        for(auto bg:bgs)if(bg)releaseOwnedBindGroup(bg);
+        for(auto p:params)if(p.handle)releaseOwnedBuffer(p);
         cleanupMs += std::chrono::duration<double, std::milli>(PrefillClock::now()-cleanupStart).count();
         done+=M;
     }
@@ -8587,7 +8546,7 @@ int32_t ModelRunner::prefillBatched(
             allPrefill.push_back({e.pipeline, e.bindGroup,
                 grids[i*3], grids[i*3+1], grids[i*3+2], e.name});
         }
-        gpu->submitOnlyProfiled(allPrefill, *profiler);
+        submitOwned(allPrefill, true, true, true);
 
         // Copy last token's norm output → normOutBuf for LM head
         {

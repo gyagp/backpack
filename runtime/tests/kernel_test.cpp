@@ -558,6 +558,44 @@ TEST(gemma_rope_reduction_reuse) {
     return {true,""};
 }
 
+TEST(standard_model_resource_ownership) {
+    const uint32_t marker=0x13579bdfu;
+    auto independent=makeBufferU32(gpu,"independent_owner",&marker,1);
+    const uint64_t baseline=gpu.totalAllocatedBytes;
+    auto& pipeline=gpu.getOrCreatePipeline("model_owner_regression",R"WGSL(
+@group(0) @binding(0) var<storage,read_write> data:array<u32>;
+@compute @workgroup_size(1) fn main(){data[0]+=1u;}
+)WGSL",1);
+    for(bool explicitDestroy:{false,true}) {
+        {
+            ModelRunner model;model.gpu=&gpu;
+            auto buffer=model.createOwnedBuffer("model_owned",4u*1024u*1024u);
+            auto alias=buffer;alias.offset=256;alias.size=256;
+            model.xBuf=buffer;model.normOutBuf=alias;
+            uint32_t initial=0;gpu.writeBuffer(buffer,&initial,4);
+            auto group=model.makeBG(pipeline,{{0,buffer}});
+            std::vector<Dispatch> commands{{pipeline.pipeline,group,1,1,1,"owner_increment"}};
+            // Cached dispatch submission must retain the owner's group reference.
+            model.submitOwned(commands,true,false,true);
+            model.submitOwned(commands,true,false,true);
+            auto bytes=gpu.readBuffer(buffer,4);uint32_t value=0;std::memcpy(&value,bytes.data(),4);
+            if(value!=2)return {false,"Cached bind group did not survive consuming submission"};
+            auto transient=model.createOwnedBuffer("model_transient",16,BUF_STORAGE|BUF_COPY_DST);
+            model.releaseOwnedBuffer(transient);model.releaseOwnedBuffer(transient);
+            auto oneShot=model.makeBG(pipeline,{{0,buffer}});
+            model.submitOwned({{pipeline.pipeline,oneShot,1,1,1,"one_shot"}},true,false,false);
+            if(explicitDestroy){model.destroy();model.destroy();}
+        }
+        if(gpu.totalAllocatedBytes!=baseline)return {false,"Model allocations survive destruction"};
+        auto bytes=gpu.readBuffer(independent,4);uint32_t value=0;std::memcpy(&value,bytes.data(),4);
+        if(value!=marker || gpu.executionError || gpu.deviceLost)
+            return {false,"Model teardown changed unrelated buffer or device state"};
+    }
+    gpu.releaseBuffer(independent);
+    return {true,""};
+}
+
+
 TEST(gemma_gateup_gelu_exact) {
     if (gpu.adapterName != "NVIDIA GeForce RTX 5080" || g_backend != WGPUBackendType_D3D12)
         return {false, "Gemma exact fusion test requires RTX 5080 / D3D12"};
