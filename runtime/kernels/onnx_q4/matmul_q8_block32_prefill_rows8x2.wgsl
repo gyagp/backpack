@@ -1,4 +1,3 @@
-// @meta noregistry=true
 enable subgroups;
 
 // Eight rows share two columns' weights without increasing the 16 output

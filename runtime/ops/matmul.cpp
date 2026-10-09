@@ -465,16 +465,17 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             outDtype = TensorDtype::Float32;
             *out[0] = ex.AllocTensor(outShape, outDtype);
         }
-        const bool useRows4Prefill = M > 1 && (K % 32u) == 0u &&
+        const bool canReuseQ8Rows = M > 1 && (K % 32u) == 0u &&
             ex.getGpu()->supportsSubgroups && ex.getGpu()->subgroupMinSize >= 2u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->adapterName == "NVIDIA GeForce RTX 5080" &&
-            effectiveLimits(*ex.getGpu()).maxComputeWorkgroupStorageSize >= 16384u && [] {
-                const char* option=std::getenv("BP_QWEN35_Q8_PREFILL_ROWS");
-                // Validated on RTX 5080: four rows share loads while a subgroup
-                // shuffle preserves product rounding. Set 0 for the scalar path.
-                return !option || !*option || std::strcmp(option,"4")==0;
-            }();
+            effectiveLimits(*ex.getGpu()).maxComputeWorkgroupStorageSize >= 16384u;
+        const char* rowOption = canReuseQ8Rows ? std::getenv("BP_QWEN35_Q8_PREFILL_ROWS") : nullptr;
+        // Both tiles preserve product rounding and the original reduction.
+        // Explicit 4 retains the previous tile; 0 selects scalar prefill.
+        const bool useRows8x2Prefill = canReuseQ8Rows &&
+            (!rowOption || !*rowOption || std::strcmp(rowOption,"8x2")==0);
+        const bool useRows4Prefill = canReuseQ8Rows && rowOption && std::strcmp(rowOption,"4")==0;
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
@@ -546,6 +547,9 @@ if (lid.x == 0u) {
         } else if (useSubgroupDecode) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
                 []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); });
+        } else if (useRows8x2Prefill) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows8x2",5,
+                [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS8X2); });
         } else if (useRows4Prefill) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows4",5,
                 [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS4); });
@@ -574,10 +578,12 @@ if (lid.x == 0u) {
                 {0, X->buffer}, {1, W->buffer}, {2, S->buffer},
                 {3, out[0]->buffer}, {4, paramBuf}});
         ex.QueueDispatch(pipeline.pipeline, group,
-                         useSubgroupDecode ? numWg : (N + 3) / 4,
+                         useSubgroupDecode ? numWg : useRows8x2Prefill ? (N + 1) / 2 : (N + 3) / 4,
+                         useRows8x2Prefill ? (static_cast<uint32_t>(M)+7u)/8u :
                          useRows4Prefill ? (static_cast<uint32_t>(M)+3u)/4u : static_cast<uint32_t>(M), 1,
                          fuseGreedyArgmax ? "matmul_q8_block32_fused_argmax" :
                          useSubgroupDecode ? "matmul_q8_block32_subgroup" :
+                         useRows8x2Prefill ? "matmul_q8_block32_prefill_rows8x2" :
                          useRows4Prefill ? "matmul_q8_block32_prefill_rows4" : "matmul_q8_block32");
         if (fuseGreedyArgmax) {
             uint32_t reduceParams[4] = {numWg, 0, 0, 0};

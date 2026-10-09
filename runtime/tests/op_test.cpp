@@ -1996,7 +1996,7 @@ TEST(matmul_q8_prefill_rows4) {
     struct Restore {std::function<void()> action;~Restore(){action();}} restore{[&]{set(saved.c_str());}};
     if(gpu.adapterName!="NVIDIA GeForce RTX 5080" || gpu.backendType!=WGPUBackendType_D3D12)
         throw std::runtime_error("Q8 prefill test requires selected RTX5080/D3D12");
-    for(int K:{32,256,2048,6144})for(int M:{2,5,32})for(bool half:{false,true}) {
+    for(int K:{32,256,2048,6144})for(int M:{2,5,7,8,9,32})for(bool half:{false,true}) {
         constexpr int N=13;Rng rng(uint32_t(K+M+23));
         std::vector<float> x(M*K),scales(N*K/32);
         for(auto& v:x)v=rng.uniform(-1.0f,1.0f);
@@ -2009,10 +2009,13 @@ TEST(matmul_q8_prefill_rows4) {
             {{"W",ONNX_UINT8,{N,K/32,32},weights},makeInitF16("scales",{N,K/32},scales)});
         const auto input=half?makeInputF16("X",{1,M,K},x):makeInputF32("X",{1,M,K},x);
         set("0");auto reference=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
-        set("4");auto actual=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
-        if(gpu.executionError || gpu.deviceLost)throw std::runtime_error("Q8 prefill row reuse GPU validation failed");
-        if(reference.at("Y").data!=actual.at("Y").data)throw std::runtime_error("Q8 prefill row reuse changed output bits at K="+std::to_string(K)+" M="+std::to_string(M)+" half="+std::to_string(half));
-        if(!gpu.hasPipeline("matmul_q8_block32_prefill_rows4"))throw std::runtime_error("Q8 prefill route was not selected");
+        for(const char* option:{"4","8x2",""}) {
+            set(option);auto actual=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
+            if(gpu.executionError || gpu.deviceLost)throw std::runtime_error("Q8 prefill row reuse GPU validation failed");
+            if(reference.at("Y").data!=actual.at("Y").data)throw std::runtime_error("Q8 prefill tile changed output bits at K="+std::to_string(K)+" M="+std::to_string(M)+" half="+std::to_string(half));
+            const char* pipeline=std::strcmp(option,"4")==0?"matmul_q8_block32_prefill_rows4":"matmul_q8_block32_prefill_rows8x2";
+            if(!gpu.hasPipeline(pipeline))throw std::runtime_error("Requested Q8 prefill route was not selected");
+        }
     }
 }
 
