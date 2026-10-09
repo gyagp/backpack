@@ -698,8 +698,9 @@ TEST(gemma_gateup_gelu_exact) {
 TEST(causal_attention_sliding_window_rows) {
     // With Q=K=0 the expected result is the mean of the visible V rows.
     // Distinct values expose over-masking of early rows in a prefill chunk.
+    for(const char* kernel:{"causal_attn","causal_attn_packed"})
     for(uint32_t hd:{128u,256u,512u}) {
-        std::string shader=getEmbeddedKernels().at("causal_attn").source;
+        std::string shader=getEmbeddedKernels().at(kernel).source;
         for(const auto& patch:std::vector<std::pair<std::string,std::string>>{
                 {"const HD: u32 = 128u;","const HD: u32 = "+std::to_string(hd)+"u;"},
                 {"const HD_PER_THREAD: u32 = 4u;","const HD_PER_THREAD: u32 = "+std::to_string(hd/32)+"u;"}})

@@ -1,4 +1,4 @@
-// @meta noregistry=true
+// @meta bindings=5 generated=false registry=causal_attn_packed
 // Whole fp16-pair loads for HD divisible by64. Preserve original online arithmetic.
 enable f16;
 enable subgroups;

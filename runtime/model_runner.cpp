@@ -837,6 +837,16 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
 }
 
 const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32_t headDim) {
+    // Preserve Gemma's online attention arithmetic while loading whole fp16
+    // cache pairs. Other dimensions and adapters keep the original kernel.
+    if (name == "causal_attn" && cfg.arch == "gemma4" &&
+        gpu->backendType == WGPUBackendType_D3D12 &&
+        gpu->adapterName == "NVIDIA GeForce RTX 5080" && gpu->supportsSubgroups &&
+        (headDim == 256 || headDim == 512)) {
+        const char* disable = std::getenv("BP_GEMMA_DISABLE_PACKED_CAUSAL_KV");
+        if (!disable || std::strcmp(disable, "1") != 0)
+            return getKernelHD("causal_attn_packed", headDim);
+    }
     const bool subgroupChunkedP1 = name == "gqa_chunked_pass1_subgroup";
     const bool portableCausal = name == "causal_attn_portable";
     const std::string sourceName = subgroupChunkedP1 ? "gqa_chunked_pass1" :
