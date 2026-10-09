@@ -7,6 +7,8 @@ bool supportsNativeQuant(GGUFType type);
 KQuantPacked pack_native_quant(const void* raw, uint32_t rows, uint32_t cols, GGUFType type);
 std::string nativeQuantShader(GGUFType type, bool gather = false, bool prefill = false,
                               uint32_t prefillRows = 16, bool alignedU16 = false);
+// The optional integer-load path retains byte assembly for odd field offsets.
+// Runtime routing qualifies scalar matrix types separately from staging/gather.
 
 // Staged prefill parameters: K, packed N, blocks/row, packed stride,
 // source column offset, output stride, M, staged columns, output offset.

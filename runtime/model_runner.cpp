@@ -44,8 +44,21 @@ bool qwen38NativeStaging(const GPUContext& gpu,const GGUFFile& model,const Model
 }
 
 const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool gather = false, bool prefill = false, uint32_t rows = 16) {
-    return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) + (gather ? "_gather" : "") + (prefill ? "_prefill"+std::to_string(rows) : ""),
-                                   nativeQuantShader(type, gather, prefill, rows), 5);
+    // Qualify scalar matrix loads separately from tiled/staged prefill and
+    // gathering. IQ4_NL regressed; IQ4_XS and Q5_K were neutral in both orders.
+    const bool measuredType = type == GGUF_TYPE_Q2_K || type == GGUF_TYPE_Q3_K ||
+        type == GGUF_TYPE_IQ2_XXS || type == GGUF_TYPE_IQ2_XS ||
+        type == GGUF_TYPE_IQ3_XXS || type == GGUF_TYPE_IQ1_S ||
+        type == GGUF_TYPE_IQ3_S || type == GGUF_TYPE_IQ2_S;
+    const char* option = std::getenv("BP_NATIVE_QUANT_ALIGNED_U16");
+    const bool alignedU16 = !gather && !prefill && measuredType &&
+        gpu.backendType == WGPUBackendType_D3D12 &&
+        gpu.adapterName == "NVIDIA GeForce RTX 5080" &&
+        (!option || std::strcmp(option, "0") != 0);
+    return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) +
+        (alignedU16 ? "_aligned_u16" : "") + (gather ? "_gather" : "") +
+        (prefill ? "_prefill"+std::to_string(rows) : ""),
+        nativeQuantShader(type, gather, prefill, rows, alignedU16), 5);
 }
 
 std::string deltaNetValueMajorSource(const std::string& source) {
