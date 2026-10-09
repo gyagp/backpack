@@ -466,6 +466,7 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             *out[0] = ex.AllocTensor(outShape, outDtype);
         }
         const bool useRows4Prefill = M > 1 && (K % 32u) == 0u &&
+            ex.getGpu()->supportsSubgroups && ex.getGpu()->subgroupMinSize >= 2u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->adapterName == "NVIDIA GeForce RTX 5080" &&
             effectiveLimits(*ex.getGpu()).maxComputeWorkgroupStorageSize >= 16384u && [] {

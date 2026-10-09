@@ -1,5 +1,12 @@
+enable subgroups;
+
 // Four prompt rows share Q8 weight/scale loads. Each retains its original
-// 256-lane K sequence and reduction tree. Products round before scale FMAs.
+// 256-lane K sequence and reduction tree. Compute adjacent-lane products and
+// shuffle them back before scaling: the cross-lane operation preserves the
+// x*q rounding boundary. A direct vector fma(x*q,scale,total) was reassociated
+// to fma(x,q*scale,total) on RTX 5080/D3D12 and failed every FP32 parity case.
+// XOR 1 stays inside each 32-value scale block and preserves the original
+// lane's accumulator sequence after the shuffle.
 struct Params { M:u32, N:u32, K:u32, _pad:u32 };
 @group(0) @binding(0) var<storage,read> X:array<f32>;
 @group(0) @binding(1) var<storage,read> W:array<u32>;
@@ -18,23 +25,23 @@ fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) id:
     var total2=vec4<f32>(0.0);var total3=vec4<f32>(0.0);
     for(var k=lane;k<p.K;k+=256u) {
         var x=vec4<f32>(0.0);
-        for(var r=0u;r<4u;r++) { if(m0+r<p.M) { x[r]=X[(m0+r)*p.K+k]; } }
-        let shift=(k&3u)*8u;let kw=k>>2u;let block=k/32u;
+        for(var r=0u;r<4u;r++) { if(m0+r<p.M) { x[r]=X[(m0+r)*p.K+(k^1u)]; } }
+        let shift=((k^1u)&3u)*8u;let kw=k>>2u;let block=k/32u;
         if(n0<p.N) {
             let q=f32(i32((W[n0*(p.K/4u)+kw]>>shift)&255u)-128);
-            let s=scale_at(n0*blocks+block);total0=fma(x*q,vec4<f32>(s),total0);
+            let s=scale_at(n0*blocks+block);let product=subgroupShuffleXor(x*q,1u);total0=fma(product,vec4<f32>(s),total0);
         }
         if(n0+1u<p.N) {
             let n=n0+1u;let q=f32(i32((W[n*(p.K/4u)+kw]>>shift)&255u)-128);
-            let s=scale_at(n*blocks+block);total1=fma(x*q,vec4<f32>(s),total1);
+            let s=scale_at(n*blocks+block);let product=subgroupShuffleXor(x*q,1u);total1=fma(product,vec4<f32>(s),total1);
         }
         if(n0+2u<p.N) {
             let n=n0+2u;let q=f32(i32((W[n*(p.K/4u)+kw]>>shift)&255u)-128);
-            let s=scale_at(n*blocks+block);total2=fma(x*q,vec4<f32>(s),total2);
+            let s=scale_at(n*blocks+block);let product=subgroupShuffleXor(x*q,1u);total2=fma(product,vec4<f32>(s),total2);
         }
         if(n0+3u<p.N) {
             let n=n0+3u;let q=f32(i32((W[n*(p.K/4u)+kw]>>shift)&255u)-128);
-            let s=scale_at(n*blocks+block);total3=fma(x*q,vec4<f32>(s),total3);
+            let s=scale_at(n*blocks+block);let product=subgroupShuffleXor(x*q,1u);total3=fma(product,vec4<f32>(s),total3);
         }
     }
     sums[lane]=total0;sums[256u+lane]=total1;sums[512u+lane]=total2;sums[768u+lane]=total3;
