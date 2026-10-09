@@ -10,18 +10,21 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 int main(int argc, char** argv) {
     if (argc != 4) {
-        std::cerr << "Usage: backpack_qwen_continuation_test MODEL [application-|boundary-|transition-]reference|queued OUTPUT.json\n";
+        std::cerr << "Usage: backpack_qwen_continuation_test MODEL [application-|boundary-|transition-]reference|queued|lifecycle OUTPUT.json\n";
         return 2;
     }
     try {
         const char* host=std::getenv("COMPUTERNAME");if(!host || _stricmp(host,"webgfx-104")!=0)return 2;
         std::string mode = argv[2];
+        const bool lifecycle = mode == "lifecycle";
+        if(lifecycle)mode="queued";
         const bool transition = mode.rfind("transition-",0)==0;
         if(transition)mode.erase(0,11);
         const bool boundary = mode.rfind("boundary-", 0) == 0;
@@ -37,6 +40,8 @@ int main(int argc, char** argv) {
         options.maxSeqLen = boundary ? 128 : 640;
         options.fastDecode = !reference;
         options.prefillChunkSize = 32;
+        auto* context=static_cast<GPUContext*>(device.GetGPUContext());
+        const uint64_t beforeSession=context->totalAllocatedBytes;
         auto session = bp::LmSession::Create(device, argv[1], options);
         if (!session.IsValid()) throw std::runtime_error("Cannot load model");
         const auto cfg = session.GetConfig();
@@ -45,6 +50,33 @@ int main(int argc, char** argv) {
         const auto folder = std::filesystem::path(argv[3]).parent_path();
         std::ofstream out(argv[3]);
         if (!out) throw std::runtime_error("Cannot open result file");
+        if(lifecycle) {
+            const auto tokens=session.Tokenize(app::applyChatTemplate("Explain in one sentence why the sky is blue.",cfg.arch));
+            std::vector<char> firstLogits;
+            out<<"{\"cycles\":[";
+            for(int cycle=0;cycle<2;++cycle) {
+                if(cycle)session=bp::LmSession::Create(device,argv[1],options);
+                if(!session.IsValid())throw std::runtime_error("Reload failed");
+                const auto dump=(folder/("lifecycle-"+std::to_string(cycle)+".f32")).string();
+                _putenv_s("BP_DUMP_PREFILL_LOGITS",dump.c_str());
+                const auto firstToken=session.Prefill(tokens.data(),uint32_t(tokens.size()));
+                _putenv_s("BP_DUMP_PREFILL_LOGITS","");
+                std::ifstream file(dump,std::ios::binary);
+                std::vector<char> logits{std::istreambuf_iterator<char>(file),{}};
+                if(logits.size()!=size_t(cfg.vocabSize)*4)throw std::runtime_error("Missing initial logits");
+                if(!cycle)firstLogits=logits;
+                else if(logits!=firstLogits)throw std::runtime_error("Reload inherited dirty recurrent state");
+                for(int i=0;i<7;++i)if(session.Decode()<0)throw std::runtime_error("Unexpected stream exhaustion");
+                const uint64_t active=context->totalAllocatedBytes;
+                // Release without Reset while speculative work remains queued.
+                session.Release();
+                if(context->totalAllocatedBytes!=beforeSession)throw std::runtime_error("Model or checkpoint buffers leaked");
+                if(context->executionError || context->deviceLost)throw std::runtime_error("GPU release failure");
+                out<<(cycle?",":"")<<"{\"cycle\":"<<cycle<<",\"first_token\":"<<firstToken
+                   <<",\"active_bytes\":"<<active<<",\"released_bytes\":"<<context->totalAllocatedBytes<<"}";out.flush();
+            }
+            out<<"],\"matching_initial_logits\":true}";return 0;
+        }
         if(boundary) {
             out<<"{\"cases\":[";bool firstCase=true;
             const auto one=session.TokenizeRaw(" A");if(one.size()!=1)throw std::runtime_error("Expected one token");
