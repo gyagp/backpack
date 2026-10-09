@@ -1,4 +1,3 @@
-// @meta noregistry=true
 enable subgroups;
 
 // Eight rows share two columns. High-half partial storage halves shared

@@ -480,6 +480,12 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         // while exceeding the per-dimension limit with only 2 columns.
         const bool useRows4Prefill = canReuseQ8Rows &&
             ((rowOption && std::strcmp(rowOption,"4")==0) || (preferRows8x2 && !useRows8x2Prefill));
+        // The smaller shared partial layout improves short-K projections.
+        // Longer K keeps the previous path, including short prompts.
+        const bool useHalfSharedPrefill = useRows8x2Prefill && K <= 2048u && [] {
+            const char* option=std::getenv("BP_QWEN35_Q8_PREFILL_HALF_SHARED");
+            return !option || std::strcmp(option,"0")!=0;
+        }();
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
@@ -551,6 +557,9 @@ if (lid.x == 0u) {
         } else if (useSubgroupDecode) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_subgroup", 5,
                 []() { return std::string(WGSL_MATMUL_Q8_BLOCK32_SUBGROUP); });
+        } else if (useHalfSharedPrefill) {
+            pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows8x2_half",5,
+                [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS8X2_HALF); });
         } else if (useRows8x2Prefill) {
             pipelinePtr = &ex.GetPipelineT("matmul_q8_block32_prefill_rows8x2",5,
                 [] { return std::string(WGSL_MATMUL_Q8_BLOCK32_PREFILL_ROWS8X2); });
@@ -587,6 +596,7 @@ if (lid.x == 0u) {
                          useRows4Prefill ? (static_cast<uint32_t>(M)+3u)/4u : static_cast<uint32_t>(M), 1,
                          fuseGreedyArgmax ? "matmul_q8_block32_fused_argmax" :
                          useSubgroupDecode ? "matmul_q8_block32_subgroup" :
+                         useHalfSharedPrefill ? "matmul_q8_block32_prefill_rows8x2_half" :
                          useRows8x2Prefill ? "matmul_q8_block32_prefill_rows8x2" :
                          useRows4Prefill ? "matmul_q8_block32_prefill_rows4" : "matmul_q8_block32");
         if (fuseGreedyArgmax) {
