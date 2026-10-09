@@ -471,7 +471,9 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
             ex.getGpu()->adapterName == "NVIDIA GeForce RTX 5080" &&
             effectiveLimits(*ex.getGpu()).maxComputeWorkgroupStorageSize >= 16384u && [] {
                 const char* option=std::getenv("BP_QWEN35_Q8_PREFILL_ROWS");
-                return option && std::strcmp(option,"4")==0;
+                // Validated on RTX 5080: four rows share loads while a subgroup
+                // shuffle preserves product rounding. Set 0 for the scalar path.
+                return !option || !*option || std::strcmp(option,"4")==0;
             }();
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
