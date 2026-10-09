@@ -572,6 +572,10 @@ TEST(standard_model_resource_ownership) {
             auto buffer=model.createOwnedBuffer("model_owned",4u*1024u*1024u);
             auto alias=buffer;alias.offset=256;alias.size=256;
             model.xBuf=buffer;model.normOutBuf=alias;
+            model.releaseOwnedBuffer(alias);
+            auto prefix=buffer;prefix.size=256;model.releaseOwnedBuffer(prefix);
+            if(model.ownedBuffers_.size()!=1)return {false,"Borrowed view released its parent"};
+
             uint32_t initial=0;gpu.writeBuffer(buffer,&initial,4);
             auto group=model.makeBG(pipeline,{{0,buffer}});
             std::vector<Dispatch> commands{{pipeline.pipeline,group,1,1,1,"owner_increment"}};
@@ -591,6 +595,16 @@ TEST(standard_model_resource_ownership) {
         if(value!=marker || gpu.executionError || gpu.deviceLost)
             return {false,"Model teardown changed unrelated buffer or device state"};
     }
+    // Exception unwinding must clean allocations made before model load fails.
+    bool caught=false;
+    try {
+        ModelRunner partial;partial.gpu=&gpu;
+        auto buffer=partial.createOwnedBuffer("partial_model",4u*1024u*1024u);
+        (void)partial.makeBG(pipeline,{{0,buffer}});
+        throw std::runtime_error("simulated partial model initialization");
+    } catch(const std::runtime_error&) { caught=true; }
+    if(!caught || gpu.totalAllocatedBytes!=baseline)
+        return {false,"Partial model initialization retained owned resources"};
     gpu.releaseBuffer(independent);
     return {true,""};
 }

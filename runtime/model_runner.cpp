@@ -608,7 +608,10 @@ WGPUBindGroup ModelRunner::makeBG(
     d.entryCount = (uint32_t)bindings.size();
     d.entries = entries;
     auto group = wgpuDeviceCreateBindGroup(gpu->device, &d);
-    if (group) ownedBindGroups_.emplace(group, true);
+    if (group) {
+        try { ownedBindGroups_.emplace(group, true); }
+        catch (...) { wgpuBindGroupRelease(group); throw; }
+    }
     return group;
 }
 
@@ -6789,13 +6792,18 @@ ModelRunner::~ModelRunner() { destroy(); }
 GPUBuffer ModelRunner::createOwnedBuffer(const std::string& name, uint64_t size,
         uint64_t usage, bool mappedAtCreation) {
     auto buffer = gpu->createBuffer(name, size, usage, mappedAtCreation);
-    if (buffer.handle) ownedBuffers_.emplace(buffer.handle, buffer);
+    if (buffer.handle) {
+        try { ownedBuffers_.emplace(buffer.handle, buffer); }
+        catch (...) { gpu->releaseBuffer(buffer); throw; }
+    }
     return buffer;
 }
 
 void ModelRunner::releaseOwnedBuffer(GPUBuffer buffer) {
+    // Offset and shortened views borrow their allocation; they cannot retire it.
+    if (buffer.offset != 0) return;
     auto found = ownedBuffers_.find(buffer.handle);
-    if (found == ownedBuffers_.end()) return;
+    if (found == ownedBuffers_.end() || buffer.size != found->second.size) return;
     gpu->releaseBuffer(found->second);
     ownedBuffers_.erase(found);
 }
