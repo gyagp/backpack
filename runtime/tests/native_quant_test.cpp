@@ -53,7 +53,8 @@ int main(int argc, char** argv) {
     const bool alignedU16 = cacheIQ3 || std::string(argv[1]) == "--aligned-u16";
     const int modeArg = (alignedU16 || packedIq4) ? 2 : 1;
     if(argc <= modeArg){std::fprintf(stderr,"Pass a mode and/or GGUF fixtures after --aligned-u16\n");return 2;}
-    const bool alignedActivations = std::string(argv[modeArg]) == "--staged-pair-vec2-a36";
+    const bool transposedPairs = std::string(argv[modeArg]) == "--staged-pair-b34";
+    const bool alignedActivations = transposedPairs || std::string(argv[modeArg]) == "--staged-pair-vec2-a36";
     const bool alignedWeights = alignedActivations || std::string(argv[modeArg]) == "--staged-pair-vec2";
     const bool paired = alignedWeights || std::string(argv[modeArg]) == "--staged-pair";
     const bool staged = paired || std::string(argv[modeArg]) == "--staged";
@@ -61,9 +62,17 @@ int main(int argc, char** argv) {
     const bool tiled = tiled32 || std::string(argv[modeArg]) == "--tiled";
     const uint32_t tileRows=tiled32?32u:16u, tileCols=tiled32?8u:16u;
     const int firstFixture = tiled ? modeArg + 1 : modeArg;
+    if (transposedPairs) {
+        for (unsigned flags=0; flags<7; ++flags) {
+            bool rejected=false;
+            try { nativeQuantDensePrefillShader((flags&1)!=0,(flags&2)!=0,(flags&4)!=0,true); }
+            catch (const std::runtime_error&) { rejected=true; }
+            if (!rejected) { std::fprintf(stderr,"Invalid transposed layout flags were accepted\n"); return 2; }
+        }
+    }
     GPUContext gpu;
     if (!gpu.init(WGPUBackendType_D3D12)) return 1;
-    if((alignedU16 || packedIq4) && (gpu.adapterName!="NVIDIA GeForce RTX 5080" || gpu.supportsSubgroupMatrix))return 2;
+    if((alignedU16 || packedIq4 || transposedPairs) && (gpu.adapterName!="NVIDIA GeForce RTX 5080" || gpu.supportsSubgroupMatrix))return 2;
     unsigned tests = 0,paddedGather = 0;
     try {
         if(packedIq4)checkLookup(gpu);
@@ -109,7 +118,7 @@ int main(int argc, char** argv) {
                 if(staged) {
                     auto scratch=upload("staged",nullptr,uint64_t(K)*8*4);
                     auto& decode=gpu.getOrCreatePipeline("native_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type,alignedU16),5);
-                    auto& dense=gpu.getOrCreatePipeline("native_dense",nativeQuantDensePrefillShader(paired,alignedWeights,alignedActivations),5);
+                    auto& dense=gpu.getOrCreatePipeline("native_dense",nativeQuantDensePrefillShader(paired,alignedWeights,alignedActivations,transposedPairs),5);
                     std::vector<GPUBuffer> paramsBuffers;std::vector<WGPUBindGroup> groups;std::vector<Dispatch> dispatches;
                     for(uint32_t col=0;col<N;col+=8) {
                         const uint32_t count=std::min(8u,N-col),p[]={K,N,packed.nBlocks,packed.rowStrideWords,col,strided?2*N:N,M,count,(strided?N:0)+col};

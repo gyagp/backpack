@@ -7691,6 +7691,10 @@ int32_t ModelRunner::prefillQwen35Batched(
             const bool alignedWeights=paired && (!alignedControl || std::strcmp(alignedControl,"0")!=0);
             const char* activationControl=std::getenv("BP_NATIVE_DENSE_PREFILL_ALIGNED_A");
             const bool alignedActivations=alignedWeights && (!activationControl || std::strcmp(activationControl,"0")!=0);
+            // This lambda is already gated to the exact RTX5080/D3D12 27B
+            // IQ3_S staging target. Preserve the accepted layout as a fallback.
+            const char* transposeControl=std::getenv("BP_NATIVE_DENSE_PREFILL_TRANSPOSED_B");
+            const bool transposedPairs=alignedActivations && (!transposeControl || std::strcmp(transposeControl,"0")!=0);
             // IQ4_XS missed the staging threshold with the original dense
             // shader. The paired shader makes its seven real-weight shape
             // groups profitable within the same 4096-column scratch bound.
@@ -7708,10 +7712,12 @@ int32_t ModelRunner::prefillQwen35Batched(
             if(type!=GGUF_TYPE_IQ3_S && type!=GGUF_TYPE_IQ3_XXS &&
                 !(type==GGUF_TYPE_IQ4_XS && stageIq4) && !stageLowBit)return false;
             auto& decode=gpu->getOrCreatePipeline("native_quant_decode_slice_"+std::to_string(type),nativeQuantDecodeSliceShader(type),5);
-            auto& dense=gpu->getOrCreatePipeline(alignedActivations?"native_quant_dense_prefill32_pair_vec2_a36":
-                (alignedWeights?"native_quant_dense_prefill32_pair_vec2":
-                 (paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32")),
-                nativeQuantDensePrefillShader(paired,alignedWeights,alignedActivations),5);
+            const char* denseKey=transposedPairs?"native_quant_dense_prefill32_pair_vec2_a36_b34":
+                alignedActivations?"native_quant_dense_prefill32_pair_vec2_a36":
+                alignedWeights?"native_quant_dense_prefill32_pair_vec2":
+                paired?"native_quant_dense_prefill32_pair":"native_quant_dense_prefill32";
+            auto& dense=gpu->getOrCreatePipeline(denseKey,
+                nativeQuantDensePrefillShader(paired,alignedWeights,alignedActivations,transposedPairs),5);
             for(uint32_t col=0;col<N;col+=4096) {
                 const uint32_t count=std::min(4096u,N-col);
                 auto p=mkp(name+"_stage_p",{K,N,nb,rs,col,outputStride,M,count,outputOffset+col});

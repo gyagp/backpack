@@ -197,7 +197,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return source;
 }
 
-std::string nativeQuantDensePrefillShader(bool columnPair, bool alignedWeights, bool alignedActivations) {
+std::string nativeQuantDensePrefillShader(bool columnPair, bool alignedWeights, bool alignedActivations, bool transposedPairs) {
+    if (transposedPairs) {
+        if (!columnPair || !alignedWeights || !alignedActivations)
+            throw std::runtime_error("Transposed dense prefill requires paired weights and aligned activations");
+        return NATIVE_DENSE_PREFILL_TRANSPOSED_B_SOURCE;
+    }
     if(columnPair) {
         if(!alignedWeights)return NATIVE_DENSE_PREFILL_PAIR_SOURCE;
         std::string source=NATIVE_DENSE_PREFILL_PAIR_VEC2_SOURCE;

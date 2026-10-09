@@ -13,4 +13,4 @@ std::string nativeQuantShader(GGUFType type, bool gather = false, bool prefill =
 // Staged prefill parameters: K, packed N, blocks/row, packed stride,
 // source column offset, output stride, M, staged columns, output offset.
 std::string nativeQuantDecodeSliceShader(GGUFType type, bool alignedU16 = false);
-std::string nativeQuantDensePrefillShader(bool columnPair = false, bool alignedWeights = false, bool alignedActivations = false);
+std::string nativeQuantDensePrefillShader(bool columnPair = false, bool alignedWeights = false, bool alignedActivations = false, bool transposedPairs = false);
