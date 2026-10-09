@@ -1,13 +1,14 @@
 # webgfx-104 model enablement
 
-Status as of 2026-10-09. The active scope in `goal.md` is this device only;
+Status as of 2026-10-10. The active scope in `goal.md` is this device only;
 neither model enablement nor acceptance requires another machine.
 
 ## Current accepted state
 
-The active runtime milestone is `dccb48c43c3950830c021e1a5115adccb4461643`
-(task #885, Gemma continuation boundary repair). It retains task #883's exact
-packed IQ4_XS lookup and task #880's IQ3_S block
+The active runtime milestone is `b185430082bf0b9b45d23c1d7b7aa91f0f0d057f`
+(task #886, Qwen GGUF continuation and lifecycle repair). It retains task #885's
+Gemma continuation recovery, task #883's exact packed IQ4_XS lookup, and task
+#880's IQ3_S block
 scale reuse, task #879's aligned
 native scalar field loads, task #877's
 Q8 product bit identities, task #875's packed
@@ -23,22 +24,23 @@ framework tests and live HTTP/SSE checks pass. Task #873 carries this exact
 controller patch in the selected source ancestry. See
 `gitignore/logs/json-policy-serialization-20261009/RESULT.md`.
 
-The independent GGUF reference was refreshed to official llama.cpp **b11515**
-on 2026-10-09 (task #857, source `3d65c90d04d337e88f2b1f7f0061f40a5324e662`).
-Its release-matched helper passes four final-answer checks, eight changing-prompt,
-reset and backend/CPU greedy cases, and all 10,240 measured tokens on Vulkan0 /
-RTX 5080. Gemma and Qwen3.5 references now match the accepted Backpack
-five-process/five-conversation schedule, retaining every conversation's cost.
-Qwen3.8 retains the matching one-process/five-conversation schedule. Requested
-context is 640; llama.cpp's effective allocation is 768. Prefill/decode rates are
-12,753.26/196.44 (Gemma), 16,349.36/239.61 (2B), 9,365.70/148.65 (4B), and
-1,879.63/47.01 tokens/s (27B). The original reference method remains separately
-recorded for release-to-release comparisons; no timing sample was removed.
-The current matched GGUF ranking still puts Qwen3.8 prefill first: 142.46 versus
-1,879.63 tokens/s, a 92.42% deficit. This reference refresh changes no Backpack
-runtime or policy. Evidence, exact artifacts, and comparison contracts:
-`gitignore/logs/llamacpp-latest-20261009/RESULT.md` and
-`gitignore/logs/llamacpp-latest-20261009/current-gguf-gap-ranking.json`.
+The independent GGUF reference was refreshed to official llama.cpp **b11535**
+on 2026-10-10 (task #888, source `f39148a953e52d6d14e92b73187e9883544dce49`).
+Its archive digest and release-matched helper ABI are verified. Four final-answer
+checks, eight changing-prompt/reset/backend-versus-CPU cases, and all 10,240
+measured tokens pass on Vulkan0 / RTX 5080. The measured tokens also match the
+existing Backpack fixtures. Gemma and Qwen3.5 use five complete processes with
+five conversations each; Qwen3.8 uses one process with five conversations. Every
+process retains one warmup. Requested context is 640; llama.cpp allocates 768.
+Prefill/decode rates are 12,759.82/196.38 (Gemma), 16,301.08/238.94 (2B),
+9,259.32/148.38 (4B), and 1,886.08/47.21 tokens/s (27B).
+The current matched GGUF ranking still puts Qwen3.8 prefill first: 142.31 versus
+1,886.08 tokens/s, a 92.45% deficit. All eight comparison contracts match the
+artifact, prompt, requested workload and process schedule; backend allocation
+padding remains explicit. Backpack stays at `b185430`, with no runtime or policy
+change from this reference refresh. Evidence and exact comparison contracts:
+`gitignore/logs/llamacpp-latest-20261010/RESULT.md` and
+`gitignore/logs/llamacpp-latest-20261010/current-gguf-gap-ranking.json`.
 
 Task #858 has rebuilt newer native ORT/GenAI sources in isolated caches:
 ORT `4124d64a` from upstream `8fe86b17`, and GenAI `df50b45e` from upstream
@@ -50,6 +52,28 @@ October8 native reference remains in use. Source bundles, build failures and
 corrections, exact caches, and the review constraint are preserved in
 `gitignore/logs/native-latest-refresh-20261009/RESULT.md`.
 
+- Task #887 qualifies a direct state-buffer handoff for Qwen ONNX appended
+  input, but it remains unselected. All 84 paired continuation/boundary cases,
+  66 controlled logit comparisons, 32 default-capture cases, 71 operators and
+  eight fixed-output formats pass. All 11,520 measured tokens are exact. The
+  27B mean decode result is +4.89%, but baseline CV10.17% exceeds the unchanged
+  5% gate (candidate CV3.49%), so the comparison is inconclusive. No timing was
+  discarded or repeated to pass. The original baseline append driver reset and
+  subsequent successful recovery are preserved; no new candidate driver event
+  occurred. Generic ONNX continuation remains open in production. See
+  `gitignore/logs/qwen-onnx-append-handoff-20261010/RESULT.md`.
+- Task #886 adds exact recurrent-state checkpoints for Qwen3.5-2B/4B and
+  Qwen3.8-27B GGUF. Interrupted generation restores the checkpoint and replays
+  only the returned segment, preserving the prompt prefix. Checkpoint storage is
+  19.69/51/151.5 MiB, allocated lazily, reused across resets, and released with
+  the model. The repair also fixes synchronous GPU embedding fallback and
+  initializes recurrent state when a device reuses pooled buffers.
+  All 90 paired continuation cases, 267 full-logit comparisons, 12 pending-work
+  release cycles, 71 operators and eight fixed-output model/format checks pass.
+  All 28,160 measured tokens remain exact. Ordinary and public-stream guards
+  pass; public-stream decode overhead is 0.08-0.33%, including allocation and
+  copying. Generic Qwen ONNX continuation remains open under task #828.
+  See `gitignore/logs/qwen-continuation-checkpoint-20261010/RESULT.md`.
 - Task #885 fixes appended input after queued Gemma E2B generation in both
   GGUF and ONNX. It drains pending maps and restores the committed chronological
   KV length without replaying the prompt. All 44 paired continuation cases,

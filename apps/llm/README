@@ -10,13 +10,19 @@ Ordinary chat output omits internal capture summaries. Set `BP_EXEC_STATS=1`
 when diagnosing capture, replay parameters, or graph execution; this diagnostic
 mode includes internal statistics and is not a clean answer or timing run.
 
-Gemma E2B GGUF and ONNX sessions support appended input after queued greedy
-generation or callback cancellation on RTX 5080. The selected `dccb48c` repair
-also covers switching to raw logits, repeated resets and contexts crossing the
-512-token sliding-attention window. Library callers can retain the session with
-`session.Generate(followup, 32, {}, nullptr, false)`. Task #828 tracks the
-remaining recurrent Qwen continuation repair. Validation is recorded in
-`gitignore/logs/gemma-continuation-boundary-20261009/RESULT.md`.
+All cared GGUF models and Gemma E2B ONNX support appended input after queued
+generation or callback cancellation on RTX 5080. Library callers retain the
+session with `session.Generate(followup, 32, {}, nullptr, false)`.
+The selected `b185430` runtime preserves Qwen's recurrent state with a checkpoint
+of 19.69 MiB (2B), 51 MiB (4B), or 151.5 MiB (27B), created when queued generation
+starts and released with the model. Interrupted generation replays only the
+returned segment. Synchronous transitions and repeated same-device sessions are
+also validated. Task #828 tracks the remaining generic Qwen ONNX continuation
+work. The newer ONNX handoff candidate #887 passes correctness but remains
+unselected because the 27B baseline timing variation exceeds policy. See
+`gitignore/logs/qwen-onnx-append-handoff-20261010/RESULT.md`.
+Evidence for the selected GGUF repair is under `gitignore/logs/qwen-continuation-checkpoint-20261010/`;
+Gemma's separate recovery is under `gitignore/logs/gemma-continuation-boundary-20261009/`.
 
 Build from the repository root:
 
@@ -47,13 +53,14 @@ MTP block is excluded from the 64-layer target decoder; speculative MTP is not
 enabled by this command.
 
 Batched prefill with bounded native weight staging is selected automatically
-for this artifact on RTX 5080. The accepted `859a23d` application measurement
-records 142.34 prefill tokens/s and 11.98 decode tokens/s for 512 input tokens,
-128 generated tokens and context 640. Prefill includes the first prediction;
-the remaining 127 decode calls are timed separately. Exact packed IQ4_XS lookup
-improves decode by 3.75% over `e5e25be`, with neutral prefill. Shared chat,
-sampling and benchmark flows are validated, but the large gap to llama.cpp
-remains open. See `docs/webgfx-104-enablement.md` for revision-linked evidence.
+for this artifact on RTX 5080. The accepted `b185430` benchmark records
+142.31 prefill tokens/s and 11.97 decode tokens/s for 512 input tokens, 128 generated
+tokens and context 640. Prefill includes the first prediction; the remaining
+127 decode calls are timed separately. The checkpoint's ordinary benchmark and
+public streaming guards pass, with 0.33% mean streamed-decode overhead for 27B.
+Earlier packed IQ4_XS lookup and IQ3 optimizations remain selected. Shared chat,
+sampling and benchmark flows are validated; the large gap to llama.cpp remains
+open. See `docs/webgfx-104-enablement.md` for revision-linked evidence.
 
 ## Qwen3.8-27B ONNX on webgfx-104
 
