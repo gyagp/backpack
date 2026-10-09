@@ -55,10 +55,14 @@ const CompiledPipeline& nativeQuantPipeline(GPUContext& gpu, GGUFType type, bool
         gpu.backendType == WGPUBackendType_D3D12 &&
         gpu.adapterName == "NVIDIA GeForce RTX 5080" &&
         (!option || std::strcmp(option, "0") != 0);
+    const char* blockOption = std::getenv("BP_NATIVE_QUANT_IQ3_BLOCK_SCALE");
+    const bool cacheBlockScale = alignedU16 && type == GGUF_TYPE_IQ3_S &&
+        (!blockOption || std::strcmp(blockOption, "0") != 0);
     return gpu.getOrCreatePipeline("native_quant_" + std::to_string(type) +
-        (alignedU16 ? "_aligned_u16" : "") + (gather ? "_gather" : "") +
+        (alignedU16 ? "_aligned_u16" : "") + (cacheBlockScale ? "_block_scale" : "") +
+        (gather ? "_gather" : "") +
         (prefill ? "_prefill"+std::to_string(rows) : ""),
-        nativeQuantShader(type, gather, prefill, rows, alignedU16), 5);
+        nativeQuantShader(type, gather, prefill, rows, alignedU16, cacheBlockScale), 5);
 }
 
 std::string deltaNetValueMajorSource(const std::string& source) {

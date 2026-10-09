@@ -34,7 +34,8 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {if(id.x<P[0]){Y[id.x]=f32(
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "Pass independent GGUF reference fixtures\n"); return 2; }
-    const bool alignedU16 = std::string(argv[1]) == "--aligned-u16";
+    const bool cacheIQ3 = std::string(argv[1]) == "--iq3-block-scale";
+    const bool alignedU16 = cacheIQ3 || std::string(argv[1]) == "--aligned-u16";
     const int modeArg = alignedU16 ? 2 : 1;
     if(argc <= modeArg){std::fprintf(stderr,"Pass a mode and/or GGUF fixtures after --aligned-u16\n");return 2;}
     const bool alignedActivations = std::string(argv[modeArg]) == "--staged-pair-vec2-a36";
@@ -69,7 +70,7 @@ int main(int argc, char** argv) {
             }
             const auto type = GGUFType(header[0]);
             for (uint32_t K : {256u, 768u, 5120u, 17408u}) {
-             for (uint32_t M : tiled32 ? std::vector<uint32_t>{3,16,17,31,32,33,35,64} : tiled ? std::vector<uint32_t>{3,35} : alignedU16 ? std::vector<uint32_t>{1,3} : std::vector<uint32_t>{3}) {
+             for (uint32_t M : tiled32 ? std::vector<uint32_t>{3,16,17,31,32,33,35,64} : tiled ? std::vector<uint32_t>{3,35} : cacheIQ3 ? std::vector<uint32_t>{1,2,3,7,8,9,17} : alignedU16 ? std::vector<uint32_t>{1,3} : std::vector<uint32_t>{3}) {
               for (bool strided : {false, true}) {
                 const uint32_t N = tiled ? 19u : K == 256u ? 13u : 5u;
                 if (size_t(N) * K > values.size()) continue;
@@ -108,13 +109,13 @@ int main(int argc, char** argv) {
                     for(auto buffer:paramsBuffers)gpu.releaseBuffer(buffer);
                     gpu.releaseBuffer(scratch);
                 } else {
-                    auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows,alignedU16),5);
+                    auto& pl=gpu.getOrCreatePipeline("native_quant_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows,alignedU16,cacheIQ3 && type==GGUF_TYPE_IQ3_S && !tiled),5);
                     auto bg=gpu.createBindGroup(pl,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
                     result=gpu.submitAndReadback({{pl.pipeline,bg,tiled?(M+tileRows-1)/tileRows:M,tiled?(N+tileCols-1)/tileCols:(N+7)/8,1,"native_quant"}},by,zeros.size()*4);
                     wgpuBindGroupRelease(bg);
                 }
                 if(alignedU16 && !tiled32){
-                    auto& original=gpu.getOrCreatePipeline("native_original_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows),5);
+                    auto& original=gpu.getOrCreatePipeline("native_original_"+std::to_string(type),nativeQuantShader(type,false,tiled,tileRows,cacheIQ3 && alignedU16,false),5);
                     auto originalGroup=gpu.createBindGroup(original,{{0,bx},{1,bw},{2,bb},{3,by},{4,bp}});
                     gpu.writeBuffer(by,zeros.data(),zeros.size()*4);
                     auto reference=gpu.submitAndReadback({{original.pipeline,originalGroup,tiled?(M+tileRows-1)/tileRows:M,tiled?(N+tileCols-1)/tileCols:(N+7)/8,1,"native_original"}},by,zeros.size()*4);
