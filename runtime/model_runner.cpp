@@ -839,7 +839,7 @@ const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name) {
 const CompiledPipeline& ModelRunner::getKernelHD(const std::string& name, uint32_t headDim) {
     // Preserve Gemma's online attention arithmetic while loading whole fp16
     // cache pairs. Other dimensions and adapters keep the original kernel.
-    if (name == "causal_attn" && cfg.arch == "gemma4" &&
+    if (name == "causal_attn" && cfg.arch == "gemma4" && modelFormat == "gguf" &&
         gpu->backendType == WGPUBackendType_D3D12 &&
         gpu->adapterName == "NVIDIA GeForce RTX 5080" && gpu->supportsSubgroups &&
         (headDim == 256 || headDim == 512)) {
