@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -25,6 +26,20 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = Path(__file__).with_name("static")
 DEFAULT_DB = ROOT / "gitignore" / "evolution" / "state.db"
 GOAL_PATH = ROOT / "goal.md"
+
+
+def response_json(value: Any, *, indent: int | None = None) -> str:
+    """Encode undefined numbers as null without changing stored policy values."""
+    def finite_values(item: Any) -> Any:
+        if isinstance(item, float) and not math.isfinite(item):
+            return None
+        if isinstance(item, dict):
+            return {key: finite_values(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [finite_values(child) for child in item]
+        return item
+
+    return json.dumps(finite_values(value), indent=indent, allow_nan=False)
 
 
 def read_goal(path: Path = GOAL_PATH) -> dict[str, Any]:
@@ -142,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
             raise DomainError(f"invalid JSON: {exc.msg}") from exc
 
     def _send_json(self, value: Any, status: int = 200) -> None:
-        data = json.dumps(value, indent=2).encode("utf-8")
+        data = response_json(value, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -432,7 +447,7 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 try:
                     message = subscriber.get(timeout=20)
-                    line = f"event: {message['event']}\ndata: {json.dumps(message['data'])}\n\n"
+                    line = f"event: {message['event']}\ndata: {response_json(message['data'])}\n\n"
                 except queue.Empty:
                     line = ": keepalive\n\n"
                 self.wfile.write(line.encode("utf-8"))
