@@ -46,7 +46,7 @@ KQuantPacked pack_native_quant(const void* raw, uint32_t rows, uint32_t cols, GG
     return out;
 }
 
-std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows, bool alignedU16, bool cacheBlockScale) {
+std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows, bool alignedU16, bool cacheBlockScale, bool packedIq4Lut) {
     const auto spec = layout(type);
     if (!spec.bytes) throw std::runtime_error("Unsupported native quantization shader");
     std::string source = NATIVE_QUANT_SOURCE;
@@ -90,6 +90,23 @@ std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t
                 if(k<K) { acc+=bitcast<f32>(X[wid.x*K+k])*decode_iq3s_block(block_base,e,block_scale); }
             }
         })WGSL");
+    }
+
+    if (packedIq4Lut) {
+        if(type!=GGUF_TYPE_IQ4_XS || gather || prefill || cacheBlockScale)
+            throw std::runtime_error("Packed IQ4 lookup is only scalar IQ4_XS");
+        const std::string old=R"WGSL(fn iq4_value(index: u32) -> f32 {
+    let values = array<i32, 16>(-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+    return f32(values[index]);
+})WGSL";
+        const auto position=source.find(old);
+        if(position==std::string::npos)throw std::runtime_error("IQ4 lookup marker missing");
+        source.replace(position,old.size(),R"WGSL(fn iq4_value(index: u32) -> f32 {
+    let low=select(0xbfad9881u,0xf6eaddcfu,(index&4u)!=0u);
+    let high=select(0x26190d01u,0x71594535u,(index&4u)!=0u);
+    let word=select(low,high,(index&8u)!=0u);
+    return f32(signed_byte((word>>(8u*(index&3u)))&255u));
+})WGSL");
     }
 
     if (prefill) {

@@ -5,8 +5,9 @@ neither model enablement nor acceptance requires another machine.
 
 ## Current accepted state
 
-The active runtime milestone is `110049ff116d814206494dfdfd4a808d81b46e97`
-(task #879, checked aligned native scalar field loads). It retains task #877's
+The active runtime milestone is `e5e25be9d8d2e146e1a425a53b993569a575b342`
+(task #880, exact IQ3_S block-scale reuse). It retains task #879's aligned
+native scalar field loads, task #877's
 Q8 product bit identities, task #875's packed
 Gemma cache reads, task #873's short-K Q8 half shared storage, task #867's
 wide-grid fallback and task #866's eight-row/two-column geometry.
@@ -47,6 +48,26 @@ October8 native reference remains in use. Source bundles, build failures and
 corrections, exact caches, and the review constraint are preserved in
 `gitignore/logs/native-latest-refresh-20261009/RESULT.md`.
 
+- Task #880 reuses the IQ3_S block base and half scale across eight ordered
+  scalar dot-product steps. Mean27B GGUF decode improves **10.9983 ->11.5419
+  tokens/s (+4.94%)**, with neutral prefill at142.2768 ->142.4055 tokens/s and
+  maximum CV0.35%. The original arithmetic,one accumulator per lane,256-thread
+  geometry and32-lane reduction remain. All71 operators,224 exact/CPU scalar
+  cases,eight model/format checks,paired15 shape/reset modes,eight full logit
+  vectors,four shared chats and1280 measured tokens pass. Final profiles reduce
+  decode GPU time92.36 ->87.92ms with matching counters and allocation.
+  `BP_NATIVE_QUANT_IQ3_BLOCK_SCALE=0` restores the accepted aligned-load path;
+  disabling aligned-u16 also disables this cache. Other quantization types,
+  gathers and tiled/staged prefill are unchanged. See
+  `gitignore/logs/qwen38-iq3-block-scale-20261009/RESULT.md`.
+- Follow-up #881 does not select IQ4_XS header caching. Its first version
+  preserved decoded weights but changed dot-product association. CPU oracles
+  identified the accepted multiply/FMA sequence; two dynamic bit identities
+  restored exact output. The repaired version passes224 scalar cases and both
+  actual-weight orders,but improves the target only0.64–0.74%,below admission.
+  All480 intervals and failed sources are retained; no runtime or full-model
+  timing change was made. See
+  `gitignore/logs/qwen38-iq4-block-header-20261009/RESULT.md`.
 - Task #879 improves Qwen3.8-27B GGUF mean decode **9.9311 -> 11.0021 tokens/s
   (+10.78%)**, with neutral prefill at142.1019 ->142.2005 tokens/s. Both guards
   pass unchanged policy; maximum CV0.47%. Eight qualified scalar native formats
