@@ -46,7 +46,7 @@ KQuantPacked pack_native_quant(const void* raw, uint32_t rows, uint32_t cols, GG
     return out;
 }
 
-std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows, bool alignedU16) {
+std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t prefillRows, bool alignedU16, bool cacheBlockScale) {
     const auto spec = layout(type);
     if (!spec.bytes) throw std::runtime_error("Unsupported native quantization shader");
     std::string source = NATIVE_QUANT_SOURCE;
@@ -61,6 +61,35 @@ std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t
         const auto position = source.find(old);
         if (position == std::string::npos) throw std::runtime_error("Native u16 helper not found");
         source.replace(position, old.size(), replacement);
+    }
+
+    if (cacheBlockScale) {
+        if (type != GGUF_TYPE_IQ3_S || gather || prefill)
+            throw std::runtime_error("Block scale cache is only scalar IQ3_S");
+        const std::string marker = "var<workgroup> sums:";
+        const auto position = source.find(marker);
+        if (position == std::string::npos) throw std::runtime_error("Native reduction marker missing");
+        source.insert(position, R"WGSL(fn decode_iq3s_block(base:u32,e:u32,d:f32)->f32 {
+    let group=e/32u;let lane=e%32u;
+    let index = u8(base+2u+e/4u) | (((u8(base+66u+group)>>(lane/4u))&1u)<<8u);
+    let signs = u8(base+74u+e/8u);
+    let scale = (u8(base+106u+group/2u)>>(4u*(group%2u)))&15u;
+    return d*f32(1u+2u*scale)*f32(code_byte(index,4u,lane%4u))*sign_value(signs,lane%8u);
+}
+
+)WGSL");
+        const std::string oldLoop = "        for(var k=lane;k<K;k+=32u) { acc+=bitcast<f32>(X[wid.x*K+k])*decode(column,k); }";
+        const auto loop = source.find(oldLoop);
+        if (loop == std::string::npos) throw std::runtime_error("Native scalar loop missing");
+        source.replace(loop,oldLoop.size(),R"WGSL(        let row_base=column*P[3]*4u;
+        for(var k0=0u;k0<K;k0+=256u) {
+            let block_base=row_base+(k0/256u)*110u;
+            let block_scale=half(block_base);
+            for(var group=0u;group<8u;group++) {
+                let e=group*32u+lane;let k=k0+e;
+                if(k<K) { acc+=bitcast<f32>(X[wid.x*K+k])*decode_iq3s_block(block_base,e,block_scale); }
+            }
+        })WGSL");
     }
 
     if (prefill) {

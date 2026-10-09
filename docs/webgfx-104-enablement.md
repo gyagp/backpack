@@ -5,8 +5,9 @@ neither model enablement nor acceptance requires another machine.
 
 ## Current accepted state
 
-The active runtime milestone is `6a82100b2db94cbdba428c2e9a344295eb43c990`
-(task #877, exact Q8 product bit identities). It retains task #875's packed
+The active runtime milestone is `110049ff116d814206494dfdfd4a808d81b46e97`
+(task #879, checked aligned native scalar field loads). It retains task #877's
+Q8 product bit identities, task #875's packed
 Gemma cache reads, task #873's short-K Q8 half shared storage, task #867's
 wide-grid fallback and task #866's eight-row/two-column geometry.
 The chronology below retains earlier experiments and limitations;
@@ -46,6 +47,19 @@ October8 native reference remains in use. Source bundles, build failures and
 corrections, exact caches, and the review constraint are preserved in
 `gitignore/logs/native-latest-refresh-20261009/RESULT.md`.
 
+- Task #879 improves Qwen3.8-27B GGUF mean decode **9.9311 -> 11.0021 tokens/s
+  (+10.78%)**, with neutral prefill at142.1019 ->142.2005 tokens/s. Both guards
+  pass unchanged policy; maximum CV0.47%. Eight qualified scalar native formats
+  read aligned16-bit fields from one storage word; odd offsets retain the
+  original byte assembly. Float arithmetic,packed data,geometry and reduction
+  are unchanged. IQ4_NL was slower,IQ4_XS/Q5_K neutral,and combined staging
+  neutral,so those paths retain the original code. The override
+  `BP_NATIVE_QUANT_ALIGNED_U16=0` restores original scalar loads. All71 operators,
+  2448 native cases over14 formats/17 fixtures,2046 raw field outputs,eight
+  model/format checks,paired15 shape/reset modes,eight full logit vectors,four
+  shared chats and1280 clean measured tokens pass. Default/fallback profiles
+  reduce decode GPU time102.54 ->92.24ms,with unchanged allocation and counters.
+  See `gitignore/logs/qwen38-native-aligned-u16-20261009/RESULT.md`.
 - Task #877 preserves Q8 product rounding with a dynamic all-ones bit identity
   before the existing scale FMA, replacing the adjacent-lane product shuffle.
   Mean ONNX prefill improves **1760.44 -> 1925.96 tokens/s (+9.40%)** for 2B

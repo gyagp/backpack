@@ -39,11 +39,11 @@ MTP block is excluded from the 64-layer target decoder; speculative MTP is not
 enabled by this command.
 
 Batched prefill with bounded native weight staging is selected automatically
-for this artifact on RTX 5080. The accepted `428350b` application measurement
-records 142.46 prefill tokens/s and 9.93 decode tokens/s for 512 input tokens,
+for this artifact on RTX 5080. The accepted `110049f` application measurement
+records 142.20 prefill tokens/s and 11.00 decode tokens/s for 512 input tokens,
 128 generated tokens and context 640. Prefill includes the first prediction;
-the remaining 127 decode calls are timed separately. Later Qwen3.5 and Gemma
-milestones retain this 27B path and its fixed-output checks. Shared chat,
+the remaining 127 decode calls are timed separately. Exact native field loads
+improve decode by 10.78% over `6a82100`, with neutral prefill. Shared chat,
 sampling and benchmark flows are validated, but the large gap to llama.cpp
 remains open. See `docs/webgfx-104-enablement.md` for revision-linked evidence.
 
