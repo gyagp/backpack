@@ -1781,8 +1781,10 @@ struct StandardState {
             } else {
                 runner.decode(0, 0);
             }
-            runner.resetKVCache();
         }
+        // Qwen skips speculative startup replay, but its pooled recurrent
+        // buffers still require initialization when a device is reused.
+        runner.resetKVCache();
         if (runner.cfg.arch != "qwen35") {
             if (!runner.loadDecodeAutotuneCache()) {
                 runner.autotuneDecodeDepth();
