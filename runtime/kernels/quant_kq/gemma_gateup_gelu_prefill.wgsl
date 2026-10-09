@@ -37,7 +37,11 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
    for(var m=0u;m<8u;m++){if(row0+m<M){let base=m*64u+lane*2u;
     let gd=dot4I8Packed(sxq[base],gw0)+dot4I8Packed(sxq[base+1u],gw1);
     let ud=dot4I8Packed(sxq[base],uw0)+dot4I8Packed(sxq[base+1u],uw1);
-    let xs=sxs[m*8u+sb];gate[m]+=f32(gd)*xs*gws;up[m]+=f32(ud)*xs*uws;}}
+    // P[3] is all ones: retain the baseline scale-product rounding before FMA.
+    let xs=sxs[m*8u+sb];let mask=P[3];
+    let gs=bitcast<f32>(bitcast<u32>(xs*gws)&mask);
+    let us=bitcast<f32>(bitcast<u32>(xs*uws)&mask);
+    gate[m]=fma(f32(gd),gs,gate[m]);up[m]=fma(f32(ud),us,up[m]);}}
   }
   workgroupBarrier();
  }
