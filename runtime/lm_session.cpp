@@ -1667,7 +1667,7 @@ struct StandardState {
         // ordinary readback supplies completion; no extra queue wait is needed.
     }
 
-    void BeginQwenQueuedSegment() {
+    void BeginQwenQueuedSegment(int32_t inputToken) {
         if (!qwenCheckpointEnabled || qwenCheckpointActive) return;
         if (!qwenCheckpoint.handle) {
             const auto& c = runner.cfg;
@@ -1698,6 +1698,10 @@ struct StandardState {
             qwenCheckpointKvLengths[i] = runner.kvCache[i].len;
         qwenCommittedInputs.clear();
         CopyQwenCheckpoint(true);
+        // A preceding synchronous step writes the shared argmax output but
+        // does not advance the slot-local token ring. Seed the new segment
+        // explicitly from the token selected by the caller.
+        runner.seedDecodeTokenInputs(inputToken);
         qwenCheckpointActive = true;
     }
 
@@ -1935,7 +1939,7 @@ struct StandardState {
 
     int32_t DecodePipelined(int32_t inputToken) {
         if (pos >= runner.maxSeqLen) return -1;
-        BeginQwenQueuedSegment();
+        BeginQwenQueuedSegment(inputToken);
         int depth = runner.decodePoolDepth;
 
         if (pipelineInFlight == 0) {

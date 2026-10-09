@@ -162,6 +162,9 @@ int main(int argc, char** argv) {
                 if(transition) {
                     _putenv_s("BP_Q35_SYNC","1");next=session.Decode();_putenv_s("BP_Q35_SYNC","");
                     if(next<0)throw std::runtime_error("Synchronous transition failed");stream.push_back(next);
+                    // Resume queued decoding directly before a new Prefill can
+                    // reseed the slot-local token inputs.
+                    step();
                 }
                 const auto boundary = session.GetPosition();
                 uint32_t expectedPosition = boundary;

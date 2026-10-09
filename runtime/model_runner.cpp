@@ -7320,13 +7320,18 @@ std::vector<float> ModelRunner::decode(int32_t tokenId, uint32_t posOffset) {
 }
 
 int32_t ModelRunner::decodeArgmax(int32_t tokenId, uint32_t posOffset) {
-    uploadEmbedding(tokenId);
+    // GPU-resident native embeddings have no CPU table. Match decode()'s
+    // embedding route while retaining the four-byte argmax readback.
+    const bool gatherEmbeddingOnGpu = embeddingCPU.empty();
+    if (gatherEmbeddingOnGpu) seedDecodeTokenInputs(tokenId);
+    else uploadEmbedding(tokenId);
 
     uint32_t cacheLen = kvCache[0].len;
     updateDecodeParams(posOffset, cacheLen);
 
     auto result = gpu->submitAndReadback(
-        allDecodeDispatches, argmaxResultBuf, 4, passPerDispatch);
+        gatherEmbeddingOnGpu ? autoDecodeDispatches : allDecodeDispatches,
+        argmaxResultBuf, 4, passPerDispatch);
 
     for (uint32_t i = 0; i < cfg.nLayer; i++)
         kvCache[i].len++;
