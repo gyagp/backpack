@@ -2020,6 +2020,42 @@ TEST(matmul_q8_prefill_rows4) {
 }
 
 
+TEST(matmul_q8_wide_grid_fallback) {
+    const char* name="BP_QWEN35_Q8_PREFILL_ROWS";
+    const char* old=std::getenv(name);const std::string saved=old?old:"";
+    auto set=[&](const char* value) {
+#ifdef _WIN32
+        _putenv_s(name,value);
+#else
+        if(*value)setenv(name,value,1);else unsetenv(name);
+#endif
+    };
+    struct Restore {std::function<void()> action;~Restore(){action();}} restore{[&]{set(saved.c_str());}};
+    const uint32_t limit=gpu.deviceLimits.maxComputeWorkgroupsPerDimension;
+    if(gpu.adapterName!="NVIDIA GeForce RTX 5080" || limit!=65535u)
+        throw std::runtime_error("Wide Q8 regression requires the validated RTX5080 dispatch limit");
+    constexpr uint32_t M=2,K=32;
+    for(uint32_t N:{2u*limit+1u,2u*limit+3u,2u*limit+5u,248319u,248320u}) {
+        std::vector<float> x(M*K),scales(N,1.0f),expected(M*N);
+        for(uint32_t m=0;m<M;++m) {
+            for(uint32_t k=0;k<K;++k)x[m*K+k]=float(m+1);
+            for(uint32_t n=0;n<N;++n)expected[m*N+n]=float((m+1)*K);
+        }
+        std::vector<uint8_t> weights(size_t(N)*K,129);
+        const auto model=buildOnnxModel({{"MatMulNBits",{"X","W","scales"},{"Y"},
+            {{"K",AttrDef::INT,K},{"N",AttrDef::INT,N},{"bits",AttrDef::INT,8},{"block_size",AttrDef::INT,32}}}},
+            {{"X",ONNX_FLOAT,{1,M,K}}},{{"Y",ONNX_FLOAT,{1,M,N}}},
+            {{"W",ONNX_UINT8,{N,1,K},weights},makeInitF16("scales",{N,1},scales)});
+        for(const char* option:{"","8x2","4"}) {
+            set(option);auto actual=runOnnxModel(gpu,model,{{"X",makeInputF32("X",{1,M,K},x)}},{"Y"});
+            if(gpu.executionError || gpu.deviceLost || actual.at("Y").asFloat32()!=expected)
+                throw std::runtime_error("Wide Q8 prefill did not preserve exact output and dispatch validity");
+            if(!gpu.hasPipeline("matmul_q8_block32_prefill_rows4"))
+                throw std::runtime_error("Wide Q8 previous-tile fallback missing");
+        }
+    }
+}
+
 TEST(linear_attention_gated_delta_vec4) {
     constexpr int T = 1, DK = 128, DV = 8;
     std::vector<float> q(T * DK), k(T * DK), v(T * DV);
@@ -2877,6 +2913,7 @@ int main(int argc, char** argv) {
     RUN(matmul_nbits_q4_decode);
     RUN(matmul_nbits_q8_decode);
     RUN(matmul_q8_prefill_rows4);
+    RUN(matmul_q8_wide_grid_fallback);
     RUN(linear_attention_gated_delta_vec4);
     RUN(causal_conv_state_fp16);
     RUN(linear_attention_state_fp16);

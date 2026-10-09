@@ -473,9 +473,13 @@ static void opMatMulNBits(OpContext& ex, const OnnxGraphNode& n,
         const char* rowOption = canReuseQ8Rows ? std::getenv("BP_QWEN35_Q8_PREFILL_ROWS") : nullptr;
         // Both tiles preserve product rounding and the original reduction.
         // Explicit 4 retains the previous tile; 0 selects scalar prefill.
-        const bool useRows8x2Prefill = canReuseQ8Rows &&
-            (!rowOption || !*rowOption || std::strcmp(rowOption,"8x2")==0);
-        const bool useRows4Prefill = canReuseQ8Rows && rowOption && std::strcmp(rowOption,"4")==0;
+        const bool preferRows8x2 = !rowOption || !*rowOption || std::strcmp(rowOption,"8x2")==0;
+        const bool useRows8x2Prefill = canReuseQ8Rows && preferRows8x2 &&
+            (uint64_t(N)+1u)/2u <= effectiveLimits(*ex.getGpu()).maxComputeWorkgroupsPerDimension;
+        // Wide multi-row vocabulary projections can fit 4-column workgroups
+        // while exceeding the per-dimension limit with only 2 columns.
+        const bool useRows4Prefill = canReuseQ8Rows &&
+            ((rowOption && std::strcmp(rowOption,"4")==0) || (preferRows8x2 && !useRows8x2Prefill));
         const bool useSubgroupDecode = M == 1 && (K % 32u) == 0u &&
             ex.getGpu()->backendType == WGPUBackendType_D3D12 &&
             ex.getGpu()->supportsSubgroups;
