@@ -10,6 +10,14 @@ Ordinary chat output omits internal capture summaries. Set `BP_EXEC_STATS=1`
 when diagnosing capture, replay parameters, or graph execution; this diagnostic
 mode includes internal statistics and is not a clean answer or timing run.
 
+Gemma E2B GGUF and ONNX sessions support appended input after queued greedy
+generation or callback cancellation on RTX 5080. The selected `dccb48c` repair
+also covers switching to raw logits, repeated resets and contexts crossing the
+512-token sliding-attention window. Library callers can retain the session with
+`session.Generate(followup, 32, {}, nullptr, false)`. Task #828 tracks the
+remaining recurrent Qwen continuation repair. Validation is recorded in
+`gitignore/logs/gemma-continuation-boundary-20261009/RESULT.md`.
+
 Build from the repository root:
 
 ```powershell

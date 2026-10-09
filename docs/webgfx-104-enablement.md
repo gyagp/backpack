@@ -5,8 +5,9 @@ neither model enablement nor acceptance requires another machine.
 
 ## Current accepted state
 
-The active runtime milestone is `859a23da3fc3980f090aca4876a511609730e016`
-(task #883, exact packed IQ4_XS lookup). It retains task #880's IQ3_S block
+The active runtime milestone is `dccb48c43c3950830c021e1a5115adccb4461643`
+(task #885, Gemma continuation boundary repair). It retains task #883's exact
+packed IQ4_XS lookup and task #880's IQ3_S block
 scale reuse, task #879's aligned
 native scalar field loads, task #877's
 Q8 product bit identities, task #875's packed
@@ -49,6 +50,22 @@ October8 native reference remains in use. Source bundles, build failures and
 corrections, exact caches, and the review constraint are preserved in
 `gitignore/logs/native-latest-refresh-20261009/RESULT.md`.
 
+- Task #885 fixes appended input after queued Gemma E2B generation in both
+  GGUF and ONNX. It drains pending maps and restores the committed chronological
+  KV length without replaying the prompt. All 44 paired continuation cases,
+  112 full-vocabulary logit comparisons, 71 operators and eight fixed-output
+  model/format checks pass. Coverage includes callback cancellation, seeded
+  sampling, resets, rejected input at capacity, and 607-token prompts beyond
+  the 512-token sliding window. Both formats pass all four throughput guards;
+  mean decode changes are below 0.03%, with all 12,800 measured tokens exact.
+  This recovery is guarded to Gemma on RTX 5080/D3D12. Task #828's recurrent
+  Qwen and generic ONNX continuation work remains unselected. See
+  `gitignore/logs/gemma-continuation-boundary-20261009/RESULT.md`.
+- Task #884 rejected compact IQ3 staging. Its signed coefficients plus fp16
+  scales preserve every tested weight and complete output, but combined
+  conversion/multiplication GPU time increases 0.70-0.85% in opposite orders.
+  No compact staging route was selected. See
+  `gitignore/logs/qwen38-iq3-compact-staging-20261009/RESULT.md`.
 - Task #883 represents the IQ4_XS lookup using four packed integer constants,
   preserving the accepted dot-product rounding with explicit guard words.
   Mean27B GGUF decode improves **11.5434 ->11.9767 tokens/s (+3.75%)**, with

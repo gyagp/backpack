@@ -1631,6 +1631,111 @@ struct StandardState {
     int pipelineInFlight = 0;
     uint32_t pipelineNextSubmitPos = 0;
 
+    // A queued Qwen segment can advance recurrent state beyond logical pos.
+    // Keep one exact checkpoint at its start, not a history of every prompt.
+    struct QwenCheckpointRange { GPUBuffer state; uint64_t offset, bytes; };
+    bool qwenCheckpointEnabled = false, qwenCheckpointActive = false;
+    GPUBuffer qwenCheckpoint;
+    std::vector<QwenCheckpointRange> qwenCheckpointRanges;
+    std::vector<uint32_t> qwenCheckpointKvLengths;
+    std::vector<int32_t> qwenCommittedInputs;
+    uint32_t qwenCheckpointPos = 0;
+
+    void CopyQwenCheckpoint(bool save) {
+        const auto start = gpu->diagnosticTimestamp();
+        WGPUCommandEncoderDescriptor encoderDesc{};
+        auto encoder = wgpuDeviceCreateCommandEncoder(gpu->device, &encoderDesc);
+        for (const auto& range : qwenCheckpointRanges) {
+            if (save) {
+                wgpuCommandEncoderCopyBufferToBuffer(encoder, range.state.handle,
+                    range.state.offset, qwenCheckpoint.handle,
+                    qwenCheckpoint.offset + range.offset, range.bytes);
+            } else {
+                wgpuCommandEncoderCopyBufferToBuffer(encoder, qwenCheckpoint.handle,
+                    qwenCheckpoint.offset + range.offset, range.state.handle,
+                    range.state.offset, range.bytes);
+            }
+        }
+        WGPUCommandBufferDescriptor commandDesc{};
+        auto command = wgpuCommandEncoderFinish(encoder, &commandDesc);
+        gpu->recordEncode(start);
+        if (gpu->diagnosticsEnabled) ++gpu->diagnostics.flushes;
+        gpu->submitCommandBuffer(command);
+        wgpuCommandBufferRelease(command);
+        wgpuCommandEncoderRelease(encoder);
+        // The same queue orders this copy before following decode work. Its
+        // ordinary readback supplies completion; no extra queue wait is needed.
+    }
+
+    void BeginQwenQueuedSegment() {
+        if (!qwenCheckpointEnabled || qwenCheckpointActive) return;
+        if (!qwenCheckpoint.handle) {
+            const auto& c = runner.cfg;
+            const uint64_t convBytes = (uint64_t(c.ssmInnerSize) +
+                2ull * c.ssmGroupCount * c.ssmStateSize) * c.ssmConvKernel * 4;
+            const uint64_t headV = c.ssmInnerSize / c.ssmTimeStepRank;
+            const uint64_t recurrentBytes = uint64_t(c.ssmTimeStepRank) * headV * headV * 4;
+            uint64_t total = 0;
+            for (uint32_t li = 0; li < c.nLayer; ++li) {
+                if (c.isAttentionLayer(li)) continue;
+                for (const auto& state : {std::pair<GPUBuffer,uint64_t>{runner.ssmConvState.at(li), convBytes},
+                                          {runner.ssmHState.at(li), recurrentBytes}}) {
+                    if (!state.first.handle || state.first.size < state.second || !state.second)
+                        throw std::runtime_error("Invalid Qwen checkpoint state extent");
+                    qwenCheckpointRanges.push_back({state.first, total, state.second});
+                    total += state.second;
+                }
+            }
+            if (!total || total > 256ull * 1024 * 1024)
+                throw std::runtime_error("Qwen checkpoint exceeds the validated state bound");
+            qwenCheckpoint = runner.createOwnedBuffer("qwen_committed_state_checkpoint", total);
+            if (!qwenCheckpoint.handle) throw std::runtime_error("Qwen checkpoint allocation failed");
+            qwenCheckpointKvLengths.resize(runner.kvCache.size());
+            qwenCommittedInputs.reserve(runner.maxSeqLen);
+        }
+        qwenCheckpointPos = pos;
+        for (size_t i = 0; i < runner.kvCache.size(); ++i)
+            qwenCheckpointKvLengths[i] = runner.kvCache[i].len;
+        qwenCommittedInputs.clear();
+        CopyQwenCheckpoint(true);
+        qwenCheckpointActive = true;
+    }
+
+    void RestoreQwenCommittedBoundary() {
+        if (!qwenCheckpointEnabled) return;
+        if (!pipelineInFlight) {
+            qwenCheckpointActive = false;
+            qwenCommittedInputs.clear();
+            return;
+        }
+        const uint32_t boundary = pos;
+        if (!qwenCheckpointActive || uint64_t(qwenCheckpointPos) + qwenCommittedInputs.size() != boundary)
+            throw std::runtime_error("Qwen committed checkpoint boundary is inconsistent");
+        const int depth = std::max(1, runner.decodePoolDepth);
+        for (int i = 0; i < pipelineInFlight; ++i)
+            (void)runner.readArgmax((pos + i) % depth);
+        pipelineInFlight = 0;
+        pipelineNextSubmitPos = 0;
+        CopyQwenCheckpoint(false);
+        for (size_t i = 0; i < runner.kvCache.size(); ++i)
+            runner.kvCache[i].len = qwenCheckpointKvLengths[i];
+        pos = qwenCheckpointPos;
+        qwenCheckpointActive = false;
+        int32_t next = -1;
+        // Replay only inputs whose predictions were returned to the caller,
+        // with the same per-position pooled arithmetic as the original stream.
+        for (const int32_t token : qwenCommittedInputs) {
+            const int slot = pos % depth;
+            runner.seedDecodeTokenInputs(token);
+            runner.submitDecode(pos++, slot);
+            next = runner.readArgmax(slot);
+        }
+        qwenCommittedInputs.clear();
+        if (next >= 0) runner.seedDecodeTokenInputs(next);
+        if (pos != boundary || gpu->executionError || gpu->deviceLost)
+            throw std::runtime_error("Qwen committed-state recovery failed");
+    }
+
     std::string arch, gpuName, backendName;
     uint32_t nLayer=0, nHead=0, nKvHeads=0, nEmbd=0, headDim=0, nVocab=0;
 
@@ -1687,6 +1792,13 @@ struct StandardState {
         nKvHeads = c.nKvHeads; nEmbd = c.nEmbd; headDim = c.headDim;
         nVocab = c.nVocab;
         gpuName = gpuCtx.adapterName;
+        qwenCheckpointEnabled = format == "gguf" && c.arch == "qwen35" &&
+            c.ssmInnerSize > 0 && c.ssmTimeStepRank > 0 &&
+            ((c.nLayer == 24 && c.nEmbd == 2048) ||
+             (c.nLayer == 32 && c.nEmbd == 2560) ||
+             (c.nLayer == 64 && c.nEmbd == 5120)) &&
+            gpuCtx.backendType == WGPUBackendType_D3D12 &&
+            gpuCtx.adapterName == "NVIDIA GeForce RTX 5080";
         return true;
     }
 
@@ -1775,6 +1887,7 @@ struct StandardState {
             return -1;
         }
         RestoreGemmaCommittedBoundary();
+        RestoreQwenCommittedBoundary();
         if (std::getenv("BP_DUMP_TOKENS")) {
             fprintf(stderr, "[debug] prompt tokens:");
             for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %d", tokens[i]);
@@ -1820,8 +1933,9 @@ struct StandardState {
         return next;
     }
 
-    int32_t DecodePipelined() {
+    int32_t DecodePipelined(int32_t inputToken) {
         if (pos >= runner.maxSeqLen) return -1;
+        BeginQwenQueuedSegment();
         int depth = runner.decodePoolDepth;
 
         if (pipelineInFlight == 0) {
@@ -1845,12 +1959,14 @@ struct StandardState {
         }
 
         pos++;
+        if (qwenCheckpointEnabled) qwenCommittedInputs.push_back(inputToken);
         return tok;
     }
 
     std::vector<float> DecodeSynchronous(int32_t token) {
         if (pos >= runner.maxSeqLen) return {};
         RestoreGemmaCommittedBoundary();
+        RestoreQwenCommittedBoundary();
         auto logits = runner.decode(token, pos);
         DumpTopLogits("decode", logits);
         pos++;
@@ -1864,6 +1980,7 @@ struct StandardState {
             return ModelRunner::argmax(logits);
         }
         RestoreGemmaCommittedBoundary();
+        RestoreQwenCommittedBoundary();
         int32_t next = runner.decodeArgmax(token, pos);
         pos++;
         return next;
@@ -1880,6 +1997,8 @@ struct StandardState {
         pipelineNextSubmitPos = 0;
         runner.resetKVCache();
         pos = 0;
+        qwenCheckpointActive = false;
+        qwenCommittedInputs.clear();
     }
 };
 
@@ -2161,7 +2280,7 @@ int32_t LmSession::Decode() {
             ? std->runner.decodeArgmaxPooled(impl_->lastToken, std->pos++)
             : std->DecodeArgmaxSynchronous(impl_->lastToken);
     } else {
-        next = std->DecodePipelined();
+        next = std->DecodePipelined(impl_->lastToken);
     }
     impl_->lastToken = next;
     return next;
@@ -2205,7 +2324,7 @@ int32_t LmSession::DecodeWithMTP(std::vector<int32_t>& acceptedTokens, int maxDr
     }
 
     // Step 1: Get the base token via normal decode
-    int32_t baseToken = std->DecodePipelined();
+    int32_t baseToken = std->DecodePipelined(impl_->lastToken);
     if (baseToken < 0) return 0;
 
     // Step 2: Draft tokens using MTP
