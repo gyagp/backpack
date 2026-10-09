@@ -1,5 +1,6 @@
 // @meta noregistry=true
-// Current-path prototype: reuse activations across gate/up and retain GELU.
+// Preserve combined-scale rounding and the separate GELU product boundary.
+// The host supplies P[3]=0xffffffff; these bit identities block reassociation.
 requires packed_4x8_integer_dot_product;
 enable subgroups;
 @group(0) @binding(0)var<storage,read>XQ:array<u32>;
@@ -47,6 +48,6 @@ fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wid:vec
  }
  for(var m=0u;m<8u;m++){
   let gv=subgroupAdd(gate[m]);let uv=subgroupAdd(up[m]);let row=row0+m;
-  if(lane==0u&&col<H&&row<M){let gelu=0.5*gv*(1.0+tanh(0.7978845608*(gv+0.044715*gv*gv*gv)));Y[row*H+col]=gelu*uv;}
+  if(lane==0u&&col<H&&row<M){let gelu=0.5*gv*(1.0+tanh(0.7978845608*(gv+0.044715*gv*gv*gv)));let orderedGelu=bitcast<f32>(bitcast<u32>(gelu)&P[3]);Y[row*H+col]=orderedGelu*uv;}
  }
 }
