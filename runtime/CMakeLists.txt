@@ -186,6 +186,8 @@ add_executable(backpack_kernel_test tests/kernel_test.cpp $<TARGET_OBJECTS:backp
 add_executable(backpack_native_quant_test tests/native_quant_test.cpp $<TARGET_OBJECTS:backpack_core>)
 target_link_libraries(backpack_native_quant_test PRIVATE backpack)
 if(WIN32)
+    add_executable(backpack_gemma_continuation_test tests/gemma_continuation_test.cpp)
+    target_link_libraries(backpack_gemma_continuation_test PRIVATE backpack)
     add_executable(backpack_native_prefill_staging_probe
         ../benchmarks/native_prefill_staging_probe.cpp $<TARGET_OBJECTS:backpack_core>)
     target_link_libraries(backpack_native_prefill_staging_probe PRIVATE backpack)

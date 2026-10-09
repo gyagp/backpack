@@ -5,8 +5,9 @@ neither model enablement nor acceptance requires another machine.
 
 ## Current accepted state
 
-The active runtime milestone is `e5e25be9d8d2e146e1a425a53b993569a575b342`
-(task #880, exact IQ3_S block-scale reuse). It retains task #879's aligned
+The active runtime milestone is `859a23da3fc3980f090aca4876a511609730e016`
+(task #883, exact packed IQ4_XS lookup). It retains task #880's IQ3_S block
+scale reuse, task #879's aligned
 native scalar field loads, task #877's
 Q8 product bit identities, task #875's packed
 Gemma cache reads, task #873's short-K Q8 half shared storage, task #867's
@@ -48,6 +49,18 @@ October8 native reference remains in use. Source bundles, build failures and
 corrections, exact caches, and the review constraint are preserved in
 `gitignore/logs/native-latest-refresh-20261009/RESULT.md`.
 
+- Task #883 represents the IQ4_XS lookup using four packed integer constants,
+  preserving the accepted dot-product rounding with explicit guard words.
+  Mean27B GGUF decode improves **11.5434 ->11.9767 tokens/s (+3.75%)**, with
+  neutral prefill at142.2018 ->142.3433 tokens/s and maximum CV0.38%. All71
+  operators,224 scalar cases,32 lookup-value checks,eight model/format checks,
+  paired15 shape/reset modes,eight full logit vectors,four chats and1280 measured
+  tokens pass. Final decode GPU time falls88.24 ->84.45ms with unchanged
+  allocation and hot counters. IQ4 mask word7 is initialized explicitly;
+  allocation padding is never read. `BP_NATIVE_QUANT_IQ4_PACKED_LUT=0` restores
+  the original scalar IQ4 path. IQ3 and other existing optimizations remain.
+  This is distinct from rejected header cache #881. See
+  `gitignore/logs/qwen38-iq4-packed-lut-20261009/RESULT.md`.
 - Task #880 reuses the IQ3_S block base and half scale across eight ordered
   scalar dot-product steps. Mean27B GGUF decode improves **10.9983 ->11.5419
   tokens/s (+4.94%)**, with neutral prefill at142.2768 ->142.4055 tokens/s and

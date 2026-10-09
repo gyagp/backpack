@@ -1751,11 +1751,30 @@ struct StandardState {
         return (format == "onnx") ? onnxTokenizer.eos_token_id : ggufTokenizer.eos_token_id;
     }
 
+    void RestoreGemmaCommittedBoundary() {
+        if (!pipelineInFlight || runner.cfg.arch != "gemma4" ||
+            runner.cfg.nLayer != 35 || runner.cfg.nEmbd != 1536 ||
+            runner.cfg.nVocab != 262144 || runner.cfg.ssmInnerSize != 0 ||
+            gpu->backendType != WGPUBackendType_D3D12 ||
+            gpu->adapterName != "NVIDIA GeForce RTX 5080") return;
+        // These Gemma caches are chronological, including sliding attention:
+        // queued work writes only positions at or beyond the committed prefix.
+        // Complete and unmap every pending slot before overwriting that suffix.
+        // Recurrent models cannot recover by truncating KV lengths alone.
+        const int depth = std::max(1, runner.decodePoolDepth);
+        for (int i = 0; i < pipelineInFlight; ++i)
+            (void)runner.readArgmax((pos + i) % depth);
+        pipelineInFlight = 0;
+        pipelineNextSubmitPos = 0;
+        for (auto& cache : runner.kvCache) cache.len = pos;
+    }
+
     int32_t Prefill(const int32_t* tokens, uint32_t n) {
         if (n > runner.maxSeqLen || pos > runner.maxSeqLen - n) {
             fprintf(stderr, "Prompt exceeds the configured context length (%u)\n", runner.maxSeqLen);
             return -1;
         }
+        RestoreGemmaCommittedBoundary();
         if (std::getenv("BP_DUMP_TOKENS")) {
             fprintf(stderr, "[debug] prompt tokens:");
             for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %d", tokens[i]);
@@ -1831,6 +1850,7 @@ struct StandardState {
 
     std::vector<float> DecodeSynchronous(int32_t token) {
         if (pos >= runner.maxSeqLen) return {};
+        RestoreGemmaCommittedBoundary();
         auto logits = runner.decode(token, pos);
         DumpTopLogits("decode", logits);
         pos++;
@@ -1843,6 +1863,7 @@ struct StandardState {
             auto logits = DecodeSynchronous(token);
             return ModelRunner::argmax(logits);
         }
+        RestoreGemmaCommittedBoundary();
         int32_t next = runner.decodeArgmax(token, pos);
         pos++;
         return next;

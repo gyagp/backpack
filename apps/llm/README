@@ -39,11 +39,11 @@ MTP block is excluded from the 64-layer target decoder; speculative MTP is not
 enabled by this command.
 
 Batched prefill with bounded native weight staging is selected automatically
-for this artifact on RTX 5080. The accepted `e5e25be` application measurement
-records 142.41 prefill tokens/s and 11.54 decode tokens/s for 512 input tokens,
+for this artifact on RTX 5080. The accepted `859a23d` application measurement
+records 142.34 prefill tokens/s and 11.98 decode tokens/s for 512 input tokens,
 128 generated tokens and context 640. Prefill includes the first prediction;
-the remaining 127 decode calls are timed separately. Exact IQ3_S block-scale
-reuse improves decode by 4.94% over `110049f`, with neutral prefill. Shared chat,
+the remaining 127 decode calls are timed separately. Exact packed IQ4_XS lookup
+improves decode by 3.75% over `e5e25be`, with neutral prefill. Shared chat,
 sampling and benchmark flows are validated, but the large gap to llama.cpp
 remains open. See `docs/webgfx-104-enablement.md` for revision-linked evidence.
 
