@@ -107,6 +107,28 @@ std::string nativeQuantShader(GGUFType type, bool gather, bool prefill, uint32_t
     let word=select(low,high,(index&8u)!=0u);
     return f32(signed_byte((word>>(8u*(index&3u)))&255u));
 })WGSL");
+        const auto reduction=source.find("var<workgroup> sums:");
+        if(reduction==std::string::npos)throw std::runtime_error("Native reduction marker missing");
+        source.insert(reduction,R"WGSL(fn iq4_dot_factors(row:u32,k:u32)->vec3<f32> {
+    let base=row*P[3]*4u+(k/256u)*136u;
+    let e=k%256u;let group=e/32u;let lane=e%32u;
+    let lo=(u8(base+4u+group/2u)>>(4u*(group%2u)))&15u;
+    let hi=(u16(base+2u)>>(2u*group))&3u;
+    let q=(u8(base+8u+group*16u+(lane%16u))>>(4u*(lane/16u)))&15u;
+    return vec3<f32>(half(base),iq4_value(q),f32(i32(lo|(hi<<4u))-32));
+}
+
+)WGSL");
+        const std::string oldLoop="        for(var k=lane;k<K;k+=32u) { acc+=bitcast<f32>(X[wid.x*K+k])*decode(column,k); }";
+        const auto loop=source.find(oldLoop);
+        if(loop==std::string::npos)throw std::runtime_error("Native scalar loop missing");
+        source.replace(loop,oldLoop.size(),R"WGSL(        let mask=P[7]; // All ones preserve the accepted compiled multiply boundaries.
+        for(var k=lane;k<K;k+=32u) {
+            let f=iq4_dot_factors(column,k);
+            let xd=bitcast<f32>(bitcast<u32>(bitcast<f32>(X[wid.x*K+k])*f.x)&mask);
+            let xdq=bitcast<f32>(bitcast<u32>(xd*f.y)&mask);
+            acc=fma(xdq,f.z,acc);
+        })WGSL");
     }
 
     if (prefill) {
