@@ -2010,7 +2010,8 @@ TEST(matmul_q8_prefill_rows4) {
         const auto input=half?makeInputF16("X",{1,M,K},x):makeInputF32("X",{1,M,K},x);
         set("0");auto reference=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
         set("4");auto actual=runOnnxModel(gpu,model,{{"X",input}},{"Y"});
-        if(reference.at("Y").data!=actual.at("Y").data)throw std::runtime_error("Q8 prefill row reuse changed output bits");
+        if(gpu.executionError || gpu.deviceLost)throw std::runtime_error("Q8 prefill row reuse GPU validation failed");
+        if(reference.at("Y").data!=actual.at("Y").data)throw std::runtime_error("Q8 prefill row reuse changed output bits at K="+std::to_string(K)+" M="+std::to_string(M)+" half="+std::to_string(half));
         if(!gpu.hasPipeline("matmul_q8_block32_prefill_rows4"))throw std::runtime_error("Q8 prefill route was not selected");
     }
 }
